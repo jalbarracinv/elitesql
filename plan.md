@@ -113,6 +113,8 @@ Criterios de aceptacion:
 - Joins con indice sobre datasets de 1M registros con latencia razonable documentada en benchmarks.
 - El parser fuzzeado no produce panics.
 
+Estado (2026-08-07): completa como modulo `sql` dentro de `clawdb-core` (la crate separada `clawdb-sql` del workspace se pospone hasta que la FFI lo pida). Decision del spike: parser propio recursive descent, no sqlparser-rs — subset chico y cerrado, mensajes de error propios ("not supported in V1" con alternativa), cero dependencias nuevas, y guard de profundidad de expresiones para que el fuzzing no pueda reventar el stack. Implementado: CREATE TABLE (tipos V1 estrictos con sugerencias), CREATE [UNIQUE] INDEX, INSERT multi-fila atomico que devuelve ids, SELECT con WHERE (=, <>, <, <=, >, >=, AND/OR/NOT, IS NULL, IN), ORDER BY multi-columna, LIMIT/OFFSET, alias, INNER/LEFT/RIGHT JOIN encadenados (RIGHT = LEFT invertido), UPDATE/DELETE con conteo de afectadas y retry ante conflicto. Planner heuristico: point lookup por id, igualdad indexada via find_eq, pushdown de filtros pre-join, index nested-loop cuando el probe es chico y la columna de join esta indexada, hash join como fallback. Consistencia: SELECT es read-committed; snapshots consistentes via API Rust. Verificacion: 19 tests sqllogictest-style + 4 de fuzzing (6000 inputs aleatorios/mutados sin panics, nesting profundo cortado por guard). Benchmarks sobre 1M ordenes + 10K usuarios: point lookup via indice unico 3.9us (SQL completo), join indexado con ORDER BY+LIMIT 361us, full scan sin indice 1.1s (limite conocido de la spec). Documentacion de usuario en manual.md.
+
 ### Phase 3: Vector Native (~5-6 semanas)
 
 Objetivo: vectores como tipo e indice de primera clase.

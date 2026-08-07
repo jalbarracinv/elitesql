@@ -459,6 +459,23 @@ impl Db {
         st.catalog.tables.iter().map(|t| t.name.clone()).collect()
     }
 
+    /// The schema of a table, if it exists.
+    pub fn table_schema(&self, table: &str) -> Option<TableSchema> {
+        let st = self.shared.state.read().unwrap();
+        st.catalog.table(table).cloned()
+    }
+
+    /// Execute one SQL statement from the deliberately small V1 dialect.
+    ///
+    /// SELECT reads the latest committed state (read committed); for
+    /// snapshot-consistent reads use [`Db::scan_at`]/[`Db::get_at`].
+    /// UPDATE/DELETE apply their write set through a transaction, retrying a
+    /// bounded number of times on optimistic conflict. Multi-row INSERTs are
+    /// a single atomic commit.
+    pub fn query(&self, sql: &str) -> Result<crate::sql::QueryOutput> {
+        crate::sql::execute(self, sql)
+    }
+
     // --- transactions --------------------------------------------------------
 
     /// Begin a transaction reading from a stable snapshot of the current

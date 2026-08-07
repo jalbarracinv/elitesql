@@ -30,11 +30,11 @@ db.open("app.clawdb")
 |---|---|---|
 | Phase 0 | Prototipo append-only + benchmarks vs SQLite | Completa |
 | Phase 1 | WAL, manifest, MVCC, transacciones, indices, crash recovery | Completa |
-| Phase 2 | Dialecto SQL minimo | Pendiente |
+| Phase 2 | Dialecto SQL minimo (ver [manual.md](manual.md)) | Completa |
 | Phase 3 | Tipo vectorial + busqueda ANN (HNSW) | Pendiente |
 | Phase 4 | C ABI, bindings Python/Node, CLI, modo sidecar | Pendiente |
 
-Verificacion actual: 41 tests (MVCC, recovery, compaction, modelo aleatorio), crash injection con `kill -9` de procesos reales, y fuzzing de corrupcion de archivos (la base nunca entra en panico ni acepta estado invalido). Detalles en [specs.md](specs.md) y [plan.md](plan.md).
+Verificacion actual: 64 tests (MVCC, recovery, compaction, modelo aleatorio, suite SQL), crash injection con `kill -9` de procesos reales, y fuzzing de corrupcion de archivos y del parser SQL (la base nunca entra en panico ni acepta estado invalido). Detalles en [specs.md](specs.md) y [plan.md](plan.md).
 
 ## Quick installation
 
@@ -99,6 +99,26 @@ fn main() -> clawdb_core::Result<()> {
     let hits = db.find_eq("docs", "title", &Value::Text("hola".into()))?;
     assert_eq!(hits.len(), 1);
     Ok(())
+}
+```
+
+### SQL
+
+El mismo motor expone un dialecto SQL deliberadamente pequeno — referencia completa con ejemplos en [manual.md](manual.md):
+
+```rust
+use clawdb_core::QueryOutput;
+
+db.query("CREATE TABLE users (name text NOT NULL, email text, age int64)")?;
+db.query("CREATE UNIQUE INDEX ON users (email)")?;
+db.query("INSERT INTO users (name, email, age) VALUES ('ana', 'ana@x.com', 30)")?;
+
+if let QueryOutput::Rows { columns, rows } = db.query(
+    "SELECT u.name, o.amount FROM users u \
+     JOIN orders o ON o.user_id = u.id \
+     WHERE u.email = 'ana@x.com' ORDER BY o.amount DESC LIMIT 10",
+)? {
+    // ...
 }
 ```
 

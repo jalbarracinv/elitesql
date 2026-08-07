@@ -53,6 +53,7 @@ mod error;
 mod manifest;
 mod schema;
 mod segment;
+mod sql;
 mod value;
 mod wal;
 
@@ -60,5 +61,6 @@ pub use check::{check, CheckReport};
 pub use db::{Db, DbOptions, Record, Snapshot, Txn};
 pub use error::{Error, Result};
 pub use schema::{Column, IndexDef, TableSchema};
+pub use sql::QueryOutput;
 pub use value::{ColumnType, Value};
 pub use wal::Durability;

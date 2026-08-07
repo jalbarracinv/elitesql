@@ -22,6 +22,8 @@ pub enum Error {
     DatabaseLocked(String),
     /// A unique index rejected a duplicate value at commit.
     UniqueViolation { table: String, column: String },
+    /// SQL parse or execution error, including features outside the V1 subset.
+    Sql(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -41,6 +43,7 @@ impl Error {
             Error::Conflict(_) => 9,
             Error::DatabaseLocked(_) => 10,
             Error::UniqueViolation { .. } => 11,
+            Error::Sql(_) => 12,
         }
     }
 }
@@ -67,6 +70,7 @@ impl fmt::Display for Error {
             Error::UniqueViolation { table, column } => {
                 write!(f, "unique index violation on {table}.{column}")
             }
+            Error::Sql(msg) => write!(f, "sql error: {msg}"),
         }
     }
 }

@@ -19,3 +19,7 @@ tempfile = "3"
 [[bench]]
 name = "vs_sqlite"
 harness = false
+
+[[bench]]
+name = "sql"
+harness = false
