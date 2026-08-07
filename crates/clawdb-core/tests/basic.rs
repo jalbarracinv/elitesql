@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 
 use clawdb_core::{Column, ColumnType, Db, Error, Record, TableSchema, Value};
 use tempfile::TempDir;
@@ -115,7 +113,7 @@ fn update_patches_and_snapshots_see_old_versions() {
     assert_eq!(now["score"], Value::Int64(99));
     assert_eq!(now["title"], Value::Text("original".into()), "patch keeps other fields");
 
-    let then = db.get_at(snap, "docs", &id).unwrap().unwrap();
+    let then = db.get_at(&snap, "docs", &id).unwrap().unwrap();
     assert_eq!(then["score"], Value::Int64(10), "snapshot sees the old version");
 }
 
@@ -130,13 +128,13 @@ fn delete_respects_snapshots() {
     assert!(db.get("docs", &id).unwrap().is_none());
     assert!(db.scan("docs").unwrap().is_empty());
 
-    let old = db.get_at(before, "docs", &id).unwrap().unwrap();
+    let old = db.get_at(&before, "docs", &id).unwrap().unwrap();
     assert_eq!(old["title"], Value::Text("ephemeral".into()));
-    assert_eq!(db.scan_at(before, "docs").unwrap().len(), 1);
+    assert_eq!(db.scan_at(&before, "docs").unwrap().len(), 1);
 }
 
 #[test]
-fn reopen_rebuilds_index_and_version_counter() {
+fn reopen_rebuilds_state() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.clawdb");
     let mut ids = Vec::new();
@@ -162,7 +160,7 @@ fn reopen_rebuilds_index_and_version_counter() {
     // Version counter continues: snapshots taken after reopen see new writes.
     let before = db.snapshot();
     let new_id = db.insert("docs", record("after reopen", 1)).unwrap();
-    assert!(db.get_at(before, "docs", &new_id).unwrap().is_none());
+    assert!(db.get_at(&before, "docs", &new_id).unwrap().is_none());
     assert!(db.get("docs", &new_id).unwrap().is_some());
 }
 
@@ -208,55 +206,6 @@ fn schema_validation_errors() {
 }
 
 #[test]
-fn torn_tail_is_dropped_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.clawdb");
-    let (id_keep, id_torn);
-    {
-        let db = Db::create(&path).unwrap();
-        db.create_table(docs_schema()).unwrap();
-        id_keep = db.insert("docs", record("keep me", 1)).unwrap();
-        id_torn = db.insert("docs", record("i will be torn", 2)).unwrap();
-    }
-
-    // Simulate a torn write: chop bytes off the tail of the last entry.
-    let seg = path.join("segments").join("000001.seg");
-    let len = std::fs::metadata(&seg).unwrap().len();
-    let f = OpenOptions::new().write(true).open(&seg).unwrap();
-    f.set_len(len - 5).unwrap();
-
-    let db = Db::open(&path).unwrap();
-    assert!(db.get("docs", &id_keep).unwrap().is_some(), "intact entry survives");
-    assert!(db.get("docs", &id_torn).unwrap().is_none(), "torn entry is dropped");
-
-    // The database keeps working after truncation.
-    let id_new = db.insert("docs", record("after recovery", 3)).unwrap();
-    drop(db);
-    let db = Db::open(&path).unwrap();
-    assert!(db.get("docs", &id_new).unwrap().is_some());
-}
-
-#[test]
-fn garbage_tail_is_ignored_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.clawdb");
-    let id;
-    {
-        let db = Db::create(&path).unwrap();
-        db.create_table(docs_schema()).unwrap();
-        id = db.insert("docs", record("solid", 1)).unwrap();
-    }
-
-    let seg = path.join("segments").join("000001.seg");
-    let mut f = OpenOptions::new().append(true).open(&seg).unwrap();
-    f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]).unwrap();
-
-    let db = Db::open(&path).unwrap();
-    assert!(db.get("docs", &id).unwrap().is_some());
-    assert_eq!(db.scan("docs").unwrap().len(), 1);
-}
-
-#[test]
 fn concurrent_readers_and_writer() {
     let (_dir, db) = new_db();
     let db = std::sync::Arc::new(db);
@@ -292,8 +241,17 @@ fn concurrent_readers_and_writer() {
 }
 
 #[test]
+fn second_process_is_locked_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.clawdb");
+    let db = Db::create(&path).unwrap();
+    assert!(matches!(Db::open(&path), Err(Error::DatabaseLocked(_))));
+    drop(db);
+    Db::open(&path).unwrap();
+}
+
+#[test]
 fn record_map_with_btreemap_alias() {
-    // Record is a plain BTreeMap: usable without engine-specific builders.
     let r: Record = BTreeMap::new();
     assert!(r.is_empty());
 }

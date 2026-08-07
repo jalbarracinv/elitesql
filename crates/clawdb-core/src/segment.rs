@@ -1,9 +1,6 @@
 use crate::error::{Error, Result};
 use crate::value::{read_u16, read_u32, read_u64, read_u8};
 
-/// Segments rotate once they exceed this size.
-pub(crate) const SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
-
 pub(crate) const KIND_PUT: u8 = 1;
 pub(crate) const KIND_TOMBSTONE: u8 = 2;
 

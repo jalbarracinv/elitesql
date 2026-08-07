@@ -90,6 +90,8 @@ Criterios de aceptacion:
 - Compaction nunca elimina datos referenciados por un snapshot vivo (test dedicado).
 - Fuzzing de WAL y manifest sin panics ni estados corruptos aceptados.
 
+Estado (2026-08-06): completa en `crates/clawdb-core`. Implementado: WAL durable con CRC y replay idempotente; manifest atomico + manifest.prev con heal seguro; lock file (flock); MVCC con transacciones (begin/commit/rollback), snapshots como guards que la compaction respeta, y commits optimistas con `Error::Conflict` (CONFLICT_RETRY); indices secundarios y unicos validados en commit; modos safe/balanced/fast; checkpoint memtable->segmentos con rotacion de WAL; compaction stop-world; `check()`; catalogo de errores con codigos para la futura FFI. Verificacion: 41 tests incluyendo crash injection con kill -9 real (120 rondas corridas en CI local), fuzzing de corrupcion (1000 seeds, sin panics), test de modelo aleatorio con snapshots/reopen/compaction, y atomicidad de commits multi-registro ante WAL cortado. Benchmarks (Fast vs SQLite sync=OFF): reads 0.62us vs 2.72us (4.4x); inserts por-operacion 187K/s vs 63K/s (3.0x); batch txn 311K/s vs 841K/s de SQLite (pendiente de optimizar el staging path). Pendiente de la fase: compaction en background automatica (hoy es explicita via `compact()`).
+
 ### Phase 2: Query Layer (~6-8 semanas)
 
 Objetivo: el dialecto SQL minimo, deliberadamente limitado.

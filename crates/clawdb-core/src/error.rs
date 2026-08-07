@@ -1,7 +1,7 @@
 use std::fmt;
 
-/// Errors surfaced by the engine. The set will grow into the full
-/// `clawdb_status` catalog during Phase 1.
+/// Errors surfaced by the engine. `code()` gives the stable numeric status
+/// that the C ABI will expose as `clawdb_status` in Phase 4.
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
@@ -14,9 +14,36 @@ pub enum Error {
     /// The record or patch does not conform to the table schema.
     SchemaViolation(String),
     InvalidArgument(String),
+    /// Optimistic commit validation failed: something this transaction wrote
+    /// was modified by a commit published after the transaction began.
+    /// The caller should retry the transaction (CONFLICT_RETRY).
+    Conflict(String),
+    /// Another process holds the database lock.
+    DatabaseLocked(String),
+    /// A unique index rejected a duplicate value at commit.
+    UniqueViolation { table: String, column: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// Stable status code for the future C ABI. 0 is reserved for OK.
+    pub fn code(&self) -> u32 {
+        match self {
+            Error::Io(_) => 1,
+            Error::Corrupt(_) => 2,
+            Error::TableExists(_) => 3,
+            Error::TableNotFound(_) => 4,
+            Error::RecordNotFound { .. } => 5,
+            Error::DuplicateId { .. } => 6,
+            Error::SchemaViolation(_) => 7,
+            Error::InvalidArgument(_) => 8,
+            Error::Conflict(_) => 9,
+            Error::DatabaseLocked(_) => 10,
+            Error::UniqueViolation { .. } => 11,
+        }
+    }
+}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -33,6 +60,13 @@ impl fmt::Display for Error {
             }
             Error::SchemaViolation(msg) => write!(f, "schema violation: {msg}"),
             Error::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
+            Error::Conflict(msg) => write!(f, "conflict, retry transaction: {msg}"),
+            Error::DatabaseLocked(path) => {
+                write!(f, "database is locked by another process: {path}")
+            }
+            Error::UniqueViolation { table, column } => {
+                write!(f, "unique index violation on {table}.{column}")
+            }
         }
     }
 }

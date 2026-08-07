@@ -2,9 +2,9 @@
 //! point reads by id.
 //!
 //! Fairness notes:
-//! - Phase 0 clawdb does not fsync, so SQLite runs with WAL + synchronous=OFF
-//!   to compare the same (non-durable) write path.
-//! - `sqlite_autocommit` commits per insert, like clawdb's per-op append.
+//! - clawdb runs with `Durability::Fast` (no per-commit fsync) and SQLite
+//!   with WAL + synchronous=OFF: the same (non-durable) write path class.
+//! - `sqlite_autocommit` commits per insert, like clawdb's per-op commit.
 //!   `sqlite_single_txn` is SQLite's best case (one transaction), shown for
 //!   transparency.
 //!
@@ -12,7 +12,7 @@
 
 use std::hint::black_box;
 
-use clawdb_core::{Column, ColumnType, Db, Record, TableSchema, Value};
+use clawdb_core::{Column, ColumnType, Db, DbOptions, Durability, Record, TableSchema, Value};
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -25,7 +25,11 @@ daft zebras jump!";
 
 fn clawdb_new() -> (TempDir, Db) {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::create(dir.path().join("bench.clawdb")).unwrap();
+    let opts = DbOptions {
+        durability: Durability::Fast,
+        ..DbOptions::default()
+    };
+    let db = Db::create_with(dir.path().join("bench.clawdb"), opts).unwrap();
     db.create_table(TableSchema::new(
         "docs",
         vec![
@@ -85,6 +89,21 @@ fn bench_inserts(c: &mut Criterion) {
                 for i in 0..INSERT_N {
                     db.insert("docs", clawdb_record(i)).unwrap();
                 }
+                (dir, db)
+            },
+            BatchSize::PerIteration,
+        )
+    });
+
+    g.bench_function("clawdb_single_txn", |b| {
+        b.iter_batched(
+            clawdb_new,
+            |(dir, db)| {
+                let mut txn = db.begin();
+                for i in 0..INSERT_N {
+                    txn.insert("docs", clawdb_record(i)).unwrap();
+                }
+                txn.commit().unwrap();
                 (dir, db)
             },
             BatchSize::PerIteration,
