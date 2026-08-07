@@ -1,0 +1,21 @@
+[package]
+name = "clawdb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ClawDB storage engine core (Phase 0 prototype)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ulid = "1"
+crc32fast = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+tempfile = "3"
+
+[[bench]]
+name = "vs_sqlite"
+harness = false
