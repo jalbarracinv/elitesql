@@ -34,7 +34,7 @@ db.open("app.esql")
 | Phase 2.5 | Aggregates (COUNT/SUM/AVG/MIN/MAX, GROUP BY, HAVING) and date/time types | Complete |
 | Phase 3 | Vector type + ANN search (our own HNSW, persisted graph) | Complete |
 | Phase 4 | C ABI (with snapshots), Python/Node bindings, CLI, repair, read-only, sidecar, docs | Complete |
-| Phase 5 | BM25 full-text, hybrid search (RRF), int8 vectors, blob chunking | Complete (WASM/sync deferred by decision) |
+| Phase 5 | BM25 full-text, hybrid search (RRF), int8 vectors, blob chunking | Complete |
 
 Current verification: 114 Rust tests (MVCC, recovery, compaction, salvage, randomized model, SQL suite, vector recall, BM25/hybrid, blobs, read-only), crash injection with real `kill -9` of live processes, corruption and SQL-parser fuzzing, plus CLI, Python FFI and Node sidecar e2e tests. Onboarding docs in [docs/](docs/). Details in [specs.md](specs.md) and [plan.md](plan.md).
 
