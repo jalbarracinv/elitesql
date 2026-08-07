@@ -27,6 +27,7 @@ USAGE:
 
 OPTIONS:
   --durability safe|balanced|fast    (query/repl/import/serve; default safe)
+  --read-only                        open without touching disk; writes fail
 ";
 
 fn main() -> ExitCode {
@@ -55,7 +56,12 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         };
         args.drain(i..=i + 1);
     }
-    let opts = DbOptions { durability, ..DbOptions::default() };
+    let mut read_only = false;
+    if let Some(i) = args.iter().position(|a| a == "--read-only") {
+        read_only = true;
+        args.remove(i);
+    }
+    let opts = DbOptions { durability, read_only, ..DbOptions::default() };
 
     let cmd = args.first().cloned().unwrap_or_default();
     match cmd.as_str() {
@@ -163,7 +169,11 @@ fn take<const N: usize>(args: &[String]) -> Result<[String; N], String> {
 }
 
 fn open(path: &str, opts: DbOptions) -> Result<Db, String> {
-    Db::open_or_create_with(path, opts).map_err(|e| e.to_string())
+    if opts.read_only {
+        Db::open_with(path, opts).map_err(|e| e.to_string())
+    } else {
+        Db::open_or_create_with(path, opts).map_err(|e| e.to_string())
+    }
 }
 
 fn repl(path: &str, opts: DbOptions) -> Result<(), String> {

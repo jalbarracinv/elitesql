@@ -197,7 +197,12 @@ Estado (2026-08-07): nucleo de la fase completo. Entregado:
 - Demo de aceptacion cumplida: examples/gunicorn_demo/run_demo.sh — gunicorn real con 4 workers contra clawdb serve; 8 visitantes x 25 requests concurrentes: 200/200 escrituras registradas, 4 PIDs de worker distintos, wall 0.7s, peor request 41ms, cero bloqueos.
 - Verificacion: 105 tests Rust + e2e del CLI completo + smoke FFI Python (flujo con vectores y filtros) + e2e Node sidecar.
 
-Pendiente de la fase (siguiente iteracion): empaquetado y publicacion (wheel PyPI, npm), binding Node nativo napi (hoy Node va via sidecar), snapshots en la ABI (lecturas de bindings son read-committed; snapshots consistentes solo en API Rust), modo read-only automatico ante corrupcion no recuperable, y docs de onboarding dedicadas mas alla de README + manual.md.
+Cierre de fase (2026-08-07): completados los pendientes.
+- Snapshots en la ABI: clawdb_snapshot_open/close/get/scan + clase Snapshot en Python (context manager) — lecturas estables desde bindings.
+- Modo read-only: DbOptions.read_only / Db::open_read_only / opcion {"read_only":true} en la ABI / --read-only en CLI. Lock compartido (varios lectores RO coexisten), carga tolerante (prefijo valido de archivos danados en vez de rechazar), cero escrituras a disco (verificado byte a byte en test), toda escritura devuelve ReadOnly (codigo 13). Es el paso previo a repair para inspeccionar una base danada.
+- Empaquetado: pyproject.toml (wheel construible con python -m build) y package.json + clawdb.d.ts para el cliente Node. La publicacion a PyPI/npm es un paso externo cuando el proyecto sea publico.
+- Docs de onboarding: docs/getting-started.md, docs/recovery.md, docs/disk-format.md.
+- Decision registrada: el binding Node embebido nativo (napi) queda diferido — el camino Node es el sidecar (cero dependencias, sin toolchain de compilacion en npm install); napi se justificara si aparece un caso Node single-proceso que necesite las latencias embebidas.
 
 ### Phase 5: Advanced (sin estimar, priorizar al llegar)
 
@@ -207,6 +212,19 @@ Pendiente de la fase (siguiente iteracion): empaquetado y publicacion (wheel PyP
 - Target WASM.
 - Sync local-first opcional.
 - Explorar modo single-file.
+
+Estado (2026-08-07): priorizacion ejecutada — la fase pedia "priorizar al llegar" y la prioridad fue la promesa AI-native. Implementado y probado:
+- Full-text basico: indice invertido en memoria con ranking BM25 (k1=1.2, b=0.75) sobre columnas text; tokenizer deliberadamente predecible (runs alfanumericos Unicode, lowercase, 2..64 chars, sin stemming ni stopwords). create_text_index + search_text con filtro por metadata; mantenido en commit, reconstruido en open y compaction, definicion persistida en el catalogo. Expuesto en ABI, sidecar, Python y Node.
+- search_hybrid: fusion Reciprocal Rank Fusion (k=60) de BM25 + ANN, una o ambas modalidades, con filtro compartido. El documento presente en ambos rankings gana — verificado en tests.
+- Vectores cuantizados: opcion quantized en el indice ANN — int8 con escala por vector (x ~ q*escala), distancias sobre enteros (dot i64) o dequantizacion al vuelo, ~4x menos memoria y dump (verificado por tamano de archivo), recall >= 0.8 vs fuerza bruta en tests. Formato vidx v3; dumps viejos se descartan y reconstruyen.
+- Blob chunking: valores blob >= external_blob_threshold (default 256 KiB) van out-of-line a blobs/<ulid>.blob con header CLAWBLOB + CRC + longitud, escritos y fsynced ANTES del commit WAL que los referencia; el payload guarda una referencia (tag 11) resuelta y validada en lectura. GC en compaction (borra chunks no referenciados, incluidos huerfanos de commits cortados); check() valida chunks referenciados desde segmentos y WAL; salvage los resuelve o reporta. Sacado del camino critico transaccional, como pedia la spec.
+- Verificacion: 9 tests dedicados (ranking BM25, updates/deletes/reopen/compaction del indice de texto, RRF, recall cuantizado + tamano de dump, roundtrip de blobs + GC + corrupcion detectada, read-only sano y sobre base corrupta) + smokes e2e Python y Node.
+
+Diferido con decision (no implementado a proposito):
+- Target WASM: el core usa fs/flock/threads/Instant; portarlo exige una capa de abstraccion de plataforma — proyecto propio, se justifica cuando exista un consumidor browser/edge concreto.
+- Sync local-first: "opcional" en la spec; requiere diseno de protocolo (CRDTs o log shipping) que merece su propia spec.
+- IVF/PQ: la cuantizacion escalar int8 cubre el objetivo de memoria en el rango de datos actual; IVF/PQ cuando haya datasets >10M vectores.
+- Modo single-file: la carpeta autocontenida sigue siendo mas simple para compaction e indices; re-evaluar con demanda real.
 
 ## Estrategia de testing (transversal)
 

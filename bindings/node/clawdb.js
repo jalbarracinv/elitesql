@@ -122,11 +122,33 @@ class SidecarClient {
     return hits.map((h) => ({ ...h, record: decodeRecord(h.record) }));
   }
 
-  createVectorIndex(table, column, { metric = 'cosine', mode = 'sync', m, efConstruction } = {}) {
+  createVectorIndex(table, column, { metric = 'cosine', mode = 'sync', m, efConstruction, quantized } = {}) {
     const request = { op: 'create_vector_index', table, column, metric, mode };
     if (m !== undefined) request.m = m;
     if (efConstruction !== undefined) request.ef_construction = efConstruction;
+    if (quantized) request.quantized = true;
     return this._call(request);
+  }
+
+  createTextIndex(table, column) {
+    return this._call({ op: 'create_text_index', table, column });
+  }
+
+  async searchText(table, column, query, { topK = 10, filter } = {}) {
+    const request = { op: 'search_text', table, column, query, top_k: topK };
+    if (filter !== undefined) request.filter = filter;
+    const { hits } = await this._call(request);
+    return hits.map((h) => ({ ...h, record: decodeRecord(h.record) }));
+  }
+
+  async searchHybrid(table, { text, vector, topK = 10, efSearch, filter } = {}) {
+    const request = { op: 'search_hybrid', table, top_k: topK };
+    if (text) request.text = { column: text[0], query: text[1] };
+    if (vector) request.vector = { column: vector[0], vector: vector[1] };
+    if (efSearch !== undefined) request.ef_search = efSearch;
+    if (filter !== undefined) request.filter = filter;
+    const { hits } = await this._call(request);
+    return hits.map((h) => ({ ...h, record: decodeRecord(h.record) }));
   }
 
   checkpoint() {

@@ -74,6 +74,9 @@ fn handle_request(db: &Db, line: &str) -> J {
         },
         "search_vector" => jsonio::search_vector_json(db, &request),
         "create_vector_index" => jsonio::create_vector_index_json(db, &request),
+        "search_text" => jsonio::search_text_json(db, &request),
+        "create_text_index" => jsonio::create_text_index_json(db, &request),
+        "search_hybrid" => jsonio::search_hybrid_json(db, &request),
         "checkpoint" => db.checkpoint().map(|()| json!(true)),
         "compact" => db.compact().map(|()| json!(true)),
         other => Err(clawdb_core::Error::InvalidArgument(format!(

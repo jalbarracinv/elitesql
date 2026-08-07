@@ -109,6 +109,8 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
                 outcome.valid_len
             ));
         }
+        let blobs_dir = dir.join(crate::db::BLOBS_DIR);
+        let mut refs = Vec::new();
         for e in &entries {
             if e.version > manifest.committed_version {
                 report.errors.push(format!(
@@ -116,6 +118,27 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
                     e.version, manifest.committed_version
                 ));
                 break;
+            }
+            if e.tombstone {
+                continue;
+            }
+            // Out-of-line blob chunks referenced by this payload must exist
+            // and validate (magic + length + crc).
+            let payload =
+                &data[e.payload_offset as usize..(e.payload_offset + e.payload_len as u64) as usize];
+            refs.clear();
+            if crate::db::scan_payload_blob_refs(payload, &mut refs).is_err() {
+                report
+                    .errors
+                    .push(format!("segment {name}: unparseable payload for {}/{}", e.table, e.id));
+                continue;
+            }
+            for r in &refs {
+                if let Err(err) = crate::value::read_blob_file(&blobs_dir, r) {
+                    report
+                        .errors
+                        .push(format!("segment {name}: {}/{}: {err}", e.table, e.id));
+                }
             }
         }
     }
@@ -160,9 +183,9 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
                 last = rec.version;
                 for ch in &rec.changes {
                     if let Some(p) = &ch.payload {
-                        if crate::db::decode_record(p).is_err() {
+                        if let Err(e) = crate::db::decode_record(p, Some(&dir.join(crate::db::BLOBS_DIR))) {
                             report.errors.push(format!(
-                                "wal {}: undecodable payload for {}/{}",
+                                "wal {}: bad payload for {}/{}: {e}",
                                 manifest.wal_id, ch.table, ch.id
                             ));
                         }

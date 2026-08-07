@@ -56,6 +56,10 @@ pub struct VectorIndexDef {
     pub ef_construction: usize,
     #[serde(default = "default_mode")]
     pub mode: IndexingMode,
+    /// Store vectors as int8 with a per-vector scale: ~4x less memory and
+    /// disk at a small recall cost. Canonical f32 data is untouched.
+    #[serde(default)]
+    pub quantized: bool,
 }
 
 fn default_m() -> usize {
@@ -77,6 +81,8 @@ pub struct VectorIndexOptions {
     pub m: usize,
     /// HNSW construction beam width (typical: 100-400).
     pub ef_construction: usize,
+    /// int8 scalar quantization of the in-index vectors.
+    pub quantized: bool,
 }
 
 impl Default for VectorIndexOptions {
@@ -86,6 +92,7 @@ impl Default for VectorIndexOptions {
             mode: IndexingMode::Sync,
             m: default_m(),
             ef_construction: default_ef_construction(),
+            quantized: false,
         }
     }
 }
@@ -146,6 +153,44 @@ impl Ord for Cand {
     }
 }
 
+/// In-index vector storage: full f32, or int8 with a per-vector scale
+/// (x ≈ q * scale), which cuts memory and dump size ~4x.
+enum VecStore {
+    F32(Vec<Vec<f32>>),
+    I8(Vec<(Vec<i8>, f32)>),
+}
+
+impl VecStore {
+    fn len(&self) -> usize {
+        match self {
+            VecStore::F32(v) => v.len(),
+            VecStore::I8(v) => v.len(),
+        }
+    }
+
+    /// Append, returning the stored vector's norm (of what was stored,
+    /// i.e. post-quantization, so cosine stays self-consistent).
+    fn push(&mut self, v: &[f32]) -> f32 {
+        match self {
+            VecStore::F32(store) => {
+                store.push(v.to_vec());
+                v.iter().map(|x| x * x).sum::<f32>().sqrt()
+            }
+            VecStore::I8(store) => {
+                let max_abs = v.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+                let q: Vec<i8> = v
+                    .iter()
+                    .map(|x| (x / scale).round().clamp(-127.0, 127.0) as i8)
+                    .collect();
+                let sumsq: i64 = q.iter().map(|&b| b as i64 * b as i64).sum();
+                store.push((q, scale));
+                scale * (sumsq as f32).sqrt()
+            }
+        }
+    }
+}
+
 struct HnswIndex {
     metric: VectorMetric,
     m: usize,
@@ -153,7 +198,7 @@ struct HnswIndex {
     ef_construction: usize,
     /// Level multiplier 1/ln(m).
     ml: f64,
-    vectors: Vec<Vec<f32>>,
+    store: VecStore,
     norms: Vec<f32>,
     /// node -> level -> neighbor labels.
     links: Vec<Vec<Vec<u32>>>,
@@ -163,7 +208,7 @@ struct HnswIndex {
 }
 
 impl HnswIndex {
-    fn new(metric: VectorMetric, m: usize, ef_construction: usize) -> HnswIndex {
+    fn new(metric: VectorMetric, m: usize, ef_construction: usize, quantized: bool) -> HnswIndex {
         let m = m.clamp(2, 256);
         HnswIndex {
             metric,
@@ -171,7 +216,11 @@ impl HnswIndex {
             m0: m * 2,
             ef_construction: ef_construction.max(m),
             ml: 1.0 / (m as f64).ln(),
-            vectors: Vec::new(),
+            store: if quantized {
+                VecStore::I8(Vec::new())
+            } else {
+                VecStore::F32(Vec::new())
+            },
             norms: Vec::new(),
             links: Vec::new(),
             entry: None,
@@ -189,26 +238,89 @@ impl HnswIndex {
     }
 
     fn dist_between(&self, a: u32, b: u32) -> f32 {
-        self.dist_raw(&self.vectors[a as usize], self.norms[a as usize], b)
+        match &self.store {
+            VecStore::F32(vs) => self.dist_raw(&vs[a as usize], self.norms[a as usize], b),
+            VecStore::I8(vs) => {
+                let (qa, sa) = &vs[a as usize];
+                let (qb, sb) = &vs[b as usize];
+                match self.metric {
+                    VectorMetric::Cosine => {
+                        let dot_i: i64 = qa
+                            .iter()
+                            .zip(qb)
+                            .map(|(&x, &y)| x as i64 * y as i64)
+                            .sum();
+                        let dot = dot_i as f32 * sa * sb;
+                        1.0 - dot
+                            / (self.norms[a as usize] * self.norms[b as usize]).max(f32::EPSILON)
+                    }
+                    VectorMetric::Dot => {
+                        let dot_i: i64 = qa
+                            .iter()
+                            .zip(qb)
+                            .map(|(&x, &y)| x as i64 * y as i64)
+                            .sum();
+                        1.0 - dot_i as f32 * sa * sb
+                    }
+                    VectorMetric::L2 => qa
+                        .iter()
+                        .zip(qb)
+                        .map(|(&x, &y)| {
+                            let d = x as f32 * sa - y as f32 * sb;
+                            d * d
+                        })
+                        .sum::<f32>()
+                        .sqrt(),
+                }
+            }
+        }
     }
 
     fn dist_raw(&self, v: &[f32], vnorm: f32, label: u32) -> f32 {
-        let w = &self.vectors[label as usize];
-        match self.metric {
-            VectorMetric::Cosine => {
-                let dot: f32 = v.iter().zip(w).map(|(x, y)| x * y).sum();
-                1.0 - dot / (vnorm * self.norms[label as usize]).max(f32::EPSILON)
+        match &self.store {
+            VecStore::F32(vs) => {
+                let w = &vs[label as usize];
+                match self.metric {
+                    VectorMetric::Cosine => {
+                        let dot: f32 = v.iter().zip(w).map(|(x, y)| x * y).sum();
+                        1.0 - dot / (vnorm * self.norms[label as usize]).max(f32::EPSILON)
+                    }
+                    VectorMetric::Dot => {
+                        let dot: f32 = v.iter().zip(w).map(|(x, y)| x * y).sum();
+                        1.0 - dot
+                    }
+                    VectorMetric::L2 => v
+                        .iter()
+                        .zip(w)
+                        .map(|(x, y)| (x - y) * (x - y))
+                        .sum::<f32>()
+                        .sqrt(),
+                }
             }
-            VectorMetric::Dot => {
-                let dot: f32 = v.iter().zip(w).map(|(x, y)| x * y).sum();
-                1.0 - dot
+            VecStore::I8(vs) => {
+                let (q, scale) = &vs[label as usize];
+                match self.metric {
+                    VectorMetric::Cosine => {
+                        let dot: f32 =
+                            v.iter().zip(q).map(|(x, &y)| x * y as f32).sum::<f32>() * scale;
+                        1.0 - dot / (vnorm * self.norms[label as usize]).max(f32::EPSILON)
+                    }
+                    VectorMetric::Dot => {
+                        let dot: f32 =
+                            v.iter().zip(q).map(|(x, &y)| x * y as f32).sum::<f32>() * scale;
+                        1.0 - dot
+                    }
+                    VectorMetric::L2 => v
+                        .iter()
+                        .zip(q)
+                        .map(|(x, &y)| {
+                            let d = x - y as f32 * scale;
+                            d * d
+                        })
+                        .sum::<f32>()
+                        .sqrt(),
+                }
             }
-            VectorMetric::L2 => v
-                .iter()
-                .zip(w)
-                .map(|(x, y)| (x - y) * (x - y))
-                .sum::<f32>()
-                .sqrt(),
         }
     }
 
@@ -300,11 +412,13 @@ impl HnswIndex {
     }
 
     fn insert(&mut self, v: &[f32]) -> u32 {
-        let label = self.vectors.len() as u32;
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let label = self.store.len() as u32;
         let level = self.random_level();
-        self.vectors.push(v.to_vec());
-        self.norms.push(norm);
+        let stored_norm = self.store.push(v);
+        // Query-side norm stays the exact f32 norm; the stored norm reflects
+        // what the index will compare against.
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        self.norms.push(stored_norm);
         self.links.push((0..=level as usize).map(|_| Vec::new()).collect());
 
         let Some(entry) = self.entry else {
@@ -387,7 +501,7 @@ pub(crate) struct VecIdx {
 impl VecIdx {
     pub fn new(def: VectorIndexDef) -> VecIdx {
         VecIdx {
-            backend: HnswIndex::new(def.metric, def.m, def.ef_construction),
+            backend: HnswIndex::new(def.metric, def.m, def.ef_construction, def.quantized),
             labels: Vec::new(),
             id_to_label: HashMap::new(),
             deleted: HashSet::new(),
@@ -463,7 +577,7 @@ impl VecIdx {
 // data" — never an error surfaced to the user.
 
 const VIDX_MAGIC: &[u8; 8] = b"CLAWVIDX";
-const VIDX_FORMAT: u32 = 2;
+const VIDX_FORMAT: u32 = 3;
 const MAX_LEVELS: usize = 64;
 
 fn write_str16(buf: &mut Vec<u8>, s: &str) {
@@ -503,25 +617,37 @@ impl VecIdx {
         dump_version: u64,
     ) -> Vec<u8> {
         let b = &self.backend;
-        let mut body = Vec::with_capacity(64 + b.vectors.len() * 64);
+        let n = b.store.len();
+        let mut body = Vec::with_capacity(64 + n * 64);
         body.extend_from_slice(&VIDX_FORMAT.to_le_bytes());
         write_str16(&mut body, table);
         write_str16(&mut body, column);
         body.push(metric_code(def.metric));
         body.extend_from_slice(&(def.m as u32).to_le_bytes());
         body.extend_from_slice(&(def.ef_construction as u32).to_le_bytes());
+        body.push(def.quantized as u8);
         body.extend_from_slice(&dump_version.to_le_bytes());
         body.push(b.top_level);
         body.extend_from_slice(&b.entry.unwrap_or(u32::MAX).to_le_bytes());
         body.extend_from_slice(&b.rng.to_le_bytes());
-        body.extend_from_slice(&(b.vectors.len() as u32).to_le_bytes());
-        for i in 0..b.vectors.len() {
+        body.extend_from_slice(&(n as u32).to_le_bytes());
+        for i in 0..n {
             write_str16(&mut body, &self.labels[i]);
             body.push(self.deleted.contains(&i) as u8);
-            let v = &b.vectors[i];
-            body.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            for x in v {
-                body.extend_from_slice(&x.to_le_bytes());
+            match &b.store {
+                VecStore::F32(vs) => {
+                    let v = &vs[i];
+                    body.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    for x in v {
+                        body.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+                VecStore::I8(vs) => {
+                    let (q, scale) = &vs[i];
+                    body.extend_from_slice(&(q.len() as u32).to_le_bytes());
+                    body.extend_from_slice(&scale.to_le_bytes());
+                    body.extend(q.iter().map(|&b| b as u8));
+                }
             }
             let levels = &b.links[i];
             body.push(levels.len() as u8);
@@ -569,7 +695,8 @@ impl VecIdx {
         }
         let same_def = read_u8(body, &mut pos)? == metric_code(def.metric)
             && read_u32(body, &mut pos)? as usize == def.m
-            && read_u32(body, &mut pos)? as usize == def.ef_construction;
+            && read_u32(body, &mut pos)? as usize == def.ef_construction
+            && read_u8(body, &mut pos)? == def.quantized as u8;
         if !same_def {
             return Err(Error::Corrupt("vidx: index definition changed".into()));
         }
@@ -587,7 +714,11 @@ impl VecIdx {
 
         let mut labels = Vec::with_capacity(n);
         let mut deleted: HashSet<usize> = HashSet::new();
-        let mut vectors = Vec::with_capacity(n);
+        let mut store = if def.quantized {
+            VecStore::I8(Vec::with_capacity(n))
+        } else {
+            VecStore::F32(Vec::with_capacity(n))
+        };
         let mut norms = Vec::with_capacity(n);
         let mut links: Vec<Vec<Vec<u32>>> = Vec::with_capacity(n);
         for i in 0..n {
@@ -596,21 +727,32 @@ impl VecIdx {
                 deleted.insert(i);
             }
             let dim = read_u32(body, &mut pos)? as usize;
-            if dim
-                .checked_mul(4)
-                .is_none_or(|b| pos + b > body.len())
-            {
-                return Err(Error::Corrupt("vidx: truncated vector".into()));
+            match &mut store {
+                VecStore::F32(vs) => {
+                    if dim.checked_mul(4).is_none_or(|b| pos + b > body.len()) {
+                        return Err(Error::Corrupt("vidx: truncated vector".into()));
+                    }
+                    let mut v = Vec::with_capacity(dim);
+                    for _ in 0..dim {
+                        v.push(f32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()));
+                        pos += 4;
+                    }
+                    norms.push(v.iter().map(|x| x * x).sum::<f32>().sqrt());
+                    vs.push(v);
+                }
+                VecStore::I8(vs) => {
+                    if dim.checked_add(4).is_none_or(|b| pos + b > body.len()) {
+                        return Err(Error::Corrupt("vidx: truncated vector".into()));
+                    }
+                    let scale = f32::from_le_bytes(body[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    let q: Vec<i8> = body[pos..pos + dim].iter().map(|&b| b as i8).collect();
+                    pos += dim;
+                    let sumsq: i64 = q.iter().map(|&b| b as i64 * b as i64).sum();
+                    norms.push(scale * (sumsq as f32).sqrt());
+                    vs.push((q, scale));
+                }
             }
-            let mut v = Vec::with_capacity(dim);
-            for _ in 0..dim {
-                v.push(f32::from_le_bytes(
-                    body[pos..pos + 4].try_into().unwrap(),
-                ));
-                pos += 4;
-            }
-            norms.push(v.iter().map(|x| x * x).sum::<f32>().sqrt());
-            vectors.push(v);
             let level_count = read_u8(body, &mut pos)? as usize;
             if level_count == 0 || level_count > MAX_LEVELS {
                 return Err(Error::Corrupt("vidx: bad level count".into()));
@@ -672,7 +814,7 @@ impl VecIdx {
             m0: m * 2,
             ef_construction: def.ef_construction.max(m),
             ml: 1.0 / (m as f64).ln(),
-            vectors,
+            store,
             norms,
             links,
             entry,

@@ -27,7 +27,7 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-__all__ = ["ClawDB", "SidecarClient", "ClawDBError", "check", "repair"]
+__all__ = ["ClawDB", "SidecarClient", "Snapshot", "ClawDBError", "check", "repair"]
 
 
 class ClawDBError(Exception):
@@ -103,6 +103,30 @@ def _configure(lib: ctypes.CDLL) -> None:
     ]
     lib.clawdb_create_vector_index.restype = ctypes.c_uint32
     lib.clawdb_create_vector_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.clawdb_create_text_index.restype = ctypes.c_uint32
+    lib.clawdb_create_text_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.clawdb_search_text.restype = ctypes.c_uint32
+    lib.clawdb_search_text.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.clawdb_search_hybrid.restype = ctypes.c_uint32
+    lib.clawdb_search_hybrid.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.clawdb_snapshot_open.restype = ctypes.c_uint32
+    lib.clawdb_snapshot_open.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    lib.clawdb_snapshot_close.restype = ctypes.c_uint32
+    lib.clawdb_snapshot_close.argtypes = [ctypes.c_void_p]
+    lib.clawdb_snapshot_get.restype = ctypes.c_uint32
+    lib.clawdb_snapshot_get.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.clawdb_snapshot_scan.restype = ctypes.c_uint32
+    lib.clawdb_snapshot_scan.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
     lib.clawdb_checkpoint.restype = ctypes.c_uint32
     lib.clawdb_checkpoint.argtypes = [ctypes.c_void_p]
     lib.clawdb_compact.restype = ctypes.c_uint32
@@ -179,10 +203,15 @@ class ClawDB:
     """Embedded ClawDB over the C ABI. Thread-safe; use as a context manager."""
 
     def __init__(self, path: str | os.PathLike, durability: Optional[str] = None,
-                 lib_path: Optional[str] = None):
+                 read_only: bool = False, lib_path: Optional[str] = None):
         self._lib = _load_lib(lib_path)
         handle = ctypes.c_void_p()
-        options = json.dumps({"durability": durability}) if durability else None
+        opts: dict[str, Any] = {}
+        if durability:
+            opts["durability"] = durability
+        if read_only:
+            opts["read_only"] = True
+        options = json.dumps(opts) if opts else None
         status = self._lib.clawdb_open(
             str(path).encode(), options.encode() if options else None, ctypes.byref(handle)
         )
@@ -245,14 +274,69 @@ class ClawDB:
 
     def create_vector_index(self, table: str, column: str, metric: str = "cosine",
                             mode: str = "sync", m: Optional[int] = None,
-                            ef_construction: Optional[int] = None) -> None:
+                            ef_construction: Optional[int] = None,
+                            quantized: bool = False) -> None:
         params: dict[str, Any] = {"table": table, "column": column, "metric": metric, "mode": mode}
         if m is not None:
             params["m"] = m
         if ef_construction is not None:
             params["ef_construction"] = ef_construction
+        if quantized:
+            params["quantized"] = True
         status = self._lib.clawdb_create_vector_index(self._h(), json.dumps(params).encode())
         _raise_if(self._lib, status)
+
+    def create_text_index(self, table: str, column: str) -> None:
+        params = json.dumps({"table": table, "column": column}).encode()
+        _raise_if(self._lib, self._lib.clawdb_create_text_index(self._h(), params))
+
+    def search_text(self, table: str, column: str, query: str, top_k: int = 10,
+                    filter: Optional[dict] = None) -> list[dict]:
+        params: dict[str, Any] = {
+            "table": table, "column": column, "query": query, "top_k": top_k,
+        }
+        if filter is not None:
+            params["filter"] = filter
+        out = ctypes.c_void_p()
+        status = self._lib.clawdb_search_text(self._h(), json.dumps(params).encode(),
+                                              ctypes.byref(out))
+        _raise_if(self._lib, status)
+        hits = json.loads(_take_string(self._lib, out))["hits"]
+        for h in hits:
+            h["record"] = _decode_record(h["record"])
+        return hits
+
+    def search_hybrid(self, table: str, text: Optional[tuple[str, str]] = None,
+                      vector: Optional[tuple[str, list[float]]] = None, top_k: int = 10,
+                      ef_search: Optional[int] = None,
+                      filter: Optional[dict] = None) -> list[dict]:
+        """RRF fusion of BM25 text and ANN vector rankings.
+
+        text=(column, query); vector=(column, embedding). One or both.
+        """
+        params: dict[str, Any] = {"table": table, "top_k": top_k}
+        if text is not None:
+            params["text"] = {"column": text[0], "query": text[1]}
+        if vector is not None:
+            params["vector"] = {"column": vector[0], "vector": vector[1]}
+        if ef_search is not None:
+            params["ef_search"] = ef_search
+        if filter is not None:
+            params["filter"] = filter
+        out = ctypes.c_void_p()
+        status = self._lib.clawdb_search_hybrid(self._h(), json.dumps(params).encode(),
+                                                ctypes.byref(out))
+        _raise_if(self._lib, status)
+        hits = json.loads(_take_string(self._lib, out))["hits"]
+        for h in hits:
+            h["record"] = _decode_record(h["record"])
+        return hits
+
+    def snapshot(self) -> "Snapshot":
+        """A stable read position; use as a context manager."""
+        handle = ctypes.c_void_p()
+        _raise_if(self._lib, self._lib.clawdb_snapshot_open(self._h(), ctypes.byref(handle)))
+        return Snapshot(self, handle)
 
     def checkpoint(self) -> None:
         _raise_if(self._lib, self._lib.clawdb_checkpoint(self._h()))
@@ -263,6 +347,56 @@ class ClawDB:
     @property
     def version(self) -> str:
         return self._lib.clawdb_version().decode()
+
+
+class Snapshot:
+    """Stable reads: `get`/`scan` see the database as of snapshot time,
+    while other writers keep committing. Close (or use `with`) to let
+    compaction reclaim old versions."""
+
+    def __init__(self, db: "ClawDB", handle: ctypes.c_void_p):
+        self._db = db
+        self._handle: Optional[ctypes.c_void_p] = handle
+
+    def _h(self) -> ctypes.c_void_p:
+        if self._handle is None:
+            raise ClawDBError(8, "snapshot is closed")
+        return self._handle
+
+    def get(self, table: str, id: str) -> Optional[dict]:
+        out = ctypes.c_void_p()
+        status = self._db._lib.clawdb_snapshot_get(
+            self._db._h(), self._h(), table.encode(), id.encode(), ctypes.byref(out)
+        )
+        _raise_if(self._db._lib, status)
+        record = json.loads(_take_string(self._db._lib, out))["record"]
+        return _decode_record(record) if record is not None else None
+
+    def scan(self, table: str) -> list[dict]:
+        out = ctypes.c_void_p()
+        status = self._db._lib.clawdb_snapshot_scan(
+            self._db._h(), self._h(), table.encode(), ctypes.byref(out)
+        )
+        _raise_if(self._db._lib, status)
+        rows = json.loads(_take_string(self._db._lib, out))["rows"]
+        return [_decode_record(r) for r in rows]
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._db._lib.clawdb_snapshot_close(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> "Snapshot":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def __del__(self):  # best effort
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def check(path: str | os.PathLike, lib_path: Optional[str] = None) -> dict:
@@ -351,7 +485,8 @@ class SidecarClient:
 
     def create_vector_index(self, table: str, column: str, metric: str = "cosine",
                             mode: str = "sync", m: Optional[int] = None,
-                            ef_construction: Optional[int] = None) -> None:
+                            ef_construction: Optional[int] = None,
+                            quantized: bool = False) -> None:
         request: dict[str, Any] = {
             "op": "create_vector_index", "table": table, "column": column,
             "metric": metric, "mode": mode,
@@ -360,7 +495,43 @@ class SidecarClient:
             request["m"] = m
         if ef_construction is not None:
             request["ef_construction"] = ef_construction
+        if quantized:
+            request["quantized"] = True
         self._call(request)
+
+    def create_text_index(self, table: str, column: str) -> None:
+        self._call({"op": "create_text_index", "table": table, "column": column})
+
+    def search_text(self, table: str, column: str, query: str, top_k: int = 10,
+                    filter: Optional[dict] = None) -> list[dict]:
+        request: dict[str, Any] = {
+            "op": "search_text", "table": table, "column": column,
+            "query": query, "top_k": top_k,
+        }
+        if filter is not None:
+            request["filter"] = filter
+        hits = self._call(request)["hits"]
+        for h in hits:
+            h["record"] = _decode_record(h["record"])
+        return hits
+
+    def search_hybrid(self, table: str, text: Optional[tuple[str, str]] = None,
+                      vector: Optional[tuple[str, list[float]]] = None, top_k: int = 10,
+                      ef_search: Optional[int] = None,
+                      filter: Optional[dict] = None) -> list[dict]:
+        request: dict[str, Any] = {"op": "search_hybrid", "table": table, "top_k": top_k}
+        if text is not None:
+            request["text"] = {"column": text[0], "query": text[1]}
+        if vector is not None:
+            request["vector"] = {"column": vector[0], "vector": vector[1]}
+        if ef_search is not None:
+            request["ef_search"] = ef_search
+        if filter is not None:
+            request["filter"] = filter
+        hits = self._call(request)["hits"]
+        for h in hits:
+            h["record"] = _decode_record(h["record"])
+        return hits
 
     def checkpoint(self) -> None:
         self._call({"op": "checkpoint"})

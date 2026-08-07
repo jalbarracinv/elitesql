@@ -242,12 +242,12 @@ Todo esto falla con un error claro, no con comportamiento sorpresa:
 | Subqueries, CTEs (`WITH`), `UNION` | reescribir como queries separadas |
 | `FULL OUTER JOIN`, `CROSS JOIN` | dos queries + merge en la app |
 | Aritmetica (`age + 1`) y funciones | calcular en la aplicacion |
-| `LIKE`, `BETWEEN` | `BETWEEN` → `>= AND <=`; busqueda de texto llega con full-text (Phase 5) |
+| `LIKE`, `BETWEEN` | `BETWEEN` → `>= AND <=`; busqueda de texto: `db.create_text_index` + `db.search_text` (BM25, API Rust/bindings) |
 | `DISTINCT` | deduplicar en la app |
 | `DROP`, `ALTER` | pendiente en el roadmap |
 | `BEGIN/COMMIT` en SQL | transacciones via API Rust: `db.begin()` |
 | `RETURNING` | INSERT ya devuelve los ids |
-| Busqueda vectorial en SQL | API Rust: `db.create_vector_index(...)` + `db.search_vector(...)` (funcion SQL explicita llega con hybrid search, Phase 5) |
+| Busqueda vectorial/texto/hibrida en SQL | API Rust y bindings: `search_vector`, `search_text` (BM25) y `search_hybrid` (RRF); la funcion SQL explicita queda para una fase futura |
 
 ## Performance de referencia
 

@@ -12,7 +12,11 @@ use crate::error::{Error, Result};
 use crate::manifest::{fsync_dir, Manifest, SegmentMeta};
 use crate::schema::{Catalog, IndexDef, TableSchema, FORMAT_VERSION, ID_COLUMN};
 use crate::segment::{encode_entry, scan_segment, segment_file_name};
-use crate::value::{decode_value, encode_value, read_u16, ColumnType, Value};
+use crate::text::{TextHit, TextIdx, TextIndexDef};
+use crate::value::{
+    decode_value, encode_blob_ref, encode_value, read_u16, skip_value, write_blob_file_bytes,
+    BlobRef, ColumnType, Value,
+};
 use crate::vector::{
     IndexingMode, VecIdx, VectorHit, VectorIndexDef, VectorIndexOptions, VectorSearchOptions,
 };
@@ -21,6 +25,7 @@ use crate::wal::{encode_commit, scan_wal, wal_path, Durability, WalWriter, WAL_D
 pub(crate) const MARKER_FILE: &str = "CLAWDB";
 pub(crate) const CATALOG_FILE: &str = "catalog.json";
 pub(crate) const SEGMENTS_DIR: &str = "segments";
+pub(crate) const BLOBS_DIR: &str = "blobs";
 const VECTORS_DIR: &str = "vectors";
 const LOCK_FILE: &str = "LOCK";
 
@@ -37,6 +42,14 @@ pub struct DbOptions {
     pub memtable_max_bytes: u64,
     /// Max time between WAL fsyncs in `Balanced` mode.
     pub balanced_sync_interval_ms: u64,
+    /// Open read-only: shared lock, tolerant loading (valid prefixes of
+    /// corrupt files are exposed instead of failing), zero writes to disk,
+    /// every write operation returns `Error::ReadOnly`. This is the
+    /// last-resort mode for inspecting a damaged database before `salvage`.
+    pub read_only: bool,
+    /// Blob values at or above this size are stored out-of-line in `blobs/`
+    /// (checksummed chunk files) instead of inline in segments/WAL.
+    pub external_blob_threshold: usize,
 }
 
 impl Default for DbOptions {
@@ -45,6 +58,8 @@ impl Default for DbOptions {
             durability: Durability::Safe,
             memtable_max_bytes: 8 * 1024 * 1024,
             balanced_sync_interval_ms: 25,
+            read_only: false,
+            external_blob_threshold: 256 * 1024,
         }
     }
 }
@@ -88,6 +103,10 @@ struct State {
     secondary: HashMap<(String, String), SecIdx>,
     /// (table, column) -> ANN index over the latest committed state.
     vector: HashMap<(String, String), VecIdx>,
+    /// (table, column) -> full-text index over the latest committed state.
+    text: HashMap<(String, String), TextIdx>,
+    /// Directory for out-of-line blob chunks.
+    blobs: PathBuf,
     readers: HashMap<u32, File>,
     segments: Vec<SegmentMeta>,
     next_segment_id: u32,
@@ -102,8 +121,15 @@ struct VecJob {
 }
 
 struct CommitState {
-    wal: WalWriter,
+    /// None only in read-only mode, where every write path is guarded.
+    wal: Option<WalWriter>,
     memtable_bytes: u64,
+}
+
+impl CommitState {
+    fn wal(&mut self) -> &mut WalWriter {
+        self.wal.as_mut().expect("write paths are guarded by read_only")
+    }
 }
 
 struct Shared {
@@ -167,6 +193,27 @@ impl std::fmt::Debug for Snapshot {
 
 fn register_snapshot(shared: &Arc<Shared>, version: u64) {
     *shared.snapshots.lock().unwrap().entry(version).or_insert(0) += 1;
+}
+
+/// Parameters for [`Db::search_hybrid`]: one or both modalities.
+#[derive(Debug, Clone, Default)]
+pub struct HybridQuery<'a> {
+    /// (text column, query string).
+    pub text: Option<(&'a str, &'a str)>,
+    /// (vector column, query embedding).
+    pub vector: Option<(&'a str, &'a [f32])>,
+    pub top_k: usize,
+    pub ef_search: Option<usize>,
+    /// Equality filters on other columns.
+    pub filter: Option<Record>,
+}
+
+/// One hybrid hit; higher `score` (RRF) is better.
+#[derive(Debug, Clone)]
+pub struct HybridHit {
+    pub id: String,
+    pub score: f32,
+    pub record: Record,
 }
 
 /// A read-write transaction. Reads see a stable snapshot plus this
@@ -251,7 +298,25 @@ impl Db {
         }
     }
 
+    /// Open read-only: reads work (over the valid prefix of any damaged
+    /// file), nothing on disk is touched, every write returns
+    /// [`Error::ReadOnly`]. Several read-only handles may coexist.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Db> {
+        Db::open_with(
+            path,
+            DbOptions {
+                read_only: true,
+                ..DbOptions::default()
+            },
+        )
+    }
+
     pub fn create_with(path: impl AsRef<Path>, opts: DbOptions) -> Result<Db> {
+        if opts.read_only {
+            return Err(Error::InvalidArgument(
+                "cannot create a database in read-only mode".into(),
+            ));
+        }
         let dir = path.as_ref().to_path_buf();
         if dir.join(MARKER_FILE).exists() {
             return Err(Error::InvalidArgument(format!(
@@ -262,7 +327,8 @@ impl Db {
         fs::create_dir_all(dir.join(SEGMENTS_DIR))?;
         fs::create_dir_all(dir.join(WAL_DIR))?;
         fs::create_dir_all(dir.join(VECTORS_DIR))?;
-        let lock_file = acquire_lock(&dir)?;
+        fs::create_dir_all(dir.join(BLOBS_DIR))?;
+        let lock_file = acquire_lock(&dir, false)?;
 
         let mut marker = File::create(dir.join(MARKER_FILE))?;
         marker.write_all(format!("clawdb format_version={FORMAT_VERSION}\n").as_bytes())?;
@@ -273,7 +339,8 @@ impl Db {
         File::create(wal_path(&dir, manifest.wal_id))?.sync_all()?;
         fsync_dir(&dir.join(WAL_DIR))?;
 
-        let wal = WalWriter::open(&dir, manifest.wal_id)?;
+        let wal = Some(WalWriter::open(&dir, manifest.wal_id)?);
+        let blobs_dir = dir.join(BLOBS_DIR);
         Ok(finish_db(Arc::new(Shared {
             dir,
             opts,
@@ -284,6 +351,8 @@ impl Db {
                 index: HashMap::new(),
                 secondary: HashMap::new(),
                 vector: HashMap::new(),
+                text: HashMap::new(),
+                blobs: blobs_dir,
                 readers: HashMap::new(),
                 segments: Vec::new(),
                 next_segment_id: 1,
@@ -300,31 +369,43 @@ impl Db {
 
     pub fn open_with(path: impl AsRef<Path>, opts: DbOptions) -> Result<Db> {
         let dir = path.as_ref().to_path_buf();
+        let ro = opts.read_only;
         if !dir.join(MARKER_FILE).exists() {
             return Err(Error::InvalidArgument(format!(
                 "not a clawdb database: {}",
                 dir.display()
             )));
         }
-        let lock_file = acquire_lock(&dir)?;
+        let lock_file = acquire_lock(&dir, ro)?;
         let catalog = Catalog::load(&dir.join(CATALOG_FILE))?;
         let (manifest, used_prev) = Manifest::load(&dir)?;
-        if used_prev {
+        if used_prev && !ro {
             // The primary manifest was unreadable; re-establish it from the
             // fallback without ever rotating the corrupt file over the good one.
             manifest.heal(&dir)?;
         }
-        fs::create_dir_all(dir.join(VECTORS_DIR))?;
-        cleanup_orphans(&dir, &manifest)?;
-        cleanup_orphan_vidx(&dir, &catalog);
+        if !ro {
+            fs::create_dir_all(dir.join(VECTORS_DIR))?;
+            fs::create_dir_all(dir.join(BLOBS_DIR))?;
+            cleanup_orphans(&dir, &manifest)?;
+            cleanup_orphan_vidx(&dir, &catalog);
+        }
 
-        // Load segments listed in the manifest.
+        // Load segments listed in the manifest. Read-only mode exposes the
+        // valid prefix of a damaged segment instead of refusing to open.
         let mut index: HashMap<String, BTreeMap<String, Vec<VersionEntry>>> = HashMap::new();
         let mut readers = HashMap::new();
         for meta in &manifest.segments {
             let seg_path = dir.join(SEGMENTS_DIR).join(segment_file_name(meta.id));
-            let data = fs::read(&seg_path)?;
-            if (data.len() as u64) < meta.len {
+            let data = match fs::read(&seg_path) {
+                Ok(d) => d,
+                Err(e) if ro => {
+                    let _ = e;
+                    continue; // missing segment: expose what the rest holds
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if (data.len() as u64) < meta.len && !ro {
                 return Err(Error::Corrupt(format!(
                     "segment {} shorter than manifest ({} < {})",
                     segment_file_name(meta.id),
@@ -332,10 +413,10 @@ impl Db {
                     meta.len
                 )));
             }
-            let valid = &data[..meta.len as usize];
+            let valid = &data[..meta.len.min(data.len() as u64) as usize];
             let mut entries = Vec::new();
             let outcome = scan_segment(valid, &mut entries);
-            if !outcome.clean || outcome.valid_len != meta.len {
+            if (!outcome.clean || outcome.valid_len != meta.len) && !ro {
                 return Err(Error::Corrupt(format!(
                     "segment {} failed validation",
                     segment_file_name(meta.id)
@@ -365,17 +446,21 @@ impl Db {
         }
 
         // Replay the WAL idempotently: only commits above the manifest
-        // watermark apply; a torn tail is truncated.
+        // watermark apply; a torn tail is truncated (never in read-only).
         let mut committed_version = manifest.committed_version;
         let mut memtable_bytes = 0u64;
         let wal_file = wal_path(&dir, manifest.wal_id);
-        if !wal_file.exists() {
+        if !wal_file.exists() && !ro {
             File::create(&wal_file)?.sync_all()?;
             fsync_dir(&dir.join(WAL_DIR))?;
         }
-        let data = fs::read(&wal_file)?;
+        let data = match fs::read(&wal_file) {
+            Ok(d) => d,
+            Err(_) if ro => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
         let scan = scan_wal(&data);
-        if !scan.clean {
+        if !scan.clean && !ro {
             let f = OpenOptions::new().write(true).open(&wal_file)?;
             f.set_len(scan.valid_len)?;
             f.sync_all()?;
@@ -405,10 +490,17 @@ impl Db {
             committed_version = rec.version;
         }
 
-        let secondary = build_secondary(&catalog, &index, &readers)?;
-        let vector = load_or_build_vector_indexes(&dir, &catalog, &index, &readers, committed_version)?;
+        let blobs_dir_open = dir.join(BLOBS_DIR);
+        let secondary = build_secondary(&blobs_dir_open, &catalog, &index, &readers)?;
+        let vector = load_or_build_vector_indexes(&dir, &blobs_dir_open, &catalog, &index, &readers, committed_version)?;
+        let text = build_text_indexes(&blobs_dir_open, &catalog, &index, &readers)?;
         let next_segment_id = manifest.segments.iter().map(|s| s.id).max().unwrap_or(0) + 1;
-        let wal = WalWriter::open(&dir, manifest.wal_id)?;
+        let wal = if ro {
+            None
+        } else {
+            Some(WalWriter::open(&dir, manifest.wal_id)?)
+        };
+        let blobs_dir = dir.join(BLOBS_DIR);
         Ok(finish_db(Arc::new(Shared {
             dir,
             opts,
@@ -419,6 +511,8 @@ impl Db {
                 index,
                 secondary,
                 vector,
+                text,
+                blobs: blobs_dir,
                 readers,
                 segments: manifest.segments,
                 next_segment_id,
@@ -436,6 +530,9 @@ impl Db {
     // --- schema ------------------------------------------------------------
 
     pub fn create_table(&self, schema: TableSchema) -> Result<()> {
+        if self.shared.opts.read_only {
+            return Err(Error::ReadOnly);
+        }
         schema.validate()?;
         let _cs = self.shared.commit.lock().unwrap();
         let mut st = self.shared.state.write().unwrap();
@@ -471,6 +568,19 @@ impl Db {
                 VecIdx::new(def.clone()),
             );
         }
+        for def in &schema.text_indexes {
+            match schema.column(&def.column) {
+                Some(col) if col.ty == ColumnType::Text => {}
+                _ => {
+                    return Err(Error::SchemaViolation(format!(
+                        "text index over non-text column '{}'",
+                        def.column
+                    )))
+                }
+            }
+            st.text
+                .insert((schema.name.clone(), def.column.clone()), TextIdx::new());
+        }
         st.catalog.tables.push(schema);
         st.catalog.save(&self.shared.dir.join(CATALOG_FILE))
     }
@@ -478,6 +588,9 @@ impl Db {
     /// Create a secondary (optionally unique) equality index over a column,
     /// built from the current committed state.
     pub fn create_index(&self, table: &str, column: &str, unique: bool) -> Result<()> {
+        if self.shared.opts.read_only {
+            return Err(Error::ReadOnly);
+        }
         let _cs = self.shared.commit.lock().unwrap();
         let mut st = self.shared.state.write().unwrap();
         {
@@ -504,7 +617,7 @@ impl Db {
             for (id, versions) in ids {
                 if let Some(last) = versions.last() {
                     if !last.is_tombstone() {
-                        let rec = read_record_kind(&st.readers, &last.kind)?;
+                        let rec = read_record_kind(&st.blobs, &st.readers, &last.kind)?;
                         if let Some(v) = rec.get(column) {
                             if !v.is_null() {
                                 let set = map.entry(index_key(v)).or_default();
@@ -546,6 +659,9 @@ impl Db {
         column: &str,
         opts: VectorIndexOptions,
     ) -> Result<()> {
+        if self.shared.opts.read_only {
+            return Err(Error::ReadOnly);
+        }
         let _cs = self.shared.commit.lock().unwrap();
         let mut st = self.shared.state.write().unwrap();
         {
@@ -576,13 +692,14 @@ impl Db {
             m: opts.m,
             ef_construction: opts.ef_construction,
             mode: opts.mode,
+            quantized: opts.quantized,
         };
         let mut vidx = VecIdx::new(def.clone());
         if let Some(ids) = st.index.get(table) {
             for (id, versions) in ids {
                 if let Some(last) = versions.last() {
                     if !last.is_tombstone() {
-                        let rec = read_record_kind(&st.readers, &last.kind)?;
+                        let rec = read_record_kind(&st.blobs, &st.readers, &last.kind)?;
                         if let Some(Value::Vector(v)) = rec.get(column) {
                             vidx.insert(id, v);
                         }
@@ -600,6 +717,176 @@ impl Db {
         st.catalog.save(&self.shared.dir.join(CATALOG_FILE))?;
         st.vector.insert((table.into(), column.into()), vidx);
         Ok(())
+    }
+
+    /// Create a basic full-text index (inverted index + BM25) over a text
+    /// column, built from the current committed state.
+    pub fn create_text_index(&self, table: &str, column: &str) -> Result<()> {
+        if self.shared.opts.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let _cs = self.shared.commit.lock().unwrap();
+        let mut st = self.shared.state.write().unwrap();
+        {
+            let schema = st
+                .catalog
+                .table(table)
+                .ok_or_else(|| Error::TableNotFound(table.into()))?;
+            let Some(col) = schema.column(column) else {
+                return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
+            };
+            if col.ty != ColumnType::Text {
+                return Err(Error::SchemaViolation(format!(
+                    "{table}.{column} is not a text column"
+                )));
+            }
+            if schema.text_indexes.iter().any(|d| d.column == column) {
+                return Err(Error::InvalidArgument(format!(
+                    "text index on {table}.{column} already exists"
+                )));
+            }
+        }
+        let mut tidx = TextIdx::new();
+        if let Some(ids) = st.index.get(table) {
+            for (id, versions) in ids {
+                if let Some(last) = versions.last() {
+                    if !last.is_tombstone() {
+                        let rec = read_record_kind(&st.blobs, &st.readers, &last.kind)?;
+                        if let Some(Value::Text(s)) = rec.get(column) {
+                            tidx.add(id, s);
+                        }
+                    }
+                }
+            }
+        }
+        let schema = st
+            .catalog
+            .tables
+            .iter_mut()
+            .find(|t| t.name == table)
+            .expect("checked above");
+        schema.text_indexes.push(TextIndexDef { column: column.into() });
+        st.catalog.save(&self.shared.dir.join(CATALOG_FILE))?;
+        st.text.insert((table.into(), column.into()), tidx);
+        Ok(())
+    }
+
+    /// BM25 full-text search over an indexed text column. Results are the
+    /// latest committed records, best score first. `filter` applies equality
+    /// constraints on other columns.
+    pub fn search_text(
+        &self,
+        table: &str,
+        column: &str,
+        query: &str,
+        top_k: usize,
+        filter: Option<&Record>,
+    ) -> Result<Vec<TextHit>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let st = self.shared.state.read().unwrap();
+        let schema = st
+            .catalog
+            .table(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        if let Some(f) = filter {
+            for key in f.keys() {
+                if key != ID_COLUMN && schema.column(key).is_none() {
+                    return Err(Error::SchemaViolation(format!(
+                        "unknown filter column '{key}'"
+                    )));
+                }
+            }
+        }
+        let tidx = st
+            .text
+            .get(&(table.to_owned(), column.to_owned()))
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "no text index on {table}.{column}; create one with create_text_index"
+                ))
+            })?;
+        let mut hits = Vec::with_capacity(top_k);
+        for (id, score) in tidx.search(query) {
+            let entry = st
+                .index
+                .get(table)
+                .and_then(|t| t.get(&id))
+                .and_then(|versions| versions.last());
+            let Some(entry) = entry else { continue };
+            if entry.is_tombstone() {
+                continue;
+            }
+            let mut rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
+            if let Some(f) = filter {
+                let ok = f.iter().all(|(k, want)| {
+                    if k == ID_COLUMN {
+                        matches!(want, Value::Text(t) if t == &id)
+                    } else {
+                        rec.get(k).unwrap_or(&Value::Null) == want
+                    }
+                });
+                if !ok {
+                    continue;
+                }
+            }
+            rec.insert(ID_COLUMN.into(), Value::Text(id.clone()));
+            hits.push(TextHit { id, score, record: rec });
+            if hits.len() == top_k {
+                break;
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Hybrid search: fuse BM25 text ranking and ANN vector ranking with
+    /// Reciprocal Rank Fusion (RRF, k=60). At least one modality is
+    /// required; both columns must be indexed.
+    pub fn search_hybrid(&self, table: &str, query: &HybridQuery<'_>) -> Result<Vec<HybridHit>> {
+        if query.text.is_none() && query.vector.is_none() {
+            return Err(Error::InvalidArgument(
+                "hybrid search needs a text query, a vector, or both".into(),
+            ));
+        }
+        if query.top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch_k = (query.top_k * 4).max(50);
+        const RRF_K: f32 = 60.0;
+
+        let mut fused: BTreeMap<String, (f32, Option<Record>)> = BTreeMap::new();
+        if let Some((column, text)) = query.text {
+            let hits = self.search_text(table, column, text, fetch_k, query.filter.as_ref())?;
+            for (rank, hit) in hits.into_iter().enumerate() {
+                let entry = fused.entry(hit.id).or_insert((0.0, None));
+                entry.0 += 1.0 / (RRF_K + rank as f32 + 1.0);
+                entry.1.get_or_insert(hit.record);
+            }
+        }
+        if let Some((column, vector)) = query.vector {
+            let opts = VectorSearchOptions {
+                ef_search: query.ef_search,
+                filter: query.filter.clone(),
+            };
+            let hits = self.search_vector(table, column, vector, fetch_k, &opts)?;
+            for (rank, hit) in hits.into_iter().enumerate() {
+                let entry = fused.entry(hit.id).or_insert((0.0, None));
+                entry.0 += 1.0 / (RRF_K + rank as f32 + 1.0);
+                entry.1.get_or_insert(hit.record);
+            }
+        }
+        let mut out: Vec<HybridHit> = fused
+            .into_iter()
+            .map(|(id, (score, record))| HybridHit {
+                id,
+                score,
+                record: record.expect("record captured from at least one modality"),
+            })
+            .collect();
+        out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        out.truncate(query.top_k);
+        Ok(out)
     }
 
     /// Approximate nearest-neighbour search over an indexed vector column.
@@ -678,7 +965,7 @@ impl Db {
                 if entry.is_tombstone() {
                     continue;
                 }
-                let mut rec = read_record_kind(&st.readers, &entry.kind)?;
+                let mut rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
                 if let Some(filter) = &opts.filter {
                     let ok = filter.iter().all(|(k, want)| {
                         if k == ID_COLUMN {
@@ -860,7 +1147,7 @@ impl Db {
                     if let Some(versions) = st.index.get(table).and_then(|t| t.get(id)) {
                         if let Some(last) = versions.last() {
                             if !last.is_tombstone() {
-                                let mut rec = read_record_kind(&st.readers, &last.kind)?;
+                                let mut rec = read_record_kind(&st.blobs, &st.readers, &last.kind)?;
                                 rec.insert(ID_COLUMN.into(), Value::Text(id.clone()));
                                 out.push((id.clone(), rec));
                             }
@@ -872,7 +1159,7 @@ impl Db {
             for (id, versions) in ids {
                 if let Some(last) = versions.last() {
                     if !last.is_tombstone() {
-                        let rec = read_record_kind(&st.readers, &last.kind)?;
+                        let rec = read_record_kind(&st.blobs, &st.readers, &last.kind)?;
                         if rec.get(column) == Some(value) {
                             let mut rec = rec;
                             rec.insert(ID_COLUMN.into(), Value::Text(id.clone()));
@@ -897,6 +1184,9 @@ impl Db {
     /// Rewrite segments keeping only versions visible to the latest state or
     /// to a live snapshot. Blocks writers for the duration (Phase 1).
     pub fn compact(&self) -> Result<()> {
+        if self.shared.opts.read_only {
+            return Err(Error::ReadOnly);
+        }
         let mut cs = self.shared.commit.lock().unwrap();
         checkpoint_locked(&self.shared, &mut cs)?;
 
@@ -1013,7 +1303,7 @@ impl Db {
             format_version: FORMAT_VERSION,
             committed_version,
             segments: new_segments.clone(),
-            wal_id: cs.wal.id,
+            wal_id: cs.wal().id,
         }
         .publish(&self.shared.dir)?;
 
@@ -1023,10 +1313,12 @@ impl Db {
             st.readers = new_readers;
             st.segments = new_segments;
             st.next_segment_id = seg_id + 1;
-            // Rebuild ANN indexes from the compacted state: tombstoned
-            // labels are dropped here (logical deletes become physical).
-            let rebuilt = build_vector_indexes(&st.catalog, &st.index, &st.readers)?;
+            // Rebuild ANN and text indexes from the compacted state:
+            // tombstoned entries are dropped here for good.
+            let rebuilt = build_vector_indexes(&st.blobs, &st.catalog, &st.index, &st.readers)?;
             st.vector = rebuilt;
+            let rebuilt_text = build_text_indexes(&st.blobs, &st.catalog, &st.index, &st.readers)?;
+            st.text = rebuilt_text;
         }
         // Persist the freshly compacted graphs (best effort).
         dump_vector_indexes(&self.shared);
@@ -1037,6 +1329,36 @@ impl Db {
                     .join(SEGMENTS_DIR)
                     .join(segment_file_name(id)),
             );
+        }
+
+        // Blob GC: every chunk referenced by a surviving payload is kept;
+        // everything else in blobs/ (dropped versions, orphans from torn
+        // commits) is deleted now.
+        {
+            let mut referenced: HashSet<String> = HashSet::new();
+            let mut refs: Vec<BlobRef> = Vec::new();
+            for k in &kept {
+                if let Some(payload) = &k.payload {
+                    refs.clear();
+                    scan_payload_blob_refs(payload, &mut refs)?;
+                    for r in &refs {
+                        referenced.insert(r.name.clone());
+                    }
+                }
+            }
+            let blobs_dir = self.shared.dir.join(BLOBS_DIR);
+            if let Ok(entries) = fs::read_dir(&blobs_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let keep = path
+                        .file_stem()
+                        .map(|s| referenced.contains(&s.to_string_lossy().into_owned()))
+                        .unwrap_or(false);
+                    if !keep {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1183,13 +1505,14 @@ impl Txn {
 
 // --- internals ----------------------------------------------------------------
 
-fn acquire_lock(dir: &Path) -> Result<File> {
+fn acquire_lock(dir: &Path, shared: bool) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join(LOCK_FILE))?;
-    match file.try_lock() {
+    let locked = if shared { file.try_lock_shared() } else { file.try_lock() };
+    match locked {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err(Error::DatabaseLocked(dir.display().to_string())),
         Err(TryLockError::Error(e)) => Err(Error::Io(e)),
@@ -1237,7 +1560,7 @@ fn shared_get_at(shared: &Shared, table: &str, id: &str, max_version: u64) -> Re
         .and_then(|versions| versions.iter().rev().find(|e| e.version <= max_version));
     match entry {
         Some(e) if !e.is_tombstone() => {
-            let mut rec = read_record_kind(&st.readers, &e.kind)?;
+            let mut rec = read_record_kind(&st.blobs, &st.readers, &e.kind)?;
             rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
             Ok(Some(rec))
         }
@@ -1255,7 +1578,7 @@ fn shared_scan_at(shared: &Shared, table: &str, max_version: u64) -> Result<Vec<
         for (id, versions) in ids {
             if let Some(e) = versions.iter().rev().find(|e| e.version <= max_version) {
                 if !e.is_tombstone() {
-                    let mut rec = read_record_kind(&st.readers, &e.kind)?;
+                    let mut rec = read_record_kind(&st.blobs, &st.readers, &e.kind)?;
                     rec.insert(ID_COLUMN.into(), Value::Text(id.clone()));
                     out.push((id.clone(), rec));
                 }
@@ -1282,6 +1605,9 @@ fn commit_staged(
     snap_version: u64,
     staged: &BTreeMap<(String, String), Option<Record>>,
 ) -> Result<u64> {
+    if shared.opts.read_only {
+        return Err(Error::ReadOnly);
+    }
     if staged.is_empty() {
         return Ok(shared.state.read().unwrap().committed_version);
     }
@@ -1290,6 +1616,7 @@ fn commit_staged(
     // One payload per staged op, paired positionally with `staged`'s
     // (deterministic BTreeMap) iteration order. Records are never cloned.
     let mut payloads: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity(staged.len());
+    let mut blob_sink = BlobSink::new(&shared.dir, shared.opts.external_blob_threshold);
     let commit_version;
     {
         let st = shared.state.read().unwrap();
@@ -1314,13 +1641,22 @@ fn commit_staged(
                         .catalog
                         .table(table)
                         .ok_or_else(|| Error::TableNotFound(table.clone()))?;
-                    payloads.push(Some(Arc::new(encode_record_ordered(schema, rec))));
+                    payloads.push(Some(Arc::new(encode_record_ordered(
+                        schema,
+                        rec,
+                        Some(&mut blob_sink),
+                    )?)));
                 }
                 None => payloads.push(None),
             }
         }
         validate_unique(&st, staged)?;
         commit_version = st.committed_version + 1;
+    }
+    // Blob chunk files (if any) must be durable before the WAL commit that
+    // references them.
+    if blob_sink.wrote {
+        fsync_dir(&shared.dir.join(BLOBS_DIR))?;
     }
 
     // Durability point: the WAL record is the commit.
@@ -1330,7 +1666,7 @@ fn commit_staged(
         .map(|(((t, i), _), p)| (t.as_str(), i.as_str(), p.as_deref().map(|b| b.as_slice())))
         .collect();
     let bytes = encode_commit(commit_version, &wal_changes);
-    cs.wal
+    cs.wal()
         .append_commit(&bytes, shared.opts.durability, shared.opts.balanced_sync_interval_ms)?;
 
     // Publish atomically to readers.
@@ -1429,12 +1765,12 @@ fn apply_one(
     put: Option<(&Arc<Vec<u8>>, &Record)>,
     jobs: &mut Vec<VecJob>,
 ) -> Result<()> {
-    let defs: Vec<IndexDef> = st
+    let (defs, tdefs): (Vec<IndexDef>, Vec<TextIndexDef>) = st
         .catalog
         .table(table)
-        .map(|t| t.indexes.clone())
+        .map(|t| (t.indexes.clone(), t.text_indexes.clone()))
         .unwrap_or_default();
-    if !defs.is_empty() {
+    if !defs.is_empty() || !tdefs.is_empty() {
         let prior: Option<Record> = match st
             .index
             .get(table)
@@ -1442,7 +1778,7 @@ fn apply_one(
             .and_then(|v| v.last())
         {
             Some(last) if !last.is_tombstone() => {
-                Some(read_record_kind(&st.readers, &last.kind)?)
+                Some(read_record_kind(&st.blobs, &st.readers, &last.kind)?)
             }
             _ => None,
         };
@@ -1461,6 +1797,15 @@ fn apply_one(
                                 }
                             }
                         }
+                    }
+                }
+            }
+            for tdef in &tdefs {
+                if let Some(Value::Text(old)) = prior.get(&tdef.column) {
+                    if let Some(tidx) =
+                        st.text.get_mut(&(table.to_owned(), tdef.column.clone()))
+                    {
+                        tidx.remove(id, old);
                     }
                 }
             }
@@ -1488,6 +1833,13 @@ fn apply_one(
                             .or_default()
                             .insert(id.to_owned());
                     }
+                }
+            }
+        }
+        for tdef in &tdefs {
+            if let Some(Value::Text(s)) = rec.get(&tdef.column) {
+                if let Some(tidx) = st.text.get_mut(&(table.to_owned(), tdef.column.clone())) {
+                    tidx.add(id, s);
                 }
             }
         }
@@ -1533,6 +1885,9 @@ fn apply_one(
 /// Drain committed in-memory data into a new segment, publish a new manifest
 /// referencing it, and rotate the WAL. Runs under the commit mutex.
 fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
+    if shared.opts.read_only {
+        return Err(Error::ReadOnly);
+    }
     struct MemEntry {
         table: String,
         id: String,
@@ -1570,7 +1925,7 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
             st.next_segment_id,
         )
     };
-    if mem.is_empty() && cs.wal.len == 0 {
+    if mem.is_empty() && cs.wal().len == 0 {
         return Ok(());
     }
     mem.sort_by_key(|m| m.version);
@@ -1604,7 +1959,7 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
 
     // Create the new WAL before the manifest that references it, so the
     // manifest never points at a missing file.
-    let new_wal_id = cs.wal.id + 1;
+    let new_wal_id = cs.wal().id + 1;
     File::create(wal_path(&shared.dir, new_wal_id))?.sync_all()?;
     fsync_dir(&shared.dir.join(WAL_DIR))?;
     Manifest {
@@ -1614,7 +1969,7 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
         wal_id: new_wal_id,
     }
     .publish(&shared.dir)?;
-    let _ = fs::remove_file(wal_path(&shared.dir, cs.wal.id));
+    let _ = fs::remove_file(wal_path(&shared.dir, cs.wal().id));
 
     {
         let mut st = shared.state.write().unwrap();
@@ -1644,12 +1999,13 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
         }
         st.segments = new_segments;
     }
-    cs.wal = WalWriter::open(&shared.dir, new_wal_id)?;
+    cs.wal = Some(WalWriter::open(&shared.dir, new_wal_id)?);
     cs.memtable_bytes = 0;
     Ok(())
 }
 
 fn build_secondary(
+    blobs: &Path,
     catalog: &Catalog,
     index: &HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
     readers: &HashMap<u32, File>,
@@ -1680,7 +2036,7 @@ fn build_secondary(
             if last.is_tombstone() {
                 continue;
             }
-            let rec = read_record_kind(readers, &last.kind)?;
+            let rec = read_record_kind(blobs, readers, &last.kind)?;
             for def in &table.indexes {
                 if let Some(v) = rec.get(&def.column) {
                     if !v.is_null() {
@@ -1702,6 +2058,7 @@ fn build_secondary(
 /// Build every ANN index from canonical data (latest visible records).
 /// Used after compaction; indexes are disposable by design.
 fn build_vector_indexes(
+    blobs: &Path,
     catalog: &Catalog,
     index: &HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
     readers: &HashMap<u32, File>,
@@ -1711,7 +2068,7 @@ fn build_vector_indexes(
         for def in &table.vector_indexes {
             out.insert(
                 (table.name.clone(), def.column.clone()),
-                build_one_vector_index(&table.name, def, index, readers)?,
+                build_one_vector_index(blobs, &table.name, def, index, readers)?,
             );
         }
     }
@@ -1719,6 +2076,7 @@ fn build_vector_indexes(
 }
 
 fn build_one_vector_index(
+    blobs: &Path,
     table: &str,
     def: &VectorIndexDef,
     index: &HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
@@ -1731,7 +2089,7 @@ fn build_one_vector_index(
             if last.is_tombstone() {
                 continue;
             }
-            let rec = read_record_kind(readers, &last.kind)?;
+            let rec = read_record_kind(blobs, readers, &last.kind)?;
             if let Some(Value::Vector(v)) = rec.get(&def.column) {
                 vidx.insert(id, v);
             }
@@ -1750,6 +2108,7 @@ fn vidx_path(dir: &Path, table: &str, column: &str) -> PathBuf {
 /// with everything committed after the dump; otherwise rebuild from scratch.
 fn load_or_build_vector_indexes(
     dir: &Path,
+    blobs: &Path,
     catalog: &Catalog,
     index: &HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
     readers: &HashMap<u32, File>,
@@ -1765,10 +2124,10 @@ fn load_or_build_vector_indexes(
                 // A dump "from the future" can exist after a manifest.prev
                 // rollback; it must be discarded, not caught up.
                 Some((mut vidx, dump_version)) if dump_version <= committed_version => {
-                    catch_up_vector_index(&mut vidx, dump_version, &table.name, def, index, readers)?;
+                    catch_up_vector_index(blobs, &mut vidx, dump_version, &table.name, def, index, readers)?;
                     vidx
                 }
-                _ => build_one_vector_index(&table.name, def, index, readers)?,
+                _ => build_one_vector_index(blobs, &table.name, def, index, readers)?,
             };
             out.insert((table.name.clone(), def.column.clone()), vidx);
         }
@@ -1779,6 +2138,7 @@ fn load_or_build_vector_indexes(
 /// Re-apply everything committed after the dump: changed/deleted records,
 /// and dumped ids whose canonical data was compacted away since.
 fn catch_up_vector_index(
+    blobs: &Path,
     vidx: &mut VecIdx,
     dump_version: u64,
     table: &str,
@@ -1797,7 +2157,7 @@ fn catch_up_vector_index(
                 vidx.remove(id);
                 continue;
             }
-            let rec = read_record_kind(readers, &last.kind)?;
+            let rec = read_record_kind(blobs, readers, &last.kind)?;
             match rec.get(&def.column) {
                 Some(Value::Vector(v)) => vidx.insert(id, v),
                 _ => vidx.remove(id),
@@ -1820,6 +2180,9 @@ fn catch_up_vector_index(
 /// Best-effort dump of every ANN graph to `vectors/` (temp file + rename).
 /// Failures are ignored: the graph is always rebuildable from canonical data.
 fn dump_vector_indexes(shared: &Shared) {
+    if shared.opts.read_only {
+        return;
+    }
     let Ok(st) = shared.state.read() else { return };
     if st.vector.is_empty() {
         return;
@@ -1875,6 +2238,42 @@ fn cleanup_orphan_vidx(dir: &Path, catalog: &Catalog) {
     }
 }
 
+/// Build every full-text index from canonical data (latest visible records).
+fn build_text_indexes(
+    blobs: &Path,
+    catalog: &Catalog,
+    index: &HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
+    readers: &HashMap<u32, File>,
+) -> Result<HashMap<(String, String), TextIdx>> {
+    let mut out: HashMap<(String, String), TextIdx> = HashMap::new();
+    for table in &catalog.tables {
+        if table.text_indexes.is_empty() {
+            continue;
+        }
+        for def in &table.text_indexes {
+            out.insert((table.name.clone(), def.column.clone()), TextIdx::new());
+        }
+        let Some(ids) = index.get(&table.name) else {
+            continue;
+        };
+        for (id, versions) in ids {
+            let Some(last) = versions.last() else { continue };
+            if last.is_tombstone() {
+                continue;
+            }
+            let rec = read_record_kind(blobs, readers, &last.kind)?;
+            for def in &table.text_indexes {
+                if let Some(Value::Text(s)) = rec.get(&def.column) {
+                    out.get_mut(&(table.name.clone(), def.column.clone()))
+                        .expect("initialized above")
+                        .add(id, s);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn payload_bytes(readers: &HashMap<u32, File>, kind: &VKind) -> Result<Option<Vec<u8>>> {
     match kind {
         VKind::MemPut(p) => Ok(Some(p.as_ref().clone())),
@@ -1894,12 +2293,12 @@ fn payload_bytes(readers: &HashMap<u32, File>, kind: &VKind) -> Result<Option<Ve
     }
 }
 
-fn read_record_kind(readers: &HashMap<u32, File>, kind: &VKind) -> Result<Record> {
+fn read_record_kind(blobs: &Path, readers: &HashMap<u32, File>, kind: &VKind) -> Result<Record> {
     match kind {
-        VKind::MemPut(p) => decode_record(p),
+        VKind::MemPut(p) => decode_record(p, Some(blobs)),
         VKind::SegPut { .. } => {
             let bytes = payload_bytes(readers, kind)?.expect("put has payload");
-            decode_record(&bytes)
+            decode_record(&bytes, Some(blobs))
         }
         VKind::MemTombstone | VKind::SegTombstone => {
             Err(Error::Corrupt("attempted to read a tombstone".into()))
@@ -1974,18 +2373,62 @@ fn normalize_record(schema: &TableSchema, mut record: Record) -> Result<Record> 
 
 /// Encode a normalized record directly in schema column order, borrowing
 /// names and values (no intermediate field list).
-pub(crate) fn encode_record_ordered(schema: &TableSchema, record: &Record) -> Vec<u8> {
+/// Writes large blob values out-of-line into `blobs/` during encoding.
+pub(crate) struct BlobSink {
+    dir: PathBuf,
+    threshold: usize,
+    pub wrote: bool,
+}
+
+impl BlobSink {
+    fn new(db_dir: &Path, threshold: usize) -> BlobSink {
+        BlobSink {
+            dir: db_dir.join(BLOBS_DIR),
+            threshold,
+            wrote: false,
+        }
+    }
+
+    /// Externalize `content` if it crosses the threshold; the chunk file is
+    /// fsynced before the WAL commit that references it.
+    fn maybe_externalize(&mut self, content: &[u8]) -> Result<Option<(String, u32)>> {
+        if content.len() < self.threshold {
+            return Ok(None);
+        }
+        let name = Ulid::new().to_string();
+        let (bytes, crc) = write_blob_file_bytes(content);
+        let path = self.dir.join(format!("{name}.blob"));
+        let mut f = File::create(&path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        self.wrote = true;
+        Ok(Some((name, crc)))
+    }
+}
+
+pub(crate) fn encode_record_ordered(
+    schema: &TableSchema,
+    record: &Record,
+    mut sink: Option<&mut BlobSink>,
+) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(64);
     buf.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
     for col in &schema.columns {
         buf.extend_from_slice(&(col.name.len() as u16).to_le_bytes());
         buf.extend_from_slice(col.name.as_bytes());
-        encode_value(&mut buf, record.get(&col.name).unwrap_or(&Value::Null));
+        let value = record.get(&col.name).unwrap_or(&Value::Null);
+        match (value, sink.as_deref_mut()) {
+            (Value::Blob(content), Some(sink)) => match sink.maybe_externalize(content)? {
+                Some((name, crc)) => encode_blob_ref(&mut buf, &name, content.len() as u64, crc),
+                None => encode_value(&mut buf, value),
+            },
+            _ => encode_value(&mut buf, value),
+        }
     }
-    buf
+    Ok(buf)
 }
 
-pub(crate) fn decode_record(buf: &[u8]) -> Result<Record> {
+pub(crate) fn decode_record(buf: &[u8], blobs: Option<&Path>) -> Result<Record> {
     let mut pos = 0usize;
     let count = read_u16(buf, &mut pos)? as usize;
     let mut record = Record::new();
@@ -2001,8 +2444,24 @@ pub(crate) fn decode_record(buf: &[u8]) -> Result<Record> {
         let name = std::str::from_utf8(name_bytes)
             .map_err(|_| Error::Corrupt("invalid utf8 in column name".into()))?
             .to_owned();
-        let value = decode_value(buf, &mut pos)?;
+        let value = decode_value(buf, &mut pos, blobs)?;
         record.insert(name, value);
     }
     Ok(record)
+}
+
+/// Collect the out-of-line blob references inside an encoded record payload
+/// without materializing any values (compaction GC and check()).
+pub(crate) fn scan_payload_blob_refs(buf: &[u8], out: &mut Vec<BlobRef>) -> Result<()> {
+    let mut pos = 0usize;
+    let count = read_u16(buf, &mut pos)? as usize;
+    for _ in 0..count {
+        let name_len = read_u16(buf, &mut pos)? as usize;
+        pos = pos
+            .checked_add(name_len)
+            .filter(|&p| p <= buf.len())
+            .ok_or_else(|| Error::Corrupt("unexpected end of record".into()))?;
+        skip_value(buf, &mut pos, Some(out))?;
+    }
+    Ok(())
 }

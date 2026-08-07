@@ -51,8 +51,29 @@ uint32_t clawdb_search_vector(ClawDb *db, const char *params_json,
 
 /* Create an ANN index. params_json: {"table","column",
  * "metric"?: "cosine"|"dot"|"l2", "mode"?: "sync"|"async",
- * "m"?, "ef_construction"?}. */
+ * "m"?, "ef_construction"?, "quantized"?: bool}. */
 uint32_t clawdb_create_vector_index(ClawDb *db, const char *params_json);
+
+/* Full-text (BM25). create: {"table","column"}. search: {"table","column",
+ * "query","top_k"?,"filter"?} -> {"hits":[{"id","score","record"}]}. */
+uint32_t clawdb_create_text_index(ClawDb *db, const char *params_json);
+uint32_t clawdb_search_text(ClawDb *db, const char *params_json,
+                            char **result_json);
+
+/* Hybrid RRF search: {"table","top_k"?,"ef_search"?,"filter"?,
+ * "text"?: {"column","query"}, "vector"?: {"column","vector":[...]}}. */
+uint32_t clawdb_search_hybrid(ClawDb *db, const char *params_json,
+                              char **result_json);
+
+/* Stable read snapshots: reads through a snapshot see the database exactly
+ * as it was when the snapshot was taken. */
+typedef struct ClawSnapshot ClawSnapshot;
+uint32_t clawdb_snapshot_open(ClawDb *db, ClawSnapshot **out);
+uint32_t clawdb_snapshot_close(ClawSnapshot *snap);
+uint32_t clawdb_snapshot_get(ClawDb *db, ClawSnapshot *snap, const char *table,
+                             const char *id, char **result_json);
+uint32_t clawdb_snapshot_scan(ClawDb *db, ClawSnapshot *snap,
+                              const char *table, char **result_json);
 
 uint32_t clawdb_checkpoint(ClawDb *db);
 uint32_t clawdb_compact(ClawDb *db);

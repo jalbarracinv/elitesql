@@ -69,6 +69,8 @@ pub struct TableSchema {
     pub indexes: Vec<IndexDef>,
     #[serde(default)]
     pub vector_indexes: Vec<crate::vector::VectorIndexDef>,
+    #[serde(default)]
+    pub text_indexes: Vec<crate::text::TextIndexDef>,
 }
 
 impl TableSchema {
@@ -78,6 +80,7 @@ impl TableSchema {
             columns,
             indexes: Vec::new(),
             vector_indexes: Vec::new(),
+            text_indexes: Vec::new(),
         }
     }
 

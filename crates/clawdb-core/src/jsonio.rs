@@ -219,8 +219,118 @@ pub fn create_vector_index_json(db: &crate::Db, params: &J) -> Result<J> {
     if let Some(efc) = params.get("ef_construction").and_then(|v| v.as_u64()) {
         opts.ef_construction = efc as usize;
     }
+    if let Some(q) = params.get("quantized").and_then(|v| v.as_bool()) {
+        opts.quantized = q;
+    }
     db.create_vector_index(table, column, opts)?;
     Ok(json!(true))
+}
+
+/// Create a full-text index from a JSON params object: {"table","column"}.
+pub fn create_text_index_json(db: &crate::Db, params: &J) -> Result<J> {
+    let table = params
+        .get("table")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::InvalidArgument("missing 'table'".into()))?;
+    let column = params
+        .get("column")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::InvalidArgument("missing 'column'".into()))?;
+    db.create_text_index(table, column)?;
+    Ok(json!(true))
+}
+
+fn filter_from_json(params: &J) -> Result<Option<Record>> {
+    match params.get("filter").and_then(|f| f.as_object()) {
+        None => Ok(None),
+        Some(filter) => {
+            let mut rec = Record::new();
+            for (k, v) in filter {
+                rec.insert(k.clone(), json_to_value(v)?);
+            }
+            Ok(Some(rec))
+        }
+    }
+}
+
+/// BM25 full-text search: {"table","column","query","top_k"?,
+/// "filter"?: {col: value}} -> {"hits":[{"id","score","record"}]}.
+pub fn search_text_json(db: &crate::Db, params: &J) -> Result<J> {
+    let table = params
+        .get("table")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::InvalidArgument("missing 'table'".into()))?;
+    let column = params
+        .get("column")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::InvalidArgument("missing 'column'".into()))?;
+    let query = params
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::InvalidArgument("missing 'query'".into()))?;
+    let top_k = params.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let filter = filter_from_json(params)?;
+    let hits = db.search_text(table, column, query, top_k, filter.as_ref())?;
+    let hits_json: Vec<J> = hits
+        .iter()
+        .map(|h| {
+            json!({"id": h.id, "score": h.score, "record": record_to_json(&h.record)})
+        })
+        .collect();
+    Ok(json!({ "hits": hits_json }))
+}
+
+/// Hybrid (RRF) search: {"table","top_k"?,"ef_search"?,"filter"?,
+/// "text"?: {"column","query"}, "vector"?: {"column","vector":[..]}}.
+pub fn search_hybrid_json(db: &crate::Db, params: &J) -> Result<J> {
+    let table = params
+        .get("table")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::InvalidArgument("missing 'table'".into()))?;
+    let text = match params.get("text").and_then(|t| t.as_object()) {
+        None => None,
+        Some(t) => Some((
+            t.get("column")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::InvalidArgument("text: missing 'column'".into()))?,
+            t.get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::InvalidArgument("text: missing 'query'".into()))?,
+        )),
+    };
+    let vector_data: Option<(&str, Vec<f32>)> = match params.get("vector").and_then(|v| v.as_object()) {
+        None => None,
+        Some(v) => {
+            let column = v
+                .get("column")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| Error::InvalidArgument("vector: missing 'column'".into()))?;
+            let vec: Vec<f32> = v
+                .get("vector")
+                .and_then(|a| a.as_array())
+                .ok_or_else(|| Error::InvalidArgument("vector: missing 'vector'".into()))?
+                .iter()
+                .map(|x| x.as_f64().map(|f| f as f32))
+                .collect::<Option<_>>()
+                .ok_or_else(|| Error::InvalidArgument("vector: non-numeric component".into()))?;
+            Some((column, vec))
+        }
+    };
+    let query = crate::HybridQuery {
+        text,
+        vector: vector_data.as_ref().map(|(c, v)| (*c, v.as_slice())),
+        top_k: params.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize,
+        ef_search: params.get("ef_search").and_then(|v| v.as_u64()).map(|n| n as usize),
+        filter: filter_from_json(params)?,
+    };
+    let hits = db.search_hybrid(table, &query)?;
+    let hits_json: Vec<J> = hits
+        .iter()
+        .map(|h| {
+            json!({"id": h.id, "score": h.score, "record": record_to_json(&h.record)})
+        })
+        .collect();
+    Ok(json!({ "hits": hits_json }))
 }
 
 /// Run an ANN search described by a JSON params object — the shared shape

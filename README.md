@@ -33,9 +33,10 @@ db.open("app.clawdb")
 | Phase 2 | Dialecto SQL minimo (ver [manual.md](manual.md)) | Completa |
 | Phase 2.5 | Agregados (COUNT/SUM/AVG/MIN/MAX, GROUP BY, HAVING) y tipos date/time | Completa |
 | Phase 3 | Tipo vectorial + busqueda ANN (HNSW propio, grafo persistido) | Completa |
-| Phase 4 | C ABI, bindings Python/Node, CLI, repair, modo sidecar | Nucleo completo |
+| Phase 4 | C ABI (con snapshots), bindings Python/Node, CLI, repair, read-only, sidecar, docs | Completa |
+| Phase 5 | Full-text BM25, hybrid search (RRF), vectores int8, blob chunking | Completa (WASM/sync diferidos con decision) |
 
-Verificacion actual: 105 tests Rust (MVCC, recovery, compaction, salvage, modelo aleatorio, suite SQL con agregados y date/time, recall vectorial vs fuerza bruta), crash injection con `kill -9` de procesos reales, fuzzing de corrupcion y del parser SQL, mas e2e de CLI, FFI Python y sidecar Node. Detalles en [specs.md](specs.md) y [plan.md](plan.md).
+Verificacion actual: 114 tests Rust (MVCC, recovery, compaction, salvage, modelo aleatorio, suite SQL, recall vectorial, BM25/hybrid, blobs, read-only), crash injection con `kill -9` de procesos reales, fuzzing de corrupcion y del parser SQL, mas e2e de CLI, FFI Python y sidecar Node. Docs de onboarding en [docs/](docs/). Detalles en [specs.md](specs.md) y [plan.md](plan.md).
 
 ## Quick installation
 
@@ -133,7 +134,20 @@ for hit in hits {
 }
 ```
 
-Sobre 100K vectores (dim 64): recall@10 de 0.88 con `ef_search=128` (0.97 con 256) y busquedas de ~95-156 µs. Modo `Async` disponible para que el commit no espere la indexacion.
+Sobre 100K vectores (dim 64): recall@10 de 0.88 con `ef_search=128` (0.97 con 256) y busquedas de ~95-156 µs. Modo `Async` disponible para que el commit no espere la indexacion, y opcion `quantized` (int8) para ~4x menos memoria.
+
+### Full-text e hibrida
+
+```rust
+db.create_text_index("notes", "body")?;                    // BM25
+let hits = db.search_text("notes", "body", "consulta", 10, None)?;
+let hits = db.search_hybrid("notes", &HybridQuery {        // RRF: texto + vector
+    text: Some(("body", "consulta")),
+    vector: Some(("emb", &embedding)),
+    top_k: 10,
+    ..Default::default()
+})?;
+```
 
 ### SQL
 

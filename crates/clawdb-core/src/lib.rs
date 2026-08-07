@@ -56,13 +56,15 @@ mod repair;
 mod schema;
 mod segment;
 mod sql;
+mod text;
 mod value;
 mod vector;
 mod wal;
 
 pub use check::{check, CheckReport};
 pub use repair::{salvage, SalvageReport};
-pub use db::{Db, DbOptions, Record, Snapshot, Txn};
+pub use db::{Db, DbOptions, HybridHit, HybridQuery, Record, Snapshot, Txn};
+pub use text::{TextHit, TextIndexDef};
 pub use error::{Error, Result};
 pub use schema::{Column, IndexDef, TableSchema};
 pub use sql::QueryOutput;

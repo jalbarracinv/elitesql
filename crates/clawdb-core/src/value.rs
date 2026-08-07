@@ -243,6 +243,79 @@ const TAG_JSON: u8 = 7;
 const TAG_VECTOR: u8 = 8;
 const TAG_DATE: u8 = 9;
 const TAG_TIME: u8 = 10;
+/// Internal only: a reference to an out-of-line blob chunk in `blobs/`.
+/// Resolved to `Value::Blob` during record decoding; never user-visible.
+const TAG_BLOBREF: u8 = 11;
+
+const BLOB_MAGIC: &[u8; 8] = b"CLAWBLOB";
+
+#[derive(Debug, Clone)]
+pub(crate) struct BlobRef {
+    pub name: String,
+    pub size: u64,
+    pub crc: u32,
+}
+
+pub(crate) fn encode_blob_ref(buf: &mut Vec<u8>, name: &str, size: u64, crc: u32) {
+    buf.push(TAG_BLOBREF);
+    buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(&size.to_le_bytes());
+    buf.extend_from_slice(&crc.to_le_bytes());
+}
+
+fn read_blob_ref(buf: &[u8], pos: &mut usize) -> Result<BlobRef> {
+    let name_len = read_u16(buf, pos)? as usize;
+    let end = pos
+        .checked_add(name_len)
+        .ok_or_else(|| Error::Corrupt("blobref: length overflow".into()))?;
+    let name_bytes = buf
+        .get(*pos..end)
+        .ok_or_else(|| Error::Corrupt("blobref: unexpected end".into()))?;
+    *pos = end;
+    let name = std::str::from_utf8(name_bytes)
+        .map_err(|_| Error::Corrupt("blobref: invalid utf8".into()))?
+        .to_owned();
+    if name.contains('/') || name.contains("..") {
+        return Err(Error::Corrupt("blobref: invalid name".into()));
+    }
+    let size = read_u64(buf, pos)?;
+    let crc = read_u32(buf, pos)?;
+    Ok(BlobRef { name, size, crc })
+}
+
+/// Blob chunk file layout: 8-byte magic, u32 crc of the content, u64 length,
+/// content. Fully validated on read.
+pub(crate) fn write_blob_file_bytes(content: &[u8]) -> (Vec<u8>, u32) {
+    let crc = crc32fast::hash(content);
+    let mut out = Vec::with_capacity(content.len() + 20);
+    out.extend_from_slice(BLOB_MAGIC);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&(content.len() as u64).to_le_bytes());
+    out.extend_from_slice(content);
+    (out, crc)
+}
+
+pub(crate) fn read_blob_file(dir: &std::path::Path, r: &BlobRef) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(dir.join(format!("{}.blob", r.name)))
+        .map_err(|e| Error::Corrupt(format!("blob chunk {} unreadable: {e}", r.name)))?;
+    if bytes.len() < 20 || &bytes[..8] != BLOB_MAGIC {
+        return Err(Error::Corrupt(format!("blob chunk {}: bad header", r.name)));
+    }
+    let crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let len = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+    let content = &bytes[20..];
+    if crc != r.crc || len != r.size || content.len() as u64 != len {
+        return Err(Error::Corrupt(format!(
+            "blob chunk {}: checksum or size mismatch",
+            r.name
+        )));
+    }
+    if crc32fast::hash(content) != crc {
+        return Err(Error::Corrupt(format!("blob chunk {}: content corrupt", r.name)));
+    }
+    Ok(content.to_vec())
+}
 
 pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
     match v {
@@ -297,7 +370,9 @@ pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
     }
 }
 
-pub(crate) fn decode_value(buf: &[u8], pos: &mut usize) -> Result<Value> {
+/// Decode one tagged value. `blobs` is the directory used to resolve
+/// out-of-line blob references; contexts without one fail on such refs.
+pub(crate) fn decode_value(buf: &[u8], pos: &mut usize, blobs: Option<&std::path::Path>) -> Result<Value> {
     let tag = read_u8(buf, pos)?;
     match tag {
         TAG_NULL => Ok(Value::Null),
@@ -331,8 +406,60 @@ pub(crate) fn decode_value(buf: &[u8], pos: &mut usize) -> Result<Value> {
         }
         TAG_DATE => Ok(Value::Date(i32::from_le_bytes(read_array(buf, pos)?))),
         TAG_TIME => Ok(Value::Time(i64::from_le_bytes(read_array(buf, pos)?))),
+        TAG_BLOBREF => {
+            let r = read_blob_ref(buf, pos)?;
+            match blobs {
+                Some(dir) => Ok(Value::Blob(read_blob_file(dir, &r)?)),
+                None => Err(Error::Corrupt(
+                    "blob reference in a context without a blobs directory".into(),
+                )),
+            }
+        }
         other => Err(Error::Corrupt(format!("unknown value tag {other}"))),
     }
+}
+
+/// Skip one tagged value without materializing it; collects blob references
+/// into `refs` when provided (used by compaction GC and check()).
+pub(crate) fn skip_value(
+    buf: &[u8],
+    pos: &mut usize,
+    refs: Option<&mut Vec<BlobRef>>,
+) -> Result<()> {
+    let tag = read_u8(buf, pos)?;
+    match tag {
+        TAG_NULL => {}
+        TAG_BOOL => {
+            read_u8(buf, pos)?;
+        }
+        TAG_INT64 | TAG_FLOAT64 | TAG_TIMESTAMP | TAG_TIME => {
+            read_array::<8>(buf, pos)?;
+        }
+        TAG_DATE => {
+            read_array::<4>(buf, pos)?;
+        }
+        TAG_TEXT | TAG_BLOB | TAG_JSON => {
+            read_len_prefixed(buf, pos)?;
+        }
+        TAG_VECTOR => {
+            let count = read_u32(buf, pos)? as usize;
+            let bytes = count
+                .checked_mul(4)
+                .ok_or_else(|| Error::Corrupt("length overflow".into()))?;
+            if *pos + bytes > buf.len() {
+                return Err(Error::Corrupt("truncated vector value".into()));
+            }
+            *pos += bytes;
+        }
+        TAG_BLOBREF => {
+            let r = read_blob_ref(buf, pos)?;
+            if let Some(refs) = refs {
+                refs.push(r);
+            }
+        }
+        other => return Err(Error::Corrupt(format!("unknown value tag {other}"))),
+    }
+    Ok(())
 }
 
 // --- Cursor helpers shared by the record and segment codecs ----------------

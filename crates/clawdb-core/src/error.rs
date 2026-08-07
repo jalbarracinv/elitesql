@@ -24,6 +24,8 @@ pub enum Error {
     UniqueViolation { table: String, column: String },
     /// SQL parse or execution error, including features outside the V1 subset.
     Sql(String),
+    /// The database was opened read-only; writes are rejected.
+    ReadOnly,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -44,6 +46,7 @@ impl Error {
             Error::DatabaseLocked(_) => 10,
             Error::UniqueViolation { .. } => 11,
             Error::Sql(_) => 12,
+            Error::ReadOnly => 13,
         }
     }
 }
@@ -71,6 +74,7 @@ impl fmt::Display for Error {
                 write!(f, "unique index violation on {table}.{column}")
             }
             Error::Sql(msg) => write!(f, "sql error: {msg}"),
+            Error::ReadOnly => write!(f, "database opened read-only; writes are rejected"),
         }
     }
 }

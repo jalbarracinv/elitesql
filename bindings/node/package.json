@@ -1,0 +1,12 @@
+{
+  "name": "@clawdb/client",
+  "version": "0.0.1",
+  "description": "ClawDB Node client for the sidecar mode (clawdb serve) — zero dependencies",
+  "main": "clawdb.js",
+  "types": "clawdb.d.ts",
+  "license": "(MIT OR Apache-2.0)",
+  "keywords": ["database", "embedded", "vector-search", "full-text", "clawdb"],
+  "engines": {
+    "node": ">=18"
+  }
+}

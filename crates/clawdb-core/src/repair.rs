@@ -121,7 +121,7 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
             report.deleted_records += 1;
             continue;
         };
-        let mut record = match decode_record(payload) {
+        let mut record = match decode_record(payload, Some(&src.join(crate::db::BLOBS_DIR))) {
             Ok(r) => r,
             Err(e) => {
                 report.skipped += 1;
