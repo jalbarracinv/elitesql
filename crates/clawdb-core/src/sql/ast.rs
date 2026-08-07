@@ -43,15 +43,47 @@ pub(crate) struct SelectStmt {
     pub from: TableRef,
     pub joins: Vec<Join>,
     pub where_clause: Option<Expr>,
+    pub group_by: Vec<ColumnRef>,
+    pub having: Option<Expr>,
     pub order_by: Vec<(ColumnRef, bool)>, // bool = descending
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggFunc {
+    pub fn name(&self) -> &'static str {
+        match self {
+            AggFunc::Count => "count",
+            AggFunc::Sum => "sum",
+            AggFunc::Avg => "avg",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum SelectItem {
     Star,
-    Column { col: ColumnRef, alias: Option<String> },
+    Column {
+        col: ColumnRef,
+        alias: Option<String>,
+    },
+    Aggregate {
+        func: AggFunc,
+        /// None = COUNT(*)
+        arg: Option<ColumnRef>,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +137,8 @@ pub(crate) enum CmpOp {
 pub(crate) enum Operand {
     Col(ColumnRef),
     Lit(Literal),
+    /// Aggregate call; only legal in HAVING.
+    Agg { func: AggFunc, arg: Option<ColumnRef> },
 }
 
 #[derive(Debug, Clone)]

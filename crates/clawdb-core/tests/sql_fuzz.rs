@@ -30,6 +30,11 @@ const CORPUS: &[&str] = &[
     "CREATE UNIQUE INDEX ON docs (c)",
     "SELECT * FROM docs RIGHT JOIN extra ON extra.doc_id = docs.id",
     "INSERT INTO docs (d) VALUES (X'00FF')",
+    "SELECT c, count(*) AS n, sum(a) FROM docs GROUP BY c HAVING count(*) > 1 ORDER BY n DESC",
+    "SELECT count(*), min(b), max(c), avg(a) FROM docs WHERE a IN (1, 2, 3)",
+    "CREATE TABLE dt (d date, t time)",
+    "INSERT INTO dt (d, t) VALUES ('2026-08-07', '09:30:00.5'), (NULL, NULL)",
+    "SELECT d FROM dt WHERE d >= '2026-01-01' AND t < '18:00:00' ORDER BY d",
 ];
 
 fn setup() -> (tempfile::TempDir, Db) {

@@ -33,10 +33,25 @@ Reglas generales:
 | `float64` | decimal o entero | `3.14`, `3` |
 | `text` | string entre comillas simples | `'hola'`, `'it''s ok'` (escape `''`) |
 | `blob` | hex literal | `X'DEADBEEF'` |
-| `timestamp` | entero (microsegundos Unix) | `1722000000000000` |
+| `timestamp` | string `'YYYY-MM-DD HH:MM:SS[.ffffff]'` (UTC) o entero (microsegundos Unix) | `'2026-08-07 09:30:00'` |
+| `date` | string `'YYYY-MM-DD'` (dias desde epoch por dentro) | `'2026-08-07'` |
+| `time` | string `'HH:MM:SS[.ffffff]'` (microsegundos desde medianoche) | `'09:30:00'` |
 | `json` | string con JSON valido | `'{"tags": ["a"], "n": 3}'` |
 | `vector(N)` | string con array JSON de N numeros | `'[0.12, -0.5, 0.33]'` |
 | null | `NULL` | `NULL` |
+
+Los literales de `date`, `time` y `timestamp` se validan de verdad: `'2026-02-30'` o `'25:00:00'` fallan con error claro. En WHERE, un string se coerciona automaticamente contra columnas date/time/timestamp: `WHERE day >= '2026-01-01'` o `WHERE at < '2026-08-07 18:00:00'` funcionan sin sintaxis de cast (tambien contra indices).
+
+Sobre `timestamp` (el "datetime" de ClawDB): representa un instante en microsegundos UTC. El literal acepta separador espacio o `T`, sufijo `Z` opcional, y fecha sola (`'2026-08-08'` = medianoche UTC). No hay offsets de timezone (`+05:00`): el motor guarda instantes; la presentacion por zona horaria es de la aplicacion.
+
+**Diferencias de fechas**: se calculan en la aplicacion, y la representacion las hace triviales — `date` son dias desde epoch, asi que restar dos `Value::Date` da la diferencia en dias directamente (los bisiestos ya los resolvio el motor al parsear); `time` y `timestamp` restan en microsegundos. Dentro de una query, expresa "ultimos N dias" o "entre fechas" como rangos, que ademas usan indices:
+
+```sql
+SELECT * FROM pedidos WHERE fecha >= '2026-07-08'                      -- limite calculado por la app
+SELECT * FROM eventos WHERE dia >= '2026-08-01' AND dia < '2026-09-01' -- rango indexable
+```
+
+Aritmetica dentro del SQL (`fecha2 - fecha1` en proyeccion o HAVING) queda para una fase futura de expresiones minimas.
 
 Coerciones automaticas: un entero es valido para columnas `float64` y `timestamp`. Un string es valido para `json` solo si parsea como JSON.
 
@@ -146,6 +161,45 @@ JOIN tags t   ON t.order_id = o.id
 - `RIGHT JOIN` preserva la tabla derecha (internamente es un LEFT con roles invertidos).
 - `FULL OUTER JOIN` y `CROSS JOIN` no estan soportados.
 
+## Agregados, GROUP BY y HAVING
+
+Funciones: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`.
+
+```sql
+-- Agregado global: siempre devuelve exactamente una fila.
+SELECT count(*), sum(amount), avg(amount) FROM sales
+
+-- Por grupo, con filtro de grupos y orden por alias:
+SELECT region, count(*) AS n, sum(amount) AS total
+FROM sales
+WHERE amount > 0
+GROUP BY region
+HAVING sum(amount) >= 300
+ORDER BY total DESC
+LIMIT 10
+
+-- Compone con joins:
+SELECT g.country, sum(s.amount) AS total
+FROM sales s JOIN regions g ON g.name = s.region
+GROUP BY g.country
+```
+
+Semantica de NULL (estandar SQL):
+
+- `COUNT(*)` cuenta filas; `COUNT(col)` ignora NULLs.
+- `SUM`/`AVG`/`MIN`/`MAX` ignoran NULLs; sobre conjunto vacio devuelven NULL.
+- Los NULL agrupan juntos en GROUP BY.
+- `SUM` de int64 desborda con error explicito (no hace wrap); si mezcla int64 y float64 promociona a float64. `AVG` siempre devuelve float64.
+
+Reglas:
+
+- Toda columna no agregada del SELECT debe estar en GROUP BY.
+- `SUM`/`AVG` exigen columnas int64 o float64.
+- HAVING solo referencia columnas agrupadas y agregados (el agregado no necesita estar en el SELECT).
+- En queries con agregados, ORDER BY referencia nombres de salida o aliases (`ORDER BY total DESC`), no llamadas a funcion: dale un alias al agregado.
+- Los agregados solo viven en SELECT y HAVING (en WHERE usa... HAVING).
+- No soportado: `COUNT(DISTINCT ...)`, agregados anidados, expresiones dentro del agregado.
+
 ## UPDATE
 
 ```sql
@@ -184,7 +238,7 @@ Todo esto falla con un error claro, no con comportamiento sorpresa:
 
 | No soportado | Alternativa |
 |---|---|
-| `COUNT(*)` y agregados, `GROUP BY`, `HAVING` | calcular en la aplicacion (Phase 2.x) |
+| `COUNT(DISTINCT ...)`, agregados anidados | deduplicar/calcular en la aplicacion |
 | Subqueries, CTEs (`WITH`), `UNION` | reescribir como queries separadas |
 | `FULL OUTER JOIN`, `CROSS JOIN` | dos queries + merge en la app |
 | Aritmetica (`age + 1`) y funciones | calcular en la aplicacion |

@@ -115,6 +115,30 @@ Criterios de aceptacion:
 
 Estado (2026-08-07): completa como modulo `sql` dentro de `clawdb-core` (la crate separada `clawdb-sql` del workspace se pospone hasta que la FFI lo pida). Decision del spike: parser propio recursive descent, no sqlparser-rs — subset chico y cerrado, mensajes de error propios ("not supported in V1" con alternativa), cero dependencias nuevas, y guard de profundidad de expresiones para que el fuzzing no pueda reventar el stack. Implementado: CREATE TABLE (tipos V1 estrictos con sugerencias), CREATE [UNIQUE] INDEX, INSERT multi-fila atomico que devuelve ids, SELECT con WHERE (=, <>, <, <=, >, >=, AND/OR/NOT, IS NULL, IN), ORDER BY multi-columna, LIMIT/OFFSET, alias, INNER/LEFT/RIGHT JOIN encadenados (RIGHT = LEFT invertido), UPDATE/DELETE con conteo de afectadas y retry ante conflicto. Planner heuristico: point lookup por id, igualdad indexada via find_eq, pushdown de filtros pre-join, index nested-loop cuando el probe es chico y la columna de join esta indexada, hash join como fallback. Consistencia: SELECT es read-committed; snapshots consistentes via API Rust. Verificacion: 19 tests sqllogictest-style + 4 de fuzzing (6000 inputs aleatorios/mutados sin panics, nesting profundo cortado por guard). Benchmarks sobre 1M ordenes + 10K usuarios: point lookup via indice unico 3.9us (SQL completo), join indexado con ORDER BY+LIMIT 361us, full scan sin indice 1.1s (limite conocido de la spec). Documentacion de usuario en manual.md.
 
+### Phase 2.5: Agregados basicos y tipos date/time (~2-3 semanas)
+
+Agregada el 2026-08-07: los agregados se referenciaban en manual.md como "Phase 2.x" sin fase real asignada, y date/time se promueven de opcionales-V1.1 a necesarios por decision de producto.
+
+Tareas:
+
+- Tipo `date`: dias desde epoch Unix (i32 logico). Literal SQL 'YYYY-MM-DD' coercionado por tipo de columna; validacion de fecha real.
+- Tipo `time`: microsegundos desde medianoche (i64). Literal SQL 'HH:MM:SS[.ffffff]'; validacion de rango.
+- Ambos comparables, ordenables e indexables como cualquier escalar.
+- Agregados globales: COUNT(*), COUNT(col), SUM, AVG, MIN, MAX.
+- GROUP BY por una o varias columnas (hash aggregation en el executor).
+- HAVING con predicados simples sobre los agregados del SELECT.
+- Composicion con el subset existente: WHERE antes de agrupar, ORDER BY sobre columnas de salida, LIMIT; rechazo claro de agregados anidados, DISTINCT dentro de agregados y expresiones.
+
+Criterios de aceptacion:
+
+- Suite sqllogictest-style para agregados incluyendo semantica de NULL (COUNT(col) ignora NULL, SUM/AVG de conjunto vacio es NULL, MIN/MAX ignoran NULL).
+- Roundtrip completo de date/time: API Rust + SQL + indices secundarios + ORDER BY; literales invalidos ('2026-02-30', '25:00:00') rechazados con error claro.
+- Fuzzing del parser extendido a las nuevas producciones sin panics.
+
+Estado (2026-08-07): completa. Tipos: `date` (dias desde epoch, algoritmo de calendario civil propio con validacion real incluyendo bisiestos — 2100-02-29 se rechaza) y `time` (microsegundos desde medianoche con fraccion opcional .ffffff); literales string coercionados por tipo de columna en INSERT/UPDATE/WHERE (tambien contra indices), constructores publicos Value::parse_date/parse_time/date_from_ymd/time_from_hms_micro; comparables, ordenables, indexables y agrupables. Agregados: COUNT(*)/COUNT(col)/SUM/AVG/MIN/MAX con hash aggregation en orden de primera aparicion, GROUP BY multi-columna (NULLs agrupan juntos), HAVING sobre columnas agrupadas y agregados (incluso agregados que no estan en el SELECT), ORDER BY por nombre de salida o alias, y composicion con WHERE/joins/LIMIT/OFFSET. Semantica NULL estandar; SUM int64 con deteccion de overflow (error, no wrap) y promocion a float64 en mezcla. Rechazos claros: agregados en WHERE (apunta a HAVING), columna no agrupada en SELECT, COUNT(DISTINCT), SUM(*), SUM/AVG sobre columnas no numericas, ORDER BY con llamada a agregado (pide alias). Verificacion: 11 tests de agregados + 8 de date/time/timestamp + fuzz extendido con las nuevas producciones; 99 tests en total, clippy limpio.
+
+Adenda datetime (2026-08-07): en lugar de un tipo `datetime` separado (timestamp ya es el tipo de instante; dos tipos de instante confunden), `timestamp` acepta literales string 'YYYY-MM-DD HH:MM:SS[.ffffff]' interpretados como UTC naive — con separador espacio o T, sufijo Z opcional y fecha sola como medianoche — en INSERT/UPDATE/WHERE y contra indices, con Value::parse_timestamp en la API. Offsets de timezone rechazados a proposito: el motor guarda instantes, la zona horaria es presentacion de la aplicacion.
+
 ### Phase 3: Vector Native (~5-6 semanas)
 
 Objetivo: vectores como tipo e indice de primera clase.

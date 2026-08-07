@@ -119,7 +119,8 @@ Opcionales para V1.1:
 
 - `decimal`, para dinero exacto.
 - `uuid`, aunque puede iniciar como `text` validado.
-- `date`, si separar fecha de timestamp aporta valor real.
+- `date`, dias desde epoch; separar fecha de timestamp evita bugs de timezone. (Promovido a necesario, ver plan Phase 2.5.)
+- `time`, microsegundos desde medianoche, para hora-del-dia sin fecha. (Promovido a necesario, ver plan Phase 2.5.)
 - `vector<int8, N>`, para embeddings cuantizados.
 
 Tipos evitados en V1:
@@ -127,7 +128,7 @@ Tipos evitados en V1:
 - `smallint`, `int32`, `bigint` separados. `int64` basta.
 - `varchar(n)`. `text` basta.
 - `char`, `nchar`, `nvarchar`.
-- `time`, `interval`.
+- `interval`.
 - `array`.
 - `enum`.
 
@@ -148,6 +149,7 @@ Soportado:
 - `LEFT JOIN`.
 - `RIGHT JOIN`.
 - Busqueda vectorial con funcion explicita.
+- Agregados basicos (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) con `GROUP BY`/`HAVING` simples (V1.1, plan Phase 2.5).
 
 Joins soportados:
 

@@ -31,10 +31,11 @@ db.open("app.clawdb")
 | Phase 0 | Prototipo append-only + benchmarks vs SQLite | Completa |
 | Phase 1 | WAL, manifest, MVCC, transacciones, indices, crash recovery | Completa |
 | Phase 2 | Dialecto SQL minimo (ver [manual.md](manual.md)) | Completa |
-| Phase 3 | Tipo vectorial + busqueda ANN (HNSW propio) | Completa |
+| Phase 2.5 | Agregados (COUNT/SUM/AVG/MIN/MAX, GROUP BY, HAVING) y tipos date/time | Completa |
+| Phase 3 | Tipo vectorial + busqueda ANN (HNSW propio, grafo persistido) | Completa |
 | Phase 4 | C ABI, bindings Python/Node, CLI, modo sidecar | Pendiente |
 
-Verificacion actual: 76 tests (MVCC, recovery, compaction, modelo aleatorio, suite SQL, recall vectorial vs fuerza bruta), crash injection con `kill -9` de procesos reales (incluida durante indexacion vectorial async), y fuzzing de corrupcion de archivos y del parser SQL (la base nunca entra en panico ni acepta estado invalido). Detalles en [specs.md](specs.md) y [plan.md](plan.md).
+Verificacion actual: 99 tests (MVCC, recovery, compaction, modelo aleatorio, suite SQL con agregados y date/time, recall vectorial vs fuerza bruta), crash injection con `kill -9` de procesos reales (incluida durante indexacion vectorial async), y fuzzing de corrupcion de archivos y del parser SQL (la base nunca entra en panico ni acepta estado invalido). Detalles en [specs.md](specs.md) y [plan.md](plan.md).
 
 ## Quick installation
 
@@ -141,9 +142,9 @@ El mismo motor expone un dialecto SQL deliberadamente pequeno — referencia com
 ```rust
 use clawdb_core::QueryOutput;
 
-db.query("CREATE TABLE users (name text NOT NULL, email text, age int64)")?;
+db.query("CREATE TABLE users (name text NOT NULL, email text, age int64, since date)")?;
 db.query("CREATE UNIQUE INDEX ON users (email)")?;
-db.query("INSERT INTO users (name, email, age) VALUES ('ana', 'ana@x.com', 30)")?;
+db.query("INSERT INTO users (name, email, age, since) VALUES ('ana', 'ana@x.com', 30, '2026-08-07')")?;
 
 if let QueryOutput::Rows { columns, rows } = db.query(
     "SELECT u.name, o.amount FROM users u \
@@ -152,6 +153,12 @@ if let QueryOutput::Rows { columns, rows } = db.query(
 )? {
     // ...
 }
+
+// Agregados con GROUP BY/HAVING y filtros por rango de fechas:
+db.query(
+    "SELECT age, count(*) AS n FROM users \
+     WHERE since >= '2026-01-01' GROUP BY age HAVING count(*) > 1 ORDER BY n DESC",
+)?;
 ```
 
 ## Durabilidad

@@ -215,6 +215,8 @@ impl Parser {
             "blob" => ColumnType::Blob,
             "timestamp" => ColumnType::Timestamp,
             "json" => ColumnType::Json,
+            "date" => ColumnType::Date,
+            "time" => ColumnType::Time,
             "vector" => {
                 self.expect(&Tok::LParen, "'(' — vector needs a dimension: vector(N)")?;
                 let dim = self.parse_uint("vector dimension")? as usize;
@@ -233,15 +235,15 @@ impl Parser {
             "varchar" | "char" | "string" | "nvarchar" => {
                 return Err(Error::Sql(format!("unknown type '{word}': use text")))
             }
-            "datetime" | "date" | "time" => {
-                return Err(Error::Sql(format!(
-                    "unknown type '{word}': use timestamp (microseconds since epoch)"
-                )))
+            "datetime" => {
+                return Err(Error::Sql(
+                    "unknown type 'datetime': use timestamp — it accepts 'YYYY-MM-DD HH:MM:SS' literals".into(),
+                ))
             }
             "boolean" => return Err(Error::Sql("unknown type 'boolean': use bool".into())),
             _ => {
                 return Err(Error::Sql(format!(
-                    "unknown type '{word}': V1 types are bool, int64, float64, text, blob, timestamp, json, vector(N)"
+                    "unknown type '{word}': V1 types are bool, int64, float64, text, blob, timestamp, date, time, json, vector(N)"
                 )))
             }
         };
@@ -357,11 +359,21 @@ impl Parser {
         loop {
             if self.eat(&Tok::Star) {
                 projection.push(SelectItem::Star);
+            } else if let Some(func) = self.peek_agg_call() {
+                self.pos += 1; // the function name
+                let (func, arg) = self.parse_agg_call(func)?;
+                self.check_no_arith()?;
+                let alias = if self.eat_kw("AS") {
+                    Some(self.ident("alias")?)
+                } else {
+                    None
+                };
+                projection.push(SelectItem::Aggregate { func, arg, alias });
             } else {
                 let col = self.parse_column_ref()?;
                 if self.peek().map(|t| &t.tok) == Some(&Tok::LParen) {
                     return Err(self.err_at(
-                        "functions and aggregates are not supported in V1",
+                        "functions are not supported in V1 (aggregates: COUNT, SUM, AVG, MIN, MAX)",
                     ));
                 }
                 self.check_no_arith()?;
@@ -409,9 +421,22 @@ impl Parser {
             joins.push(Join { kind, table, on });
         }
         let where_clause = self.parse_optional_where()?;
+        let mut group_by = Vec::new();
+        if self.eat_kw("GROUP") {
+            self.expect_kw("BY")?;
+            loop {
+                group_by.push(self.parse_column_ref()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        let having = if self.eat_kw("HAVING") {
+            Some(self.parse_expr(0, true)?)
+        } else {
+            None
+        };
         for (kw, msg) in [
-            ("GROUP", "GROUP BY is not supported in V1"),
-            ("HAVING", "HAVING is not supported in V1"),
             ("UNION", "UNION is not supported in V1"),
             ("EXCEPT", "EXCEPT is not supported in V1"),
             ("INTERSECT", "INTERSECT is not supported in V1"),
@@ -424,6 +449,11 @@ impl Parser {
         if self.eat_kw("ORDER") {
             self.expect_kw("BY")?;
             loop {
+                if self.peek_agg_call().is_some() {
+                    return Err(self.err_at(
+                        "ORDER BY cannot use an aggregate call; give it an alias in SELECT and order by the alias",
+                    ));
+                }
                 let col = self.parse_column_ref()?;
                 let desc = if self.eat_kw("DESC") {
                     true
@@ -450,10 +480,50 @@ impl Parser {
             from,
             joins,
             where_clause,
+            group_by,
+            having,
             order_by,
             limit,
             offset,
         })))
+    }
+
+    /// Detects `count(`/`sum(`/`avg(`/`min(`/`max(` at the cursor without
+    /// consuming anything.
+    fn peek_agg_call(&self) -> Option<AggFunc> {
+        let Some(Lexed { tok: Tok::Ident(w), .. }) = self.peek() else {
+            return None;
+        };
+        if self.peek2().map(|t| &t.tok) != Some(&Tok::LParen) {
+            return None;
+        }
+        match w.to_ascii_lowercase().as_str() {
+            "count" => Some(AggFunc::Count),
+            "sum" => Some(AggFunc::Sum),
+            "avg" => Some(AggFunc::Avg),
+            "min" => Some(AggFunc::Min),
+            "max" => Some(AggFunc::Max),
+            _ => None,
+        }
+    }
+
+    /// Parses the parenthesized argument of an aggregate call; the function
+    /// name has already been consumed.
+    fn parse_agg_call(&mut self, func: AggFunc) -> Result<(AggFunc, Option<ColumnRef>)> {
+        self.expect(&Tok::LParen, "'('")?;
+        if self.eat(&Tok::Star) {
+            if func != AggFunc::Count {
+                return Err(self.err_at("only COUNT accepts *"));
+            }
+            self.expect(&Tok::RParen, "')'")?;
+            return Ok((func, None));
+        }
+        if self.is_kw("DISTINCT") {
+            return Err(self.err_at("DISTINCT inside aggregates is not supported in V1"));
+        }
+        let col = self.parse_column_ref()?;
+        self.expect(&Tok::RParen, "')'")?;
+        Ok((func, Some(col)))
     }
 
     fn parse_uint(&mut self, what: &str) -> Result<u64> {
@@ -488,7 +558,7 @@ impl Parser {
     }
 
     fn parse_join_on(&mut self) -> Result<(ColumnRef, ColumnRef)> {
-        let expr = self.parse_expr(0)?;
+        let expr = self.parse_expr(0, false)?;
         match expr {
             Expr::Cmp {
                 left: Operand::Col(l),
@@ -504,43 +574,45 @@ impl Parser {
 
     fn parse_optional_where(&mut self) -> Result<Option<Expr>> {
         if self.eat_kw("WHERE") {
-            Ok(Some(self.parse_expr(0)?))
+            Ok(Some(self.parse_expr(0, false)?))
         } else {
             Ok(None)
         }
     }
 
     // --- expressions -----------------------------------------------------------
+    // `allow_agg` is true only inside HAVING: aggregate calls anywhere else
+    // are rejected with a pointed message.
 
-    fn parse_expr(&mut self, depth: u32) -> Result<Expr> {
+    fn parse_expr(&mut self, depth: u32, allow_agg: bool) -> Result<Expr> {
         self.guard(depth)?;
-        let mut left = self.parse_and(depth + 1)?;
+        let mut left = self.parse_and(depth + 1, allow_agg)?;
         while self.eat_kw("OR") {
-            let right = self.parse_and(depth + 1)?;
+            let right = self.parse_and(depth + 1, allow_agg)?;
             left = Expr::Or(Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    fn parse_and(&mut self, depth: u32) -> Result<Expr> {
+    fn parse_and(&mut self, depth: u32, allow_agg: bool) -> Result<Expr> {
         self.guard(depth)?;
-        let mut left = self.parse_not(depth + 1)?;
+        let mut left = self.parse_not(depth + 1, allow_agg)?;
         while self.eat_kw("AND") {
-            let right = self.parse_not(depth + 1)?;
+            let right = self.parse_not(depth + 1, allow_agg)?;
             left = Expr::And(Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    fn parse_not(&mut self, depth: u32) -> Result<Expr> {
+    fn parse_not(&mut self, depth: u32, allow_agg: bool) -> Result<Expr> {
         self.guard(depth)?;
         if self.eat_kw("NOT") {
-            return Ok(Expr::Not(Box::new(self.parse_not(depth + 1)?)));
+            return Ok(Expr::Not(Box::new(self.parse_not(depth + 1, allow_agg)?)));
         }
-        self.parse_predicate(depth + 1)
+        self.parse_predicate(depth + 1, allow_agg)
     }
 
-    fn parse_predicate(&mut self, depth: u32) -> Result<Expr> {
+    fn parse_predicate(&mut self, depth: u32, allow_agg: bool) -> Result<Expr> {
         self.guard(depth)?;
         if self.peek().map(|t| &t.tok) == Some(&Tok::LParen) {
             if let Some(Lexed { tok: Tok::Ident(w), .. }) = self.peek2() {
@@ -549,11 +621,11 @@ impl Parser {
                 }
             }
             self.pos += 1;
-            let inner = self.parse_expr(depth + 1)?;
+            let inner = self.parse_expr(depth + 1, allow_agg)?;
             self.expect(&Tok::RParen, "')'")?;
             return Ok(inner);
         }
-        let left = self.parse_operand()?;
+        let left = self.parse_operand(allow_agg)?;
         self.check_no_arith()?;
 
         // IS [NOT] NULL and [NOT] IN need a column on the left.
@@ -562,7 +634,7 @@ impl Parser {
             self.expect_kw("NULL")?;
             match left {
                 Operand::Col(col) => return Ok(Expr::IsNull { col, negated }),
-                Operand::Lit(_) => {
+                _ => {
                     return Err(self.err_at("IS NULL applies to a column"));
                 }
             }
@@ -601,14 +673,14 @@ impl Parser {
                     return Err(self.err_at("expected a comparison operator"));
                 }
             };
-            let right = self.parse_operand()?;
+            let right = self.parse_operand(allow_agg)?;
             self.check_no_arith()?;
             return Ok(Expr::Cmp { left, op, right });
         };
         // IN list
         let col = match left {
             Operand::Col(c) => c,
-            Operand::Lit(_) => return Err(self.err_at("IN applies to a column")),
+            _ => return Err(self.err_at("IN applies to a column")),
         };
         self.expect(&Tok::LParen, "'('")?;
         if self.is_kw("SELECT") {
@@ -626,7 +698,17 @@ impl Parser {
         Ok(Expr::InList { col, list, negated: negated_in })
     }
 
-    fn parse_operand(&mut self) -> Result<Operand> {
+    fn parse_operand(&mut self, allow_agg: bool) -> Result<Operand> {
+        if let Some(func) = self.peek_agg_call() {
+            if !allow_agg {
+                return Err(self.err_at(
+                    "aggregates are only allowed in the SELECT list and HAVING",
+                ));
+            }
+            self.pos += 1;
+            let (func, arg) = self.parse_agg_call(func)?;
+            return Ok(Operand::Agg { func, arg });
+        }
         match self.peek().map(|t| t.tok.clone()) {
             Some(Tok::Ident(w)) => {
                 if w.eq_ignore_ascii_case("TRUE") {

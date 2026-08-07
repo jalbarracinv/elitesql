@@ -351,8 +351,10 @@ fn unsupported_features_fail_with_clear_errors() {
     assert_sql_err(&db, "SELECT * FROM users WHERE id IN (SELECT id FROM users)", "subqueries");
     assert_sql_err(&db, "SELECT * FROM users WHERE (SELECT 1) = 1", "subqueries");
     assert_sql_err(&db, "WITH x AS (SELECT 1) SELECT * FROM x", "CTEs");
-    assert_sql_err(&db, "SELECT COUNT(*) FROM users", "aggregates");
-    assert_sql_err(&db, "SELECT name FROM users GROUP BY name", "GROUP BY");
+    // Aggregates exist since Phase 2.5, but only in SELECT and HAVING.
+    assert_sql_err(&db, "SELECT name FROM users WHERE COUNT(*) > 1", "HAVING");
+    assert_sql_err(&db, "SELECT COUNT(DISTINCT name) FROM users", "DISTINCT inside aggregates");
+    assert_sql_err(&db, "SELECT SUM(*) FROM users", "only COUNT accepts *");
     assert_sql_err(&db, "SELECT name FROM users UNION SELECT name FROM users", "UNION");
     assert_sql_err(&db, "SELECT DISTINCT name FROM users", "DISTINCT");
     assert_sql_err(&db, "SELECT age + 1 FROM users", "arithmetic");
