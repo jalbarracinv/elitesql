@@ -47,6 +47,7 @@
 //! assert_eq!(read["score"], Value::Int64(42));
 //! ```
 
+mod backup;
 mod check;
 mod db;
 mod error;
@@ -61,6 +62,7 @@ mod value;
 mod vector;
 mod wal;
 
+pub use backup::{restore, BackupReport, RestoreReport};
 pub use check::{check, CheckReport};
 pub use repair::{salvage, SalvageReport};
 pub use db::{Db, DbOptions, HybridHit, HybridQuery, Record, Snapshot, Txn};

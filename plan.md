@@ -226,6 +226,8 @@ Deferred with a decision (deliberately not implemented):
 - IVF/PQ: int8 scalar quantization covers the memory goal at the current data scale; IVF/PQ when datasets exceed ~10M vectors.
 - Single-file mode: the self-contained directory remains simpler for compaction and indexes; re-evaluate on real demand.
 
+Post-closure addition (2026-08-07): backup and restore. `Db::backup(dst)` is a snapshot-consistent logical copy into a fresh directory — concurrent writers are never blocked, ids/schemas/index definitions are preserved, the copy is born compacted, written to `<dst>.partial` and renamed only after the final checkpoint (an interrupted backup never leaves a half-written directory under the final name). `restore(src, dst)` refuses an existing destination, runs `check` on the backup (a damaged backup is reported, never restored), copies the canonical files and opens the result once to replay the WAL and rebuild derived indexes. Both exposed in the CLI (`elitesql backup` verifies the copy with `check` before reporting success). 5 dedicated tests including a hot backup under 4 concurrent writer threads and a corrupted-backup refusal. Not yet in the ABI/sidecar/bindings — pending demand, same criterion as napi.
+
 ## Testing strategy (cross-cutting)
 
 Durability testing is first-class work, not an afterthought. It is built in Phase 1 and maintained across every phase:

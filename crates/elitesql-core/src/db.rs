@@ -27,7 +27,7 @@ pub(crate) const CATALOG_FILE: &str = "catalog.json";
 pub(crate) const SEGMENTS_DIR: &str = "segments";
 pub(crate) const BLOBS_DIR: &str = "blobs";
 const VECTORS_DIR: &str = "vectors";
-const LOCK_FILE: &str = "LOCK";
+pub(crate) const LOCK_FILE: &str = "LOCK";
 
 /// A record is a map from column name to value. On reads the implicit
 /// primary key is included under the key `"id"`.

@@ -1,7 +1,8 @@
 //! `elitesql` — the EliteSQL command line.
 //!
-//! Subcommands: query, repl, tables, check, compact, repair, export, import,
-//! serve (Unix-socket sidecar for multi-process deployments), version.
+//! Subcommands: query, repl, tables, check, compact, backup, restore, repair,
+//! export, import, serve (Unix-socket sidecar for multi-process deployments),
+//! version.
 
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
@@ -19,6 +20,8 @@ USAGE:
   elitesql tables <db>                 list tables with their schemas
   elitesql check <db>                  offline integrity check
   elitesql compact <db>                compact segments and vector indexes
+  elitesql backup <db> <dst>           snapshot-consistent copy, then verified
+  elitesql restore <backup> <dst>      validate a backup and materialize it
   elitesql repair <src> <dst>          salvage records into a fresh database
   elitesql export <db> <table>         records as JSON lines on stdout
   elitesql import <db> <table>         JSON lines from stdin into a table
@@ -105,6 +108,35 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             let db = open(&db_path, opts)?;
             db.compact().map_err(|e| e.to_string())?;
             println!("ok: compacted");
+            Ok(())
+        }
+        "backup" => {
+            let [db_path, dst] = take::<2>(&args)?;
+            let db = open(&db_path, opts)?;
+            let report = db.backup(&dst).map_err(|e| e.to_string())?;
+            let check = elitesql_core::check(&dst).map_err(|e| e.to_string())?;
+            if !check.is_ok() {
+                return Err(format!(
+                    "backup written but failed verification: {}",
+                    check.errors.join("; ")
+                ));
+            }
+            println!(
+                "ok: backed up {} table(s), {} record(s) into {dst} (verified)",
+                report.tables, report.records
+            );
+            Ok(())
+        }
+        "restore" => {
+            let [src, dst] = take::<2>(&args)?;
+            let report = elitesql_core::restore(&src, &dst).map_err(|e| e.to_string())?;
+            for w in &report.warnings {
+                println!("warning: {w}");
+            }
+            println!(
+                "ok: restored {} table(s), {} record(s) into {dst}",
+                report.tables, report.records
+            );
             Ok(())
         }
         "repair" => {

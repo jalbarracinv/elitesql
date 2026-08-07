@@ -125,6 +125,7 @@ Reproducible demo with gunicorn and 4 workers: `examples/gunicorn_demo/run_demo.
 ## When something goes wrong
 
 See [recovery.md](recovery.md). The summary: the database always opens to the
-last complete commit; `elitesql check` validates; `--read-only` inspects even
-a damaged database; `elitesql repair` salvages into a fresh one, reporting
-everything.
+last complete commit; `elitesql backup`/`elitesql restore` make and materialize
+verified snapshot-consistent copies; `elitesql check` validates; `--read-only`
+inspects even a damaged database; `elitesql repair` salvages into a fresh one,
+reporting everything.

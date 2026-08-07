@@ -36,7 +36,7 @@ db.open("app.esql")
 | Phase 4 | C ABI (with snapshots), Python/Node bindings, CLI, repair, read-only, sidecar, docs | Complete |
 | Phase 5 | BM25 full-text, hybrid search (RRF), int8 vectors, blob chunking | Complete |
 
-Current verification: 114 Rust tests (MVCC, recovery, compaction, salvage, randomized model, SQL suite, vector recall, BM25/hybrid, blobs, read-only), crash injection with real `kill -9` of live processes, corruption and SQL-parser fuzzing, plus CLI, Python FFI and Node sidecar e2e tests. Onboarding docs in [docs/](docs/). Details in [specs.md](specs.md) and [plan.md](plan.md).
+Current verification: 118 Rust tests (MVCC, recovery, compaction, salvage, backup/restore, randomized model, SQL suite, vector recall, BM25/hybrid, blobs, read-only), crash injection with real `kill -9` of live processes, corruption and SQL-parser fuzzing, plus CLI, Python FFI and Node sidecar e2e tests. Onboarding docs in [docs/](docs/). Details in [specs.md](specs.md) and [plan.md](plan.md).
 
 ## Quick installation
 
@@ -185,6 +185,8 @@ elitesql repl app.esql                  # interactive shell (.exit to quit)
 elitesql tables app.esql                # schemas as JSON
 elitesql check app.esql                 # offline integrity check
 elitesql compact app.esql
+elitesql backup app.esql backup.esql    # snapshot-consistent copy, verified
+elitesql restore backup.esql app.esql   # validate a backup and materialize it
 elitesql export app.esql docs > docs.jsonl
 elitesql import app.esql docs < docs.jsonl
 elitesql repair damaged.esql rescued.esql    # salvage, never silent

@@ -27,6 +27,34 @@ This is verified with real crash injection: processes killed with `kill -9`
 at random points, thousands of rounds, zero acknowledged commits lost and
 zero partial commits visible.
 
+## Backup and restore
+
+The first line of defense is a backup taken BEFORE anything goes wrong:
+
+```bash
+elitesql backup app.esql backup.esql     # snapshot-consistent copy, verified
+elitesql restore backup.esql app.esql    # validate a backup, materialize it
+```
+
+`backup` is a logical copy under a snapshot: it contains exactly the state
+committed when it started, preserves ids, schemas and index definitions, and
+is born compacted. From the CLI it needs the lock (no other process may hold
+the database open); embedded apps can call `db.backup(dst)` directly and
+back up WHILE other threads keep committing — writers are never blocked.
+The copy is written to `<dst>.partial` and renamed at the end (an interrupted
+backup never leaves a partial directory under the final name), then verified
+with `check` before reporting success.
+
+`restore` refuses to touch an existing destination, runs `check` on the
+backup first (a damaged backup is reported, never restored), copies the
+canonical files, and opens the result once to replay the WAL and rebuild
+derived indexes.
+
+A cold copy (`cp -R`) of a CLOSED database is also a valid backup — the
+directory is self-contained. Never file-copy a database that a process has
+open for writing: a multi-file copy is not atomic and can miss a WAL rotated
+away by a checkpoint mid-copy.
+
 ## Tools, in escalation order
 
 ### 1. `elitesql check <db>` — diagnosis
