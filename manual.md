@@ -1,63 +1,63 @@
-# Manual SQL de ClawDB
+# EliteSQL SQL Manual
 
-Referencia del dialecto SQL de ClawDB (V1). Es un subset deliberadamente pequeno: cubre lo que una app operacional necesita y rechaza todo lo demas con un error explicito que dice que usar en su lugar.
+Reference for the EliteSQL SQL dialect (V1). It is a deliberately small subset: it covers what an operational app needs and rejects everything else with an explicit error that says what to use instead.
 
-## Como ejecutar SQL
+## Running SQL
 
 ```rust
-use clawdb_core::{Db, QueryOutput};
+use elitesql_core::{Db, QueryOutput};
 
-let db = Db::open_or_create("app.clawdb")?;
+let db = Db::open_or_create("app.esql")?;
 match db.query("SELECT name FROM users WHERE age > 30")? {
     QueryOutput::Rows { columns, rows } => { /* SELECT */ }
-    QueryOutput::Inserted { ids }        => { /* INSERT: ids generados */ }
-    QueryOutput::Affected(n)             => { /* UPDATE/DELETE: filas afectadas */ }
+    QueryOutput::Inserted { ids }        => { /* INSERT: generated ids */ }
+    QueryOutput::Affected(n)             => { /* UPDATE/DELETE: affected rows */ }
     QueryOutput::None                    => { /* DDL */ }
 }
 ```
 
-Reglas generales:
+General rules:
 
-- Una sentencia por llamada a `query()`.
-- Keywords case-insensitive (`SELECT` = `select`).
-- Comentarios de linea con `--`.
-- Los SELECT leen el ultimo estado commiteado (read committed). Para lecturas consistentes por snapshot usa la API Rust (`db.snapshot()` + `scan_at`/`get_at`).
-- UPDATE/DELETE se aplican en una transaccion con reintentos automaticos ante conflicto optimista. Un INSERT multi-fila es un solo commit atomico: o entran todas las filas o ninguna.
+- One statement per `query()` call.
+- Case-insensitive keywords (`SELECT` = `select`).
+- Line comments with `--`.
+- SELECT reads the latest committed state (read committed). For snapshot-consistent reads use the Rust API (`db.snapshot()` + `scan_at`/`get_at`).
+- UPDATE/DELETE run inside a transaction with automatic retries on optimistic conflict. A multi-row INSERT is a single atomic commit: all rows land or none do.
 
-## Tipos y literales
+## Types and literals
 
-| Tipo | Literal SQL | Ejemplo |
+| Type | SQL literal | Example |
 |---|---|---|
 | `bool` | `TRUE` / `FALSE` | `TRUE` |
-| `int64` | entero | `42`, `-7` |
-| `float64` | decimal o entero | `3.14`, `3` |
-| `text` | string entre comillas simples | `'hola'`, `'it''s ok'` (escape `''`) |
+| `int64` | integer | `42`, `-7` |
+| `float64` | decimal or integer | `3.14`, `3` |
+| `text` | single-quoted string | `'hello'`, `'it''s ok'` (escape `''`) |
 | `blob` | hex literal | `X'DEADBEEF'` |
-| `timestamp` | string `'YYYY-MM-DD HH:MM:SS[.ffffff]'` (UTC) o entero (microsegundos Unix) | `'2026-08-07 09:30:00'` |
-| `date` | string `'YYYY-MM-DD'` (dias desde epoch por dentro) | `'2026-08-07'` |
-| `time` | string `'HH:MM:SS[.ffffff]'` (microsegundos desde medianoche) | `'09:30:00'` |
-| `json` | string con JSON valido | `'{"tags": ["a"], "n": 3}'` |
-| `vector(N)` | string con array JSON de N numeros | `'[0.12, -0.5, 0.33]'` |
+| `timestamp` | string `'YYYY-MM-DD HH:MM:SS[.ffffff]'` (UTC) or integer (Unix microseconds) | `'2026-08-07 09:30:00'` |
+| `date` | string `'YYYY-MM-DD'` (days since epoch internally) | `'2026-08-07'` |
+| `time` | string `'HH:MM:SS[.ffffff]'` (microseconds since midnight) | `'09:30:00'` |
+| `json` | string containing valid JSON | `'{"tags": ["a"], "n": 3}'` |
+| `vector(N)` | string containing a JSON array of N numbers | `'[0.12, -0.5, 0.33]'` |
 | null | `NULL` | `NULL` |
 
-Los literales de `date`, `time` y `timestamp` se validan de verdad: `'2026-02-30'` o `'25:00:00'` fallan con error claro. En WHERE, un string se coerciona automaticamente contra columnas date/time/timestamp: `WHERE day >= '2026-01-01'` o `WHERE at < '2026-08-07 18:00:00'` funcionan sin sintaxis de cast (tambien contra indices).
+`date`, `time` and `timestamp` literals are truly validated: `'2026-02-30'` or `'25:00:00'` fail with a clear error. In WHERE, a string coerces automatically against date/time/timestamp columns: `WHERE day >= '2026-01-01'` or `WHERE at < '2026-08-07 18:00:00'` work without any cast syntax (and through indexes too).
 
-Sobre `timestamp` (el "datetime" de ClawDB): representa un instante en microsegundos UTC. El literal acepta separador espacio o `T`, sufijo `Z` opcional, y fecha sola (`'2026-08-08'` = medianoche UTC). No hay offsets de timezone (`+05:00`): el motor guarda instantes; la presentacion por zona horaria es de la aplicacion.
+About `timestamp` (EliteSQL's "datetime"): it represents an instant in UTC microseconds. The literal accepts a space or `T` separator, an optional `Z` suffix, and a date-only form (`'2026-08-08'` = midnight UTC). There are no timezone offsets (`+05:00`): the engine stores instants; timezone presentation belongs to the application.
 
-**Diferencias de fechas**: se calculan en la aplicacion, y la representacion las hace triviales — `date` son dias desde epoch, asi que restar dos `Value::Date` da la diferencia en dias directamente (los bisiestos ya los resolvio el motor al parsear); `time` y `timestamp` restan en microsegundos. Dentro de una query, expresa "ultimos N dias" o "entre fechas" como rangos, que ademas usan indices:
+**Date differences**: computed in the application, and the representation makes them trivial — `date` is days since epoch, so subtracting two `Value::Date` values gives the difference in days directly (the engine already resolved leap years when parsing); `time` and `timestamp` subtract in microseconds. Inside a query, express "last N days" or "between dates" as ranges, which also use indexes:
 
 ```sql
-SELECT * FROM pedidos WHERE fecha >= '2026-07-08'                      -- limite calculado por la app
-SELECT * FROM eventos WHERE dia >= '2026-08-01' AND dia < '2026-09-01' -- rango indexable
+SELECT * FROM orders WHERE order_date >= '2026-07-08'                      -- bound computed by the app
+SELECT * FROM events WHERE day >= '2026-08-01' AND day < '2026-09-01'      -- indexable range
 ```
 
-Aritmetica dentro del SQL (`fecha2 - fecha1` en proyeccion o HAVING) queda para una fase futura de expresiones minimas.
+Arithmetic inside SQL (`date2 - date1` in projections or HAVING) is left for a future minimal-expressions phase.
 
-Coerciones automaticas: un entero es valido para columnas `float64` y `timestamp`. Un string es valido para `json` solo si parsea como JSON.
+Automatic coercions: an integer is valid for `float64` and `timestamp` columns. A string is valid for `json` only if it parses as JSON.
 
-## La primary key implicita
+## The implicit primary key
 
-Toda tabla tiene una columna `id` de tipo `text` que **no se declara**. Si no la provees en el INSERT, el motor genera un [ULID](https://github.com/ulid/spec) (26 caracteres, ordenable por tiempo). Puedes proveerla explicitamente, y no puede modificarse con UPDATE.
+Every table has an `id` column of type `text` that is **not declared**. If you don't provide it on INSERT, the engine generates a [ULID](https://github.com/ulid/spec) (26 characters, time-sortable). You may provide it explicitly, and it cannot be changed with UPDATE.
 
 ## CREATE TABLE
 
@@ -71,39 +71,39 @@ CREATE TABLE users (
 )
 ```
 
-- Columnas nullable por defecto; `NOT NULL` para exigir valor.
-- No hay `PRIMARY KEY` (es el `id` implicito), ni `DEFAULT`, ni `REFERENCES`, ni `UNIQUE` inline (usa `CREATE UNIQUE INDEX`).
-- Los nombres de tipo son exactos: `int` o `varchar` fallan con un error que indica el tipo correcto (`use int64`, `use text`).
+- Columns are nullable by default; `NOT NULL` to require a value.
+- There is no `PRIMARY KEY` (it's the implicit `id`), no `DEFAULT`, no `REFERENCES`, no inline `UNIQUE` (use `CREATE UNIQUE INDEX`).
+- Type names are exact: `int` or `varchar` fail with an error pointing to the right type (`use int64`, `use text`).
 
 ## CREATE INDEX
 
 ```sql
-CREATE INDEX ON orders (user_id)          -- indice de igualdad
-CREATE UNIQUE INDEX ON users (email)      -- unicidad validada en cada commit
-CREATE UNIQUE INDEX idx_email ON users (email)  -- el nombre es opcional
+CREATE INDEX ON orders (user_id)          -- equality index
+CREATE UNIQUE INDEX ON users (email)      -- uniqueness validated at every commit
+CREATE UNIQUE INDEX idx_email ON users (email)  -- the name is optional
 ```
 
-- Un indice por columna; multi-columna no soportado en V1.
-- Los `NULL` no participan de la unicidad (varias filas pueden tener `email NULL`).
-- Crear un indice unico sobre datos con duplicados existentes falla.
-- El planner los usa automaticamente en igualdades de WHERE y en JOINs.
+- One index per column; multi-column is not supported in V1.
+- `NULL`s do not participate in uniqueness (several rows may have `email NULL`).
+- Creating a unique index over data with existing duplicates fails.
+- The planner uses indexes automatically on WHERE equalities and in JOINs.
 
 ## INSERT
 
 ```sql
 INSERT INTO users (name, email, age) VALUES ('ana', 'ana@x.com', 30)
 
--- Multi-fila: un solo commit atomico. Devuelve los ids en orden.
+-- Multi-row: one atomic commit. Returns the ids in order.
 INSERT INTO users (name, age) VALUES ('bob', 25), ('eva', 41)
 
--- Con id explicito:
+-- With an explicit id:
 INSERT INTO users (id, name) VALUES ('u-admin', 'root')
 ```
 
-- La lista de columnas es **obligatoria**.
-- Columnas no listadas quedan `NULL` (error si son `NOT NULL`).
-- Devuelve `QueryOutput::Inserted { ids }` con los ULIDs generados o los ids provistos.
-- `INSERT ... SELECT` y `RETURNING` no estan soportados.
+- The column list is **required**.
+- Unlisted columns become `NULL` (an error if they are `NOT NULL`).
+- Returns `QueryOutput::Inserted { ids }` with the generated ULIDs or the provided ids.
+- `INSERT ... SELECT` and `RETURNING` are not supported.
 
 ## SELECT
 
@@ -115,16 +115,16 @@ SELECT name AS who, age AS years FROM users
 
 ### WHERE
 
-Operadores: `=`, `!=` (o `<>`), `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, parentesis, `IS NULL`, `IS NOT NULL`, `IN (...)`, `NOT IN (...)`.
+Operators: `=`, `!=` (or `<>`), `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, parentheses, `IS NULL`, `IS NOT NULL`, `IN (...)`, `NOT IN (...)`.
 
 ```sql
 SELECT name FROM users WHERE age >= 25 AND email IS NOT NULL
 SELECT name FROM users WHERE age IN (25, 30, 41)
 SELECT name FROM users WHERE (age < 18 OR age > 65) AND NOT name = 'admin'
-SELECT name FROM users WHERE id = 'u-admin'        -- point lookup directo
+SELECT name FROM users WHERE id = 'u-admin'        -- direct point lookup
 ```
 
-Semantica de NULL (logica simplificada de dos valores): cualquier comparacion que involucre `NULL` es falsa. `email = NULL` nunca matchea — usa `email IS NULL`.
+NULL semantics (simplified two-valued logic): any comparison involving `NULL` is false. `email = NULL` never matches — use `email IS NULL`.
 
 ### ORDER BY, LIMIT, OFFSET
 
@@ -132,44 +132,44 @@ Semantica de NULL (logica simplificada de dos valores): cualquier comparacion qu
 SELECT name, age FROM users ORDER BY age DESC, name ASC LIMIT 10 OFFSET 20
 ```
 
-Los `NULL` ordenan primero. `LIMIT`/`OFFSET` se aplican despues de ordenar.
+`NULL`s sort first. `LIMIT`/`OFFSET` apply after sorting.
 
 ## JOINs
 
-Soportados: `INNER JOIN` (o `JOIN`), `LEFT JOIN`, `RIGHT JOIN`. La condicion `ON` es exactamente una igualdad de columnas; filtros adicionales van en `WHERE`.
+Supported: `INNER JOIN` (or `JOIN`), `LEFT JOIN`, `RIGHT JOIN`. The `ON` condition is exactly one column equality; extra filters go in `WHERE`.
 
 ```sql
--- Ordenes de un usuario, usando el indice de orders.user_id:
+-- A user's orders, using the orders.user_id index:
 SELECT u.name, o.amount
 FROM users u
 INNER JOIN orders o ON o.user_id = u.id
 WHERE u.email = 'ana@x.com'
 ORDER BY o.amount DESC
 
--- LEFT JOIN: usuarios sin ordenes aparecen con NULL:
+-- LEFT JOIN: users without orders appear with NULL:
 SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON o.user_id = u.id
 
--- Joins encadenados:
+-- Chained joins:
 SELECT u.name, o.amount, t.tag
 FROM users u
 JOIN orders o ON o.user_id = u.id
 JOIN tags t   ON t.order_id = o.id
 ```
 
-- Alias de tabla con o sin `AS` (`users u` o `users AS u`).
-- Con mas de una tabla, las columnas repetidas (como `id`) deben calificarse: `u.id`. `SELECT *` devuelve headers calificados (`u.id`, `o.amount`).
-- `RIGHT JOIN` preserva la tabla derecha (internamente es un LEFT con roles invertidos).
-- `FULL OUTER JOIN` y `CROSS JOIN` no estan soportados.
+- Table aliases with or without `AS` (`users u` or `users AS u`).
+- With more than one table, repeated columns (like `id`) must be qualified: `u.id`. `SELECT *` returns qualified headers (`u.id`, `o.amount`).
+- `RIGHT JOIN` preserves the right table (internally a LEFT with roles swapped).
+- `FULL OUTER JOIN` and `CROSS JOIN` are not supported.
 
-## Agregados, GROUP BY y HAVING
+## Aggregates, GROUP BY and HAVING
 
-Funciones: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`.
+Functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`.
 
 ```sql
--- Agregado global: siempre devuelve exactamente una fila.
+-- Global aggregate: always returns exactly one row.
 SELECT count(*), sum(amount), avg(amount) FROM sales
 
--- Por grupo, con filtro de grupos y orden por alias:
+-- Per group, with group filtering and ordering by alias:
 SELECT region, count(*) AS n, sum(amount) AS total
 FROM sales
 WHERE amount > 0
@@ -178,27 +178,27 @@ HAVING sum(amount) >= 300
 ORDER BY total DESC
 LIMIT 10
 
--- Compone con joins:
+-- Composes with joins:
 SELECT g.country, sum(s.amount) AS total
 FROM sales s JOIN regions g ON g.name = s.region
 GROUP BY g.country
 ```
 
-Semantica de NULL (estandar SQL):
+NULL semantics (standard SQL):
 
-- `COUNT(*)` cuenta filas; `COUNT(col)` ignora NULLs.
-- `SUM`/`AVG`/`MIN`/`MAX` ignoran NULLs; sobre conjunto vacio devuelven NULL.
-- Los NULL agrupan juntos en GROUP BY.
-- `SUM` de int64 desborda con error explicito (no hace wrap); si mezcla int64 y float64 promociona a float64. `AVG` siempre devuelve float64.
+- `COUNT(*)` counts rows; `COUNT(col)` ignores NULLs.
+- `SUM`/`AVG`/`MIN`/`MAX` ignore NULLs; over an empty set they return NULL.
+- NULLs group together in GROUP BY.
+- An int64 `SUM` overflows with an explicit error (no wrapping); mixing int64 and float64 promotes to float64. `AVG` always returns float64.
 
-Reglas:
+Rules:
 
-- Toda columna no agregada del SELECT debe estar en GROUP BY.
-- `SUM`/`AVG` exigen columnas int64 o float64.
-- HAVING solo referencia columnas agrupadas y agregados (el agregado no necesita estar en el SELECT).
-- En queries con agregados, ORDER BY referencia nombres de salida o aliases (`ORDER BY total DESC`), no llamadas a funcion: dale un alias al agregado.
-- Los agregados solo viven en SELECT y HAVING (en WHERE usa... HAVING).
-- No soportado: `COUNT(DISTINCT ...)`, agregados anidados, expresiones dentro del agregado.
+- Every non-aggregated column in the SELECT must appear in GROUP BY.
+- `SUM`/`AVG` require int64 or float64 columns.
+- HAVING may only reference grouped columns and aggregates (the aggregate does not need to appear in the SELECT).
+- In aggregate queries, ORDER BY references output names or aliases (`ORDER BY total DESC`), not function calls: give the aggregate an alias.
+- Aggregates live only in SELECT and HAVING (in WHERE, use... HAVING).
+- Not supported: `COUNT(DISTINCT ...)`, nested aggregates, expressions inside aggregates.
 
 ## UPDATE
 
@@ -207,56 +207,56 @@ UPDATE users SET age = 31 WHERE id = 'u-admin'
 UPDATE users SET email = NULL, age = 0 WHERE age > 100
 ```
 
-- `SET` acepta solo literales (no `SET age = age + 1`; calcula en la aplicacion).
-- Sin `WHERE` afecta todas las filas.
-- Devuelve `QueryOutput::Affected(n)`.
+- `SET` accepts literals only (no `SET age = age + 1`; compute in the application).
+- Without `WHERE` it affects every row.
+- Returns `QueryOutput::Affected(n)`.
 
 ## DELETE
 
 ```sql
 DELETE FROM orders WHERE amount < 100
-DELETE FROM orders          -- todas las filas
+DELETE FROM orders          -- every row
 ```
 
-Devuelve `QueryOutput::Affected(n)`. Los snapshots vivos siguen viendo lo borrado hasta que se liberan.
+Returns `QueryOutput::Affected(n)`. Live snapshots keep seeing the deleted rows until they are released.
 
-## Como decide el planner
+## How the planner decides
 
-Heuristico, sin cost model:
+Heuristic, no cost model:
 
-1. `WHERE id = '...'` → point lookup directo.
-2. Igualdad sobre columna indexada → busqueda por indice.
-3. Cualquier otro filtro → full scan + filtro.
-4. Los filtros de una sola tabla se empujan **antes** del join.
-5. Joins: si el lado a sondear es chico (≤1024 filas) y la columna de join esta indexada (o es `id`), usa el indice por fila (index nested-loop); si no, hash join.
+1. `WHERE id = '...'` → direct point lookup.
+2. Equality on an indexed column → index lookup.
+3. Any other filter → full scan + filter.
+4. Single-table filters are pushed **below** the join.
+5. Joins: when the probe side is small (≤1024 rows) and the join column is indexed (or is `id`), per-row index lookups (index nested-loop); otherwise a hash join.
 
-Regla practica: **indexa las columnas de join** (`orders.user_id`) y las columnas de busqueda frecuente.
+Practical rule: **index your join columns** (`orders.user_id`) and your frequent lookup columns.
 
-## Fuera del subset V1
+## Outside the V1 subset
 
-Todo esto falla con un error claro, no con comportamiento sorpresa:
+All of this fails with a clear error, never with surprise behavior:
 
-| No soportado | Alternativa |
+| Not supported | Alternative |
 |---|---|
-| `COUNT(DISTINCT ...)`, agregados anidados | deduplicar/calcular en la aplicacion |
-| Subqueries, CTEs (`WITH`), `UNION` | reescribir como queries separadas |
-| `FULL OUTER JOIN`, `CROSS JOIN` | dos queries + merge en la app |
-| Aritmetica (`age + 1`) y funciones | calcular en la aplicacion |
-| `LIKE`, `BETWEEN` | `BETWEEN` → `>= AND <=`; busqueda de texto: `db.create_text_index` + `db.search_text` (BM25, API Rust/bindings) |
-| `DISTINCT` | deduplicar en la app |
-| `DROP`, `ALTER` | pendiente en el roadmap |
-| `BEGIN/COMMIT` en SQL | transacciones via API Rust: `db.begin()` |
-| `RETURNING` | INSERT ya devuelve los ids |
-| Busqueda vectorial/texto/hibrida en SQL | API Rust y bindings: `search_vector`, `search_text` (BM25) y `search_hybrid` (RRF); la funcion SQL explicita queda para una fase futura |
+| `COUNT(DISTINCT ...)`, nested aggregates | deduplicate/compute in the application |
+| Subqueries, CTEs (`WITH`), `UNION` | rewrite as separate queries |
+| `FULL OUTER JOIN`, `CROSS JOIN` | two queries + merge in the app |
+| Arithmetic (`age + 1`) and functions | compute in the application |
+| `LIKE`, `BETWEEN` | `BETWEEN` → `>= AND <=`; text search: `db.create_text_index` + `db.search_text` (BM25, Rust API/bindings) |
+| `DISTINCT` | deduplicate in the app |
+| `DROP`, `ALTER` | pending on the roadmap |
+| `BEGIN/COMMIT` in SQL | transactions via the Rust API: `db.begin()` |
+| `RETURNING` | INSERT already reports the ids |
+| Vector/text/hybrid search in SQL | Rust API and bindings: `search_vector`, `search_text` (BM25) and `search_hybrid` (RRF); an explicit SQL function is left for a future phase |
 
-## Performance de referencia
+## Reference performance
 
-Sobre 1M de ordenes + 10K usuarios (Apple Silicon, `cargo bench --bench sql`):
+Over 1M orders + 10K users (Apple Silicon, `cargo bench --bench sql`):
 
-| Query | Latencia |
+| Query | Latency |
 |---|---|
-| Point lookup por indice unico (SQL completo: parse + plan + exec) | ~4 µs |
-| JOIN indexado: usuario → sus ~100 ordenes de 1M, ORDER BY + LIMIT | ~360 µs |
-| Full scan con filtro sin indice sobre 1M filas | ~1.1 s |
+| Point lookup via unique index (full SQL path: parse + plan + exec) | ~4 µs |
+| Indexed JOIN: a user → their ~100 orders out of 1M, ORDER BY + LIMIT | ~360 µs |
+| Unindexed full scan with a filter over 1M rows | ~1.1 s |
 
-La ultima fila es el limite conocido de la spec ("joins grandes sin indice seran caros"): si una query es frecuente, indexala.
+The last row is the spec's known limit ("large joins without an index will be expensive"): if a query is frequent, index it.

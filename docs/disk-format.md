@@ -1,96 +1,96 @@
-# Formato en disco
+# On-disk format
 
-Una base ClawDB es una carpeta autocontenida. Todos los enteros son
-little-endian. `format_version` actual: 2.
+An EliteSQL database is a self-contained directory. All integers are
+little-endian. Current `format_version`: 2.
 
 ```text
-app.clawdb/
-  CLAWDB          # marker: "clawdb format_version=2\n"
-  LOCK            # flock: exclusivo (escritor) o compartido (read-only)
-  catalog.json    # tablas, columnas, indices (JSON atomico via tmp+rename)
-  manifest        # puntero atomico al estado visible
-  manifest.prev   # manifest anterior (fallback de recovery)
-  wal/NNNNNN.wal  # commits durables desde el ultimo checkpoint
-  segments/NNNNNN.seg   # datos inmutables (se crean en checkpoint/compaction)
-  vectors/XXXXXXXX.vidx # grafos ANN persistidos (derivados, desechables)
-  blobs/<ulid>.blob     # chunks de blobs grandes (out-of-line)
+app.esql/
+  ELITESQL        # marker: "elitesql format_version=2\n"
+  LOCK            # flock: exclusive (writer) or shared (read-only)
+  catalog.json    # tables, columns, indexes (atomic JSON via tmp+rename)
+  manifest        # atomic pointer to the visible state
+  manifest.prev   # previous manifest (recovery fallback)
+  wal/NNNNNN.wal  # durable commits since the last checkpoint
+  segments/NNNNNN.seg   # immutable data (created at checkpoint/compaction)
+  vectors/XXXXXXXX.vidx # persisted ANN graphs (derived, disposable)
+  blobs/<ulid>.blob     # large-blob chunks (out-of-line)
 ```
 
 ## manifest
 
-`CLAWMANI` (8 bytes) + u32 crc32 del cuerpo + u32 longitud + cuerpo JSON:
+`ESQLMANI` (8 bytes) + u32 crc32 of the body + u32 length + JSON body:
 `{format_version, committed_version, segments: [{id, len}], wal_id}`.
-Publicacion: escribir `manifest.tmp` (fsync), rotar `manifest` →
-`manifest.prev`, rename `manifest.tmp` → `manifest`, fsync del directorio.
-Un crash entre los renames deja un `manifest.prev` valido.
+Publication: write `manifest.tmp` (fsync), rotate `manifest` →
+`manifest.prev`, rename `manifest.tmp` → `manifest`, fsync the directory.
+A crash between the renames leaves a valid `manifest.prev`.
 
-## Segmentos (`segments/`)
+## Segments (`segments/`)
 
-Log append-only de versiones de registros. Cada entrada:
+An append-only log of record versions. Each entry:
 
 ```text
 u8   kind          1 = put, 2 = tombstone
-u64  version       secuencia global de commit
-u16  table_len     + nombre de tabla (utf8)
-u16  id_len        + id (utf8, ULID o provisto)
-u32  payload_len   + payload (registro codificado; vacio en tombstone)
-u32  crc32         sobre todos los bytes anteriores de la entrada
+u64  version       global commit sequence
+u16  table_len     + table name (utf8)
+u16  id_len        + id (utf8, ULID or user-provided)
+u32  payload_len   + payload (encoded record; empty for tombstones)
+u32  crc32         over every preceding byte of the entry
 ```
 
-El manifest registra la longitud valida (`len`); bytes posteriores se
-ignoran. Compaction reescribe los segmentos conservando solo las versiones
-visibles para el ultimo estado o para snapshots vivos.
+The manifest records the valid length (`len`); bytes past it are ignored.
+Compaction rewrites segments keeping only the versions visible to the latest
+state or to live snapshots.
 
 ## WAL (`wal/`)
 
-Un registro por commit (multi-cambio, atomico):
+One record per commit (multi-change, atomic):
 
 ```text
 u64  commit_version
 u32  change_count
-por cambio: u8 kind, u16+tabla, u16+id, u32+payload
-u32  crc32 del registro completo
+per change: u8 kind, u16+table, u16+id, u32+payload
+u32  crc32 of the whole record
 ```
 
-Replay idempotente: los registros con version <= la marca del manifest se
-saltan; una cola rota se trunca. En checkpoint el WAL rota (id+1) y el
-anterior se borra una vez publicado el manifest.
+Idempotent replay: records at or below the manifest's watermark are skipped;
+a torn tail is truncated. At checkpoint the WAL rotates (id+1) and the old
+file is deleted once the manifest is published.
 
-## Payload de registro
+## Record payload
 
-Auto-descriptivo (sobrevive evolucion de esquema):
+Self-describing (survives schema evolution):
 
 ```text
 u16 field_count
-por campo: u16+nombre, valor etiquetado
+per field: u16+name, tagged value
 ```
 
-Tags de valor: 0 null, 1 bool, 2 int64, 3 float64, 4 text(u32+utf8),
-5 blob(u32+bytes), 6 timestamp(i64 us), 7 json(u32+utf8), 8 vector(u32
-count + f32*count), 9 date(i32 dias), 10 time(i64 us), 11 blobref
-(u16+nombre, u64 size, u32 crc — referencia a `blobs/<nombre>.blob`).
+Value tags: 0 null, 1 bool, 2 int64, 3 float64, 4 text(u32+utf8),
+5 blob(u32+bytes), 6 timestamp(i64 µs), 7 json(u32+utf8), 8 vector(u32
+count + f32*count), 9 date(i32 days), 10 time(i64 µs), 11 blobref
+(u16+name, u64 size, u32 crc — a reference to `blobs/<name>.blob`).
 
 ## Blobs (`blobs/`)
 
-Valores blob >= `external_blob_threshold` (default 256 KiB) se escriben
-fuera de linea ANTES del commit WAL que los referencia:
-`CLAWBLOB` (8) + u32 crc + u64 len + contenido. Lectura totalmente validada.
-GC en compaction: se borran los chunks no referenciados por ningun payload
-superviviente (incluye huerfanos de commits cortados).
+Blob values >= `external_blob_threshold` (default 256 KiB) are written
+out-of-line BEFORE the WAL commit that references them:
+`ESQLBLOB` (8) + u32 crc + u64 len + content. Reads are fully validated.
+GC at compaction: chunks not referenced by any surviving payload are deleted
+(including orphans from torn commits).
 
-## Grafos ANN (`vectors/`)
+## ANN graphs (`vectors/`)
 
-`CLAWVIDX` + crc + longitud + cuerpo: identidad del indice (tabla, columna,
-metrica, m, ef_construction, quantized), version de commit del dump, y el
-grafo completo (vectores f32 o int8+escala, niveles y vecinos, tombstones).
-Se escribe al cerrar la base y al compactar. Al abrir: si valida y no es
-mas nuevo que el estado, se carga y se pone al dia con lo commiteado
-despues; ante cualquier problema se reconstruye desde los datos canonicos.
-Nombre de archivo: crc32 de "tabla\0columna" en hex.
+`ESQLVIDX` + crc + length + body: the index identity (table, column, metric,
+m, ef_construction, quantized), the dump's commit version, and the full
+graph (f32 or int8+scale vectors, levels and neighbors, tombstones).
+Written on database close and at compaction. On open: if it validates and
+is not newer than the state, it is loaded and caught up with everything
+committed afterwards; on any problem it is rebuilt from canonical data.
+File name: crc32 of "table\0column" in hex.
 
-## Politica de versionado
+## Versioning policy
 
-`format_version` va en el marker, el catalogo y el manifest; un numero
-distinto rechaza el open con error claro. Los indices derivados (vidx)
-tienen su propio numero de formato: una version vieja simplemente se
-descarta y reconstruye.
+`format_version` lives in the marker, the catalog and the manifest; a
+different number rejects the open with a clear error. Derived indexes (vidx)
+carry their own format number: an old version is simply discarded and
+rebuilt.

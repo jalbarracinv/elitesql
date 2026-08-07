@@ -1,0 +1,17 @@
+[package]
+name = "elitesql-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EliteSQL command line: query/repl, check, repair, import/export and sidecar server"
+
+[[bin]]
+name = "elitesql"
+path = "src/main.rs"
+
+[dependencies]
+elitesql-core = { path = "../elitesql-core" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

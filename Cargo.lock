@@ -128,36 +128,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "clawdb-cli"
-version = "0.0.1"
-dependencies = [
- "clawdb-core",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "clawdb-core"
-version = "0.0.1"
-dependencies = [
- "crc32fast",
- "criterion",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "ulid",
-]
-
-[[package]]
-name = "clawdb-ffi"
-version = "0.0.1"
-dependencies = [
- "clawdb-core",
- "serde_json",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -211,6 +181,36 @@ name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
+
+[[package]]
+name = "elitesql-cli"
+version = "0.0.1"
+dependencies = [
+ "elitesql-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "elitesql-core"
+version = "0.0.1"
+dependencies = [
+ "crc32fast",
+ "criterion",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ulid",
+]
+
+[[package]]
+name = "elitesql-ffi"
+version = "0.0.1"
+dependencies = [
+ "elitesql-core",
+ "serde_json",
+]
 
 [[package]]
 name = "errno"

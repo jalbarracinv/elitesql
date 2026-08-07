@@ -1,4 +1,4 @@
-"""Phase 4 acceptance demo: gunicorn multi-worker against `clawdb serve`.
+"""Phase 4 acceptance demo: gunicorn multi-worker against `elitesql serve`.
 
 Each gunicorn worker (a separate OS process) opens one SidecarClient to the
 single engine process. Visitors read and write concurrently: MVCC inside the
@@ -18,9 +18,9 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "bindings", "python"))
-from clawdb import SidecarClient  # noqa: E402
+from elitesql import SidecarClient  # noqa: E402
 
-SOCKET = os.environ.get("CLAWDB_SOCKET", "/tmp/clawdb-demo.sock")
+SOCKET = os.environ.get("ELITESQL_SOCKET", "/tmp/elitesql-demo.sock")
 _client = None
 
 

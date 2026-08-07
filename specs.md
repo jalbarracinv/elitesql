@@ -1,71 +1,71 @@
-# ClawDB Specs
+# EliteSQL Specs
 
-## Por que es necesario
+## Why it is needed
 
-Las aplicaciones modernas estan cargando mas estado local, mas datos semi-estructurados y mas capacidades de IA. Una app pequena hoy termina usando una torre innecesaria: SQLite para metadata, Redis para cache, un vector database para embeddings, archivos sueltos para blobs, y una capa propia de sync o snapshots.
+Modern applications carry more local state, more semi-structured data and more AI capabilities. A small app today ends up running an unnecessary tower: SQLite for metadata, Redis for caching, a vector database for embeddings, loose files for blobs, and a homemade sync or snapshot layer.
 
-Eso funciona, pero pesa demasiado para apps locales, edge, desktop, mobile, agentes y SaaS pequenos/medianos que necesitan moverse rapido sin operar infraestructura de base de datos.
+That works, but it weighs too much for local, edge, desktop and mobile apps, agents, and small/medium SaaS that need to move fast without operating database infrastructure.
 
-ClawDB nace como un motor embebido, ligero y moderno: simple como los motores xBase de los 90s en filosofia operativa, ergonomico como SQLite, pero disenado desde el inicio para concurrencia moderna y busqueda vectorial nativa.
+EliteSQL is born as an embedded, lightweight, modern engine: simple like the xBase engines of the 90s in operational philosophy, ergonomic like SQLite, but designed from the start for modern concurrency and native vector search.
 
-## Ventajas
+## Advantages
 
-- **Embebido y ligero**: sin servidor obligatorio, sin daemon, sin tuning ceremonial.
-- **Formato autocontenido**: facil de copiar, respaldar, mover e inspeccionar.
-- **Concurrencia moderna**: muchos lectores y multiples escritores preparando transacciones en paralelo.
-- **Vectores nativos**: embeddings no como extension pegada, sino como tipo e indice de primera clase.
-- **Fail-safe por diseno**: crash recovery, checksums, WAL replay y snapshots consistentes.
-- **Superficie pequena**: CRUD, filtros, joins basicos, indices y ANN; no una recreacion completa de PostgreSQL.
-- **Integracion universal**: core moderno con API C estable para bindings en varios lenguajes.
-- **Ideal para AI/local-first**: metadata, documentos, blobs, embeddings, busqueda semantica y snapshots en un solo motor.
+- **Embedded and lightweight**: no mandatory server, no daemon, no ceremonial tuning.
+- **Self-contained format**: easy to copy, back up, move and inspect.
+- **Modern concurrency**: many readers and multiple writers preparing transactions in parallel.
+- **Native vectors**: embeddings not as a bolted-on extension but as a first-class type and index.
+- **Fail-safe by design**: crash recovery, checksums, WAL replay and consistent snapshots.
+- **Small surface**: CRUD, filters, basic joins, indexes and ANN; not a full PostgreSQL recreation.
+- **Universal integration**: modern core with a stable C API for bindings in multiple languages.
+- **Ideal for AI/local-first**: metadata, documents, blobs, embeddings, semantic search and snapshots in a single engine.
 
-## Tesis del producto
+## Product thesis
 
 **A tiny operational database for AI-native apps.**
 
-ClawDB no compite directamente contra PostgreSQL. Compite contra la complejidad de armar y operar:
+EliteSQL does not compete head-on with PostgreSQL. It competes against the complexity of assembling and operating:
 
 ```text
 SQLite + vector DB + cache + sync layer + files + embeddings metadata
 ```
 
-La promesa:
+The promise:
 
 ```text
-db.open("app.clawdb")
+db.open("app.esql")
 ```
 
-Y adentro tener registros, texto, blobs, JSON, indices normales, busqueda vectorial ANN, snapshots y concurrencia sana.
+And inside it: records, text, blobs, JSON, regular indexes, ANN vector search, snapshots and sane concurrency.
 
-Pitch tecnico:
+Technical pitch:
 
 ```text
 SQLite-fast reads, better concurrent writes, native ANN.
 ```
 
-## Alcance V1
+## V1 scope
 
-ClawDB debe ser una base de datos operacional embebida para aplicaciones reales, no un motor SQL completo.
+EliteSQL must be an embedded operational database for real applications, not a complete SQL engine.
 
-Incluye:
+Included:
 
-- Crear y abrir bases de datos.
-- Crear tablas/colecciones con esquema simple.
-- Insertar registros.
-- Leer registros por id o indice.
-- Actualizar registros.
-- Eliminar registros.
-- Escanear con filtros simples.
-- Joins basicos.
-- Indices normales.
-- Almacenamiento de blobs.
-- Tipo vectorial nativo.
-- Busqueda ANN.
-- Transacciones basicas.
+- Create and open databases.
+- Create tables/collections with a simple schema.
+- Insert records.
+- Read records by id or index.
+- Update records.
+- Delete records.
+- Scan with simple filters.
+- Basic joins.
+- Regular indexes.
+- Blob storage.
+- Native vector type.
+- ANN search.
+- Basic transactions.
 - Snapshots.
-- Compaction en background.
+- Background compaction.
 
-No incluye en V1:
+Not included in V1:
 
 - Triggers.
 - Stored procedures.
@@ -73,15 +73,15 @@ No incluye en V1:
 - Materialized views.
 - Full outer join.
 - Recursive queries.
-- CTEs complejas.
-- Subqueries avanzadas.
+- Complex CTEs.
+- Advanced subqueries.
 - Grants/roles.
-- Planner SQL de gran complejidad.
-- Replicacion distribuida compleja.
+- A highly complex SQL planner.
+- Complex distributed replication.
 
-## Operaciones core
+## Core operations
 
-API conceptual minima:
+Minimal conceptual API:
 
 ```text
 open(path)
@@ -102,9 +102,9 @@ snapshot()
 compact()
 ```
 
-## Tipos de datos V1
+## V1 data types
 
-Lista final recomendada:
+Final recommended list:
 
 - `bool`
 - `int64`
@@ -115,96 +115,96 @@ Lista final recomendada:
 - `json`
 - `vector<float32, N>`
 
-Opcionales para V1.1:
+Optional for V1.1:
 
-- `decimal`, para dinero exacto.
-- `uuid`, aunque puede iniciar como `text` validado.
-- `date`, dias desde epoch; separar fecha de timestamp evita bugs de timezone. (Promovido a necesario, ver plan Phase 2.5.)
-- `time`, microsegundos desde medianoche, para hora-del-dia sin fecha. (Promovido a necesario, ver plan Phase 2.5.)
-- `vector<int8, N>`, para embeddings cuantizados.
+- `decimal`, for exact money.
+- `uuid`, though it can start as validated `text`.
+- `date`, days since epoch; separating date from timestamp avoids timezone bugs. (Promoted to required — see plan, Phase 2.5.)
+- `time`, microseconds since midnight, for time-of-day without a date. (Promoted to required — see plan, Phase 2.5.)
+- `vector<int8, N>`, for quantized embeddings.
 
-Tipos evitados en V1:
+Types avoided in V1:
 
-- `smallint`, `int32`, `bigint` separados. `int64` basta.
-- `varchar(n)`. `text` basta.
+- Separate `smallint`, `int32`, `bigint`. `int64` is enough.
+- `varchar(n)`. `text` is enough.
 - `char`, `nchar`, `nvarchar`.
 - `interval`.
 - `array`.
 - `enum`.
 
-## Modelo de queries
+## Query model
 
-ClawDB puede tener un dialecto SQL pequeno o una API estructurada. Si existe SQL, debe mantenerse deliberadamente limitado.
+EliteSQL may have a small SQL dialect or a structured API. If SQL exists, it must stay deliberately limited.
 
-Soportado:
+Supported:
 
 - `SELECT`
 - `INSERT`
 - `UPDATE`
 - `DELETE`
-- `WHERE` con filtros simples.
-- `ORDER BY` basico.
+- `WHERE` with simple filters.
+- Basic `ORDER BY`.
 - `LIMIT`.
 - `INNER JOIN`.
 - `LEFT JOIN`.
 - `RIGHT JOIN`.
-- Busqueda vectorial con funcion explicita.
-- Agregados basicos (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) con `GROUP BY`/`HAVING` simples (V1.1, plan Phase 2.5).
+- Vector search through an explicit function.
+- Basic aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) with simple `GROUP BY`/`HAVING` (V1.1, plan Phase 2.5).
 
-Joins soportados:
+Supported joins:
 
-- Igualdad sobre campos indexables.
-- Uno o varios joins simples.
-- Filtros antes o despues del join cuando sean optimizables.
+- Equality over indexable fields.
+- One or several simple joins.
+- Filters before or after the join when they can be optimized.
 
-No soportado en V1:
+Not supported in V1:
 
 - `FULL OUTER JOIN`.
-- Joins recursivos.
-- Subqueries complejas.
-- Optimizador cost-based sofisticado.
+- Recursive joins.
+- Complex subqueries.
+- A sophisticated cost-based optimizer.
 
-`RIGHT JOIN` puede normalizarse internamente como `LEFT JOIN` con tablas invertidas.
+`RIGHT JOIN` may be normalized internally as a `LEFT JOIN` with tables swapped.
 
-## Concurrencia
+## Concurrency
 
-La concurrencia se basa en:
+Concurrency is built on:
 
 - MVCC.
-- WAL append-only.
-- Commits optimistas.
-- Snapshots por version.
-- Compaction en background.
+- Append-only WAL.
+- Optimistic commits.
+- Per-version snapshots.
+- Background compaction.
 
-Principio:
+Principle:
 
 ```text
 Readers never block writers. Writers only meet at commit.
 ```
 
-Flujo:
+Flow:
 
-1. Cada transaccion lee desde un snapshot estable.
-2. Los writers preparan cambios sin modificar registros existentes.
-3. Las escrituras se agregan como nuevas versiones en segmentos append-only.
-4. En `commit`, el motor valida conflictos.
-5. Si no hay conflicto, publica una nueva version visible.
-6. Si hay conflicto, retorna `CONFLICT_RETRY`.
+1. Every transaction reads from a stable snapshot.
+2. Writers prepare changes without modifying existing records.
+3. Writes are appended as new versions in append-only segments.
+4. At `commit`, the engine validates conflicts.
+5. If there is no conflict, it publishes a new visible version.
+6. If there is a conflict, it returns `CONFLICT_RETRY`.
 
-Conflictos:
+Conflicts:
 
-- `insert` con id nuevo: normalmente no conflictua.
-- `update` sobre el mismo registro: conflicto si el registro cambio desde el snapshot.
-- `delete` sobre el mismo registro: conflicto si el registro cambio desde el snapshot.
-- Indice unico: conflicto si otro commit publico el mismo valor.
-- Vector index: actualizacion sincrona o asincrona segun modo.
+- `insert` with a new id: normally does not conflict.
+- `update` on the same record: conflict if the record changed since the snapshot.
+- `delete` on the same record: conflict if the record changed since the snapshot.
+- Unique index: conflict if another commit published the same value.
+- Vector index: synchronous or asynchronous update depending on mode.
 
 ## Storage
 
-Estructura sugerida:
+Suggested layout:
 
 ```text
-app.clawdb/
+app.esql/
   manifest
   manifest.prev
   wal/
@@ -216,123 +216,123 @@ app.clawdb/
   recovery/
 ```
 
-Componentes:
+Components:
 
-- **Manifest**: puntero atomico al estado visible actual.
-- **Manifest.prev**: copia anterior para rollback de metadata si el ultimo publish se corta.
-- **WAL**: commits pendientes y durables.
-- **Segments**: datos append-only con versiones de registros.
-- **Indexes**: indices normales para busquedas por campos.
-- **Vectors**: indices ANN por columna vectorial.
-- **Blobs**: objetos grandes en chunks o segmentos separados.
-- **Snapshots**: referencias a versiones estables.
-- **Recovery**: metadatos temporales para reparacion, replay y compaction segura.
+- **Manifest**: atomic pointer to the currently visible state.
+- **Manifest.prev**: previous copy for metadata rollback if the last publish is cut short.
+- **WAL**: pending, durable commits.
+- **Segments**: append-only data with record versions.
+- **Indexes**: regular indexes for field lookups.
+- **Vectors**: ANN indexes per vector column.
+- **Blobs**: large objects in chunks or separate segments.
+- **Snapshots**: references to stable versions.
+- **Recovery**: temporary metadata for repair, replay and safe compaction.
 
-El formato puede ser carpeta autocontenida en V1 para simplificar compaction, indices y blobs. Mas adelante se puede explorar modo single-file.
+The format can be a self-contained directory in V1 to simplify compaction, indexes and blobs. A single-file mode can be explored later.
 
-## Fail-safe y recovery
+## Fail-safe and recovery
 
-ClawDB debe asumir que el proceso puede morir en cualquier momento: durante un insert, durante un commit, durante una actualizacion de indice, durante compaction o justo despues de escribir al disco.
+EliteSQL must assume the process can die at any moment: during an insert, during a commit, during an index update, during compaction, or right after writing to disk.
 
-Objetivo:
+Goal:
 
 ```text
 After a crash, the database opens to the last fully committed state.
 ```
 
-Garantias V1:
+V1 guarantees:
 
-- Un commit es visible completo o no es visible.
-- Nunca debe quedar una version parcialmente publicada.
-- Readers solo ven manifests validos.
-- WAL replay debe ser idempotente.
-- Compaction nunca debe borrar datos aun referenciados por un snapshot.
-- Indices derivados pueden reconstruirse desde datos canonicos.
-- Blobs deben tener checksums y referencias validables.
+- A commit is either fully visible or not visible at all.
+- A partially published version must never remain.
+- Readers only ever see valid manifests.
+- WAL replay must be idempotent.
+- Compaction must never delete data still referenced by a snapshot.
+- Derived indexes can be rebuilt from canonical data.
+- Blobs must have checksums and verifiable references.
 
-Mecanismo de commit:
+Commit mechanism:
 
-1. Escribir registros nuevos en segmentos append-only.
-2. Escribir entrada de WAL con `txn_id`, lista de cambios y checksums.
-3. Forzar durabilidad segun modo (`fsync` o equivalente).
-4. Actualizar indices requeridos para modo `sync`.
-5. Escribir nuevo manifest temporal.
-6. Validar checksum del manifest temporal.
-7. Renombrar manifest temporal a manifest activo de forma atomica.
-8. Marcar WAL como aplicado.
+1. Write new records into append-only segments.
+2. Write a WAL entry with `txn_id`, change list and checksums.
+3. Force durability according to mode (`fsync` or equivalent).
+4. Update the indexes required by `sync` mode.
+5. Write a new temporary manifest.
+6. Validate the temporary manifest's checksum.
+7. Atomically rename the temporary manifest to the active manifest.
+8. Mark the WAL as applied.
 
-Recovery al abrir:
+Recovery on open:
 
-1. Leer `manifest`.
-2. Si falla checksum o version, probar `manifest.prev`.
-3. Escanear WAL desde el ultimo commit aplicado.
-4. Reaplicar commits completos y validos.
-5. Ignorar commits incompletos o con checksum invalido.
-6. Reconstruir indices marcados como dirty.
-7. Reanudar o revertir compactions incompletas.
-8. Dejar la DB en estado consistente antes de aceptar writes.
+1. Read `manifest`.
+2. If checksum or version fails, try `manifest.prev`.
+3. Scan the WAL from the last applied commit.
+4. Reapply complete, valid commits.
+5. Ignore incomplete commits or those with invalid checksums.
+6. Rebuild indexes marked dirty.
+7. Resume or revert incomplete compactions.
+8. Leave the DB in a consistent state before accepting writes.
 
 Checksums:
 
-- Manifest: checksum obligatorio.
-- WAL entries: checksum obligatorio por entrada.
-- Segment blocks: checksum por bloque o pagina.
-- Blob chunks: checksum por chunk.
-- Vector index: checksum de metadata; el grafo ANN puede reconstruirse si se marca corrupto.
+- Manifest: checksum mandatory.
+- WAL entries: checksum mandatory per entry.
+- Segment blocks: checksum per block or page.
+- Blob chunks: checksum per chunk.
+- Vector index: metadata checksum; the ANN graph can be rebuilt if marked corrupt.
 
-Modos de durabilidad:
+Durability modes:
 
-- `safe`: fsync en commits criticos; mas lento, recomendado por defecto.
-- `balanced`: batch fsync; buen equilibrio para apps.
-- `fast`: menos fsync; acepta perdida de ultimos commits ante crash del sistema.
+- `safe`: fsync on critical commits; slower, recommended default.
+- `balanced`: batched fsync; a good balance for apps.
+- `fast`: fewer fsyncs; accepts losing the latest commits on a system crash.
 
-Comportamiento ante corrupcion:
+Behavior under corruption:
 
-- Abrir en modo read-only si hay corrupcion no recuperable.
-- Exponer `clawdb_check`.
-- Exponer `clawdb_repair`.
-- Permitir exportar registros recuperables.
-- Nunca "arreglar" silenciosamente descartando datos sin reportarlo.
+- Open in read-only mode when corruption is unrecoverable.
+- Expose `elitesql_check`.
+- Expose `elitesql_repair`.
+- Allow exporting recoverable records.
+- Never "fix" silently by discarding data without reporting it.
 
-Regla de oro:
+Golden rule:
 
 ```text
 Data files are canonical. Indexes are disposable.
 ```
 
-Si un indice se rompe, se reconstruye. Si el manifest se rompe, se usa el anterior. Si el WAL tiene una entrada incompleta, se ignora. Si un segmento canonico se rompe, se reporta y se recupera todo lo posible sin inventar estado.
+If an index breaks, it is rebuilt. If the manifest breaks, the previous one is used. If the WAL has an incomplete entry, it is ignored. If a canonical segment breaks, it is reported and everything possible is recovered without inventing state.
 
-## Indices
+## Indexes
 
-Indices V1:
+V1 indexes:
 
 - Primary key index.
-- Secondary indexes por campo.
+- Secondary indexes per field.
 - Unique indexes.
 - Vector ANN index.
 
-Estructuras candidatas:
+Candidate structures:
 
-- B-tree para indices ordenados simples.
-- LSM para escrituras intensas.
-- HNSW para ANN inicial.
-- IVF/PQ o cuantizacion para datasets grandes en versiones futuras.
+- B-tree for simple ordered indexes.
+- LSM for write-heavy loads.
+- HNSW for initial ANN.
+- IVF/PQ or quantization for large datasets in future versions.
 
 ## Vector Search
 
-Tipo principal:
+Primary type:
 
 ```text
 vector<float32, N>
 ```
 
-Metricas:
+Metrics:
 
 - cosine
 - dot
 - l2
 
-API conceptual:
+Conceptual API:
 
 ```text
 search_vector(
@@ -345,50 +345,50 @@ search_vector(
 )
 ```
 
-ANN inicial:
+Initial ANN:
 
-- HNSW como default por ergonomia y calidad.
-- Parametros simples: `top_k`, `metric`, `ef_search`.
-- Parametros avanzados ocultos o con defaults razonables.
+- HNSW as the default for ergonomics and quality.
+- Simple parameters: `top_k`, `metric`, `ef_search`.
+- Advanced parameters hidden or with sensible defaults.
 
-Modos de indexacion:
+Indexing modes:
 
-- `sync`: el vector queda searchable al confirmar el commit.
-- `async`: el commit termina rapido y el vector entra al indice en background.
+- `sync`: the vector is searchable as soon as the commit confirms.
+- `async`: the commit finishes fast and the vector enters the index in the background.
 
 ## Performance
 
-ClawDB debe optimizar para:
+EliteSQL must optimize for:
 
-- Lecturas por id muy rapidas.
-- Inserts secuenciales rapidos.
-- Updates baratos por versionado.
-- Deletes baratos por tombstone.
-- Snapshots baratos.
-- Vector search rapido con HNSW.
-- Buen rendimiento con multiples writers concurrentes.
+- Very fast reads by id.
+- Fast sequential inserts.
+- Cheap updates through versioning.
+- Cheap deletes through tombstones.
+- Cheap snapshots.
+- Fast vector search with HNSW.
+- Good performance with multiple concurrent writers.
 
-Decisiones de performance:
+Performance decisions:
 
-- Append-only para evitar reescrituras caras.
-- mmap para lecturas rapidas.
-- Cache de paginas e indices calientes.
-- Batch commits para cargas de escritura.
-- Compaction en background.
-- Checksums por bloques criticos con validacion barata.
-- Recovery rapido usando manifest + WAL replay incremental.
-- Blobs grandes fuera del camino critico transaccional.
+- Append-only to avoid expensive rewrites.
+- mmap for fast reads.
+- Cache for hot pages and indexes.
+- Batch commits for write-heavy loads.
+- Background compaction.
+- Checksums on critical blocks with cheap validation.
+- Fast recovery using manifest + incremental WAL replay.
+- Large blobs kept out of the transactional critical path.
 
-Limites conocidos:
+Known limits:
 
-- Joins grandes sin indice seran caros.
-- Updates masivos generan basura hasta compactar.
-- Vector indexing sincrono puede hacer commits lentos.
-- Blobs enormes deben manejarse por chunks.
+- Large joins without an index will be expensive.
+- Massive updates generate garbage until compaction.
+- Synchronous vector indexing can slow down commits.
+- Huge blobs must be handled through chunks.
 
-## Lenguaje de implementacion
+## Implementation language
 
-Decision recomendada:
+Recommended decision:
 
 ```text
 Rust inside, C outside.
@@ -396,96 +396,96 @@ Rust inside, C outside.
 
 Core:
 
-- Rust para storage, transacciones, concurrencia, indices, ANN y CLI.
+- Rust for storage, transactions, concurrency, indexes, ANN and the CLI.
 
-API publica:
+Public API:
 
-- C ABI estable.
+- Stable C ABI.
 
 Bindings:
 
 - Python.
 - Node.js.
 - Go.
-- Swift/Kotlin posteriormente.
-- WASM como target futuro.
+- Swift/Kotlin later.
+- WASM as a future target.
 
-Razonamiento:
+Reasoning:
 
-- Rust ofrece performance tipo C/C++ sin garbage collector.
-- Reduce riesgos de memoria en un motor complejo.
-- Tiene buen ecosistema para mmap, parsers, serializacion, concurrencia, SIMD y FFI.
-- C ABI permite integracion universal.
+- Rust offers C/C++-class performance without a garbage collector.
+- It reduces memory risks in a complex engine.
+- It has a good ecosystem for mmap, parsers, serialization, concurrency, SIMD and FFI.
+- A C ABI enables universal integration.
 
-## API C conceptual
+## Conceptual C API
 
-Ejemplo orientativo:
+Illustrative example:
 
 ```c
-clawdb_status clawdb_open(const char *path, clawdb_handle **db);
-clawdb_status clawdb_close(clawdb_handle *db);
+elitesql_status elitesql_open(const char *path, elitesql_handle **db);
+elitesql_status elitesql_close(elitesql_handle *db);
 
-clawdb_status clawdb_exec(clawdb_handle *db, const char *statement);
-clawdb_status clawdb_query(clawdb_handle *db, const char *statement, clawdb_result **result);
+elitesql_status elitesql_exec(elitesql_handle *db, const char *statement);
+elitesql_status elitesql_query(elitesql_handle *db, const char *statement, elitesql_result **result);
 
-clawdb_status clawdb_begin(clawdb_handle *db, clawdb_txn **txn);
-clawdb_status clawdb_commit(clawdb_txn *txn);
-clawdb_status clawdb_rollback(clawdb_txn *txn);
+elitesql_status elitesql_begin(elitesql_handle *db, elitesql_txn **txn);
+elitesql_status elitesql_commit(elitesql_txn *txn);
+elitesql_status elitesql_rollback(elitesql_txn *txn);
 
-clawdb_status clawdb_insert(clawdb_txn *txn, const char *table, const clawdb_record *record);
-clawdb_status clawdb_get(clawdb_txn *txn, const char *table, const char *id, clawdb_record **record);
-clawdb_status clawdb_update(clawdb_txn *txn, const char *table, const char *id, const clawdb_patch *patch);
-clawdb_status clawdb_delete(clawdb_txn *txn, const char *table, const char *id);
+elitesql_status elitesql_insert(elitesql_txn *txn, const char *table, const elitesql_record *record);
+elitesql_status elitesql_get(elitesql_txn *txn, const char *table, const char *id, elitesql_record **record);
+elitesql_status elitesql_update(elitesql_txn *txn, const char *table, const char *id, const elitesql_patch *patch);
+elitesql_status elitesql_delete(elitesql_txn *txn, const char *table, const char *id);
 
-clawdb_status clawdb_search_vector(
-  clawdb_txn *txn,
+elitesql_status elitesql_search_vector(
+  elitesql_txn *txn,
   const char *table,
   const char *column,
   const float *vector,
   size_t dimensions,
   size_t top_k,
-  clawdb_result **result
+  elitesql_result **result
 );
 ```
 
-## Roadmap sugerido
+## Suggested roadmap
 
 ### Phase 0: Prototype
 
-- Rust crate basica.
-- Formato append-only simple.
+- Basic Rust crate.
+- Simple append-only format.
 - Insert/get/update/delete.
-- Snapshot por version.
-- Indice primario en memoria.
-- Benchmarks contra SQLite para inserts/reads basicos.
+- Per-version snapshot.
+- In-memory primary index.
+- Benchmarks against SQLite for basic inserts/reads.
 
 ### Phase 1: MVP Storage
 
-- WAL durable.
-- Manifest atomico.
-- `manifest.prev` para rollback seguro.
-- MVCC real.
+- Durable WAL.
+- Atomic manifest.
+- `manifest.prev` for safe rollback.
+- Real MVCC.
 - Secondary indexes.
-- Transactions con commit optimista.
-- Crash recovery con WAL replay.
-- Checksums para manifest, WAL y segmentos.
-- `clawdb_check` basico.
-- Compaction inicial.
+- Transactions with optimistic commit.
+- Crash recovery with WAL replay.
+- Checksums for manifest, WAL and segments.
+- Basic `elitesql_check`.
+- Initial compaction.
 
 ### Phase 2: Query Layer
 
-- Dialecto SQL pequeno o query builder estructurado.
-- WHERE basico.
+- Small SQL dialect or structured query builder.
+- Basic WHERE.
 - ORDER BY/LIMIT.
-- INNER/LEFT/RIGHT JOIN limitados.
+- Limited INNER/LEFT/RIGHT JOIN.
 
 ### Phase 3: Vector Native
 
 - `vector<float32, N>`.
 - HNSW.
 - `search_vector`.
-- Filtros por metadata.
-- Modo sync/async para indexing.
+- Metadata filters.
+- Sync/async indexing mode.
 
 ### Phase 4: Developer Experience
 
@@ -493,29 +493,29 @@ clawdb_status clawdb_search_vector(
 - Python binding.
 - Node binding.
 - CLI.
-- `clawdb check`.
-- `clawdb repair`.
+- `elitesql check`.
+- `elitesql repair`.
 - Docs.
 - Import/export.
-- Benchmarks reproducibles.
+- Reproducible benchmarks.
 
 ### Phase 5: Advanced
 
-- Full-text basico.
+- Basic full-text.
 - Hybrid search.
 - Blob chunking.
 - Quantized vectors.
 - WASM.
-- Sync local-first opcional.
+- Optional local-first sync.
 
-## Principios de diseno
+## Design principles
 
-- Mantener el motor pequeno.
-- Preferir operaciones predecibles sobre magia.
-- Hacer facil lo comun y explicito lo avanzado.
-- No perseguir compatibilidad SQL completa.
-- No competir con PostgreSQL.
-- No depender de un servidor para funcionar.
-- Preferir recovery explicito sobre reparaciones silenciosas.
-- Optimizar para apps AI-native, local-first y edge.
-- Cada feature debe justificar su peso.
+- Keep the engine small.
+- Prefer predictable operations over magic.
+- Make the common easy and the advanced explicit.
+- Do not chase full SQL compatibility.
+- Do not compete with PostgreSQL.
+- Do not depend on a server to function.
+- Prefer explicit recovery over silent repairs.
+- Optimize for AI-native, local-first and edge apps.
+- Every feature must justify its weight.

@@ -1,71 +1,71 @@
-# ClawDB
+# EliteSQL
 
 > **A tiny operational database for AI-native apps.**
 > SQLite-fast reads, better concurrent writes, native ANN.
 
-ClawDB es un motor de base de datos **embebido** (sin servidor, sin daemon, sin tuning ceremonial) escrito en Rust. Una base de datos es una carpeta autocontenida que puedes copiar, respaldar y mover.
+EliteSQL is an **embedded** database engine (no server, no daemon, no ceremonial tuning) written in Rust. A database is a self-contained directory you can copy, back up and move.
 
-No compite contra PostgreSQL: compite contra la complejidad de operar esta torre en una app moderna:
+It does not compete with PostgreSQL: it competes against the complexity of operating this tower in a modern app:
 
 ```text
 SQLite + vector DB + cache + sync layer + files + embeddings metadata
 ```
 
-La promesa es abrir un solo archivo y tener adentro registros, JSON, blobs, indices, busqueda vectorial ANN, snapshots y concurrencia sana:
+The promise is opening a single file and having records, JSON, blobs, indexes, ANN vector search, snapshots and sane concurrency inside:
 
 ```text
-db.open("app.clawdb")
+db.open("app.esql")
 ```
 
-## Por que ClawDB
+## Why EliteSQL
 
-- **Escritura concurrente real.** SQLite serializa todos los escritores con un lock global. ClawDB usa MVCC con commits optimistas: los escritores preparan transacciones en paralelo y solo se encuentran en el commit (`Readers never block writers. Writers only meet at commit.`).
-- **Vectores nativos** *(en desarrollo, Phase 3)*: `vector<float32, N>` e indice HNSW como tipo de primera clase, no como extension pegada.
-- **Fail-safe por diseno.** WAL con checksums, manifest atomico con fallback (`manifest.prev`), replay idempotente y recovery automatico: tras un crash, la base abre al ultimo estado commiteado completo. Un commit es visible completo o no es visible.
-- **Superficie pequena.** CRUD, filtros, indices, transacciones, snapshots. No es una recreacion de PostgreSQL.
+- **Real concurrent writes.** SQLite serializes all writers behind a global lock. EliteSQL uses MVCC with optimistic commits: writers prepare transactions in parallel and only meet at commit (`Readers never block writers. Writers only meet at commit.`).
+- **Native vectors**: `vector<float32, N>` and an HNSW index as a first-class type, not a bolted-on extension.
+- **Fail-safe by design.** Checksummed WAL, atomic manifest with a fallback (`manifest.prev`), idempotent replay and automatic recovery: after a crash, the database opens to the last fully committed state. A commit is either fully visible or not visible at all.
+- **Small surface.** CRUD, filters, indexes, transactions, snapshots. Not a PostgreSQL recreation.
 
-## Estado actual
+## Current status
 
-| Fase | Contenido | Estado |
+| Phase | Contents | Status |
 |---|---|---|
-| Phase 0 | Prototipo append-only + benchmarks vs SQLite | Completa |
-| Phase 1 | WAL, manifest, MVCC, transacciones, indices, crash recovery | Completa |
-| Phase 2 | Dialecto SQL minimo (ver [manual.md](manual.md)) | Completa |
-| Phase 2.5 | Agregados (COUNT/SUM/AVG/MIN/MAX, GROUP BY, HAVING) y tipos date/time | Completa |
-| Phase 3 | Tipo vectorial + busqueda ANN (HNSW propio, grafo persistido) | Completa |
-| Phase 4 | C ABI (con snapshots), bindings Python/Node, CLI, repair, read-only, sidecar, docs | Completa |
-| Phase 5 | Full-text BM25, hybrid search (RRF), vectores int8, blob chunking | Completa (WASM/sync diferidos con decision) |
+| Phase 0 | Append-only prototype + benchmarks vs SQLite | Complete |
+| Phase 1 | WAL, manifest, MVCC, transactions, indexes, crash recovery | Complete |
+| Phase 2 | Minimal SQL dialect (see [manual.md](manual.md)) | Complete |
+| Phase 2.5 | Aggregates (COUNT/SUM/AVG/MIN/MAX, GROUP BY, HAVING) and date/time types | Complete |
+| Phase 3 | Vector type + ANN search (our own HNSW, persisted graph) | Complete |
+| Phase 4 | C ABI (with snapshots), Python/Node bindings, CLI, repair, read-only, sidecar, docs | Complete |
+| Phase 5 | BM25 full-text, hybrid search (RRF), int8 vectors, blob chunking | Complete (WASM/sync deferred by decision) |
 
-Verificacion actual: 114 tests Rust (MVCC, recovery, compaction, salvage, modelo aleatorio, suite SQL, recall vectorial, BM25/hybrid, blobs, read-only), crash injection con `kill -9` de procesos reales, fuzzing de corrupcion y del parser SQL, mas e2e de CLI, FFI Python y sidecar Node. Docs de onboarding en [docs/](docs/). Detalles en [specs.md](specs.md) y [plan.md](plan.md).
+Current verification: 114 Rust tests (MVCC, recovery, compaction, salvage, randomized model, SQL suite, vector recall, BM25/hybrid, blobs, read-only), crash injection with real `kill -9` of live processes, corruption and SQL-parser fuzzing, plus CLI, Python FFI and Node sidecar e2e tests. Onboarding docs in [docs/](docs/). Details in [specs.md](specs.md) and [plan.md](plan.md).
 
 ## Quick installation
 
-Requisitos: [Rust](https://rustup.rs) 1.89 o superior.
+Requirements: [Rust](https://rustup.rs) 1.89 or newer.
 
 ```bash
-git clone https://192.168.1.67:3100/jalbarracin/sqlcola.git clawdb
-cd clawdb
+git clone <repo-url> elitesql
+cd elitesql
 cargo build --release
-cargo test          # suite completa
+cargo test          # full suite
 cargo bench         # benchmarks vs SQLite
 ```
 
-Para usarlo como dependencia en otro proyecto Rust:
+To use it as a dependency in another Rust project:
 
 ```toml
 [dependencies]
-clawdb-core = { path = "../clawdb/crates/clawdb-core" }
-# o directamente desde git:
-# clawdb-core = { git = "https://192.168.1.67:3100/jalbarracin/sqlcola.git" }
+elitesql-core = { path = "../elitesql/crates/elitesql-core" }
+# or straight from git:
+# elitesql-core = { git = "<repo-url>" }
 ```
 
 ## Quick start
 
 ```rust
-use clawdb_core::{Column, ColumnType, Db, Record, TableSchema, Value};
+use elitesql_core::{Column, ColumnType, Db, Record, TableSchema, Value};
 
-fn main() -> clawdb_core::Result<()> {
-    let db = Db::open_or_create("app.clawdb")?;
+fn main() -> elitesql_core::Result<()> {
+    let db = Db::open_or_create("app.esql")?;
 
     db.create_table(TableSchema::new(
         "docs",
@@ -77,39 +77,39 @@ fn main() -> clawdb_core::Result<()> {
     ))?;
     db.create_index("docs", "title", false)?;
 
-    // Escritura simple (auto-commit). El id es un ULID generado por el motor.
+    // Simple write (auto-commit). The id is a ULID generated by the engine.
     let mut rec = Record::new();
-    rec.insert("title".into(), Value::Text("hola".into()));
+    rec.insert("title".into(), Value::Text("hello".into()));
     rec.insert("score".into(), Value::Int64(10));
     let id = db.insert("docs", rec)?;
 
-    // Transaccion multi-operacion: atomica, aislada, con validacion
-    // optimista en el commit (Error::Conflict => reintentar).
+    // Multi-operation transaction: atomic, isolated, optimistically
+    // validated at commit (Error::Conflict => retry).
     let mut txn = db.begin();
     let mut patch = Record::new();
     patch.insert("score".into(), Value::Int64(99));
     txn.update("docs", &id, patch)?;
     txn.commit()?;
 
-    // Snapshots: lecturas estables mientras otros escriben.
+    // Snapshots: stable reads while others write.
     let snap = db.snapshot();
-    let actual = db.get("docs", &id)?.unwrap();
-    let en_snapshot = db.get_at(&snap, "docs", &id)?.unwrap();
-    assert_eq!(actual["score"], en_snapshot["score"]);
+    let current = db.get("docs", &id)?.unwrap();
+    let at_snapshot = db.get_at(&snap, "docs", &id)?.unwrap();
+    assert_eq!(current["score"], at_snapshot["score"]);
 
-    // Busqueda por igualdad (usa el indice secundario si existe).
-    let hits = db.find_eq("docs", "title", &Value::Text("hola".into()))?;
+    // Equality lookup (uses the secondary index when one exists).
+    let hits = db.find_eq("docs", "title", &Value::Text("hello".into()))?;
     assert_eq!(hits.len(), 1);
     Ok(())
 }
 ```
 
-### Busqueda vectorial (ANN)
+### Vector search (ANN)
 
-Embeddings como tipo de primera clase, con HNSW propio y filtros por metadata:
+Embeddings as a first-class type, with our own HNSW and metadata filters:
 
 ```rust
-use clawdb_core::{Column, ColumnType, TableSchema, VectorIndexOptions, VectorSearchOptions};
+use elitesql_core::{Column, ColumnType, TableSchema, VectorIndexOptions, VectorSearchOptions};
 
 db.create_table(TableSchema::new(
     "notes",
@@ -121,9 +121,9 @@ db.create_table(TableSchema::new(
 ))?;
 db.create_vector_index("notes", "embedding", VectorIndexOptions::default())?; // cosine, sync
 
-// ... insertar registros con Value::Vector(...) ...
+// ... insert records with Value::Vector(...) ...
 
-let mut filter = clawdb_core::Record::new();
+let mut filter = elitesql_core::Record::new();
 filter.insert("workspace".into(), Value::Text("acme".into()));
 let hits = db.search_vector(
     "notes", "embedding", &query_embedding, 20,
@@ -134,15 +134,15 @@ for hit in hits {
 }
 ```
 
-Sobre 100K vectores (dim 64): recall@10 de 0.88 con `ef_search=128` (0.97 con 256) y busquedas de ~95-156 µs. Modo `Async` disponible para que el commit no espere la indexacion, y opcion `quantized` (int8) para ~4x menos memoria.
+Over 100K vectors (dim 64): recall@10 of 0.88 at `ef_search=128` (0.97 at 256) and ~95-156 µs searches. An `Async` mode is available so commits don't wait for indexing, plus a `quantized` (int8) option for ~4x less memory.
 
-### Full-text e hibrida
+### Full-text and hybrid
 
 ```rust
 db.create_text_index("notes", "body")?;                    // BM25
-let hits = db.search_text("notes", "body", "consulta", 10, None)?;
-let hits = db.search_hybrid("notes", &HybridQuery {        // RRF: texto + vector
-    text: Some(("body", "consulta")),
+let hits = db.search_text("notes", "body", "query", 10, None)?;
+let hits = db.search_hybrid("notes", &HybridQuery {        // RRF: text + vector
+    text: Some(("body", "query")),
     vector: Some(("emb", &embedding)),
     top_k: 10,
     ..Default::default()
@@ -151,10 +151,10 @@ let hits = db.search_hybrid("notes", &HybridQuery {        // RRF: texto + vecto
 
 ### SQL
 
-El mismo motor expone un dialecto SQL deliberadamente pequeno — referencia completa con ejemplos en [manual.md](manual.md):
+The same engine exposes a deliberately small SQL dialect — full reference with examples in [manual.md](manual.md):
 
 ```rust
-use clawdb_core::QueryOutput;
+use elitesql_core::QueryOutput;
 
 db.query("CREATE TABLE users (name text NOT NULL, email text, age int64, since date)")?;
 db.query("CREATE UNIQUE INDEX ON users (email)")?;
@@ -168,7 +168,7 @@ if let QueryOutput::Rows { columns, rows } = db.query(
     // ...
 }
 
-// Agregados con GROUP BY/HAVING y filtros por rango de fechas:
+// Aggregates with GROUP BY/HAVING and date-range filters:
 db.query(
     "SELECT age, count(*) AS n FROM users \
      WHERE since >= '2026-01-01' GROUP BY age HAVING count(*) > 1 ORDER BY n DESC",
@@ -178,118 +178,119 @@ db.query(
 ## CLI
 
 ```bash
-cargo build --release -p clawdb-cli     # produce target/release/clawdb
+cargo build --release -p elitesql-cli     # produces target/release/elitesql
 
-clawdb query app.clawdb "SELECT count(*) AS n FROM docs"
-clawdb repl app.clawdb                  # shell interactivo (.exit para salir)
-clawdb tables app.clawdb                # esquemas en JSON
-clawdb check app.clawdb                 # verificacion de integridad offline
-clawdb compact app.clawdb
-clawdb export app.clawdb docs > docs.jsonl
-clawdb import app.clawdb docs < docs.jsonl
-clawdb repair danada.clawdb rescatada.clawdb   # salvage, nunca silencioso
-clawdb serve app.clawdb /tmp/clawdb.sock       # modo sidecar
+elitesql query app.esql "SELECT count(*) AS n FROM docs"
+elitesql repl app.esql                  # interactive shell (.exit to quit)
+elitesql tables app.esql                # schemas as JSON
+elitesql check app.esql                 # offline integrity check
+elitesql compact app.esql
+elitesql export app.esql docs > docs.jsonl
+elitesql import app.esql docs < docs.jsonl
+elitesql repair damaged.esql rescued.esql    # salvage, never silent
+elitesql serve app.esql /tmp/elitesql.sock   # sidecar mode
 ```
 
-## Multi-worker: el modo sidecar
+## Multi-worker: the sidecar mode
 
-Para despliegues con varios procesos (gunicorn, PHP-FPM), un solo proceso es dueno del motor y los workers se conectan por Unix socket:
+For multi-process deployments (gunicorn, PHP-FPM), a single process owns the engine and the workers connect over a Unix socket:
 
 ```bash
-clawdb serve app.clawdb /tmp/clawdb.sock
+elitesql serve app.esql /tmp/elitesql.sock
 ```
 
 ```python
-# cada worker de gunicorn:
-from clawdb import SidecarClient
-db = SidecarClient("/tmp/clawdb.sock")
+# each gunicorn worker:
+from elitesql import SidecarClient
+db = SidecarClient("/tmp/elitesql.sock")
 db.query("INSERT INTO visits (who) VALUES ('ana')")
 db.query("SELECT count(*) AS n FROM visits")
 ```
 
-Demo reproducible con gunicorn real (4 workers, visitantes concurrentes leyendo y escribiendo sin bloquearse): `examples/gunicorn_demo/run_demo.sh`.
+Reproducible demo with real gunicorn (4 workers, concurrent visitors reading and writing without blocking): `examples/gunicorn_demo/run_demo.sh`.
 
 ## Bindings
 
-**Python** ([bindings/python/clawdb.py](bindings/python/clawdb.py)) — embebido via C ABI (ctypes libera el GIL en cada llamada: los threads paralelizan de verdad) o via sidecar:
+**Python** ([bindings/python/elitesql.py](bindings/python/elitesql.py)) — embedded via the C ABI (ctypes releases the GIL on every call: threads truly parallelize) or via the sidecar:
 
 ```python
-from clawdb import ClawDB
+from elitesql import EliteSQL
 
-with ClawDB("app.clawdb") as db:
+with EliteSQL("app.esql") as db:
     db.query("CREATE TABLE notes (body text NOT NULL, emb vector(768))")
     db.create_vector_index("notes", "emb", metric="cosine")
-    db.query("INSERT INTO notes (body, emb) VALUES ('hola', '[...]')")
+    db.query("INSERT INTO notes (body, emb) VALUES ('hello', '[...]')")
     hits = db.search_vector("notes", "emb", embedding, top_k=10, filter={"ws": "acme"})
 ```
 
-**Node** ([bindings/node/clawdb.js](bindings/node/clawdb.js)) — cliente sidecar sin dependencias:
+**Node** ([bindings/node/elitesql.js](bindings/node/elitesql.js)) — dependency-free sidecar client:
 
 ```js
-const { SidecarClient } = require('./clawdb');
-const db = await SidecarClient.connect('/tmp/clawdb.sock');
+const { SidecarClient } = require('./elitesql');
+const db = await SidecarClient.connect('/tmp/elitesql.sock');
 const { rows } = await db.query('SELECT * FROM notes LIMIT 10');
 const hits = await db.searchVector('notes', 'emb', embedding, { topK: 10 });
 ```
 
-**C** — header en [crates/clawdb-ffi/include/clawdb.h](crates/clawdb-ffi/include/clawdb.h); `cargo build --release -p clawdb-ffi` produce `libclawdb`.
+**C** — header at [crates/elitesql-ffi/include/elitesql.h](crates/elitesql-ffi/include/elitesql.h); `cargo build --release -p elitesql-ffi` produces `libelitesql`.
 
-## Durabilidad
+## Durability
 
-| Modo | fsync | Ante crash del proceso | Ante crash del SO |
+| Mode | fsync | On process crash | On OS crash |
 |---|---|---|---|
-| `Safe` (default) | En cada commit | No pierde nada | No pierde nada |
-| `Balanced` | Cada ~25 ms | No pierde nada | Puede perder los ultimos ms |
-| `Fast` | Solo en checkpoints | No pierde nada | Puede perder commits recientes |
+| `Safe` (default) | Every commit | Loses nothing | Loses nothing |
+| `Balanced` | Every ~25 ms | Loses nothing | May lose the last few ms |
+| `Fast` | Checkpoints only | Loses nothing | May lose recent commits |
 
 ```rust
-use clawdb_core::{Db, DbOptions, Durability};
+use elitesql_core::{Db, DbOptions, Durability};
 let opts = DbOptions { durability: Durability::Balanced, ..Default::default() };
-let db = Db::open_or_create_with("app.clawdb", opts)?;
+let db = Db::open_or_create_with("app.esql", opts)?;
 ```
 
-## Formato en disco
+## On-disk format
 
 ```text
-app.clawdb/
-  CLAWDB          # marker + format_version
-  LOCK            # exclusion de proceso (flock)
-  catalog.json    # tablas, columnas, indices
-  manifest        # puntero atomico al estado visible
-  manifest.prev   # fallback de recovery
-  wal/            # commits durables (CRC por registro)
-  segments/       # datos inmutables (CRC por entrada)
-  vectors/        # grafos ANN persistidos (CRC; desechables y reconstruibles)
+app.esql/
+  ELITESQL        # marker + format_version
+  LOCK            # process exclusion (flock)
+  catalog.json    # tables, columns, indexes
+  manifest        # atomic pointer to the visible state
+  manifest.prev   # recovery fallback
+  wal/            # durable commits (per-record CRC)
+  segments/       # immutable data (per-entry CRC)
+  vectors/        # persisted ANN graphs (CRC; disposable and rebuildable)
+  blobs/          # out-of-line blob chunks (CRC)
 ```
 
-Regla de oro del motor: `Data files are canonical. Indexes are disposable.` Si un indice se rompe, se reconstruye desde los datos; si el manifest se rompe, se usa el anterior; si el WAL tiene una entrada incompleta, se descarta completa (nunca medio commit).
+The engine's golden rule: `Data files are canonical. Indexes are disposable.` If an index breaks, it is rebuilt from data; if the manifest breaks, the previous one is used; if the WAL has an incomplete entry, the whole entry is discarded (never half a commit).
 
-## Verificacion de integridad
+## Integrity checking
 
 ```rust
-let report = clawdb_core::check("app.clawdb")?;
+let report = elitesql_core::check("app.esql")?;
 assert!(report.is_ok());
 ```
 
-Para correr la suite de crash injection y el fuzzing con mas iteraciones:
+To run the crash-injection suite and fuzzing with more iterations:
 
 ```bash
-CLAWDB_CRASH_ITERS=500 cargo test --release --test crash_kill
-CLAWDB_FUZZ_ITERS=5000 cargo test --release --test corruption
+ELITESQL_CRASH_ITERS=500 cargo test --release --test crash_kill
+ELITESQL_FUZZ_ITERS=5000 cargo test --release --test corruption
 ```
 
 ## Performance
 
-Benchmarks en Apple Silicon (`cargo bench`), ClawDB en modo `Fast` vs SQLite con WAL + `synchronous=OFF` (misma clase de durabilidad):
+Benchmarks on Apple Silicon (`cargo bench`), EliteSQL in `Fast` mode vs SQLite with WAL + `synchronous=OFF` (the same durability class):
 
-| Operacion | ClawDB | SQLite | |
+| Operation | EliteSQL | SQLite | |
 |---|---|---|---|
-| Lectura por id (10K filas) | 0.62 µs | 2.72 µs | 4.4x mas rapido |
-| 1K inserts, commit por operacion | 4.6 ms | 15.9 ms | 3.4x mas rapido |
-| 1K inserts, una transaccion | 3.3 ms | 1.2 ms | SQLite gana en batch* |
+| Read by id (10K rows) | 0.62 µs | 2.72 µs | 4.4x faster |
+| 1K inserts, per-operation commit | 4.6 ms | 15.9 ms | 3.4x faster |
+| 1K inserts, one transaction | 3.3 ms | 1.2 ms | SQLite wins at batch* |
 
-\* El caso de uso que ClawDB optimiza es el operacional (commits chicos concurrentes), donde gana 3-4x. El bulk-load en una transaccion paga el costo por registro del staging MVCC (~3 µs/registro); las palancas identificadas para cerrarlo (arena de payloads por commit, aplicacion al indice agrupada por tabla) estan anotadas en el plan.
+\* The use case EliteSQL optimizes is the operational one (small concurrent commits), where it wins 3-4x. Bulk loading in a single transaction pays the per-record cost of MVCC staging (~3 µs/record); the identified levers to close the gap (a per-commit payload arena, table-grouped index apply) are noted in the plan.
 
-## Licencia
+## License
 
 MIT OR Apache-2.0

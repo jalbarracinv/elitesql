@@ -1,79 +1,79 @@
-# Guia de recovery
+# Recovery guide
 
-Principio de diseno: `After a crash, the database opens to the last fully
-committed state.` Un commit es visible completo o no es visible. Y la regla
-de oro: `Data files are canonical. Indexes are disposable.`
+Design principle: `After a crash, the database opens to the last fully
+committed state.` A commit is either fully visible or not visible at all.
+And the golden rule: `Data files are canonical. Indexes are disposable.`
 
-## Que pasa en un crash
+## What happens on a crash
 
-ClawDB asume que el proceso puede morir en cualquier instruccion. El commit
-escribe: (1) chunks de blobs grandes (fsync), (2) el registro WAL con CRC
-(fsync segun modo de durabilidad), (3) aplica en memoria. El manifest solo
-se reemplaza via archivo temporal + rename atomico, guardando el anterior
-como `manifest.prev`.
+EliteSQL assumes the process can die on any instruction. A commit writes:
+(1) large blob chunks (fsync), (2) the checksummed WAL record (fsync per the
+durability mode), (3) the in-memory apply. The manifest is only ever replaced
+through a temp file + atomic rename, keeping the previous one as
+`manifest.prev`.
 
-Al abrir despues de un crash:
+Opening after a crash:
 
-1. Se lee `manifest`; si su checksum falla, se usa `manifest.prev` (y el
-   primario se re-establece sin jamas pisar la copia buena).
-2. Se cargan los segmentos listados (CRC por entrada).
-3. Se reaplica el WAL desde la marca del manifest — replay idempotente; una
-   cola rota (commit a medio escribir) se trunca: ese commit nunca existio,
-   completo o nada.
-4. Los indices (secundarios, texto, ANN) se reconstruyen desde los datos
-   canonicos; el grafo ANN se carga de su dump si es valido y se pone al dia,
-   o se reconstruye.
+1. `manifest` is read; if its checksum fails, `manifest.prev` is used (and
+   the primary is re-established without ever clobbering the good copy).
+2. The listed segments are loaded (per-entry CRC).
+3. The WAL is replayed from the manifest's watermark — idempotent replay; a
+   torn tail (a half-written commit) is truncated: that commit never existed.
+   All or nothing.
+4. Indexes (secondary, text, ANN) are rebuilt from canonical data; the ANN
+   graph is loaded from its dump when valid and caught up, or rebuilt.
 
-Esto esta verificado con crash injection real: procesos asesinados con
-`kill -9` en momentos aleatorios, miles de rondas, cero perdidas de commits
-confirmados y cero commits parciales visibles.
+This is verified with real crash injection: processes killed with `kill -9`
+at random points, thousands of rounds, zero acknowledged commits lost and
+zero partial commits visible.
 
-## Herramientas, en orden de escalada
+## Tools, in escalation order
 
-### 1. `clawdb check <db>` — diagnostico
+### 1. `elitesql check <db>` — diagnosis
 
-Validacion offline de checksums y estructura: manifest y fallback, entradas
-de segmentos, registros WAL, chunks de blobs referenciados, archivos
-huerfanos. No modifica nada. Codigo de salida != 0 si hay errores.
+Offline validation of checksums and structure: manifest and its fallback,
+segment entries, WAL records, referenced blob chunks, orphan files. Modifies
+nothing. Non-zero exit code when errors exist.
 
-### 2. `--read-only` — inspeccion de una base danada
+### 2. `--read-only` — inspecting a damaged database
 
-Si `open` normal rechaza la base (corrupcion en un segmento listado), el modo
-read-only abre igual: expone el prefijo valido de cada archivo, no escribe ni
-un byte (lock compartido, sin truncar WAL, sin heal, sin dumps) y rechaza toda
-escritura con `ReadOnly` (codigo 13). Util para mirar y exportar antes de
-reparar:
+If a normal `open` refuses the database (corruption inside a listed segment),
+read-only mode opens anyway: it exposes the valid prefix of every file,
+writes not a single byte (shared lock, no WAL truncation, no healing, no
+dumps), and rejects every write with `ReadOnly` (code 13). Useful for
+inspecting and exporting before repairing:
 
 ```bash
-clawdb export danada.clawdb tabla --read-only > rescate.jsonl
+elitesql export damaged.esql table --read-only > rescue.jsonl
 ```
 
-### 3. `clawdb repair <src> <dst>` — salvage
+### 3. `elitesql repair <src> <dst>` — salvage
 
-Reconstruye una base NUEVA en `dst` con todo lo recuperable de `src`:
-recorre segmentos y WAL directamente (prefijo valido de cada archivo),
-toma la ultima version de cada registro, respeta tombstones y re-inserta
-con el esquema del catalogo. Requiere `catalog.json` legible.
+Builds a NEW database at `dst` with everything recoverable from `src`: it
+walks segments and WAL directly (valid prefix of each file), takes the latest
+version of every record, honors tombstones and re-inserts using the catalog's
+schema. Requires a readable `catalog.json`.
 
-Nunca es silencioso — el reporte cuenta recuperados, borrados legitimos,
-saltados, y una nota por cada dano encontrado. Lo que quedo despues de un
-punto de corrupcion en un archivo se pierde (y se reporta cuanto).
+It is never silent — the report counts recovered records, legitimate
+deletions, skipped entries, and one note per damage found. Whatever sat after
+a corruption point within a file is lost (and the report says how much).
 
-## Semantica por modo de durabilidad
+## Semantics per durability mode
 
-- `safe`: un commit confirmado sobrevive crash del proceso Y del SO.
-- `balanced`: sobrevive crash del proceso; un crash del SO puede perder los
-  ultimos ~25ms de commits.
-- `fast`: sobrevive crash del proceso (el WAL se escribio, el page cache lo
-  tiene); un crash del SO puede perder los commits desde el ultimo checkpoint.
+- `safe`: an acknowledged commit survives both process AND OS crashes.
+- `balanced`: survives process crashes; an OS crash may lose the last ~25ms
+  of commits.
+- `fast`: survives process crashes (the WAL was written; the page cache has
+  it); an OS crash may lose commits since the last checkpoint.
 
-En los tres modos la atomicidad se mantiene: nunca medio commit.
+In all three modes atomicity holds: never half a commit.
 
-## Que NO se repara solo
+## What does NOT self-repair
 
-- `catalog.json` corrupto: el salvage necesita el esquema para re-tipar; hay
-  que restaurarlo de un backup (es un JSON chico y estable — respaldalo).
-- Chunks de blobs danados: el registro que los referencia falla su lectura
-  con error explicito y check() lo reporta; el resto de la base sigue.
-- Bit rot en un segmento en medio de datos viejos: open falla, read-only y
-  repair aplican (prefijo valido).
+- A corrupt `catalog.json`: salvage needs the schema to re-type records;
+  restore it from a backup (it is a small, stable JSON — back it up).
+- Damaged blob chunks: the record referencing them fails its read with an
+  explicit error and check() reports it; the rest of the database keeps
+  working.
+- Bit rot inside old segment data: open fails; read-only and repair apply
+  (valid prefix).

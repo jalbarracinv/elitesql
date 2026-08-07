@@ -1,11 +1,11 @@
 {
-  "name": "@clawdb/client",
+  "name": "@elitesql/client",
   "version": "0.0.1",
-  "description": "ClawDB Node client for the sidecar mode (clawdb serve) — zero dependencies",
-  "main": "clawdb.js",
-  "types": "clawdb.d.ts",
+  "description": "EliteSQL Node client for the sidecar mode (elitesql serve) — zero dependencies",
+  "main": "elitesql.js",
+  "types": "elitesql.d.ts",
   "license": "(MIT OR Apache-2.0)",
-  "keywords": ["database", "embedded", "vector-search", "full-text", "clawdb"],
+  "keywords": ["database", "embedded", "vector-search", "full-text", "elitesql"],
   "engines": {
     "node": ">=18"
   }

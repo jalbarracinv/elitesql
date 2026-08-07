@@ -1,29 +1,29 @@
-# clawdb (Python)
+# elitesql (Python)
 
-Binding de Python para ClawDB.
+Python binding for EliteSQL.
 
-- `ClawDB(path)`: embebido en el proceso via la C ABI (`libclawdb`). ctypes
-  libera el GIL en cada llamada, asi que los threads paralelizan de verdad.
-  Requiere `libclawdb` construida (`cargo build --release -p clawdb-ffi`);
-  se localiza automaticamente dentro del repo o via `CLAWDB_LIB`.
-- `SidecarClient(socket)`: cliente del modo sidecar
-  (`clawdb serve <db> <socket>`) para despliegues multi-worker
+- `EliteSQL(path)`: embedded in-process over the C ABI (`libelitesql`).
+  ctypes releases the GIL on every foreign call, so threads truly
+  parallelize. Requires `libelitesql` to be built
+  (`cargo build --release -p elitesql-ffi`); it is located automatically
+  inside the repo or via `ELITESQL_LIB`.
+- `SidecarClient(socket)`: client for the sidecar mode
+  (`elitesql serve <db> <socket>`) for multi-worker deployments
   (gunicorn, uwsgi).
 
 ```python
-from clawdb import ClawDB
+from elitesql import EliteSQL
 
-with ClawDB("app.clawdb") as db:
+with EliteSQL("app.esql") as db:
     db.query("CREATE TABLE notes (body text NOT NULL, emb vector(768))")
     db.create_text_index("notes", "body")
     db.create_vector_index("notes", "emb", quantized=True)
-    db.query("INSERT INTO notes (body, emb) VALUES ('hola mundo', '[...]')")
+    db.query("INSERT INTO notes (body, emb) VALUES ('hello world', '[...]')")
 
-    hits = db.search_hybrid("notes", text=("body", "hola"), vector=("emb", embedding))
+    hits = db.search_hybrid("notes", text=("body", "hello"), vector=("emb", embedding))
     with db.snapshot() as snap:
-        rows = snap.scan("notes")   # lectura estable mientras otros escriben
+        rows = snap.scan("notes")   # stable read while others write
 ```
 
-Build del wheel: `python -m build --wheel` en este directorio (requiere
-`pip install build`). La `libclawdb` se distribuye por separado o via
-`CLAWDB_LIB`.
+Wheel build: `python -m build --wheel` in this directory (requires
+`pip install build`). `libelitesql` ships separately or via `ELITESQL_LIB`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 4 acceptance demo: gunicorn with 4 workers against `clawdb serve`.
+# Phase 4 acceptance demo: gunicorn with 4 workers against `elitesql serve`.
 #
 # 1. Starts the sidecar (one process owning the engine).
 # 2. Starts gunicorn with 4 worker processes.
@@ -14,8 +14,8 @@ cd "$(dirname "$0")/../.."
 VISITORS="${1:-8}"
 REQUESTS="${2:-25}"
 DEMO_DIR="$(mktemp -d)"
-export CLAWDB_SOCKET="$DEMO_DIR/clawdb.sock"
-DB="$DEMO_DIR/demo.clawdb"
+export ELITESQL_SOCKET="$DEMO_DIR/elitesql.sock"
+DB="$DEMO_DIR/demo.esql"
 HTTP_PORT=8137
 
 cleanup() {
@@ -25,21 +25,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> building clawdb"
-cargo build --release -p clawdb-cli >/dev/null 2>&1
+echo "==> building elitesql"
+cargo build --release -p elitesql-cli >/dev/null 2>&1
 
 echo "==> preparing schema"
-./target/release/clawdb query "$DB" \
+./target/release/elitesql query "$DB" \
   "CREATE TABLE visits (who text NOT NULL, worker_pid int64, at timestamp)" >/dev/null
-./target/release/clawdb query "$DB" "CREATE INDEX ON visits (who)" >/dev/null
+./target/release/elitesql query "$DB" "CREATE INDEX ON visits (who)" >/dev/null
 
-echo "==> starting sidecar (clawdb serve)"
+echo "==> starting sidecar (elitesql serve)"
 # Logs go to files: inheriting our stdout pipe would keep readers of it
 # alive past the script's exit.
-./target/release/clawdb serve "$DB" "$CLAWDB_SOCKET" >"$DEMO_DIR/sidecar.log" 2>&1 &
+./target/release/elitesql serve "$DB" "$ELITESQL_SOCKET" >"$DEMO_DIR/sidecar.log" 2>&1 &
 SIDECAR_PID=$!
-for _ in $(seq 50); do [ -S "$CLAWDB_SOCKET" ] && break; sleep 0.1; done
-[ -S "$CLAWDB_SOCKET" ] || { echo "sidecar socket never appeared"; cat "$DEMO_DIR/sidecar.log"; exit 1; }
+for _ in $(seq 50); do [ -S "$ELITESQL_SOCKET" ] && break; sleep 0.1; done
+[ -S "$ELITESQL_SOCKET" ] || { echo "sidecar socket never appeared"; cat "$DEMO_DIR/sidecar.log"; exit 1; }
 
 echo "==> starting gunicorn with 4 workers"
 # exec: the subshell PID becomes the gunicorn master, so cleanup can kill it.
