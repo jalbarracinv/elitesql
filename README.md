@@ -31,10 +31,10 @@ db.open("app.clawdb")
 | Phase 0 | Prototipo append-only + benchmarks vs SQLite | Completa |
 | Phase 1 | WAL, manifest, MVCC, transacciones, indices, crash recovery | Completa |
 | Phase 2 | Dialecto SQL minimo (ver [manual.md](manual.md)) | Completa |
-| Phase 3 | Tipo vectorial + busqueda ANN (HNSW) | Pendiente |
+| Phase 3 | Tipo vectorial + busqueda ANN (HNSW propio) | Completa |
 | Phase 4 | C ABI, bindings Python/Node, CLI, modo sidecar | Pendiente |
 
-Verificacion actual: 64 tests (MVCC, recovery, compaction, modelo aleatorio, suite SQL), crash injection con `kill -9` de procesos reales, y fuzzing de corrupcion de archivos y del parser SQL (la base nunca entra en panico ni acepta estado invalido). Detalles en [specs.md](specs.md) y [plan.md](plan.md).
+Verificacion actual: 76 tests (MVCC, recovery, compaction, modelo aleatorio, suite SQL, recall vectorial vs fuerza bruta), crash injection con `kill -9` de procesos reales (incluida durante indexacion vectorial async), y fuzzing de corrupcion de archivos y del parser SQL (la base nunca entra en panico ni acepta estado invalido). Detalles en [specs.md](specs.md) y [plan.md](plan.md).
 
 ## Quick installation
 
@@ -101,6 +101,38 @@ fn main() -> clawdb_core::Result<()> {
     Ok(())
 }
 ```
+
+### Busqueda vectorial (ANN)
+
+Embeddings como tipo de primera clase, con HNSW propio y filtros por metadata:
+
+```rust
+use clawdb_core::{Column, ColumnType, TableSchema, VectorIndexOptions, VectorSearchOptions};
+
+db.create_table(TableSchema::new(
+    "notes",
+    vec![
+        Column::new("body", ColumnType::Text).not_null(),
+        Column::new("workspace", ColumnType::Text),
+        Column::vector("embedding", 768),
+    ],
+))?;
+db.create_vector_index("notes", "embedding", VectorIndexOptions::default())?; // cosine, sync
+
+// ... insertar registros con Value::Vector(...) ...
+
+let mut filter = clawdb_core::Record::new();
+filter.insert("workspace".into(), Value::Text("acme".into()));
+let hits = db.search_vector(
+    "notes", "embedding", &query_embedding, 20,
+    &VectorSearchOptions { filter: Some(filter), ..Default::default() },
+)?;
+for hit in hits {
+    println!("{} (dist {:.3})", hit.id, hit.distance);
+}
+```
+
+Sobre 100K vectores (dim 64): recall@10 de 0.88 con `ef_search=128` (0.97 con 256) y busquedas de ~95-156 µs. Modo `Async` disponible para que el commit no espere la indexacion.
 
 ### SQL
 

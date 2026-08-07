@@ -33,6 +33,8 @@ pub(crate) struct ColumnDef {
     pub name: String,
     pub ty: crate::value::ColumnType,
     pub not_null: bool,
+    /// Dimension for `vector(N)` columns.
+    pub dim: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

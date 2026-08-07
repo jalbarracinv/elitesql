@@ -173,7 +173,7 @@ impl Parser {
                 ));
             }
             let col_name = self.ident("column name")?;
-            let ty = self.parse_type()?;
+            let (ty, dim) = self.parse_type()?;
             let mut not_null = false;
             loop {
                 if self.eat_kw("NOT") {
@@ -195,7 +195,7 @@ impl Parser {
                     break;
                 }
             }
-            columns.push(ColumnDef { name: col_name, ty, not_null });
+            columns.push(ColumnDef { name: col_name, ty, not_null, dim });
             if self.eat(&Tok::Comma) {
                 continue;
             }
@@ -205,7 +205,7 @@ impl Parser {
         Ok(Statement::CreateTable { name, columns })
     }
 
-    fn parse_type(&mut self) -> Result<ColumnType> {
+    fn parse_type(&mut self) -> Result<(ColumnType, Option<usize>)> {
         let word = self.ident("column type")?;
         let ty = match word.to_ascii_lowercase().as_str() {
             "bool" => ColumnType::Bool,
@@ -215,6 +215,15 @@ impl Parser {
             "blob" => ColumnType::Blob,
             "timestamp" => ColumnType::Timestamp,
             "json" => ColumnType::Json,
+            "vector" => {
+                self.expect(&Tok::LParen, "'(' — vector needs a dimension: vector(N)")?;
+                let dim = self.parse_uint("vector dimension")? as usize;
+                self.expect(&Tok::RParen, "')'")?;
+                if dim == 0 {
+                    return Err(Error::Sql("vector dimension must be >= 1".into()));
+                }
+                return Ok((ColumnType::Vector, Some(dim)));
+            }
             "int" | "integer" | "bigint" | "smallint" => {
                 return Err(Error::Sql(format!("unknown type '{word}': use int64")))
             }
@@ -232,11 +241,11 @@ impl Parser {
             "boolean" => return Err(Error::Sql("unknown type 'boolean': use bool".into())),
             _ => {
                 return Err(Error::Sql(format!(
-                    "unknown type '{word}': V1 types are bool, int64, float64, text, blob, timestamp, json"
+                    "unknown type '{word}': V1 types are bool, int64, float64, text, blob, timestamp, json, vector(N)"
                 )))
             }
         };
-        Ok(ty)
+        Ok((ty, None))
     }
 
     fn parse_create_index(&mut self, unique: bool) -> Result<Statement> {

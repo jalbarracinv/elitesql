@@ -3,7 +3,8 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 
 use ulid::Ulid;
 
@@ -11,7 +12,10 @@ use crate::error::{Error, Result};
 use crate::manifest::{fsync_dir, Manifest, SegmentMeta};
 use crate::schema::{Catalog, IndexDef, TableSchema, FORMAT_VERSION, ID_COLUMN};
 use crate::segment::{encode_entry, scan_segment, segment_file_name};
-use crate::value::{decode_value, encode_value, read_u16, Value};
+use crate::value::{decode_value, encode_value, read_u16, ColumnType, Value};
+use crate::vector::{
+    IndexingMode, VecIdx, VectorHit, VectorIndexDef, VectorIndexOptions, VectorSearchOptions,
+};
 use crate::wal::{encode_commit, scan_wal, wal_path, Durability, WalWriter, WAL_DIR};
 
 pub(crate) const MARKER_FILE: &str = "CLAWDB";
@@ -81,9 +85,19 @@ struct State {
     index: HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
     /// (table, column) -> equality index over the latest committed state.
     secondary: HashMap<(String, String), SecIdx>,
+    /// (table, column) -> ANN index over the latest committed state.
+    vector: HashMap<(String, String), VecIdx>,
     readers: HashMap<u32, File>,
     segments: Vec<SegmentMeta>,
     next_segment_id: u32,
+}
+
+/// A vector waiting to be indexed in background (Async mode).
+struct VecJob {
+    table: String,
+    column: String,
+    id: String,
+    vector: Vec<f32>,
 }
 
 struct CommitState {
@@ -102,6 +116,10 @@ struct Shared {
     commit: Mutex<CommitState>,
     /// version -> live snapshot refcount; compaction preserves these.
     snapshots: Mutex<BTreeMap<u64, usize>>,
+    /// Queue into the background vector-indexing thread (Async mode).
+    vector_tx: Mutex<Option<mpsc::Sender<VecJob>>>,
+    /// Vectors enqueued but not yet searchable.
+    vector_backlog: AtomicU64,
 }
 
 /// A stable read position. Reads through a snapshot see the database exactly
@@ -163,14 +181,48 @@ pub struct Txn {
 
 /// An embedded ClawDB database backed by a self-contained directory.
 ///
-/// Phase 1 storage: commits are appended to a durable WAL (fsync per the
+/// Storage: commits are appended to a durable WAL (fsync per the
 /// durability mode) and applied to an in-memory MVCC index; checkpoints
 /// drain committed data into immutable segments and publish an atomic
 /// manifest (with `manifest.prev` as the recovery fallback). On open, the
 /// manifest chain is loaded, segments are scanned, and the WAL is replayed
-/// idempotently; a torn WAL tail is truncated.
+/// idempotently; a torn WAL tail is truncated. Vector (ANN) indexes are
+/// derived structures rebuilt from canonical data on open and compaction.
 pub struct Db {
     shared: Arc<Shared>,
+    vector_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        // Close the channel so the background indexer exits, then join it.
+        *self.shared.vector_tx.lock().unwrap() = None;
+        if let Some(handle) = self.vector_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Attach the background vector-indexing thread and produce the handle.
+fn finish_db(shared: Arc<Shared>) -> Db {
+    let (tx, rx) = mpsc::channel::<VecJob>();
+    *shared.vector_tx.lock().unwrap() = Some(tx);
+    let sh = shared.clone();
+    let handle = std::thread::spawn(move || {
+        while let Ok(job) = rx.recv() {
+            {
+                let mut st = sh.state.write().unwrap();
+                if let Some(vidx) = st.vector.get_mut(&(job.table, job.column)) {
+                    vidx.insert(&job.id, &job.vector);
+                }
+            }
+            sh.vector_backlog.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
+    });
+    Db {
+        shared,
+        vector_thread: Some(handle),
+    }
 }
 
 impl Db {
@@ -216,27 +268,28 @@ impl Db {
         fsync_dir(&dir.join(WAL_DIR))?;
 
         let wal = WalWriter::open(&dir, manifest.wal_id)?;
-        Ok(Db {
-            shared: Arc::new(Shared {
-                dir,
-                opts,
-                _lock_file: lock_file,
-                state: RwLock::new(State {
-                    catalog: Catalog::new(),
-                    committed_version: 0,
-                    index: HashMap::new(),
-                    secondary: HashMap::new(),
-                    readers: HashMap::new(),
-                    segments: Vec::new(),
-                    next_segment_id: 1,
-                }),
-                commit: Mutex::new(CommitState {
-                    wal,
-                    memtable_bytes: 0,
-                }),
-                snapshots: Mutex::new(BTreeMap::new()),
+        Ok(finish_db(Arc::new(Shared {
+            dir,
+            opts,
+            _lock_file: lock_file,
+            state: RwLock::new(State {
+                catalog: Catalog::new(),
+                committed_version: 0,
+                index: HashMap::new(),
+                secondary: HashMap::new(),
+                vector: HashMap::new(),
+                readers: HashMap::new(),
+                segments: Vec::new(),
+                next_segment_id: 1,
             }),
-        })
+            commit: Mutex::new(CommitState {
+                wal,
+                memtable_bytes: 0,
+            }),
+            snapshots: Mutex::new(BTreeMap::new()),
+            vector_tx: Mutex::new(None),
+            vector_backlog: AtomicU64::new(0),
+        })))
     }
 
     pub fn open_with(path: impl AsRef<Path>, opts: DbOptions) -> Result<Db> {
@@ -345,29 +398,31 @@ impl Db {
         }
 
         let secondary = build_secondary(&catalog, &index, &readers)?;
+        let vector = build_vector_indexes(&catalog, &index, &readers)?;
         let next_segment_id = manifest.segments.iter().map(|s| s.id).max().unwrap_or(0) + 1;
         let wal = WalWriter::open(&dir, manifest.wal_id)?;
-        Ok(Db {
-            shared: Arc::new(Shared {
-                dir,
-                opts,
-                _lock_file: lock_file,
-                state: RwLock::new(State {
-                    catalog,
-                    committed_version,
-                    index,
-                    secondary,
-                    readers,
-                    segments: manifest.segments,
-                    next_segment_id,
-                }),
-                commit: Mutex::new(CommitState {
-                    wal,
-                    memtable_bytes,
-                }),
-                snapshots: Mutex::new(BTreeMap::new()),
+        Ok(finish_db(Arc::new(Shared {
+            dir,
+            opts,
+            _lock_file: lock_file,
+            state: RwLock::new(State {
+                catalog,
+                committed_version,
+                index,
+                secondary,
+                vector,
+                readers,
+                segments: manifest.segments,
+                next_segment_id,
             }),
-        })
+            commit: Mutex::new(CommitState {
+                wal,
+                memtable_bytes,
+            }),
+            snapshots: Mutex::new(BTreeMap::new()),
+            vector_tx: Mutex::new(None),
+            vector_backlog: AtomicU64::new(0),
+        })))
     }
 
     // --- schema ------------------------------------------------------------
@@ -393,6 +448,21 @@ impl Db {
                 },
             );
         }
+        for def in &schema.vector_indexes {
+            match schema.column(&def.column) {
+                Some(col) if col.ty == ColumnType::Vector => {}
+                _ => {
+                    return Err(Error::SchemaViolation(format!(
+                        "vector index over non-vector column '{}'",
+                        def.column
+                    )))
+                }
+            }
+            st.vector.insert(
+                (schema.name.clone(), def.column.clone()),
+                VecIdx::new(def.clone()),
+            );
+        }
         st.catalog.tables.push(schema);
         st.catalog.save(&self.shared.dir.join(CATALOG_FILE))
     }
@@ -407,8 +477,13 @@ impl Db {
                 .catalog
                 .table(table)
                 .ok_or_else(|| Error::TableNotFound(table.into()))?;
-            if schema.column(column).is_none() {
+            let Some(col) = schema.column(column) else {
                 return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
+            };
+            if col.ty == ColumnType::Vector {
+                return Err(Error::SchemaViolation(format!(
+                    "{table}.{column} is a vector column; use create_vector_index"
+                )));
             }
             if schema.indexes.iter().any(|d| d.column == column) {
                 return Err(Error::InvalidArgument(format!(
@@ -452,6 +527,189 @@ impl Db {
         st.secondary
             .insert((table.into(), column.into()), SecIdx { map });
         Ok(())
+    }
+
+    /// Create an ANN (HNSW) index over a vector column, built from the
+    /// current committed state. The index is a derived structure: it is
+    /// rebuilt from canonical data on open and on compaction.
+    pub fn create_vector_index(
+        &self,
+        table: &str,
+        column: &str,
+        opts: VectorIndexOptions,
+    ) -> Result<()> {
+        let _cs = self.shared.commit.lock().unwrap();
+        let mut st = self.shared.state.write().unwrap();
+        {
+            let schema = st
+                .catalog
+                .table(table)
+                .ok_or_else(|| Error::TableNotFound(table.into()))?;
+            let Some(col) = schema.column(column) else {
+                return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
+            };
+            if col.ty != ColumnType::Vector {
+                return Err(Error::SchemaViolation(format!(
+                    "{table}.{column} is not a vector column"
+                )));
+            }
+            if schema.vector_indexes.iter().any(|d| d.column == column) {
+                return Err(Error::InvalidArgument(format!(
+                    "vector index on {table}.{column} already exists"
+                )));
+            }
+            if opts.m == 0 || opts.m > 256 {
+                return Err(Error::InvalidArgument("m must be between 1 and 256".into()));
+            }
+        }
+        let def = VectorIndexDef {
+            column: column.into(),
+            metric: opts.metric,
+            m: opts.m,
+            ef_construction: opts.ef_construction,
+            mode: opts.mode,
+        };
+        let mut vidx = VecIdx::new(def.clone());
+        if let Some(ids) = st.index.get(table) {
+            for (id, versions) in ids {
+                if let Some(last) = versions.last() {
+                    if !last.is_tombstone() {
+                        let rec = read_record_kind(&st.readers, &last.kind)?;
+                        if let Some(Value::Vector(v)) = rec.get(column) {
+                            vidx.insert(id, v);
+                        }
+                    }
+                }
+            }
+        }
+        let schema = st
+            .catalog
+            .tables
+            .iter_mut()
+            .find(|t| t.name == table)
+            .expect("checked above");
+        schema.vector_indexes.push(def);
+        st.catalog.save(&self.shared.dir.join(CATALOG_FILE))?;
+        st.vector.insert((table.into(), column.into()), vidx);
+        Ok(())
+    }
+
+    /// Approximate nearest-neighbour search over an indexed vector column.
+    /// Results are the latest committed records, closest first (lower
+    /// distance = closer). Deleted records never appear; with `Async`
+    /// indexing, very recent vectors may not be searchable yet (see
+    /// [`Db::wait_vector_indexing`]).
+    pub fn search_vector(
+        &self,
+        table: &str,
+        column: &str,
+        query: &[f32],
+        top_k: usize,
+        opts: &VectorSearchOptions,
+    ) -> Result<Vec<VectorHit>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let st = self.shared.state.read().unwrap();
+        let schema = st
+            .catalog
+            .table(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        let Some(col) = schema.column(column) else {
+            return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
+        };
+        if col.ty != ColumnType::Vector {
+            return Err(Error::SchemaViolation(format!(
+                "{table}.{column} is not a vector column"
+            )));
+        }
+        if let Some(dim) = col.dim {
+            if query.len() != dim {
+                return Err(Error::InvalidArgument(format!(
+                    "query has dimension {}, column expects {dim}",
+                    query.len()
+                )));
+            }
+        }
+        if let Some(filter) = &opts.filter {
+            for key in filter.keys() {
+                if key != ID_COLUMN && schema.column(key).is_none() {
+                    return Err(Error::SchemaViolation(format!(
+                        "unknown filter column '{key}'"
+                    )));
+                }
+            }
+        }
+        let vidx = st
+            .vector
+            .get(&(table.to_owned(), column.to_owned()))
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "no vector index on {table}.{column}; create one with create_vector_index"
+                ))
+            })?;
+
+        let ef_base = opts.ef_search.unwrap_or_else(|| (top_k * 2).max(64));
+        if vidx.live_len() == 0 {
+            return Ok(Vec::new());
+        }
+        // Over-fetch to survive tombstones and metadata filtering, escalating
+        // until enough hits pass or every backend label has been considered.
+        let total = vidx.total_len();
+        let mut fetch = (top_k * 4).max(32).min(total);
+        loop {
+            let raw = vidx.search_raw(query, fetch, ef_base.max(fetch));
+            let mut hits: Vec<VectorHit> = Vec::with_capacity(top_k);
+            for (id, distance) in &raw {
+                let entry = st
+                    .index
+                    .get(table)
+                    .and_then(|t| t.get(id))
+                    .and_then(|versions| versions.last());
+                let Some(entry) = entry else { continue };
+                if entry.is_tombstone() {
+                    continue;
+                }
+                let mut rec = read_record_kind(&st.readers, &entry.kind)?;
+                if let Some(filter) = &opts.filter {
+                    let ok = filter.iter().all(|(k, want)| {
+                        if k == ID_COLUMN {
+                            matches!(want, Value::Text(t) if t == id)
+                        } else {
+                            rec.get(k).unwrap_or(&Value::Null) == want
+                        }
+                    });
+                    if !ok {
+                        continue;
+                    }
+                }
+                rec.insert(ID_COLUMN.into(), Value::Text(id.clone()));
+                hits.push(VectorHit {
+                    id: id.clone(),
+                    distance: *distance,
+                    record: rec,
+                });
+                if hits.len() == top_k {
+                    break;
+                }
+            }
+            if hits.len() >= top_k || fetch >= total {
+                return Ok(hits);
+            }
+            fetch = (fetch * 4).min(total);
+        }
+    }
+
+    /// Vectors committed in `Async` mode that are not yet searchable.
+    pub fn vector_indexing_backlog(&self) -> u64 {
+        self.shared.vector_backlog.load(AtomicOrdering::SeqCst)
+    }
+
+    /// Block until every async-committed vector is searchable.
+    pub fn wait_vector_indexing(&self) {
+        while self.vector_indexing_backlog() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     pub fn tables(&self) -> Vec<String> {
@@ -756,6 +1014,10 @@ impl Db {
             st.readers = new_readers;
             st.segments = new_segments;
             st.next_segment_id = seg_id + 1;
+            // Rebuild ANN indexes from the compacted state: tombstoned
+            // labels are dropped here (logical deletes become physical).
+            let rebuilt = build_vector_indexes(&st.catalog, &st.index, &st.readers)?;
+            st.vector = rebuilt;
         }
         for id in old_ids {
             let _ = fs::remove_file(
@@ -1058,13 +1320,27 @@ fn commit_staged(
 
     // Publish atomically to readers.
     let mut added = 0u64;
+    let mut jobs: Vec<VecJob> = Vec::new();
     {
         let mut st = shared.state.write().unwrap();
         for (table, id, p) in &encoded {
-            apply_one(&mut st, commit_version, table, id, p.as_ref())?;
+            apply_one(&mut st, commit_version, table, id, p.as_ref(), &mut jobs)?;
             added += p.as_ref().map_or(0, |(b, _)| b.len() as u64) + 32;
         }
         st.committed_version = commit_version;
+    }
+    if !jobs.is_empty() {
+        let tx = shared.vector_tx.lock().unwrap();
+        if let Some(tx) = tx.as_ref() {
+            shared
+                .vector_backlog
+                .fetch_add(jobs.len() as u64, AtomicOrdering::SeqCst);
+            for job in jobs {
+                if tx.send(job).is_err() {
+                    shared.vector_backlog.fetch_sub(1, AtomicOrdering::SeqCst);
+                }
+            }
+        }
     }
     cs.memtable_bytes += added;
     if cs.memtable_bytes >= shared.opts.memtable_max_bytes {
@@ -1124,13 +1400,15 @@ fn validate_unique(
 }
 
 /// Apply one committed change to the in-memory state, maintaining secondary
-/// indexes (which track the latest committed state only).
+/// and vector indexes (which track the latest committed state only). Async
+/// vector insertions are returned as jobs for the background thread.
 fn apply_one(
     st: &mut State,
     version: u64,
     table: &str,
     id: &str,
     put: Option<&(Arc<Vec<u8>>, Record)>,
+    jobs: &mut Vec<VecJob>,
 ) -> Result<()> {
     let defs: Vec<IndexDef> = st
         .catalog
@@ -1191,6 +1469,41 @@ fn apply_one(
                             .or_default()
                             .insert(id.to_owned());
                     }
+                }
+            }
+        }
+    }
+
+    // Vector index maintenance. Inserting tombstones the previous label for
+    // the same id; a put without a vector (or a delete) tombstones directly.
+    let vdefs: Vec<VectorIndexDef> = st
+        .catalog
+        .table(table)
+        .map(|t| t.vector_indexes.clone())
+        .unwrap_or_default();
+    for vdef in &vdefs {
+        let key = (table.to_owned(), vdef.column.clone());
+        let new_vec = put.and_then(|(_, rec)| match rec.get(&vdef.column) {
+            Some(Value::Vector(v)) => Some(v.clone()),
+            _ => None,
+        });
+        match new_vec {
+            Some(v) => match vdef.mode {
+                IndexingMode::Sync => {
+                    if let Some(vidx) = st.vector.get_mut(&key) {
+                        vidx.insert(id, &v);
+                    }
+                }
+                IndexingMode::Async => jobs.push(VecJob {
+                    table: table.to_owned(),
+                    column: vdef.column.clone(),
+                    id: id.to_owned(),
+                    vector: v,
+                }),
+            },
+            None => {
+                if let Some(vidx) = st.vector.get_mut(&key) {
+                    vidx.remove(id);
                 }
             }
         }
@@ -1367,6 +1680,45 @@ fn build_secondary(
     Ok(secondary)
 }
 
+/// Build every ANN index from canonical data (latest visible records).
+/// Used on open and after compaction; indexes are disposable by design.
+fn build_vector_indexes(
+    catalog: &Catalog,
+    index: &HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
+    readers: &HashMap<u32, File>,
+) -> Result<HashMap<(String, String), VecIdx>> {
+    let mut out: HashMap<(String, String), VecIdx> = HashMap::new();
+    for table in &catalog.tables {
+        if table.vector_indexes.is_empty() {
+            continue;
+        }
+        for def in &table.vector_indexes {
+            out.insert(
+                (table.name.clone(), def.column.clone()),
+                VecIdx::new(def.clone()),
+            );
+        }
+        let Some(ids) = index.get(&table.name) else {
+            continue;
+        };
+        for (id, versions) in ids {
+            let Some(last) = versions.last() else { continue };
+            if last.is_tombstone() {
+                continue;
+            }
+            let rec = read_record_kind(readers, &last.kind)?;
+            for def in &table.vector_indexes {
+                if let Some(Value::Vector(v)) = rec.get(&def.column) {
+                    out.get_mut(&(table.name.clone(), def.column.clone()))
+                        .expect("initialized above")
+                        .insert(id, v);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn payload_bytes(readers: &HashMap<u32, File>, kind: &VKind) -> Result<Option<Vec<u8>>> {
     match kind {
         VKind::MemPut(p) => Ok(Some(p.as_ref().clone())),
@@ -1420,6 +1772,15 @@ fn check_value(col: &crate::schema::Column, value: &Value) -> Result<()> {
             "column '{}' expects {}, got {:?}",
             col.name, col.ty, value
         )));
+    }
+    if let (Value::Vector(v), Some(dim)) = (value, col.dim) {
+        if v.len() != dim {
+            return Err(Error::SchemaViolation(format!(
+                "column '{}' expects vector<float32, {dim}>, got dimension {}",
+                col.name,
+                v.len()
+            )));
+        }
     }
     Ok(())
 }

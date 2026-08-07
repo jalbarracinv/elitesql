@@ -3,7 +3,8 @@ use std::fmt;
 
 use crate::error::{Error, Result};
 
-/// The V1 column types from the spec. `vector<float32, N>` arrives in Phase 3.
+/// The V1 column types from the spec, including the native vector type.
+/// Vector columns carry their dimension in [`crate::Column::dim`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ColumnType {
@@ -14,6 +15,7 @@ pub enum ColumnType {
     Blob,
     Timestamp,
     Json,
+    Vector,
 }
 
 impl fmt::Display for ColumnType {
@@ -26,12 +28,14 @@ impl fmt::Display for ColumnType {
             ColumnType::Blob => "blob",
             ColumnType::Timestamp => "timestamp",
             ColumnType::Json => "json",
+            ColumnType::Vector => "vector",
         };
         f.write_str(s)
     }
 }
 
-/// A single field value. `Timestamp` is microseconds since the Unix epoch.
+/// A single field value. `Timestamp` is microseconds since the Unix epoch;
+/// `Vector` is an embedding of f32 components (dimension fixed per column).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -42,6 +46,7 @@ pub enum Value {
     Blob(Vec<u8>),
     Timestamp(i64),
     Json(serde_json::Value),
+    Vector(Vec<f32>),
 }
 
 impl Value {
@@ -59,6 +64,7 @@ impl Value {
                 | (Value::Blob(_), ColumnType::Blob)
                 | (Value::Timestamp(_), ColumnType::Timestamp)
                 | (Value::Json(_), ColumnType::Json)
+                | (Value::Vector(_), ColumnType::Vector)
         )
     }
 
@@ -83,6 +89,7 @@ const TAG_TEXT: u8 = 4;
 const TAG_BLOB: u8 = 5;
 const TAG_TIMESTAMP: u8 = 6;
 const TAG_JSON: u8 = 7;
+const TAG_VECTOR: u8 = 8;
 
 pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
     match v {
@@ -119,6 +126,13 @@ pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(&bytes);
         }
+        Value::Vector(v) => {
+            buf.push(TAG_VECTOR);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for x in v {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
     }
 }
 
@@ -142,6 +156,17 @@ pub(crate) fn decode_value(buf: &[u8], pos: &mut usize) -> Result<Value> {
             let j = serde_json::from_slice(bytes)
                 .map_err(|_| Error::Corrupt("invalid json value".into()))?;
             Ok(Value::Json(j))
+        }
+        TAG_VECTOR => {
+            let count = read_u32(buf, pos)? as usize;
+            if count.checked_mul(4).is_none_or(|bytes| *pos + bytes > buf.len()) {
+                return Err(Error::Corrupt("truncated vector value".into()));
+            }
+            let mut v = Vec::with_capacity(count);
+            for _ in 0..count {
+                v.push(f32::from_le_bytes(read_array(buf, pos)?));
+            }
+            Ok(Value::Vector(v))
         }
         other => Err(Error::Corrupt(format!("unknown value tag {other}"))),
     }

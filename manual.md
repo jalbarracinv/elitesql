@@ -35,6 +35,7 @@ Reglas generales:
 | `blob` | hex literal | `X'DEADBEEF'` |
 | `timestamp` | entero (microsegundos Unix) | `1722000000000000` |
 | `json` | string con JSON valido | `'{"tags": ["a"], "n": 3}'` |
+| `vector(N)` | string con array JSON de N numeros | `'[0.12, -0.5, 0.33]'` |
 | null | `NULL` | `NULL` |
 
 Coerciones automaticas: un entero es valido para columnas `float64` y `timestamp`. Un string es valido para `json` solo si parsea como JSON.
@@ -47,10 +48,11 @@ Toda tabla tiene una columna `id` de tipo `text` que **no se declara**. Si no la
 
 ```sql
 CREATE TABLE users (
-  name  text NOT NULL,
-  email text,
-  age   int64,
-  prefs json
+  name      text NOT NULL,
+  email     text,
+  age       int64,
+  prefs     json,
+  embedding vector(768)
 )
 ```
 
@@ -191,6 +193,7 @@ Todo esto falla con un error claro, no con comportamiento sorpresa:
 | `DROP`, `ALTER` | pendiente en el roadmap |
 | `BEGIN/COMMIT` en SQL | transacciones via API Rust: `db.begin()` |
 | `RETURNING` | INSERT ya devuelve los ids |
+| Busqueda vectorial en SQL | API Rust: `db.create_vector_index(...)` + `db.search_vector(...)` (funcion SQL explicita llega con hybrid search, Phase 5) |
 
 ## Performance de referencia
 

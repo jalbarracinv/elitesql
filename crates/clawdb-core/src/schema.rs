@@ -18,6 +18,9 @@ pub struct Column {
     pub ty: ColumnType,
     #[serde(default = "default_true")]
     pub nullable: bool,
+    /// Dimension for vector columns; None for every other type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dim: Option<usize>,
 }
 
 fn default_true() -> bool {
@@ -30,6 +33,17 @@ impl Column {
             name: name.into(),
             ty,
             nullable: true,
+            dim: None,
+        }
+    }
+
+    /// A `vector<float32, dim>` column.
+    pub fn vector(name: impl Into<String>, dim: usize) -> Self {
+        Column {
+            name: name.into(),
+            ty: ColumnType::Vector,
+            nullable: true,
+            dim: Some(dim),
         }
     }
 
@@ -53,6 +67,8 @@ pub struct TableSchema {
     pub columns: Vec<Column>,
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
+    #[serde(default)]
+    pub vector_indexes: Vec<crate::vector::VectorIndexDef>,
 }
 
 impl TableSchema {
@@ -61,6 +77,7 @@ impl TableSchema {
             name: name.into(),
             columns,
             indexes: Vec::new(),
+            vector_indexes: Vec::new(),
         }
     }
 
@@ -86,6 +103,22 @@ impl TableSchema {
                     "duplicate column name '{}'",
                     col.name
                 )));
+            }
+            match (col.ty, col.dim) {
+                (ColumnType::Vector, Some(d)) if d >= 1 => {}
+                (ColumnType::Vector, _) => {
+                    return Err(Error::InvalidArgument(format!(
+                        "vector column '{}' needs a dimension >= 1",
+                        col.name
+                    )))
+                }
+                (_, Some(_)) => {
+                    return Err(Error::InvalidArgument(format!(
+                        "column '{}' is not a vector; it cannot have a dimension",
+                        col.name
+                    )))
+                }
+                _ => {}
             }
         }
         Ok(())

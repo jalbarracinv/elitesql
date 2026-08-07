@@ -47,7 +47,10 @@ pub(crate) fn execute(db: &Db, sql: &str) -> Result<QueryOutput> {
         Statement::CreateTable { name, columns } => {
             let mut cols = Vec::with_capacity(columns.len());
             for c in columns {
-                let mut col = crate::schema::Column::new(c.name, c.ty);
+                let mut col = match c.dim {
+                    Some(dim) => crate::schema::Column::vector(c.name, dim),
+                    None => crate::schema::Column::new(c.name, c.ty),
+                };
                 if c.not_null {
                     col = col.not_null();
                 }
@@ -87,6 +90,14 @@ fn literal_to_value(lit: &Literal, ty: ColumnType, col: &str) -> Result<Value> {
             let j = serde_json::from_str(s)
                 .map_err(|e| Error::Sql(format!("invalid json literal for '{col}': {e}")))?;
             Value::Json(j)
+        }
+        (Literal::Str(s), ColumnType::Vector) => {
+            let v: Vec<f32> = serde_json::from_str(s).map_err(|e| {
+                Error::Sql(format!(
+                    "invalid vector literal for '{col}' (expected a JSON array of numbers): {e}"
+                ))
+            })?;
+            Value::Vector(v)
         }
         (Literal::Blob(b), ColumnType::Blob) => Value::Blob(b.clone()),
         _ => {
@@ -151,6 +162,7 @@ fn sort_cmp(a: &Value, b: &Value) -> Ordering {
             Value::Text(_) => 3,
             Value::Blob(_) => 4,
             Value::Json(_) => 5,
+            Value::Vector(_) => 6,
         }
     }
     let (ra, rb) = (rank(a), rank(b));

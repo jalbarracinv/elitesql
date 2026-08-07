@@ -55,6 +55,7 @@ mod schema;
 mod segment;
 mod sql;
 mod value;
+mod vector;
 mod wal;
 
 pub use check::{check, CheckReport};
@@ -63,4 +64,8 @@ pub use error::{Error, Result};
 pub use schema::{Column, IndexDef, TableSchema};
 pub use sql::QueryOutput;
 pub use value::{ColumnType, Value};
+pub use vector::{
+    IndexingMode, VectorHit, VectorIndexDef, VectorIndexOptions, VectorMetric,
+    VectorSearchOptions,
+};
 pub use wal::Durability;
