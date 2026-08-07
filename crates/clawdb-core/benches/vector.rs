@@ -134,10 +134,10 @@ fn measure_recall(db: &Db, vectors: &[Vec<f32>], ef_search: usize, queries: usiz
 }
 
 fn bench_vector(c: &mut Criterion) {
-    let (_dir, db, vectors) = build();
+    let (dir, db, vectors) = build();
 
     // Acceptance metric: recall@10 vs brute-force ground truth.
-    for ef in [64, 128, 256] {
+    for ef in [64, 128, 256, 512] {
         let recall = measure_recall(&db, &vectors, ef, 50);
         println!("recall@{K} (N={N}, dim={DIM}, ef_search={ef}): {recall:.4}");
         if ef == 128 {
@@ -148,7 +148,7 @@ fn bench_vector(c: &mut Criterion) {
     let mut g = c.benchmark_group("vector_100k");
     g.sample_size(30);
     let mut gen = Clustered::new(0x1111);
-    for ef in [64_usize, 128] {
+    for ef in [64_usize, 128, 256, 512] {
         g.bench_function(format!("search_top10_ef{ef}"), |b| {
             let opts = VectorSearchOptions {
                 ef_search: Some(ef),
@@ -162,6 +162,17 @@ fn bench_vector(c: &mut Criterion) {
         });
     }
     g.finish();
+
+    // Open-time with the persisted graph (vs a full rebuild of 100K inserts).
+    drop(db);
+    let t0 = std::time::Instant::now();
+    let opts = DbOptions {
+        durability: Durability::Fast,
+        ..DbOptions::default()
+    };
+    let db = Db::open_with(dir.path().join("vec.clawdb"), opts).unwrap();
+    println!("open with persisted graph (N={N}, dim={DIM}): {:?}", t0.elapsed());
+    drop(db);
 }
 
 criterion_group!(benches, bench_vector);

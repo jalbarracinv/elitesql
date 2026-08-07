@@ -21,6 +21,7 @@ use crate::wal::{encode_commit, scan_wal, wal_path, Durability, WalWriter, WAL_D
 pub(crate) const MARKER_FILE: &str = "CLAWDB";
 pub(crate) const CATALOG_FILE: &str = "catalog.json";
 pub(crate) const SEGMENTS_DIR: &str = "segments";
+const VECTORS_DIR: &str = "vectors";
 const LOCK_FILE: &str = "LOCK";
 
 /// A record is a map from column name to value. On reads the implicit
@@ -195,11 +196,13 @@ pub struct Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        // Close the channel so the background indexer exits, then join it.
+        // Close the channel so the background indexer exits, then join it
+        // so every pending async vector lands before the graph is dumped.
         *self.shared.vector_tx.lock().unwrap() = None;
         if let Some(handle) = self.vector_thread.take() {
             let _ = handle.join();
         }
+        dump_vector_indexes(&self.shared);
     }
 }
 
@@ -256,6 +259,7 @@ impl Db {
         }
         fs::create_dir_all(dir.join(SEGMENTS_DIR))?;
         fs::create_dir_all(dir.join(WAL_DIR))?;
+        fs::create_dir_all(dir.join(VECTORS_DIR))?;
         let lock_file = acquire_lock(&dir)?;
 
         let mut marker = File::create(dir.join(MARKER_FILE))?;
@@ -308,7 +312,9 @@ impl Db {
             // fallback without ever rotating the corrupt file over the good one.
             manifest.heal(&dir)?;
         }
+        fs::create_dir_all(dir.join(VECTORS_DIR))?;
         cleanup_orphans(&dir, &manifest)?;
+        cleanup_orphan_vidx(&dir, &catalog);
 
         // Load segments listed in the manifest.
         let mut index: HashMap<String, BTreeMap<String, Vec<VersionEntry>>> = HashMap::new();
@@ -398,7 +404,7 @@ impl Db {
         }
 
         let secondary = build_secondary(&catalog, &index, &readers)?;
-        let vector = build_vector_indexes(&catalog, &index, &readers)?;
+        let vector = load_or_build_vector_indexes(&dir, &catalog, &index, &readers, committed_version)?;
         let next_segment_id = manifest.segments.iter().map(|s| s.id).max().unwrap_or(0) + 1;
         let wal = WalWriter::open(&dir, manifest.wal_id)?;
         Ok(finish_db(Arc::new(Shared {
@@ -1019,6 +1025,8 @@ impl Db {
             let rebuilt = build_vector_indexes(&st.catalog, &st.index, &st.readers)?;
             st.vector = rebuilt;
         }
+        // Persist the freshly compacted graphs (best effort).
+        dump_vector_indexes(&self.shared);
         for id in old_ids {
             let _ = fs::remove_file(
                 self.shared
@@ -1681,7 +1689,7 @@ fn build_secondary(
 }
 
 /// Build every ANN index from canonical data (latest visible records).
-/// Used on open and after compaction; indexes are disposable by design.
+/// Used after compaction; indexes are disposable by design.
 fn build_vector_indexes(
     catalog: &Catalog,
     index: &HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
@@ -1689,34 +1697,171 @@ fn build_vector_indexes(
 ) -> Result<HashMap<(String, String), VecIdx>> {
     let mut out: HashMap<(String, String), VecIdx> = HashMap::new();
     for table in &catalog.tables {
-        if table.vector_indexes.is_empty() {
-            continue;
-        }
         for def in &table.vector_indexes {
             out.insert(
                 (table.name.clone(), def.column.clone()),
-                VecIdx::new(def.clone()),
+                build_one_vector_index(&table.name, def, index, readers)?,
             );
         }
-        let Some(ids) = index.get(&table.name) else {
-            continue;
-        };
+    }
+    Ok(out)
+}
+
+fn build_one_vector_index(
+    table: &str,
+    def: &VectorIndexDef,
+    index: &HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
+    readers: &HashMap<u32, File>,
+) -> Result<VecIdx> {
+    let mut vidx = VecIdx::new(def.clone());
+    if let Some(ids) = index.get(table) {
         for (id, versions) in ids {
             let Some(last) = versions.last() else { continue };
             if last.is_tombstone() {
                 continue;
             }
             let rec = read_record_kind(readers, &last.kind)?;
-            for def in &table.vector_indexes {
-                if let Some(Value::Vector(v)) = rec.get(&def.column) {
-                    out.get_mut(&(table.name.clone(), def.column.clone()))
-                        .expect("initialized above")
-                        .insert(id, v);
-                }
+            if let Some(Value::Vector(v)) = rec.get(&def.column) {
+                vidx.insert(id, v);
             }
         }
     }
+    Ok(vidx)
+}
+
+fn vidx_path(dir: &Path, table: &str, column: &str) -> PathBuf {
+    let key = format!("{table}\u{0}{column}");
+    dir.join(VECTORS_DIR)
+        .join(format!("{:08x}.vidx", crc32fast::hash(key.as_bytes())))
+}
+
+/// On open: load each persisted graph if valid, catching up incrementally
+/// with everything committed after the dump; otherwise rebuild from scratch.
+fn load_or_build_vector_indexes(
+    dir: &Path,
+    catalog: &Catalog,
+    index: &HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
+    readers: &HashMap<u32, File>,
+    committed_version: u64,
+) -> Result<HashMap<(String, String), VecIdx>> {
+    let mut out: HashMap<(String, String), VecIdx> = HashMap::new();
+    for table in &catalog.tables {
+        for def in &table.vector_indexes {
+            let loaded = fs::read(vidx_path(dir, &table.name, &def.column))
+                .ok()
+                .and_then(|bytes| VecIdx::load_bytes(&bytes, &table.name, &def.column, def).ok());
+            let vidx = match loaded {
+                // A dump "from the future" can exist after a manifest.prev
+                // rollback; it must be discarded, not caught up.
+                Some((mut vidx, dump_version)) if dump_version <= committed_version => {
+                    catch_up_vector_index(&mut vidx, dump_version, &table.name, def, index, readers)?;
+                    vidx
+                }
+                _ => build_one_vector_index(&table.name, def, index, readers)?,
+            };
+            out.insert((table.name.clone(), def.column.clone()), vidx);
+        }
+    }
     Ok(out)
+}
+
+/// Re-apply everything committed after the dump: changed/deleted records,
+/// and dumped ids whose canonical data was compacted away since.
+fn catch_up_vector_index(
+    vidx: &mut VecIdx,
+    dump_version: u64,
+    table: &str,
+    def: &VectorIndexDef,
+    index: &HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
+    readers: &HashMap<u32, File>,
+) -> Result<()> {
+    let ids = index.get(table);
+    if let Some(ids) = ids {
+        for (id, versions) in ids {
+            let Some(last) = versions.last() else { continue };
+            if last.version <= dump_version {
+                continue;
+            }
+            if last.is_tombstone() {
+                vidx.remove(id);
+                continue;
+            }
+            let rec = read_record_kind(readers, &last.kind)?;
+            match rec.get(&def.column) {
+                Some(Value::Vector(v)) => vidx.insert(id, v),
+                _ => vidx.remove(id),
+            }
+        }
+    }
+    for id in vidx.ids() {
+        let alive = ids
+            .and_then(|t| t.get(&id))
+            .and_then(|versions| versions.last())
+            .map(|e| !e.is_tombstone())
+            .unwrap_or(false);
+        if !alive {
+            vidx.remove(&id);
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort dump of every ANN graph to `vectors/` (temp file + rename).
+/// Failures are ignored: the graph is always rebuildable from canonical data.
+fn dump_vector_indexes(shared: &Shared) {
+    let Ok(st) = shared.state.read() else { return };
+    if st.vector.is_empty() {
+        return;
+    }
+    let vdir = shared.dir.join(VECTORS_DIR);
+    let _ = fs::create_dir_all(&vdir);
+    for ((table, column), vidx) in &st.vector {
+        let Some(def) = st
+            .catalog
+            .table(table)
+            .and_then(|t| t.vector_indexes.iter().find(|d| &d.column == column))
+        else {
+            continue;
+        };
+        let bytes = vidx.dump_bytes(table, column, def, st.committed_version);
+        let path = vidx_path(&shared.dir, table, column);
+        let tmp = path.with_extension("vidx.tmp");
+        let written = File::create(&tmp)
+            .and_then(|mut f| {
+                f.write_all(&bytes)?;
+                f.sync_all()
+            })
+            .is_ok();
+        if written {
+            let _ = fs::rename(&tmp, &path);
+        } else {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+    let _ = fsync_dir(&vdir);
+}
+
+/// Remove vector dumps that no longer correspond to a cataloged index.
+fn cleanup_orphan_vidx(dir: &Path, catalog: &Catalog) {
+    let expected: HashSet<PathBuf> = catalog
+        .tables
+        .iter()
+        .flat_map(|t| {
+            t.vector_indexes
+                .iter()
+                .map(|d| vidx_path(dir, &t.name, &d.column))
+        })
+        .collect();
+    if let Ok(entries) = fs::read_dir(dir.join(VECTORS_DIR)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let known = expected.contains(&path);
+            let is_vidx = path.extension().is_some_and(|e| e == "vidx");
+            if !known && (is_vidx || path.extension().is_some_and(|e| e == "tmp")) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
 }
 
 fn payload_bytes(readers: &HashMap<u32, File>, kind: &VKind) -> Result<Option<Vec<u8>>> {

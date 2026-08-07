@@ -22,6 +22,9 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Error, Result};
+use crate::value::{read_u16, read_u32, read_u64, read_u8};
+
 /// Distance metric for a vector index. Scores returned by searches are
 /// distances: lower is closer (`cosine` and `dot` return `1 - similarity`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +424,11 @@ impl VecIdx {
         self.labels.len()
     }
 
+    /// Ids currently indexed (latest labels only).
+    pub fn ids(&self) -> Vec<String> {
+        self.id_to_label.keys().cloned().collect()
+    }
+
     /// Raw ANN candidates with tombstones and stale labels filtered out,
     /// sorted by ascending distance. May return fewer than `fetch_k`.
     pub fn search_raw(&self, q: &[f32], fetch_k: usize, ef: usize) -> Vec<(String, f32)> {
@@ -443,5 +451,242 @@ impl VecIdx {
             out.push((id.clone(), distance));
         }
         out
+    }
+}
+
+// --- graph persistence -------------------------------------------------------
+//
+// File layout: 8-byte magic, u32 crc32 of the body, u64 body length, body.
+// The body carries the index identity (table, column, metric, m,
+// ef_construction) for validation, the commit version the dump reflects,
+// and the full graph. Any validation failure means "rebuild from canonical
+// data" — never an error surfaced to the user.
+
+const VIDX_MAGIC: &[u8; 8] = b"CLAWVIDX";
+const VIDX_FORMAT: u32 = 2;
+const MAX_LEVELS: usize = 64;
+
+fn write_str16(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn read_str16(buf: &[u8], pos: &mut usize) -> Result<String> {
+    let len = read_u16(buf, pos)? as usize;
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::Corrupt("vidx: length overflow".into()))?;
+    let slice = buf
+        .get(*pos..end)
+        .ok_or_else(|| Error::Corrupt("vidx: unexpected end".into()))?;
+    *pos = end;
+    std::str::from_utf8(slice)
+        .map(|s| s.to_owned())
+        .map_err(|_| Error::Corrupt("vidx: invalid utf8".into()))
+}
+
+fn metric_code(m: VectorMetric) -> u8 {
+    match m {
+        VectorMetric::Cosine => 0,
+        VectorMetric::Dot => 1,
+        VectorMetric::L2 => 2,
+    }
+}
+
+impl VecIdx {
+    /// Serialize the full index state as of `dump_version`.
+    pub fn dump_bytes(
+        &self,
+        table: &str,
+        column: &str,
+        def: &VectorIndexDef,
+        dump_version: u64,
+    ) -> Vec<u8> {
+        let b = &self.backend;
+        let mut body = Vec::with_capacity(64 + b.vectors.len() * 64);
+        body.extend_from_slice(&VIDX_FORMAT.to_le_bytes());
+        write_str16(&mut body, table);
+        write_str16(&mut body, column);
+        body.push(metric_code(def.metric));
+        body.extend_from_slice(&(def.m as u32).to_le_bytes());
+        body.extend_from_slice(&(def.ef_construction as u32).to_le_bytes());
+        body.extend_from_slice(&dump_version.to_le_bytes());
+        body.push(b.top_level);
+        body.extend_from_slice(&b.entry.unwrap_or(u32::MAX).to_le_bytes());
+        body.extend_from_slice(&b.rng.to_le_bytes());
+        body.extend_from_slice(&(b.vectors.len() as u32).to_le_bytes());
+        for i in 0..b.vectors.len() {
+            write_str16(&mut body, &self.labels[i]);
+            body.push(self.deleted.contains(&i) as u8);
+            let v = &b.vectors[i];
+            body.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for x in v {
+                body.extend_from_slice(&x.to_le_bytes());
+            }
+            let levels = &b.links[i];
+            body.push(levels.len() as u8);
+            for level in levels {
+                body.extend_from_slice(&(level.len() as u32).to_le_bytes());
+                for &n in level {
+                    body.extend_from_slice(&n.to_le_bytes());
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(body.len() + 20);
+        out.extend_from_slice(VIDX_MAGIC);
+        out.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Deserialize and validate a dump. Returns the index and the commit
+    /// version it reflects. Every failure mode is `Corrupt`, which callers
+    /// treat as "rebuild from canonical data".
+    pub fn load_bytes(
+        bytes: &[u8],
+        table: &str,
+        column: &str,
+        def: &VectorIndexDef,
+    ) -> Result<(VecIdx, u64)> {
+        if bytes.len() < 20 || &bytes[..8] != VIDX_MAGIC {
+            return Err(Error::Corrupt("vidx: bad magic".into()));
+        }
+        let stored_crc = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let body_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap()) as usize;
+        let body = bytes
+            .get(20..20 + body_len)
+            .ok_or_else(|| Error::Corrupt("vidx: truncated body".into()))?;
+        if crc32fast::hash(body) != stored_crc {
+            return Err(Error::Corrupt("vidx: crc mismatch".into()));
+        }
+        let mut pos = 0usize;
+        if read_u32(body, &mut pos)? != VIDX_FORMAT {
+            return Err(Error::Corrupt("vidx: unsupported format".into()));
+        }
+        if read_str16(body, &mut pos)? != table || read_str16(body, &mut pos)? != column {
+            return Err(Error::Corrupt("vidx: identity mismatch".into()));
+        }
+        let same_def = read_u8(body, &mut pos)? == metric_code(def.metric)
+            && read_u32(body, &mut pos)? as usize == def.m
+            && read_u32(body, &mut pos)? as usize == def.ef_construction;
+        if !same_def {
+            return Err(Error::Corrupt("vidx: index definition changed".into()));
+        }
+        let dump_version = read_u64(body, &mut pos)?;
+        let top_level = read_u8(body, &mut pos)?;
+        if top_level as usize >= MAX_LEVELS {
+            return Err(Error::Corrupt("vidx: implausible top level".into()));
+        }
+        let entry_raw = read_u32(body, &mut pos)?;
+        let rng = read_u64(body, &mut pos)?;
+        let n = read_u32(body, &mut pos)? as usize;
+        if n as u64 > body.len() as u64 {
+            return Err(Error::Corrupt("vidx: implausible node count".into()));
+        }
+
+        let mut labels = Vec::with_capacity(n);
+        let mut deleted: HashSet<usize> = HashSet::new();
+        let mut vectors = Vec::with_capacity(n);
+        let mut norms = Vec::with_capacity(n);
+        let mut links: Vec<Vec<Vec<u32>>> = Vec::with_capacity(n);
+        for i in 0..n {
+            labels.push(read_str16(body, &mut pos)?);
+            if read_u8(body, &mut pos)? != 0 {
+                deleted.insert(i);
+            }
+            let dim = read_u32(body, &mut pos)? as usize;
+            if dim
+                .checked_mul(4)
+                .is_none_or(|b| pos + b > body.len())
+            {
+                return Err(Error::Corrupt("vidx: truncated vector".into()));
+            }
+            let mut v = Vec::with_capacity(dim);
+            for _ in 0..dim {
+                v.push(f32::from_le_bytes(
+                    body[pos..pos + 4].try_into().unwrap(),
+                ));
+                pos += 4;
+            }
+            norms.push(v.iter().map(|x| x * x).sum::<f32>().sqrt());
+            vectors.push(v);
+            let level_count = read_u8(body, &mut pos)? as usize;
+            if level_count == 0 || level_count > MAX_LEVELS {
+                return Err(Error::Corrupt("vidx: bad level count".into()));
+            }
+            let mut node_links = Vec::with_capacity(level_count);
+            for _ in 0..level_count {
+                let cnt = read_u32(body, &mut pos)? as usize;
+                if cnt
+                    .checked_mul(4)
+                    .is_none_or(|b| pos + b > body.len())
+                {
+                    return Err(Error::Corrupt("vidx: truncated links".into()));
+                }
+                let mut level = Vec::with_capacity(cnt);
+                for _ in 0..cnt {
+                    let neighbor = read_u32(body, &mut pos)?;
+                    if neighbor as usize >= n {
+                        return Err(Error::Corrupt("vidx: neighbor out of range".into()));
+                    }
+                    level.push(neighbor);
+                }
+                node_links.push(level);
+            }
+            links.push(node_links);
+        }
+
+        // Structural invariants that keep search panic-free: the entry point
+        // must reach top_level, and any node listed at layer L must have L.
+        let entry = if entry_raw == u32::MAX {
+            None
+        } else {
+            let e = entry_raw as usize;
+            if e >= n || links[e].len() <= top_level as usize {
+                return Err(Error::Corrupt("vidx: invalid entry point".into()));
+            }
+            Some(entry_raw)
+        };
+        for node_links in &links {
+            for (layer, level) in node_links.iter().enumerate() {
+                for &nb in level {
+                    if links[nb as usize].len() <= layer {
+                        return Err(Error::Corrupt("vidx: neighbor below its layer".into()));
+                    }
+                }
+            }
+        }
+
+        let mut id_to_label = HashMap::with_capacity(n);
+        for (i, id) in labels.iter().enumerate() {
+            if !deleted.contains(&i) {
+                id_to_label.insert(id.clone(), i);
+            }
+        }
+
+        let m = def.m.clamp(2, 256);
+        let backend = HnswIndex {
+            metric: def.metric,
+            m,
+            m0: m * 2,
+            ef_construction: def.ef_construction.max(m),
+            ml: 1.0 / (m as f64).ln(),
+            vectors,
+            norms,
+            links,
+            entry,
+            top_level,
+            rng,
+        };
+        Ok((
+            VecIdx {
+                backend,
+                labels,
+                id_to_label,
+                deleted,
+            },
+            dump_version,
+        ))
     }
 }

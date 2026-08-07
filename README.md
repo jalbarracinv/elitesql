@@ -179,6 +179,7 @@ app.clawdb/
   manifest.prev   # fallback de recovery
   wal/            # commits durables (CRC por registro)
   segments/       # datos inmutables (CRC por entrada)
+  vectors/        # grafos ANN persistidos (CRC; desechables y reconstruibles)
 ```
 
 Regla de oro del motor: `Data files are canonical. Indexes are disposable.` Si un indice se rompe, se reconstruye desde los datos; si el manifest se rompe, se usa el anterior; si el WAL tiene una entrada incompleta, se descarta completa (nunca medio commit).
