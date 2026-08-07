@@ -271,8 +271,10 @@ Benchmarks en Apple Silicon (`cargo bench`), ClawDB en modo `Fast` vs SQLite con
 | Operacion | ClawDB | SQLite | |
 |---|---|---|---|
 | Lectura por id (10K filas) | 0.62 µs | 2.72 µs | 4.4x mas rapido |
-| 1K inserts, commit por operacion | 5.3 ms | 15.9 ms | 3.0x mas rapido |
-| 1K inserts, una transaccion | 3.2 ms | 1.2 ms | SQLite gana en batch (pendiente de optimizar) |
+| 1K inserts, commit por operacion | 4.6 ms | 15.9 ms | 3.4x mas rapido |
+| 1K inserts, una transaccion | 3.3 ms | 1.2 ms | SQLite gana en batch* |
+
+\* El caso de uso que ClawDB optimiza es el operacional (commits chicos concurrentes), donde gana 3-4x. El bulk-load en una transaccion paga el costo por registro del staging MVCC (~3 µs/registro); las palancas identificadas para cerrarlo (arena de payloads por commit, aplicacion al indice agrupada por tabla) estan anotadas en el plan.
 
 ## Licencia
 

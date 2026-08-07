@@ -178,6 +178,8 @@ pub struct Txn {
     snapshot: Snapshot,
     /// (table, id) -> staged full record, or None for delete.
     staged: BTreeMap<(String, String), Option<Record>>,
+    /// Schemas touched by this transaction: one clone per table, not per op.
+    schemas: HashMap<String, TableSchema>,
 }
 
 /// An embedded ClawDB database backed by a self-contained directory.
@@ -750,6 +752,7 @@ impl Db {
             shared: self.shared.clone(),
             snapshot: self.snapshot(),
             staged: BTreeMap::new(),
+            schemas: HashMap::new(),
         }
     }
 
@@ -1044,6 +1047,20 @@ impl Txn {
         self.snapshot.version
     }
 
+    /// Cached schema lookup: clones from the catalog once per table.
+    fn schema(&mut self, table: &str) -> Result<&TableSchema> {
+        if !self.schemas.contains_key(table) {
+            let st = self.shared.state.read().unwrap();
+            let schema = st
+                .catalog
+                .table(table)
+                .ok_or_else(|| Error::TableNotFound(table.into()))?
+                .clone();
+            self.schemas.insert(table.to_owned(), schema);
+        }
+        Ok(self.schemas.get(table).expect("just inserted"))
+    }
+
     /// Read through this transaction: staged writes first, then the snapshot.
     pub fn get(&self, table: &str, id: &str) -> Result<Option<Record>> {
         match self.staged.get(&(table.to_owned(), id.to_owned())) {
@@ -1058,13 +1075,6 @@ impl Txn {
     }
 
     pub fn insert(&mut self, table: &str, record: Record) -> Result<String> {
-        let schema = {
-            let st = self.shared.state.read().unwrap();
-            st.catalog
-                .table(table)
-                .ok_or_else(|| Error::TableNotFound(table.into()))?
-                .clone()
-        };
         let id = match record.get(ID_COLUMN) {
             None => Ulid::new().to_string(),
             Some(Value::Text(s)) if !s.is_empty() => s.clone(),
@@ -1072,6 +1082,10 @@ impl Txn {
                 return Err(Error::InvalidArgument("id must not be empty".into()))
             }
             Some(_) => return Err(Error::SchemaViolation("id must be a text value".into())),
+        };
+        let normalized = {
+            let schema = self.schema(table)?;
+            normalize_record(schema, record)?
         };
         let key = (table.to_owned(), id.clone());
         let exists = match self.staged.get(&key) {
@@ -1085,27 +1099,31 @@ impl Txn {
                 id,
             });
         }
-        let stored = build_stored(&schema, record)?;
-        self.staged.insert(key, Some(stored.into_iter().collect()));
+        self.staged.insert(key, Some(normalized));
         Ok(id)
     }
 
     pub fn update(&mut self, table: &str, id: &str, patch: Record) -> Result<()> {
-        let schema = {
-            let st = self.shared.state.read().unwrap();
-            st.catalog
-                .table(table)
-                .ok_or_else(|| Error::TableNotFound(table.into()))?
-                .clone()
-        };
         if patch.contains_key(ID_COLUMN) {
             return Err(Error::InvalidArgument(
                 "the primary key cannot be updated".into(),
             ));
         }
+        self.schema(table)?; // cache + existence check
         let key = (table.to_owned(), id.to_owned());
-        let mut current = match self.staged.get(&key) {
-            Some(Some(rec)) => rec.clone(),
+        let mut current = match self.staged.get_mut(&key) {
+            Some(Some(rec)) => {
+                // Patch the staged record in place: no clone, no restage.
+                let schema = self.schemas.get(table).expect("cached above");
+                for (name, value) in patch {
+                    let col = schema.column(&name).ok_or_else(|| {
+                        Error::SchemaViolation(format!("unknown column '{name}'"))
+                    })?;
+                    check_value(col, &value)?;
+                    rec.insert(name, value);
+                }
+                return Ok(());
+            }
             Some(None) => {
                 return Err(Error::RecordNotFound {
                     table: table.into(),
@@ -1120,6 +1138,7 @@ impl Txn {
             )?,
         };
         current.remove(ID_COLUMN);
+        let schema = self.schemas.get(table).expect("cached above");
         for (name, value) in patch {
             let col = schema
                 .column(&name)
@@ -1268,8 +1287,9 @@ fn commit_staged(
     }
     let mut cs = shared.commit.lock().unwrap();
 
-    type EncodedChange = (String, String, Option<(Arc<Vec<u8>>, Record)>);
-    let mut encoded: Vec<EncodedChange> = Vec::with_capacity(staged.len());
+    // One payload per staged op, paired positionally with `staged`'s
+    // (deterministic BTreeMap) iteration order. Records are never cloned.
+    let mut payloads: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity(staged.len());
     let commit_version;
     {
         let st = shared.state.read().unwrap();
@@ -1294,23 +1314,9 @@ fn commit_staged(
                         .catalog
                         .table(table)
                         .ok_or_else(|| Error::TableNotFound(table.clone()))?;
-                    let stored: Vec<(String, Value)> = schema
-                        .columns
-                        .iter()
-                        .map(|c| {
-                            (
-                                c.name.clone(),
-                                rec.get(&c.name).cloned().unwrap_or(Value::Null),
-                            )
-                        })
-                        .collect();
-                    encoded.push((
-                        table.clone(),
-                        id.clone(),
-                        Some((Arc::new(encode_record(&stored)), rec.clone())),
-                    ));
+                    payloads.push(Some(Arc::new(encode_record_ordered(schema, rec))));
                 }
-                None => encoded.push((table.clone(), id.clone(), None)),
+                None => payloads.push(None),
             }
         }
         validate_unique(&st, staged)?;
@@ -1318,9 +1324,10 @@ fn commit_staged(
     }
 
     // Durability point: the WAL record is the commit.
-    let wal_changes: Vec<(&str, &str, Option<&[u8]>)> = encoded
+    let wal_changes: Vec<(&str, &str, Option<&[u8]>)> = staged
         .iter()
-        .map(|(t, i, p)| (t.as_str(), i.as_str(), p.as_ref().map(|(b, _)| b.as_slice())))
+        .zip(&payloads)
+        .map(|(((t, i), _), p)| (t.as_str(), i.as_str(), p.as_deref().map(|b| b.as_slice())))
         .collect();
     let bytes = encode_commit(commit_version, &wal_changes);
     cs.wal
@@ -1331,9 +1338,13 @@ fn commit_staged(
     let mut jobs: Vec<VecJob> = Vec::new();
     {
         let mut st = shared.state.write().unwrap();
-        for (table, id, p) in &encoded {
-            apply_one(&mut st, commit_version, table, id, p.as_ref(), &mut jobs)?;
-            added += p.as_ref().map_or(0, |(b, _)| b.len() as u64) + 32;
+        for (((table, id), op), payload) in staged.iter().zip(&payloads) {
+            let put = match (op, payload) {
+                (Some(rec), Some(p)) => Some((p, rec)),
+                _ => None,
+            };
+            apply_one(&mut st, commit_version, table, id, put, &mut jobs)?;
+            added += payload.as_deref().map_or(0, |b| b.len() as u64) + 32;
         }
         st.committed_version = commit_version;
     }
@@ -1415,7 +1426,7 @@ fn apply_one(
     version: u64,
     table: &str,
     id: &str,
-    put: Option<&(Arc<Vec<u8>>, Record)>,
+    put: Option<(&Arc<Vec<u8>>, &Record)>,
     jobs: &mut Vec<VecJob>,
 ) -> Result<()> {
     let defs: Vec<IndexDef> = st
@@ -1930,35 +1941,46 @@ fn check_value(col: &crate::schema::Column, value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Validate an insert against the schema and produce the stored field list
-/// in schema column order. Missing nullable columns are stored as Null.
-fn build_stored(schema: &TableSchema, mut record: Record) -> Result<Vec<(String, Value)>> {
+/// Validate an insert against the schema, normalizing the caller's map in
+/// place: unknown columns rejected, missing columns become Null (or error
+/// when NOT NULL). No rebuild — the caller's allocations are reused.
+fn normalize_record(schema: &TableSchema, mut record: Record) -> Result<Record> {
     record.remove(ID_COLUMN);
     for name in record.keys() {
         if schema.column(name).is_none() {
             return Err(Error::SchemaViolation(format!("unknown column '{name}'")));
         }
     }
-    let mut stored = Vec::with_capacity(schema.columns.len());
     for col in &schema.columns {
-        let value = record.remove(&col.name).unwrap_or(Value::Null);
-        check_value(col, &value)?;
-        stored.push((col.name.clone(), value));
+        match record.get(&col.name) {
+            Some(value) => check_value(col, value)?,
+            None => {
+                if !col.nullable {
+                    return Err(Error::SchemaViolation(format!(
+                        "column '{}' is not nullable",
+                        col.name
+                    )));
+                }
+                record.insert(col.name.clone(), Value::Null);
+            }
+        }
     }
-    Ok(stored)
+    Ok(record)
 }
 
 // Record payload layout: u16 field count, then per field a u16-length-prefixed
 // column name followed by a tagged value. Self-describing so that schema
 // evolution in later phases does not invalidate old segments.
 
-pub(crate) fn encode_record(fields: &[(String, Value)]) -> Vec<u8> {
+/// Encode a normalized record directly in schema column order, borrowing
+/// names and values (no intermediate field list).
+pub(crate) fn encode_record_ordered(schema: &TableSchema, record: &Record) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
-    buf.extend_from_slice(&(fields.len() as u16).to_le_bytes());
-    for (name, value) in fields {
-        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        buf.extend_from_slice(name.as_bytes());
-        encode_value(&mut buf, value);
+    buf.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
+    for col in &schema.columns {
+        buf.extend_from_slice(&(col.name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(col.name.as_bytes());
+        encode_value(&mut buf, record.get(&col.name).unwrap_or(&Value::Null));
     }
     buf
 }
