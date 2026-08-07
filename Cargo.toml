@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/clawdb-core"]
+members = ["crates/clawdb-core", "crates/clawdb-ffi", "crates/clawdb-cli"]
 
 [workspace.package]
 version = "0.0.1"

@@ -33,9 +33,9 @@ db.open("app.clawdb")
 | Phase 2 | Dialecto SQL minimo (ver [manual.md](manual.md)) | Completa |
 | Phase 2.5 | Agregados (COUNT/SUM/AVG/MIN/MAX, GROUP BY, HAVING) y tipos date/time | Completa |
 | Phase 3 | Tipo vectorial + busqueda ANN (HNSW propio, grafo persistido) | Completa |
-| Phase 4 | C ABI, bindings Python/Node, CLI, modo sidecar | Pendiente |
+| Phase 4 | C ABI, bindings Python/Node, CLI, repair, modo sidecar | Nucleo completo |
 
-Verificacion actual: 99 tests (MVCC, recovery, compaction, modelo aleatorio, suite SQL con agregados y date/time, recall vectorial vs fuerza bruta), crash injection con `kill -9` de procesos reales (incluida durante indexacion vectorial async), y fuzzing de corrupcion de archivos y del parser SQL (la base nunca entra en panico ni acepta estado invalido). Detalles en [specs.md](specs.md) y [plan.md](plan.md).
+Verificacion actual: 105 tests Rust (MVCC, recovery, compaction, salvage, modelo aleatorio, suite SQL con agregados y date/time, recall vectorial vs fuerza bruta), crash injection con `kill -9` de procesos reales, fuzzing de corrupcion y del parser SQL, mas e2e de CLI, FFI Python y sidecar Node. Detalles en [specs.md](specs.md) y [plan.md](plan.md).
 
 ## Quick installation
 
@@ -160,6 +160,65 @@ db.query(
      WHERE since >= '2026-01-01' GROUP BY age HAVING count(*) > 1 ORDER BY n DESC",
 )?;
 ```
+
+## CLI
+
+```bash
+cargo build --release -p clawdb-cli     # produce target/release/clawdb
+
+clawdb query app.clawdb "SELECT count(*) AS n FROM docs"
+clawdb repl app.clawdb                  # shell interactivo (.exit para salir)
+clawdb tables app.clawdb                # esquemas en JSON
+clawdb check app.clawdb                 # verificacion de integridad offline
+clawdb compact app.clawdb
+clawdb export app.clawdb docs > docs.jsonl
+clawdb import app.clawdb docs < docs.jsonl
+clawdb repair danada.clawdb rescatada.clawdb   # salvage, nunca silencioso
+clawdb serve app.clawdb /tmp/clawdb.sock       # modo sidecar
+```
+
+## Multi-worker: el modo sidecar
+
+Para despliegues con varios procesos (gunicorn, PHP-FPM), un solo proceso es dueno del motor y los workers se conectan por Unix socket:
+
+```bash
+clawdb serve app.clawdb /tmp/clawdb.sock
+```
+
+```python
+# cada worker de gunicorn:
+from clawdb import SidecarClient
+db = SidecarClient("/tmp/clawdb.sock")
+db.query("INSERT INTO visits (who) VALUES ('ana')")
+db.query("SELECT count(*) AS n FROM visits")
+```
+
+Demo reproducible con gunicorn real (4 workers, visitantes concurrentes leyendo y escribiendo sin bloquearse): `examples/gunicorn_demo/run_demo.sh`.
+
+## Bindings
+
+**Python** ([bindings/python/clawdb.py](bindings/python/clawdb.py)) — embebido via C ABI (ctypes libera el GIL en cada llamada: los threads paralelizan de verdad) o via sidecar:
+
+```python
+from clawdb import ClawDB
+
+with ClawDB("app.clawdb") as db:
+    db.query("CREATE TABLE notes (body text NOT NULL, emb vector(768))")
+    db.create_vector_index("notes", "emb", metric="cosine")
+    db.query("INSERT INTO notes (body, emb) VALUES ('hola', '[...]')")
+    hits = db.search_vector("notes", "emb", embedding, top_k=10, filter={"ws": "acme"})
+```
+
+**Node** ([bindings/node/clawdb.js](bindings/node/clawdb.js)) — cliente sidecar sin dependencias:
+
+```js
+const { SidecarClient } = require('./clawdb');
+const db = await SidecarClient.connect('/tmp/clawdb.sock');
+const { rows } = await db.query('SELECT * FROM notes LIMIT 10');
+const hits = await db.searchVector('notes', 'emb', embedding, { topK: 10 });
+```
+
+**C** — header en [crates/clawdb-ffi/include/clawdb.h](crates/clawdb-ffi/include/clawdb.h); `cargo build --release -p clawdb-ffi` produce `libclawdb`.
 
 ## Durabilidad
 

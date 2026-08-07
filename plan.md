@@ -185,6 +185,18 @@ Criterios de aceptacion:
 - `clawdb check` detecta las corrupciones inyectadas por la suite de crash tests.
 - Docs suficientes para onboarding sin leer el codigo.
 
+Estado (2026-08-07): nucleo de la fase completo. Entregado:
+- C ABI (`crates/clawdb-ffi`, libclawdb cdylib+staticlib, header include/clawdb.h): open/close/query(SQL)/search_vector/create_vector_index/checkpoint/compact/check/repair. Codigos de estado estables (Error::code), mensajes via clawdb_last_error thread-local, panic-safe (catch_unwind, nunca unwinding a traves de la ABI). Payloads JSON con valores etiquetados ({"$t": date|time|timestamp|blob|json|vector}) via el modulo compartido clawdb_core::jsonio.
+- CLI `clawdb` (crates/clawdb-cli): query, repl, tables, check, compact, repair, export/import JSONL con coercion por tipo de columna, serve, version. Sin dependencias de parsing de argumentos.
+- `clawdb repair`: salvage a una DB nueva desde segmentos+WAL, tolerante a corrupcion (prefijo valido por archivo), nunca silencioso — reporta recuperados/borrados/saltados con una nota por cada dano.
+- Sidecar `clawdb serve <db> <socket>`: Unix socket, protocolo JSON por linea (query, search_vector, create_vector_index, checkpoint, compact, ping), un thread por conexion sobre un Db compartido.
+- Binding Python (bindings/python/clawdb.py): ClawDB embebido sobre la C ABI via ctypes — el GIL se libera automaticamente en cada llamada foranea, cumpliendo el requisito de la fase — mas SidecarClient para multi-worker; decodifica date/time/timestamp a datetime.*, blob a bytes, y expone check()/repair().
+- Binding Node (bindings/node/clawdb.js): cliente sidecar puro JS sin dependencias, API de promesas, decodifica a Date/Buffer.
+- Demo de aceptacion cumplida: examples/gunicorn_demo/run_demo.sh — gunicorn real con 4 workers contra clawdb serve; 8 visitantes x 25 requests concurrentes: 200/200 escrituras registradas, 4 PIDs de worker distintos, wall 0.7s, peor request 41ms, cero bloqueos.
+- Verificacion: 105 tests Rust + e2e del CLI completo + smoke FFI Python (flujo con vectores y filtros) + e2e Node sidecar.
+
+Pendiente de la fase (siguiente iteracion): empaquetado y publicacion (wheel PyPI, npm), binding Node nativo napi (hoy Node va via sidecar), snapshots en la ABI (lecturas de bindings son read-committed; snapshots consistentes solo en API Rust), modo read-only automatico ante corrupcion no recuperable, y docs de onboarding dedicadas mas alla de README + manual.md.
+
 ### Phase 5: Advanced (sin estimar, priorizar al llegar)
 
 - Full-text basico y `search_hybrid`.

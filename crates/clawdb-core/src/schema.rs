@@ -81,7 +81,8 @@ impl TableSchema {
         }
     }
 
-    pub(crate) fn column(&self, name: &str) -> Option<&Column> {
+    /// Look up a column by name (the implicit `id` is not listed here).
+    pub fn column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
     }
 

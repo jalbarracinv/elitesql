@@ -50,7 +50,9 @@
 mod check;
 mod db;
 mod error;
+pub mod jsonio;
 mod manifest;
+mod repair;
 mod schema;
 mod segment;
 mod sql;
@@ -59,6 +61,7 @@ mod vector;
 mod wal;
 
 pub use check::{check, CheckReport};
+pub use repair::{salvage, SalvageReport};
 pub use db::{Db, DbOptions, Record, Snapshot, Txn};
 pub use error::{Error, Result};
 pub use schema::{Column, IndexDef, TableSchema};

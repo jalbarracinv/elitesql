@@ -1,0 +1,14 @@
+[package]
+name = "clawdb-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ClawDB stable C ABI (cdylib) for language bindings"
+
+[lib]
+name = "clawdb"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+clawdb-core = { path = "../clawdb-core" }
+serde_json = "1"
