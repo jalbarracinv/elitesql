@@ -1,0 +1,38 @@
+Metadata-Version: 2.4
+Name: elitesql
+Version: 0.0.1
+Summary: EliteSQL Python binding: embedded (ctypes over libelitesql) and sidecar client
+License: MIT OR Apache-2.0
+Keywords: database,embedded,vector-search,full-text
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+
+# elitesql (Python)
+
+Python binding for EliteSQL.
+
+- `EliteSQL(path)`: embedded in-process over the C ABI (`libelitesql`).
+  ctypes releases the GIL on every foreign call, so threads truly
+  parallelize. Requires `libelitesql` to be built
+  (`cargo build --release -p elitesql-ffi`); it is located automatically
+  inside the repo or via `ELITESQL_LIB`.
+- `SidecarClient(socket)`: client for the sidecar mode
+  (`elitesql serve <db> <socket>`) for multi-worker deployments
+  (gunicorn, uwsgi).
+
+```python
+from elitesql import EliteSQL
+
+with EliteSQL("app.esql") as db:
+    db.query("CREATE TABLE notes (body text NOT NULL, emb vector(768))")
+    db.create_text_index("notes", "body")
+    db.create_vector_index("notes", "emb", quantized=True)
+    db.query("INSERT INTO notes (body, emb) VALUES ('hello world', '[...]')")
+
+    hits = db.search_hybrid("notes", text=("body", "hello"), vector=("emb", embedding))
+    with db.snapshot() as snap:
+        rows = snap.scan("notes")   # stable read while others write
+```
+
+Wheel build: `python -m build --wheel` in this directory (requires
+`pip install build`). `libelitesql` ships separately or via `ELITESQL_LIB`.
