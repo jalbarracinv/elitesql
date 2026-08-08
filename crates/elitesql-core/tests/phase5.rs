@@ -38,10 +38,17 @@ fn bm25_ranks_relevance_sensibly() {
     let heavy = db
         .insert("docs", doc("rust rust rust database engine", "a"))
         .unwrap();
-    let light = db.insert("docs", doc("a rust mention among many other words here", "a")).unwrap();
-    db.insert("docs", doc("python snake tutorial", "a")).unwrap();
+    let light = db
+        .insert(
+            "docs",
+            doc("a rust mention among many other words here", "a"),
+        )
+        .unwrap();
+    db.insert("docs", doc("python snake tutorial", "a"))
+        .unwrap();
     for i in 0..20 {
-        db.insert("docs", doc(&format!("filler document number {i}"), "a")).unwrap();
+        db.insert("docs", doc(&format!("filler document number {i}"), "a"))
+            .unwrap();
     }
 
     let hits = db.search_text("docs", "body", "rust", 10, None).unwrap();
@@ -52,7 +59,9 @@ fn bm25_ranks_relevance_sensibly() {
 
     // Multi-term: rarer terms weigh more (idf).
     let rare = db.insert("docs", doc("zanahoria database", "a")).unwrap();
-    let hits = db.search_text("docs", "body", "zanahoria database", 5, None).unwrap();
+    let hits = db
+        .search_text("docs", "body", "zanahoria database", 5, None)
+        .unwrap();
     assert_eq!(hits[0].id, rare, "doc matching the rare term wins");
 
     // Case-insensitive, punctuation-tolerant.
@@ -60,8 +69,14 @@ fn bm25_ranks_relevance_sensibly() {
     assert_eq!(hits.len(), 2);
 
     // No matches / empty query.
-    assert!(db.search_text("docs", "body", "inexistente", 5, None).unwrap().is_empty());
-    assert!(db.search_text("docs", "body", "", 5, None).unwrap().is_empty());
+    assert!(db
+        .search_text("docs", "body", "inexistente", 5, None)
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .search_text("docs", "body", "", 5, None)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -87,19 +102,55 @@ fn text_index_tracks_updates_deletes_reopen_compaction() {
         let mut patch = Record::new();
         patch.insert("body".into(), Value::Text("loro verde".into()));
         db.update("docs", &a, patch).unwrap();
-        assert!(db.search_text("docs", "body", "gato", 5, None).unwrap().is_empty());
-        assert_eq!(db.search_text("docs", "body", "loro", 5, None).unwrap()[0].id, a);
+        assert!(db
+            .search_text("docs", "body", "gato", 5, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.search_text("docs", "body", "loro", 5, None).unwrap()[0].id,
+            a
+        );
 
         // Delete: gone from results.
         db.delete("docs", &b).unwrap();
-        assert!(db.search_text("docs", "body", "perro", 5, None).unwrap().is_empty());
+        assert!(db
+            .search_text("docs", "body", "perro", 5, None)
+            .unwrap()
+            .is_empty());
         db.compact().unwrap();
-        assert_eq!(db.search_text("docs", "body", "loro", 5, None).unwrap().len(), 1);
+        assert_eq!(
+            db.search_text("docs", "body", "loro", 5, None)
+                .unwrap()
+                .len(),
+            1
+        );
     }
     // Reopen rebuilds the inverted index from canonical data.
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.search_text("docs", "body", "loro verde", 5, None).unwrap()[0].id, a);
-    assert!(db.search_text("docs", "body", "gato", 5, None).unwrap().is_empty());
+    assert_eq!(
+        db.search_text("docs", "body", "loro verde", 5, None)
+            .unwrap()[0]
+            .id,
+        a
+    );
+    assert!(db
+        .search_text("docs", "body", "gato", 5, None)
+        .unwrap()
+        .is_empty());
+
+    // The reopened index is an mmap-backed base. Updates must hide its old
+    // postings and publish the new terms through the mutable delta.
+    let mut patch = Record::new();
+    patch.insert("body".into(), Value::Text("buho nocturno".into()));
+    db.update("docs", &a, patch).unwrap();
+    assert!(db
+        .search_text("docs", "body", "loro", 5, None)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.search_text("docs", "body", "buho", 5, None).unwrap()[0].id,
+        a
+    );
 }
 
 #[test]
@@ -110,7 +161,9 @@ fn text_filter_and_errors() {
 
     let mut filter = Record::new();
     filter.insert("ws".into(), Value::Text("beta".into()));
-    let hits = db.search_text("docs", "body", "informe", 10, Some(&filter)).unwrap();
+    let hits = db
+        .search_text("docs", "body", "informe", 10, Some(&filter))
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].record["ws"], Value::Text("beta".into()));
 
@@ -131,7 +184,8 @@ fn text_filter_and_errors() {
 #[test]
 fn hybrid_rrf_fuses_both_modalities() {
     let (_d, db) = text_db();
-    db.create_vector_index("docs", "emb", VectorIndexOptions::default()).unwrap();
+    db.create_vector_index("docs", "emb", VectorIndexOptions::default())
+        .unwrap();
 
     let mk = |body: &str, emb: [f32; 4]| {
         let mut r = doc(body, "a");
@@ -139,13 +193,23 @@ fn hybrid_rrf_fuses_both_modalities() {
         r
     };
     // both: matches text AND is near the query vector.
-    let both = db.insert("docs", mk("motor de base vectorial", [1.0, 0.0, 0.0, 0.0])).unwrap();
+    let both = db
+        .insert("docs", mk("motor de base vectorial", [1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
     // text_only: strong text match, far vector.
-    let text_only = db.insert("docs", mk("base vectorial de conocimiento", [0.0, 0.0, 0.0, 1.0])).unwrap();
+    let text_only = db
+        .insert(
+            "docs",
+            mk("base vectorial de conocimiento", [0.0, 0.0, 0.0, 1.0]),
+        )
+        .unwrap();
     // vec_only: near vector, unrelated text.
-    let vec_only = db.insert("docs", mk("receta de cocina", [0.9, 0.1, 0.0, 0.0])).unwrap();
+    let vec_only = db
+        .insert("docs", mk("receta de cocina", [0.9, 0.1, 0.0, 0.0]))
+        .unwrap();
     for i in 0..10 {
-        db.insert("docs", mk(&format!("relleno {i}"), [0.0, 1.0, 0.0, 0.0])).unwrap();
+        db.insert("docs", mk(&format!("relleno {i}"), [0.0, 1.0, 0.0, 0.0]))
+            .unwrap();
     }
 
     let q = HybridQuery {
@@ -166,8 +230,14 @@ fn hybrid_rrf_fuses_both_modalities() {
         top_k: 2,
         ..Default::default()
     };
-    assert_eq!(db.search_hybrid("docs", &only_text).unwrap()[0].id, vec_only);
-    let none = HybridQuery { top_k: 3, ..Default::default() };
+    assert_eq!(
+        db.search_hybrid("docs", &only_text).unwrap()[0].id,
+        vec_only
+    );
+    let none = HybridQuery {
+        top_k: 3,
+        ..Default::default()
+    };
     assert!(matches!(
         db.search_hybrid("docs", &none),
         Err(Error::InvalidArgument(_))
@@ -206,15 +276,15 @@ fn quantized_index_keeps_recall_and_shrinks_dump() {
     let n = 1500;
     let build = |path: &std::path::Path, quantized: bool| -> (Db, Vec<(String, Vec<f32>)>) {
         let db = Db::create(path).unwrap();
-        db.create_table(TableSchema::new(
-            "v",
-            vec![Column::vector("emb", dim)],
-        ))
-        .unwrap();
+        db.create_table(TableSchema::new("v", vec![Column::vector("emb", dim)]))
+            .unwrap();
         db.create_vector_index(
             "v",
             "emb",
-            VectorIndexOptions { quantized, ..Default::default() },
+            VectorIndexOptions {
+                quantized,
+                ..Default::default()
+            },
         )
         .unwrap();
         let mut rng = XorShift(99);
@@ -248,9 +318,15 @@ fn quantized_index_keeps_recall_and_shrinks_dump() {
         truth.sort_by(|a, b| a.1.total_cmp(&b.1));
         let truth_ids: std::collections::HashSet<&str> =
             truth[..k].iter().map(|(id, _)| *id).collect();
-        let opts = VectorSearchOptions { ef_search: Some(128), ..Default::default() };
+        let opts = VectorSearchOptions {
+            ef_search: Some(128),
+            ..Default::default()
+        };
         let found = dbq.search_vector("v", "emb", &q, k, &opts).unwrap();
-        hit += found.iter().filter(|h| truth_ids.contains(h.id.as_str())).count();
+        hit += found
+            .iter()
+            .filter(|h| truth_ids.contains(h.id.as_str()))
+            .count();
     }
     let recall = hit as f64 / (30 * k) as f64;
     assert!(recall >= 0.8, "quantized recall too low: {recall:.3}");
@@ -282,7 +358,10 @@ fn quantized_index_keeps_recall_and_shrinks_dump() {
     let hits = db
         .search_vector("v", "emb", &data[0].1, 3, &VectorSearchOptions::default())
         .unwrap();
-    assert_eq!(hits[0].id, data[0].0, "self-query finds itself after reload");
+    assert_eq!(
+        hits[0].id, data[0].0,
+        "self-query finds itself after reload"
+    );
 }
 
 // --- blob chunking ------------------------------------------------------------------
@@ -333,17 +412,26 @@ fn big_blobs_go_out_of_line_and_roundtrip() {
         Value::Blob(big.clone()),
         "byte-exact roundtrip through the chunk file"
     );
-    assert_eq!(db.get("files", &small_id).unwrap().unwrap()["data"], Value::Blob(small));
+    assert_eq!(
+        db.get("files", &small_id).unwrap().unwrap()["data"],
+        Value::Blob(small)
+    );
 
     // Survives checkpoint + reopen (reference travels through segments).
     db.checkpoint().unwrap();
     drop(db);
     let db = Db::open_with(
         dir.path().join("b.esql"),
-        DbOptions { external_blob_threshold: 64, ..DbOptions::default() },
+        DbOptions {
+            external_blob_threshold: 64,
+            ..DbOptions::default()
+        },
     )
     .unwrap();
-    assert_eq!(db.get("files", &big_id).unwrap().unwrap()["data"], Value::Blob(big));
+    assert_eq!(
+        db.get("files", &big_id).unwrap().unwrap()["data"],
+        Value::Blob(big)
+    );
     let report = check(dir.path().join("b.esql")).unwrap();
     assert!(report.is_ok(), "{:?}", report.errors);
 }
@@ -351,7 +439,8 @@ fn big_blobs_go_out_of_line_and_roundtrip() {
 #[test]
 fn blob_gc_on_compaction_and_corruption_detection() {
     let (dir, db) = blob_db(64);
-    let payload = |seed: u8| -> Vec<u8> { (0..5000).map(|i| (i as u8).wrapping_mul(seed)) .collect() };
+    let payload =
+        |seed: u8| -> Vec<u8> { (0..5000).map(|i| (i as u8).wrapping_mul(seed)).collect() };
 
     let mut ids = Vec::new();
     for i in 0..4u8 {
@@ -414,7 +503,8 @@ fn read_only_reads_and_rejects_writes() {
     {
         let db = Db::create(&path).unwrap();
         db.query("CREATE TABLE t (n int64 NOT NULL)").unwrap();
-        db.query("INSERT INTO t (id, n) VALUES ('a', 1), ('b', 2)").unwrap();
+        db.query("INSERT INTO t (id, n) VALUES ('a', 1), ('b', 2)")
+            .unwrap();
     }
     // Snapshot the on-disk bytes: read-only must not touch anything.
     let before = dir_bytes(&path);
@@ -446,7 +536,11 @@ fn read_only_reads_and_rejects_writes() {
     drop(db2);
     drop(db);
 
-    assert_eq!(before, dir_bytes(&path), "read-only left every byte untouched");
+    assert_eq!(
+        before,
+        dir_bytes(&path),
+        "read-only left every byte untouched"
+    );
     // And a writer works again after the readers are gone.
     let db = Db::open(&path).unwrap();
     db.query("INSERT INTO t (n) VALUES (3)").unwrap();
@@ -460,7 +554,8 @@ fn read_only_opens_a_corrupt_database_best_effort() {
         let db = Db::create(&path).unwrap();
         db.query("CREATE TABLE t (n int64 NOT NULL)").unwrap();
         for i in 0..30 {
-            db.query(&format!("INSERT INTO t (id, n) VALUES ('r-{i:03}', {i})")).unwrap();
+            db.query(&format!("INSERT INTO t (id, n) VALUES ('r-{i:03}', {i})"))
+                .unwrap();
         }
         db.checkpoint().unwrap();
     }
@@ -479,7 +574,10 @@ fn read_only_opens_a_corrupt_database_best_effort() {
     assert!(Db::open(&path).is_err(), "normal open refuses");
     let db = Db::open_read_only(&path).unwrap();
     let visible = db.scan("t").unwrap().len();
-    assert!(visible > 5 && visible < 30, "valid prefix visible: {visible}");
+    assert!(
+        visible > 5 && visible < 30,
+        "valid prefix visible: {visible}"
+    );
     assert!(matches!(db.checkpoint().unwrap_err(), Error::ReadOnly));
 }
 

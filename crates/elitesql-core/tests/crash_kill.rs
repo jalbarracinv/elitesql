@@ -21,7 +21,9 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use elitesql_core::{check, Column, ColumnType, Db, DbOptions, Durability, Record, TableSchema, Value};
+use elitesql_core::{
+    check, Column, ColumnType, Db, DbOptions, Durability, Record, TableSchema, Value,
+};
 
 const ENV_WORKER: &str = "ELITESQL_CRASH_WORKER_DIR";
 
@@ -58,7 +60,11 @@ fn crash_worker() {
         .ok()
         .and_then(|s| s.lines().filter_map(|l| l.trim().parse::<i64>().ok()).max())
         .unwrap_or(0);
-    let mut ack = OpenOptions::new().create(true).append(true).open(&ack_path).unwrap();
+    let mut ack = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ack_path)
+        .unwrap();
 
     loop {
         seq += 1;
@@ -121,6 +127,22 @@ fn kill9_recovers_to_last_committed_state() {
             .lines()
             .filter_map(|l| l.trim().parse().ok())
             .collect();
+
+        // A first-round kill may land between the fixture's two independent
+        // CREATE TABLE operations. That is a valid pre-workload state: no
+        // transaction has been acknowledged yet, and the next worker will
+        // finish creating the missing table.
+        let tables = db.tables();
+        if !tables.iter().any(|table| table == "left")
+            || !tables.iter().any(|table| table == "right")
+        {
+            assert!(
+                acked.is_empty(),
+                "round {round}: an acknowledged commit exists but a fixture table is missing"
+            );
+            drop(db);
+            continue;
+        }
 
         // 2. Every acknowledged commit survived.
         for seq in &acked {

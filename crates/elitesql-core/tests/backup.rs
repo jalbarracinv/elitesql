@@ -49,12 +49,18 @@ fn populated_db() -> (TempDir, Db) {
     ))
     .unwrap();
 
-    db.insert("notes", note("rust database engine", 1, [1.0, 0.0, 0.0, 0.0]))
-        .unwrap();
+    db.insert(
+        "notes",
+        note("rust database engine", 1, [1.0, 0.0, 0.0, 0.0]),
+    )
+    .unwrap();
     db.insert("notes", note("python tutorial", 2, [0.0, 1.0, 0.0, 0.0]))
         .unwrap();
-    db.insert("notes", note("rust vectors and search", 1, [0.9, 0.1, 0.0, 0.0]))
-        .unwrap();
+    db.insert(
+        "notes",
+        note("rust vectors and search", 1, [0.9, 0.1, 0.0, 0.0]),
+    )
+    .unwrap();
     let mut rec = Record::new();
     rec.insert("data".into(), Value::Blob(vec![7u8; 4096])); // out-of-line
     db.insert("files", rec).unwrap();

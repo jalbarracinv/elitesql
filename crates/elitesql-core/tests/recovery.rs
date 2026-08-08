@@ -101,8 +101,14 @@ fn torn_wal_tail_drops_whole_commit_atomically() {
     let db = Db::open(&path).unwrap();
     assert!(db.get("docs", &a1).unwrap().is_some(), "commit A intact");
     assert!(db.get("docs", &a2).unwrap().is_some(), "commit A intact");
-    assert!(db.get("docs", &b1).unwrap().is_none(), "commit B fully dropped");
-    assert!(db.get("docs", &b2).unwrap().is_none(), "commit B fully dropped");
+    assert!(
+        db.get("docs", &b1).unwrap().is_none(),
+        "commit B fully dropped"
+    );
+    assert!(
+        db.get("docs", &b2).unwrap().is_none(),
+        "commit B fully dropped"
+    );
 
     // The database keeps working after truncation.
     let c = db.insert("docs", record("after recovery", 5)).unwrap();
@@ -123,7 +129,8 @@ fn garbage_wal_tail_is_ignored() {
     }
     let wal = wal_file(&path);
     let mut f = OpenOptions::new().append(true).open(&wal).unwrap();
-    f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02]).unwrap();
+    f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02])
+        .unwrap();
 
     let db = Db::open(&path).unwrap();
     assert!(db.get("docs", &id).unwrap().is_some());
@@ -161,7 +168,10 @@ fn corrupt_manifest_falls_back_to_prev() {
     // set B's WAL was rotated away by the second checkpoint).
     let db = Db::open(&path).unwrap();
     for i in 0..5 {
-        assert!(db.get("docs", &format!("a-{i}")).unwrap().is_some(), "set A survives");
+        assert!(
+            db.get("docs", &format!("a-{i}")).unwrap().is_some(),
+            "set A survives"
+        );
     }
     assert_eq!(db.scan("docs").unwrap().len(), 5);
 

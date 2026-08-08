@@ -17,11 +17,14 @@ cargo test                              # full suite
 
 ```bash
 ESQL=target/release/elitesql
-$ESQL query app.esql "CREATE TABLE notes (body text NOT NULL, score int64, day date)"
+$ESQL query app.esql "CREATE TABLE notes (body text NOT NULL, score int, day date)"
 $ESQL query app.esql "INSERT INTO notes (body, score, day) VALUES ('hello', 10, '2026-08-07')"
 $ESQL query app.esql "SELECT body, score FROM notes WHERE day >= '2026-01-01' ORDER BY score DESC"
-$ESQL repl app.esql            # interactive shell; .exit to quit
+$ESQL app.esql                 # interactive shell; .help for shell commands
 ```
+
+Inside the shell, terminate SQL statements with `;`. Input may span multiple
+lines; semicolons inside strings or comments do not end the statement.
 
 ## Rust (embedded)
 
@@ -83,6 +86,9 @@ from elitesql import EliteSQL
 
 with EliteSQL("app.esql") as db:          # ctypes releases the GIL: real threads
     db.query("CREATE TABLE notes (body text NOT NULL, emb vector(768))")
+    db.query("INSERT INTO notes (body, emb) VALUES (%s, %s)", ["hello", emb])
+    rows = db.query("SELECT * FROM notes WHERE body = %(body)s LIMIT %(n)s",
+                    {"body": "hello", "n": 10})
     db.create_text_index("notes", "body")
     db.create_vector_index("notes", "emb")
     hits = db.search_hybrid("notes", text=("body", "hello"), vector=("emb", emb))
@@ -107,7 +113,7 @@ db.query("SELECT count(*) AS n FROM notes")
 ```js
 const { SidecarClient } = require('./bindings/node/elitesql');
 const db = await SidecarClient.connect('/tmp/elitesql.sock');
-await db.query('SELECT * FROM notes LIMIT 10');
+await db.query('SELECT * FROM notes WHERE body = %s LIMIT %s', ['hello', 10]);
 ```
 
 Reproducible demo with gunicorn and 4 workers: `examples/gunicorn_demo/run_demo.sh`.

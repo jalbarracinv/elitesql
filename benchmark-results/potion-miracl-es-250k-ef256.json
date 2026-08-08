@@ -1,0 +1,52 @@
+{
+  "model": "minishlab/potion-multilingual-128M",
+  "model_revision": "73908c3438cf03b6a01bcb9611d62b23d0726f08",
+  "model_dimension": 256,
+  "dataset": "jinaai/miracl-es",
+  "dataset_revision": "c2c5c2776af79b9d0a831a44195573a5d7213d63",
+  "corpus": "miracl/miracl-corpus",
+  "corpus_revision": "d921ec7e349ce0d28daf30b2da9da5ee698bef0d",
+  "documents": 250000,
+  "queries": 648,
+  "top_k": 10,
+  "ef_search": 256,
+  "quantized_index": false,
+  "memory": {
+    "total_memory_mib": 640,
+    "maintenance_memory_mib": 512
+  },
+  "model_load_seconds": 1.1771360409911722,
+  "embedding_seconds": {
+    "documents": 11.85248954105191,
+    "queries": 0.007342832861468196
+  },
+  "database": {
+    "path": "target/potion-miracl-es-250k.esql",
+    "database_reused": true
+  },
+  "reranking": {
+    "hit_rate": 1.0,
+    "recall": 1.0,
+    "mrr": 0.7187873554771703,
+    "ndcg": 0.7719501847676092
+  },
+  "pooled_exact": {
+    "hit_rate": 0.5972222222222222,
+    "recall": 0.28854227905153834,
+    "mrr": 0.36838256907701356,
+    "ndcg": 0.2531351609142933
+  },
+  "pooled_elitesql": {
+    "hit_rate": 0.5895061728395061,
+    "recall": 0.28558262296688225,
+    "mrr": 0.3661553252988438,
+    "ndcg": 0.2516477262136759
+  },
+  "ann_recall": 0.9788580246913569,
+  "latency_ms": {
+    "mean": 1.7209472870370368,
+    "p50": 1.708542,
+    "p95": 2.1064874,
+    "p99": 2.423436229999996
+  }
+}

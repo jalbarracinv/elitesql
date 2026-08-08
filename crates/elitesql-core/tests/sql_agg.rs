@@ -40,13 +40,24 @@ fn global_aggregates() {
     );
     assert_eq!(
         cols,
-        vec!["count(*)", "count(amount)", "sum(amount)", "avg(amount)", "min(amount)", "max(amount)"]
+        vec![
+            "count(*)",
+            "count(amount)",
+            "sum(amount)",
+            "avg(amount)",
+            "min(amount)",
+            "max(amount)"
+        ]
     );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Int64(6), "COUNT(*) counts all rows");
     assert_eq!(r[0][1], Value::Int64(5), "COUNT(col) ignores NULLs");
     assert_eq!(r[0][2], Value::Int64(775));
-    assert_eq!(r[0][3], Value::Float64(155.0), "AVG over non-null values only");
+    assert_eq!(
+        r[0][3],
+        Value::Float64(155.0),
+        "AVG over non-null values only"
+    );
     assert_eq!(r[0][4], Value::Int64(50));
     assert_eq!(r[0][5], Value::Int64(350));
 }
@@ -73,7 +84,11 @@ fn sum_promotes_to_float_when_mixed() {
     let (_, r) = rows(db.query("SELECT sum(score) FROM sales").unwrap());
     assert_eq!(r[0][0], Value::Float64(11.0));
     let (_, r) = rows(db.query("SELECT avg(score) FROM sales").unwrap());
-    assert_eq!(r[0][0], Value::Float64(2.75), "AVG ignores the two NULL scores");
+    assert_eq!(
+        r[0][0],
+        Value::Float64(2.75),
+        "AVG ignores the two NULL scores"
+    );
 }
 
 #[test]
@@ -102,16 +117,20 @@ fn group_by_multiple_columns_and_null_groups() {
     let (_d, db) = seeded();
     // NULL rep forms its own group (SQL GROUP BY semantics).
     let (_, r) = rows(
-        db.query("SELECT rep, count(*) AS n FROM sales GROUP BY rep ORDER BY n DESC, rep ASC").unwrap(),
+        db.query("SELECT rep, count(*) AS n FROM sales GROUP BY rep ORDER BY n DESC, rep ASC")
+            .unwrap(),
     );
     // ana appears twice; bob/eva/gil/NULL once each.
     assert_eq!(r.len(), 5);
     assert_eq!(r[0][0], Value::Text("ana".into()));
     assert_eq!(r[0][1], Value::Int64(2));
-    assert!(r.iter().any(|row| row[0] == Value::Null && row[1] == Value::Int64(1)));
+    assert!(r
+        .iter()
+        .any(|row| row[0] == Value::Null && row[1] == Value::Int64(1)));
 
     let (_, r) = rows(
-        db.query("SELECT region, rep, count(*) AS n FROM sales GROUP BY region, rep").unwrap(),
+        db.query("SELECT region, rep, count(*) AS n FROM sales GROUP BY region, rep")
+            .unwrap(),
     );
     assert_eq!(r.len(), 6, "every (region, rep) pair is distinct here");
 }
@@ -143,20 +162,27 @@ fn having_filters_groups() {
 
     // HAVING an aggregate that is not in the SELECT list.
     let (_, r) = rows(
-        db.query("SELECT region FROM sales GROUP BY region HAVING max(amount) = 350").unwrap(),
+        db.query("SELECT region FROM sales GROUP BY region HAVING max(amount) = 350")
+            .unwrap(),
     );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("south".into()));
 
     // Global HAVING without GROUP BY.
-    let (_, r) = rows(db.query("SELECT count(*) FROM sales HAVING count(*) > 100").unwrap());
+    let (_, r) = rows(
+        db.query("SELECT count(*) FROM sales HAVING count(*) > 100")
+            .unwrap(),
+    );
     assert!(r.is_empty());
 }
 
 #[test]
 fn group_by_without_aggregates_is_distinct_groups() {
     let (_d, db) = seeded();
-    let (_, r) = rows(db.query("SELECT region FROM sales GROUP BY region ORDER BY region").unwrap());
+    let (_, r) = rows(
+        db.query("SELECT region FROM sales GROUP BY region ORDER BY region")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][0], Value::Text("north".into()));
 }
@@ -164,7 +190,8 @@ fn group_by_without_aggregates_is_distinct_groups() {
 #[test]
 fn aggregates_compose_with_where_and_joins() {
     let (_d, db) = seeded();
-    db.query("CREATE TABLE regions (name text NOT NULL, country text)").unwrap();
+    db.query("CREATE TABLE regions (name text NOT NULL, country text)")
+        .unwrap();
     db.query(
         "INSERT INTO regions (id, name, country) VALUES \
          ('r1', 'north', 'peru'), ('r2', 'south', 'peru'), ('r3', 'west', 'chile')",
@@ -202,20 +229,30 @@ fn count_star_with_limit_offset() {
 #[test]
 fn aggregate_errors_are_clear() {
     let (_d, db) = seeded();
-    let err = |sql: &str, needle: &str| {
-        match db.query(sql) {
-            Err(Error::Sql(m)) => assert!(
-                m.to_lowercase().contains(&needle.to_lowercase()),
-                "for {sql}: got {m:?}"
-            ),
-            other => panic!("for {sql}: expected Sql error, got {other:?}"),
-        }
+    let err = |sql: &str, needle: &str| match db.query(sql) {
+        Err(Error::Sql(m)) => assert!(
+            m.to_lowercase().contains(&needle.to_lowercase()),
+            "for {sql}: got {m:?}"
+        ),
+        other => panic!("for {sql}: expected Sql error, got {other:?}"),
     };
-    err("SELECT region, count(*) FROM sales", "must appear in GROUP BY");
-    err("SELECT * FROM sales GROUP BY region", "list columns explicitly");
-    err("SELECT sum(region) FROM sales", "requires an int64 or float64");
+    err(
+        "SELECT region, count(*) FROM sales",
+        "must appear in GROUP BY",
+    );
+    err(
+        "SELECT * FROM sales GROUP BY region",
+        "list columns explicitly",
+    );
+    err(
+        "SELECT sum(region) FROM sales",
+        "requires an int64 or float64",
+    );
     err("SELECT avg(rep) FROM sales", "requires an int64 or float64");
-    err("SELECT count(*) FROM sales WHERE count(*) > 1", "SELECT list and HAVING");
+    err(
+        "SELECT count(*) FROM sales WHERE count(*) > 1",
+        "SELECT list and HAVING",
+    );
     err(
         "SELECT region FROM sales GROUP BY region HAVING rep = 'ana'",
         "is not grouped",
@@ -224,7 +261,10 @@ fn aggregate_errors_are_clear() {
         "SELECT region, count(*) FROM sales GROUP BY region ORDER BY count(*)",
         "alias",
     );
-    err("SELECT count(DISTINCT rep) FROM sales", "DISTINCT inside aggregates");
+    err(
+        "SELECT count(DISTINCT rep) FROM sales",
+        "DISTINCT inside aggregates",
+    );
     err("SELECT sum(*) FROM sales", "only COUNT accepts *");
 }
 
@@ -233,7 +273,12 @@ fn sum_overflow_is_an_error_not_a_wrap() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::create(dir.path().join("ovf.esql")).unwrap();
     db.query("CREATE TABLE t (n int64)").unwrap();
-    db.query(&format!("INSERT INTO t (n) VALUES ({}), ({})", i64::MAX, i64::MAX)).unwrap();
+    db.query(&format!(
+        "INSERT INTO t (n) VALUES ({}), ({})",
+        i64::MAX,
+        i64::MAX
+    ))
+    .unwrap();
     let err = db.query("SELECT sum(n) FROM t").unwrap_err();
     assert!(err.to_string().contains("overflow"), "{err}");
 }

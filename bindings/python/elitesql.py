@@ -21,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import datetime as _dt
 import json
+import math
 import os
 import socket
 import threading
@@ -95,6 +96,11 @@ def _configure(lib: ctypes.CDLL) -> None:
     lib.elitesql_close.argtypes = [ctypes.c_void_p]
     lib.elitesql_query.restype = ctypes.c_uint32
     lib.elitesql_query.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+    lib.elitesql_query_params.restype = ctypes.c_uint32
+    lib.elitesql_query_params.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
     lib.elitesql_search_vector.restype = ctypes.c_uint32
     lib.elitesql_search_vector.argtypes = [
         ctypes.c_void_p,
@@ -196,6 +202,76 @@ def _decode_record(record: dict) -> dict:
     return {k: _decode_value(v) for k, v in record.items()}
 
 
+def _json_native(value: Any) -> Any:
+    """Validate/normalize a value intended for an EliteSQL JSON parameter."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        if not -(2 ** 63) <= value < 2 ** 63:
+            raise OverflowError("JSON integer parameter is out of int64 range")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("JSON parameters require finite numbers")
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_native(item) for item in value]
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("JSON parameter object keys must be strings")
+        return {key: _json_native(item) for key, item in value.items()}
+    raise TypeError(f"unsupported nested JSON parameter type: {type(value).__name__}")
+
+
+def _encode_param(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        if not -(2 ** 63) <= value < 2 ** 63:
+            raise OverflowError("EliteSQL int64 parameter is out of range")
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        representation = "NaN" if math.isnan(value) else ("inf" if value > 0 else "-inf")
+        return {"$t": "float64", "repr": representation}
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"$t": "blob", "hex": bytes(value).hex()}
+    if isinstance(value, _dt.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=_dt.timezone.utc)
+        else:
+            value = value.astimezone(_dt.timezone.utc)
+        delta = value - _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+        micros = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+        return {"$t": "timestamp", "us": micros}
+    if isinstance(value, _dt.date):
+        return {"$t": "date", "days": (value - _EPOCH_DATE).days}
+    if isinstance(value, _dt.time):
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            raise TypeError("EliteSQL time parameters cannot carry a timezone")
+        micros = (
+            value.hour * 3_600_000_000
+            + value.minute * 60_000_000
+            + value.second * 1_000_000
+            + value.microsecond
+        )
+        return {"$t": "time", "us": micros}
+    if isinstance(value, (dict, list, tuple)):
+        return {"$t": "json", "v": _json_native(value)}
+    raise TypeError(f"unsupported EliteSQL parameter type: {type(value).__name__}")
+
+
+def _encode_params(params: Any) -> list[Any] | dict[str, Any]:
+    if isinstance(params, dict):
+        if not all(isinstance(key, str) for key in params):
+            raise TypeError("named SQL parameter keys must be strings")
+        return {key: _encode_param(value) for key, value in params.items()}
+    if isinstance(params, (list, tuple)):
+        return [_encode_param(value) for value in params]
+    raise TypeError("SQL params must be a sequence or mapping")
+
+
 # --- embedded (C ABI) --------------------------------------------------------
 
 
@@ -203,7 +279,8 @@ class EliteSQL:
     """Embedded EliteSQL over the C ABI. Thread-safe; use as a context manager."""
 
     def __init__(self, path: str | os.PathLike, durability: Optional[str] = None,
-                 read_only: bool = False, lib_path: Optional[str] = None):
+                 read_only: bool = False, lib_path: Optional[str] = None,
+                 memory: Optional[dict[str, Any]] = None):
         self._lib = _load_lib(lib_path)
         handle = ctypes.c_void_p()
         opts: dict[str, Any] = {}
@@ -211,6 +288,8 @@ class EliteSQL:
             opts["durability"] = durability
         if read_only:
             opts["read_only"] = True
+        if memory is not None:
+            opts["memory"] = memory
         options = json.dumps(opts) if opts else None
         status = self._lib.elitesql_open(
             str(path).encode(), options.encode() if options else None, ctypes.byref(handle)
@@ -242,14 +321,22 @@ class EliteSQL:
         return self._handle
 
     # -- operations
-    def query(self, sql: str) -> Any:
+    def query(self, sql: str, params: Any = None) -> Any:
         """Execute one SQL statement.
 
         Returns {"columns", "rows"} for SELECT (values decoded to Python
         types), {"inserted": [ids]}, {"affected": n} or {"ok": True}.
+        ``params`` is a sequence for ``?``/``%s`` placeholders or a mapping
+        for ``%(name)s`` placeholders. Values are bound, never interpolated.
         """
         out = ctypes.c_void_p()
-        status = self._lib.elitesql_query(self._h(), sql.encode(), ctypes.byref(out))
+        if params is None:
+            status = self._lib.elitesql_query(self._h(), sql.encode(), ctypes.byref(out))
+        else:
+            encoded = json.dumps(_encode_params(params), separators=(",", ":")).encode()
+            status = self._lib.elitesql_query_params(
+                self._h(), sql.encode(), encoded, ctypes.byref(out)
+            )
         _raise_if(self._lib, status)
         return _decode_result(json.loads(_take_string(self._lib, out)))
 
@@ -465,8 +552,11 @@ class SidecarClient:
     def ping(self) -> bool:
         return self._call({"op": "ping"}) == "pong"
 
-    def query(self, sql: str) -> Any:
-        return _decode_result(self._call({"op": "query", "sql": sql}))
+    def query(self, sql: str, params: Any = None) -> Any:
+        request: dict[str, Any] = {"op": "query", "sql": sql}
+        if params is not None:
+            request["params"] = _encode_params(params)
+        return _decode_result(self._call(request))
 
     def search_vector(self, table: str, column: str, vector: list[float], top_k: int = 10,
                       ef_search: Optional[int] = None, filter: Optional[dict] = None) -> list[dict]:

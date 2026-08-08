@@ -57,6 +57,55 @@ function decodeRecord(record) {
   return out;
 }
 
+function jsonNative(value) {
+  if (value === null || ['boolean', 'string'].includes(typeof value)) return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('JSON parameters require finite numbers');
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(jsonNative);
+  if (value && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, jsonNative(item)]));
+  }
+  throw new TypeError(`unsupported nested JSON parameter type: ${typeof value}`);
+}
+
+function encodeParam(value) {
+  if (value === null || ['boolean', 'string'].includes(typeof value)) return value;
+  if (typeof value === 'number') {
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new RangeError('unsafe integer SQL parameter; pass a BigInt instead');
+    }
+    if (Number.isFinite(value)) return value;
+    return { $t: 'float64', repr: Number.isNaN(value) ? 'NaN' : (value > 0 ? 'inf' : '-inf') };
+  }
+  if (typeof value === 'bigint') {
+    if (value < -(2n ** 63n) || value >= 2n ** 63n) {
+      throw new RangeError('EliteSQL int64 parameter is out of range');
+    }
+    return { $t: 'int64', v: value.toString() };
+  }
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return { $t: 'blob', hex: Buffer.from(value).toString('hex') };
+  }
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) throw new TypeError('invalid Date parameter');
+    return { $t: 'timestamp', us: value.getTime() * 1000 };
+  }
+  if (Array.isArray(value) || (value && Object.getPrototypeOf(value) === Object.prototype)) {
+    return { $t: 'json', v: jsonNative(value) };
+  }
+  throw new TypeError(`unsupported EliteSQL parameter type: ${typeof value}`);
+}
+
+function encodeParams(params) {
+  if (Array.isArray(params)) return params.map(encodeParam);
+  if (params && Object.getPrototypeOf(params) === Object.prototype) {
+    return Object.fromEntries(Object.entries(params).map(([key, value]) => [key, encodeParam(value)]));
+  }
+  throw new TypeError('SQL params must be an array or object');
+}
+
 class EliteSQLError extends Error {
   constructor(code, message) {
     super(`[elitesql:${code}] ${message}`);
@@ -110,8 +159,10 @@ class SidecarClient {
     return (await this._call({ op: 'ping' })) === 'pong';
   }
 
-  async query(sql) {
-    return decodeResult(await this._call({ op: 'query', sql }));
+  async query(sql, params) {
+    const request = { op: 'query', sql };
+    if (params !== undefined) request.params = encodeParams(params);
+    return decodeResult(await this._call(request));
   }
 
   async searchVector(table, column, vector, { topK = 10, efSearch, filter } = {}) {
@@ -164,4 +215,4 @@ class SidecarClient {
   }
 }
 
-module.exports = { SidecarClient, EliteSQLError, decodeValue };
+module.exports = { SidecarClient, EliteSQLError, decodeValue, encodeParam, encodeParams };

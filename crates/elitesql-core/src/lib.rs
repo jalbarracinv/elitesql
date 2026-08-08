@@ -50,10 +50,14 @@
 mod backup;
 mod check;
 mod db;
+mod ddl;
 mod error;
 pub mod jsonio;
 mod manifest;
+mod memory;
+mod paged;
 mod repair;
+mod run_manifest;
 mod schema;
 mod segment;
 mod sql;
@@ -64,15 +68,18 @@ mod wal;
 
 pub use backup::{restore, BackupReport, RestoreReport};
 pub use check::{check, CheckReport};
-pub use repair::{salvage, SalvageReport};
-pub use db::{Db, DbOptions, HybridHit, HybridQuery, Record, Snapshot, Txn};
-pub use text::{TextHit, TextIndexDef};
+pub use db::{
+    AutoCompactionOptions, Db, DbOptions, HybridHit, HybridQuery, MaintenanceStats, MemoryOptions,
+    QueryMemoryStats, Record, Snapshot, Txn,
+};
 pub use error::{Error, Result};
+pub use memory::GlobalMemoryStats;
+pub use repair::{salvage, SalvageReport};
 pub use schema::{Column, IndexDef, TableSchema};
-pub use sql::QueryOutput;
+pub use sql::{QueryCursor, QueryOutput};
+pub use text::{TextHit, TextIndexDef};
 pub use value::{ColumnType, Value};
 pub use vector::{
-    IndexingMode, VectorHit, VectorIndexDef, VectorIndexOptions, VectorMetric,
-    VectorSearchOptions,
+    IndexingMode, VectorHit, VectorIndexDef, VectorIndexOptions, VectorMetric, VectorSearchOptions,
 };
 pub use wal::Durability;

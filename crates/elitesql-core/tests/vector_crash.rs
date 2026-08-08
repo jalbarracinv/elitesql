@@ -10,8 +10,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use elitesql_core::{
-    check, Column, ColumnType, Db, DbOptions, Durability, IndexingMode, Record, TableSchema,
-    Value, VectorIndexOptions, VectorSearchOptions,
+    check, Column, ColumnType, Db, DbOptions, Durability, IndexingMode, Record, TableSchema, Value,
+    VectorIndexOptions, VectorSearchOptions,
 };
 
 const ENV_WORKER: &str = "ELITESQL_VECTOR_CRASH_DIR";
@@ -26,7 +26,9 @@ fn worker_opts() -> DbOptions {
 }
 
 fn seq_vector(seq: i64) -> Vec<f32> {
-    (0..DIM).map(|j| ((seq * 31 + j as i64) % 97) as f32 / 97.0).collect()
+    (0..DIM)
+        .map(|j| ((seq * 31 + j as i64) % 97) as f32 / 97.0)
+        .collect()
 }
 
 #[test]
@@ -60,7 +62,11 @@ fn vector_crash_worker() {
         .ok()
         .and_then(|s| s.lines().filter_map(|l| l.trim().parse::<i64>().ok()).max())
         .unwrap_or(0);
-    let mut ack = OpenOptions::new().create(true).append(true).open(&ack_path).unwrap();
+    let mut ack = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ack_path)
+        .unwrap();
 
     loop {
         seq += 1;
@@ -138,7 +144,10 @@ fn kill9_during_async_indexing_preserves_canonical_data() {
                     &VectorSearchOptions::default(),
                 )
                 .unwrap();
-            assert!(!hits.is_empty(), "round {round}: rebuilt index returned nothing");
+            assert!(
+                !hits.is_empty(),
+                "round {round}: rebuilt index returned nothing"
+            );
         }
         drop(db);
     }

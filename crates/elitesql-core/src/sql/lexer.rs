@@ -7,6 +7,8 @@ pub(crate) enum Tok {
     Int(i64),
     Float(f64),
     Blob(Vec<u8>),
+    PositionalParam,
+    NamedParam(String),
     LParen,
     RParen,
     Comma,
@@ -53,53 +55,132 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Lexed>> {
                     i += 1;
                 }
             }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                if i + 1 >= b.len() {
+                    return Err(err(start, "unterminated block comment"));
+                }
+                i += 2;
+            }
             b'(' => {
-                out.push(Lexed { tok: Tok::LParen, pos: start });
+                out.push(Lexed {
+                    tok: Tok::LParen,
+                    pos: start,
+                });
                 i += 1;
             }
             b')' => {
-                out.push(Lexed { tok: Tok::RParen, pos: start });
+                out.push(Lexed {
+                    tok: Tok::RParen,
+                    pos: start,
+                });
                 i += 1;
             }
             b',' => {
-                out.push(Lexed { tok: Tok::Comma, pos: start });
+                out.push(Lexed {
+                    tok: Tok::Comma,
+                    pos: start,
+                });
                 i += 1;
             }
             b'.' => {
-                out.push(Lexed { tok: Tok::Dot, pos: start });
+                out.push(Lexed {
+                    tok: Tok::Dot,
+                    pos: start,
+                });
                 i += 1;
             }
             b'*' => {
-                out.push(Lexed { tok: Tok::Star, pos: start });
+                out.push(Lexed {
+                    tok: Tok::Star,
+                    pos: start,
+                });
                 i += 1;
             }
             b';' => {
-                out.push(Lexed { tok: Tok::Semi, pos: start });
+                out.push(Lexed {
+                    tok: Tok::Semi,
+                    pos: start,
+                });
                 i += 1;
             }
             b'+' => {
-                out.push(Lexed { tok: Tok::Plus, pos: start });
+                out.push(Lexed {
+                    tok: Tok::Plus,
+                    pos: start,
+                });
                 i += 1;
             }
             b'-' => {
-                out.push(Lexed { tok: Tok::Minus, pos: start });
+                out.push(Lexed {
+                    tok: Tok::Minus,
+                    pos: start,
+                });
                 i += 1;
             }
             b'/' => {
-                out.push(Lexed { tok: Tok::Slash, pos: start });
+                out.push(Lexed {
+                    tok: Tok::Slash,
+                    pos: start,
+                });
                 i += 1;
             }
             b'%' => {
-                out.push(Lexed { tok: Tok::Percent, pos: start });
+                if i + 1 < b.len() && b[i + 1] == b's' {
+                    out.push(Lexed {
+                        tok: Tok::PositionalParam,
+                        pos: start,
+                    });
+                    i += 2;
+                } else if i + 2 < b.len() && b[i + 1] == b'(' {
+                    let mut end = i + 2;
+                    if end >= b.len() || !(b[end].is_ascii_alphabetic() || b[end] == b'_') {
+                        return Err(err(start, "invalid named parameter"));
+                    }
+                    end += 1;
+                    while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                        end += 1;
+                    }
+                    if end + 1 >= b.len() || b[end] != b')' || b[end + 1] != b's' {
+                        return Err(err(start, "named parameter must use %(name)s syntax"));
+                    }
+                    let name = std::str::from_utf8(&b[i + 2..end]).expect("ascii parameter");
+                    out.push(Lexed {
+                        tok: Tok::NamedParam(name.to_owned()),
+                        pos: start,
+                    });
+                    i = end + 2;
+                } else {
+                    out.push(Lexed {
+                        tok: Tok::Percent,
+                        pos: start,
+                    });
+                    i += 1;
+                }
+            }
+            b'?' => {
+                out.push(Lexed {
+                    tok: Tok::PositionalParam,
+                    pos: start,
+                });
                 i += 1;
             }
             b'=' => {
-                out.push(Lexed { tok: Tok::Eq, pos: start });
+                out.push(Lexed {
+                    tok: Tok::Eq,
+                    pos: start,
+                });
                 i += 1;
             }
             b'!' => {
                 if i + 1 < b.len() && b[i + 1] == b'=' {
-                    out.push(Lexed { tok: Tok::Neq, pos: start });
+                    out.push(Lexed {
+                        tok: Tok::Neq,
+                        pos: start,
+                    });
                     i += 2;
                 } else {
                     return Err(err(start, "unexpected '!'"));
@@ -107,33 +188,54 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Lexed>> {
             }
             b'<' => {
                 if i + 1 < b.len() && b[i + 1] == b'=' {
-                    out.push(Lexed { tok: Tok::Le, pos: start });
+                    out.push(Lexed {
+                        tok: Tok::Le,
+                        pos: start,
+                    });
                     i += 2;
                 } else if i + 1 < b.len() && b[i + 1] == b'>' {
-                    out.push(Lexed { tok: Tok::Neq, pos: start });
+                    out.push(Lexed {
+                        tok: Tok::Neq,
+                        pos: start,
+                    });
                     i += 2;
                 } else {
-                    out.push(Lexed { tok: Tok::Lt, pos: start });
+                    out.push(Lexed {
+                        tok: Tok::Lt,
+                        pos: start,
+                    });
                     i += 1;
                 }
             }
             b'>' => {
                 if i + 1 < b.len() && b[i + 1] == b'=' {
-                    out.push(Lexed { tok: Tok::Ge, pos: start });
+                    out.push(Lexed {
+                        tok: Tok::Ge,
+                        pos: start,
+                    });
                     i += 2;
                 } else {
-                    out.push(Lexed { tok: Tok::Gt, pos: start });
+                    out.push(Lexed {
+                        tok: Tok::Gt,
+                        pos: start,
+                    });
                     i += 1;
                 }
             }
             b'\'' => {
                 let (s, next) = lex_string(b, i)?;
-                out.push(Lexed { tok: Tok::Str(s), pos: start });
+                out.push(Lexed {
+                    tok: Tok::Str(s),
+                    pos: start,
+                });
                 i = next;
             }
             b'x' | b'X' if i + 1 < b.len() && b[i + 1] == b'\'' => {
                 let (bytes, next) = lex_hex_blob(b, i)?;
-                out.push(Lexed { tok: Tok::Blob(bytes), pos: start });
+                out.push(Lexed {
+                    tok: Tok::Blob(bytes),
+                    pos: start,
+                });
                 i = next;
             }
             b'0'..=b'9' => {
@@ -147,7 +249,10 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Lexed>> {
                     j += 1;
                 }
                 let word = std::str::from_utf8(&b[i..j]).expect("ascii ident");
-                out.push(Lexed { tok: Tok::Ident(word.to_owned()), pos: start });
+                out.push(Lexed {
+                    tok: Tok::Ident(word.to_owned()),
+                    pos: start,
+                });
                 i = j;
             }
             _ => {
@@ -197,12 +302,17 @@ fn lex_hex_blob(b: &[u8], start: usize) -> Result<(Vec<u8>, usize)> {
     }
     let hex = &b[hex_start..i];
     if !hex.len().is_multiple_of(2) {
-        return Err(err(start, "blob literal needs an even number of hex digits"));
+        return Err(err(
+            start,
+            "blob literal needs an even number of hex digits",
+        ));
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for pair in hex.chunks(2) {
-        let hi = hex_digit(pair[0]).ok_or_else(|| err(start, "invalid hex digit in blob literal"))?;
-        let lo = hex_digit(pair[1]).ok_or_else(|| err(start, "invalid hex digit in blob literal"))?;
+        let hi =
+            hex_digit(pair[0]).ok_or_else(|| err(start, "invalid hex digit in blob literal"))?;
+        let lo =
+            hex_digit(pair[1]).ok_or_else(|| err(start, "invalid hex digit in blob literal"))?;
         bytes.push(hi << 4 | lo);
     }
     Ok((bytes, i + 1))

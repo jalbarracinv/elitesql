@@ -32,17 +32,24 @@ pub(crate) fn segment_file_name(id: u32) -> String {
     format!("{id:06}.seg")
 }
 
-/// Encode a full entry. Returns the bytes and the offset of the payload
-/// relative to the start of the entry.
-pub(crate) fn encode_entry(
+/// Encode an entry into reusable storage. Checkpoint and compaction call this
+/// to avoid one heap allocation for every persisted record. Returns the
+/// offset of the payload relative to the start of the entry.
+pub(crate) fn encode_entry_into(
+    buf: &mut Vec<u8>,
     version: u64,
     table: &str,
     id: &str,
     payload: Option<&[u8]>,
-) -> (Vec<u8>, u64) {
-    let kind = if payload.is_some() { KIND_PUT } else { KIND_TOMBSTONE };
+) -> u64 {
+    let kind = if payload.is_some() {
+        KIND_PUT
+    } else {
+        KIND_TOMBSTONE
+    };
     let payload = payload.unwrap_or(&[]);
-    let mut buf = Vec::with_capacity(1 + 8 + 2 + table.len() + 2 + id.len() + 4 + payload.len() + 4);
+    buf.clear();
+    buf.reserve(1 + 8 + 2 + table.len() + 2 + id.len() + 4 + payload.len() + 4);
     buf.push(kind);
     buf.extend_from_slice(&version.to_le_bytes());
     buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
@@ -52,9 +59,9 @@ pub(crate) fn encode_entry(
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     let payload_offset = buf.len() as u64;
     buf.extend_from_slice(payload);
-    let crc = crc32fast::hash(&buf);
+    let crc = crc32fast::hash(buf);
     buf.extend_from_slice(&crc.to_le_bytes());
-    (buf, payload_offset)
+    payload_offset
 }
 
 pub(crate) struct ScanOutcome {
@@ -86,6 +93,90 @@ pub(crate) fn scan_segment(data: &[u8], out: &mut Vec<EntryRef>) -> ScanOutcome 
             }
         }
     }
+}
+
+/// Scan a segment while handing each entry to a visitor immediately. Unlike
+/// [`scan_segment`], this keeps memory independent of the number of records in
+/// the segment and is used by recovery/index rebuild paths.
+pub(crate) fn visit_segment(
+    data: &[u8],
+    mut visit: impl FnMut(EntryRef) -> Result<()>,
+) -> Result<ScanOutcome> {
+    let mut pos = 0usize;
+    loop {
+        let entry_start = pos;
+        if pos >= data.len() {
+            return Ok(ScanOutcome {
+                valid_len: entry_start as u64,
+                clean: true,
+            });
+        }
+        match parse_entry(data, &mut pos, entry_start as u64) {
+            Ok(entry) => visit(entry)?,
+            Err(_) => {
+                return Ok(ScanOutcome {
+                    valid_len: entry_start as u64,
+                    clean: false,
+                })
+            }
+        }
+    }
+}
+
+/// Validate framing and CRCs without allocating table/id strings. Used when
+/// a current mmap primary directory already supplies every entry location.
+pub(crate) fn validate_segment(data: &[u8]) -> ScanOutcome {
+    let mut pos = 0usize;
+    loop {
+        let entry_start = pos;
+        if pos >= data.len() {
+            return ScanOutcome {
+                valid_len: entry_start as u64,
+                clean: true,
+            };
+        }
+        if validate_entry(data, &mut pos, entry_start).is_err() {
+            return ScanOutcome {
+                valid_len: entry_start as u64,
+                clean: false,
+            };
+        }
+    }
+}
+
+fn validate_entry(data: &[u8], pos: &mut usize, entry_start: usize) -> Result<()> {
+    let kind = read_u8(data, pos)?;
+    if kind != KIND_PUT && kind != KIND_TOMBSTONE {
+        return Err(Error::Corrupt(format!("unknown entry kind {kind}")));
+    }
+    read_u64(data, pos)?;
+    validate_short_str(data, pos)?;
+    validate_short_str(data, pos)?;
+    let payload_len = read_u32(data, pos)? as usize;
+    let payload_end = pos
+        .checked_add(payload_len)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| Error::Corrupt("truncated payload".into()))?;
+    *pos = payload_end;
+    let stored_crc = read_u32(data, pos)?;
+    if stored_crc != crc32fast::hash(&data[entry_start..payload_end]) {
+        return Err(Error::Corrupt("entry crc mismatch".into()));
+    }
+    if kind == KIND_TOMBSTONE && payload_len != 0 {
+        return Err(Error::Corrupt("tombstone with payload".into()));
+    }
+    Ok(())
+}
+
+fn validate_short_str(data: &[u8], pos: &mut usize) -> Result<()> {
+    let len = read_u16(data, pos)? as usize;
+    let end = pos
+        .checked_add(len)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| Error::Corrupt("unexpected end of data".into()))?;
+    std::str::from_utf8(&data[*pos..end]).map_err(|_| Error::Corrupt("invalid utf8".into()))?;
+    *pos = end;
+    Ok(())
 }
 
 fn parse_entry(data: &[u8], pos: &mut usize, entry_start: u64) -> Result<EntryRef> {

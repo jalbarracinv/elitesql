@@ -84,7 +84,10 @@ fn compaction_preserves_live_snapshot_versions() {
     drop(snap_v2);
     db.compact().unwrap();
     for id in &ids {
-        assert_eq!(db.get("docs", id).unwrap().unwrap()["score"], Value::Int64(3));
+        assert_eq!(
+            db.get("docs", id).unwrap().unwrap()["score"],
+            Value::Int64(3)
+        );
     }
     drop(db);
     // Everything still consistent after reopen.
@@ -130,7 +133,10 @@ fn compaction_purges_deleted_records_and_shrinks_disk() {
 
     assert_eq!(db.scan("docs").unwrap().len(), 100);
     for id in ids.iter().take(100) {
-        assert!(db.get("docs", id).unwrap().is_none(), "deleted stays deleted");
+        assert!(
+            db.get("docs", id).unwrap().is_none(),
+            "deleted stays deleted"
+        );
     }
     drop(db);
     let db = Db::open(&path).unwrap();
@@ -171,8 +177,45 @@ fn secondary_index_correct_after_compaction() {
         db.insert("docs", record(&format!("d{i}"), i % 3)).unwrap();
     }
     db.compact().unwrap();
-    assert_eq!(db.find_eq("docs", "score", &Value::Int64(1)).unwrap().len(), 10);
+    assert_eq!(
+        db.find_eq("docs", "score", &Value::Int64(1)).unwrap().len(),
+        10
+    );
     drop(db);
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.find_eq("docs", "score", &Value::Int64(1)).unwrap().len(), 10);
+    assert_eq!(
+        db.find_eq("docs", "score", &Value::Int64(1)).unwrap().len(),
+        10
+    );
+}
+
+#[test]
+fn stale_primary_dump_from_before_compaction_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("primary-generation.esql");
+    let expected_ids;
+    let stale_dump;
+    {
+        let db = Db::create(&path).unwrap();
+        db.create_table(schema()).unwrap();
+        let mut ids = Vec::new();
+        for score in 0..40 {
+            ids.push(db.insert("docs", record("generation", score)).unwrap());
+        }
+        db.checkpoint().unwrap();
+        stale_dump = std::fs::read(path.join("indexes/primary.pidx")).unwrap();
+        db.compact().unwrap();
+        expected_ids = ids;
+    }
+
+    // Simulate a crash window where the new manifest landed but an older
+    // same-commit-version primary directory remained. Its segment generation
+    // differs, so open must rebuild rather than follow stale offsets.
+    std::fs::write(path.join("indexes/primary.pidx"), stale_dump).unwrap();
+    let db = Db::open(&path).unwrap();
+    let rows = db.scan("docs").unwrap();
+    assert_eq!(rows.len(), expected_ids.len());
+    for id in expected_ids {
+        assert!(db.get("docs", &id).unwrap().is_some());
+    }
 }

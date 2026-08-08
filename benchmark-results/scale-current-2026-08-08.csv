@@ -1,0 +1,6 @@
+profile,rows,engine,load_mode,ingest_wall_seconds,final_checkpoint_seconds,maintenance_drain_seconds,total_load_seconds,rows_per_second,point_read_us,full_scan_seconds,disk_mib,logical_total_mib,query_peak_mib,index_delta_peak_mib,maintenance_peak_mib,max_rss_bytes,peak_footprint_bytes
+paired-transactional,10000000,EliteSQL,transactions,23.480,0.096,2.408,25.984,384850,26.202,0.926,2248.85,128,16.00,22.81,32.00,,
+paired-transactional,10000000,SQLite,transactions,11.555,2.898,0.000,14.454,691870,62.205,1.061,1520.11,,,,,,
+paired-bulk,10000000,EliteSQL,sorted-bulk,9.968,0.000,0.000,9.968,1003181,12.584,0.692,2248.84,128,16.00,0.00,32.00,,
+paired-bulk,10000000,SQLite,transactions,11.549,2.273,0.000,13.822,723498,64.928,1.085,1520.11,,,,,,
+isolated-memory,10000000,EliteSQL,transactions,24.199,0.071,1.042,25.312,395074,5.966,1.932,2044.07,128,16.00,22.81,32.00,922189824,68747672

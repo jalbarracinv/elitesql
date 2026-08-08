@@ -41,10 +41,23 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
     })?;
 
     // Latest version per (table, id): version -> payload (None = tombstone).
+    // Entries the catalog does not own are skipped, exactly as `open` skips
+    // them: a table that was dropped, or a record written by an earlier table
+    // of a name that has since been re-created. Segments keep those bytes until
+    // a compaction, and salvage must not resurrect them.
     type Versions = BTreeMap<u64, Option<Vec<u8>>>;
     let mut latest: BTreeMap<(String, String), Versions> = BTreeMap::new();
-    let mut push = |table: String, id: String, version: u64, payload: Option<Vec<u8>>| {
-        latest.entry((table, id)).or_default().insert(version, payload);
+    let mut ignored: BTreeMap<String, u64> = BTreeMap::new();
+    let mut push = |table: String, id: String, version: u64, payload: Option<Vec<u8>>| match catalog
+        .table(&table)
+    {
+        Some(schema) if version > schema.epoch => {
+            latest
+                .entry((table, id))
+                .or_default()
+                .insert(version, payload);
+        }
+        _ => *ignored.entry(table).or_default() += 1,
     };
 
     // Segments: valid prefix of every file, in id order.
@@ -52,7 +65,9 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
     seg_files.sort();
     for path in &seg_files {
         let Ok(data) = fs::read(path) else {
-            report.notes.push(format!("unreadable segment {}", path.display()));
+            report
+                .notes
+                .push(format!("unreadable segment {}", path.display()));
             continue;
         };
         let mut entries = Vec::new();
@@ -69,7 +84,11 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
             let payload = if e.tombstone {
                 None
             } else {
-                Some(data[e.payload_offset as usize..(e.payload_offset + e.payload_len as u64) as usize].to_vec())
+                Some(
+                    data[e.payload_offset as usize
+                        ..(e.payload_offset + e.payload_len as u64) as usize]
+                        .to_vec(),
+                )
             };
             push(e.table, e.id, e.version, payload);
         }
@@ -81,7 +100,9 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
     wal_files.sort();
     for path in &wal_files {
         let Ok(data) = fs::read(path) else {
-            report.notes.push(format!("unreadable wal {}", path.display()));
+            report
+                .notes
+                .push(format!("unreadable wal {}", path.display()));
             continue;
         };
         let scan = scan_wal(&data);
@@ -100,6 +121,14 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
         report.wal_files_scanned += 1;
     }
 
+    for (table, count) in &ignored {
+        report.notes.push(format!(
+            "{count} entr{} for '{table}' skipped: not owned by the catalog (dropped table, or \
+             written before the current one of that name)",
+            if *count == 1 { "y" } else { "ies" }
+        ));
+    }
+
     // Rebuild into a fresh database with the same schema (indexes included).
     if dst.exists() {
         return Err(Error::InvalidArgument(format!(
@@ -116,7 +145,9 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
     let mut txn = out.begin();
     let mut in_batch = 0usize;
     for ((table, id), versions) in latest {
-        let Some((_, payload)) = versions.iter().next_back() else { continue };
+        let Some((_, payload)) = versions.iter().next_back() else {
+            continue;
+        };
         let Some(payload) = payload else {
             report.deleted_records += 1;
             continue;
@@ -125,7 +156,9 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
             Ok(r) => r,
             Err(e) => {
                 report.skipped += 1;
-                report.notes.push(format!("{table}/{id}: undecodable payload ({e})"));
+                report
+                    .notes
+                    .push(format!("{table}/{id}: undecodable payload ({e})"));
                 continue;
             }
         };
@@ -137,7 +170,9 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
             }
             Err(e) => {
                 report.skipped += 1;
-                report.notes.push(format!("{table}/{id}: not re-inserted ({e})"));
+                report
+                    .notes
+                    .push(format!("{table}/{id}: not re-inserted ({e})"));
             }
         }
         if in_batch >= 1000 {
@@ -152,7 +187,9 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
 }
 
 fn list_numbered(dir: &Path, suffix: &str) -> Vec<std::path::PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
     entries
         .flatten()
         .map(|e| e.path())

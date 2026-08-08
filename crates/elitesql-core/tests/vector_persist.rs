@@ -79,18 +79,27 @@ fn clean_close_dumps_and_open_loads_identically() {
     {
         let db = Db::create(&path).unwrap();
         db.create_table(schema()).unwrap();
-        db.create_vector_index("docs", "embedding", VectorIndexOptions::default()).unwrap();
+        db.create_vector_index("docs", "embedding", VectorIndexOptions::default())
+            .unwrap();
         for i in 0..400 {
-            db.insert("docs", doc(&format!("d{i}"), rng.vec(DIM))).unwrap();
+            db.insert("docs", doc(&format!("d{i}"), rng.vec(DIM)))
+                .unwrap();
         }
         expected = search_ids(&db, &q, 10);
     } // drop dumps the graph
 
     let dump = vidx_file(&path);
-    assert!(std::fs::metadata(&dump).unwrap().len() > 0, "dump written on close");
+    assert!(
+        std::fs::metadata(&dump).unwrap().len() > 0,
+        "dump written on close"
+    );
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(search_ids(&db, &q, 10), expected, "loaded graph answers identically");
+    assert_eq!(
+        search_ids(&db, &q, 10),
+        expected,
+        "loaded graph answers identically"
+    );
 }
 
 #[test]
@@ -105,9 +114,13 @@ fn stale_dump_catches_up_with_newer_commits() {
     {
         let db = Db::create(&path).unwrap();
         db.create_table(schema()).unwrap();
-        db.create_vector_index("docs", "embedding", VectorIndexOptions::default()).unwrap();
+        db.create_vector_index("docs", "embedding", VectorIndexOptions::default())
+            .unwrap();
         for i in 0..100 {
-            ids.push(db.insert("docs", doc(&format!("old {i}"), rng.vec(DIM))).unwrap());
+            ids.push(
+                db.insert("docs", doc(&format!("old {i}"), rng.vec(DIM)))
+                    .unwrap(),
+            );
         }
     }
     // Save the V1 dump aside.
@@ -123,7 +136,10 @@ fn stale_dump_catches_up_with_newer_commits() {
             db.delete("docs", id).unwrap();
         }
         let mut patch = Record::new();
-        patch.insert("embedding".into(), Value::Vector(near.iter().map(|x| x * 0.9).collect()));
+        patch.insert(
+            "embedding".into(),
+            Value::Vector(near.iter().map(|x| x * 0.9).collect()),
+        );
         db.update("docs", &ids[40], patch).unwrap();
     }
     // Restore the STALE dump: simulates a crash after those commits (WAL
@@ -132,12 +148,21 @@ fn stale_dump_catches_up_with_newer_commits() {
 
     let db = Db::open(&path).unwrap();
     let top = search_ids(&db, &near, 2);
-    assert_eq!(top[0], winner, "record committed after the dump is searchable");
-    assert_eq!(top[1], ids[40], "update committed after the dump is reflected");
+    assert_eq!(
+        top[0], winner,
+        "record committed after the dump is searchable"
+    );
+    assert_eq!(
+        top[1], ids[40],
+        "update committed after the dump is reflected"
+    );
     // Deletions after the dump never resurface.
     let all = search_ids(&db, &rng.vec(DIM), 71);
     let deleted: std::collections::HashSet<&String> = ids.iter().take(30).collect();
-    assert!(all.iter().all(|id| !deleted.contains(id)), "deleted doc resurfaced from stale dump");
+    assert!(
+        all.iter().all(|id| !deleted.contains(id)),
+        "deleted doc resurfaced from stale dump"
+    );
     // 100 - 30 deleted + 1 winner = 71 live docs.
     assert_eq!(db.scan("docs").unwrap().len(), 71);
 }
@@ -152,9 +177,11 @@ fn corrupt_dump_falls_back_to_rebuild() {
     {
         let db = Db::create(&path).unwrap();
         db.create_table(schema()).unwrap();
-        db.create_vector_index("docs", "embedding", VectorIndexOptions::default()).unwrap();
+        db.create_vector_index("docs", "embedding", VectorIndexOptions::default())
+            .unwrap();
         for i in 0..200 {
-            db.insert("docs", doc(&format!("d{i}"), rng.vec(DIM))).unwrap();
+            db.insert("docs", doc(&format!("d{i}"), rng.vec(DIM)))
+                .unwrap();
         }
         expected = search_ids(&db, &q, 10);
     }
@@ -166,7 +193,11 @@ fn corrupt_dump_falls_back_to_rebuild() {
     std::fs::write(&dump_path, &bytes).unwrap();
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(search_ids(&db, &q, 10), expected, "rebuild produces correct results");
+    assert_eq!(
+        search_ids(&db, &q, 10),
+        expected,
+        "rebuild produces correct results"
+    );
     // And truncated garbage doesn't panic either.
     drop(db);
     std::fs::write(&dump_path, b"ESQLVIDXgarbage").unwrap();
@@ -182,10 +213,14 @@ fn compaction_refreshes_the_dump() {
     {
         let db = Db::create(&path).unwrap();
         db.create_table(schema()).unwrap();
-        db.create_vector_index("docs", "embedding", VectorIndexOptions::default()).unwrap();
+        db.create_vector_index("docs", "embedding", VectorIndexOptions::default())
+            .unwrap();
         let mut ids = Vec::new();
         for i in 0..100 {
-            ids.push(db.insert("docs", doc(&format!("d{i}"), rng.vec(DIM))).unwrap());
+            ids.push(
+                db.insert("docs", doc(&format!("d{i}"), rng.vec(DIM)))
+                    .unwrap(),
+            );
         }
         for id in ids.iter().take(50) {
             db.delete("docs", id).unwrap();
@@ -198,7 +233,10 @@ fn compaction_refreshes_the_dump() {
         let after = std::fs::metadata(vidx_file(&path)).unwrap().len();
         assert!(after > 0);
         if before > 0 {
-            assert!(after < before, "compacted dump should shrink: {before} -> {after}");
+            assert!(
+                after < before,
+                "compacted dump should shrink: {before} -> {after}"
+            );
         }
     }
     let db = Db::open(&path).unwrap();

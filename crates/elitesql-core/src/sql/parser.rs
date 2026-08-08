@@ -12,10 +12,53 @@ const MAX_EXPR_DEPTH: u32 = 64;
 
 /// Reserved words that can never be a table alias.
 const RESERVED: &[&str] = &[
-    "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "ON",
-    "AND", "OR", "NOT", "ORDER", "BY", "LIMIT", "OFFSET", "GROUP", "HAVING", "UNION", "AS", "IN",
-    "IS", "NULL", "VALUES", "INSERT", "INTO", "UPDATE", "SET", "DELETE", "CREATE", "TABLE",
-    "INDEX", "UNIQUE", "TRUE", "FALSE", "ASC", "DESC", "EXCEPT", "INTERSECT",
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "OUTER",
+    "CROSS",
+    "ON",
+    "AND",
+    "OR",
+    "NOT",
+    "ORDER",
+    "BY",
+    "LIMIT",
+    "OFFSET",
+    "GROUP",
+    "HAVING",
+    "UNION",
+    "AS",
+    "IN",
+    "IS",
+    "NULL",
+    "VALUES",
+    "INSERT",
+    "INTO",
+    "UPDATE",
+    "SET",
+    "DELETE",
+    "CREATE",
+    "TABLE",
+    "INDEX",
+    "UNIQUE",
+    "TRUE",
+    "FALSE",
+    "ASC",
+    "DESC",
+    "EXCEPT",
+    "INTERSECT",
+    "DROP",
+    "ALTER",
+    "ADD",
+    "RENAME",
+    "COLUMN",
+    "DEFAULT",
 ];
 
 pub(crate) fn parse(sql: &str) -> Result<Statement> {
@@ -102,7 +145,9 @@ impl Parser {
 
     fn ident(&mut self, what: &str) -> Result<String> {
         match self.next() {
-            Some(Lexed { tok: Tok::Ident(w), .. }) => Ok(w),
+            Some(Lexed {
+                tok: Tok::Ident(w), ..
+            }) => Ok(w),
             _ => {
                 self.pos = self.pos.saturating_sub(1);
                 Err(self.err_at(&format!("expected {what}")))
@@ -128,21 +173,149 @@ impl Parser {
         if self.eat_kw("CREATE") {
             return self.parse_create();
         }
+        if self.eat_kw("DROP") {
+            return self.parse_drop();
+        }
+        if self.eat_kw("ALTER") {
+            return self.parse_alter();
+        }
         for (kw, msg) in [
             ("WITH", "CTEs (WITH) are not supported in V1"),
-            ("DROP", "DROP is not supported in V1"),
-            ("ALTER", "ALTER is not supported in V1"),
             ("EXPLAIN", "EXPLAIN is not supported in V1"),
-            ("BEGIN", "SQL transactions are not supported in V1; use the Txn API"),
-            ("COMMIT", "SQL transactions are not supported in V1; use the Txn API"),
-            ("ROLLBACK", "SQL transactions are not supported in V1; use the Txn API"),
+            (
+                "BEGIN",
+                "SQL transactions are not supported in V1; use the Txn API",
+            ),
+            (
+                "COMMIT",
+                "SQL transactions are not supported in V1; use the Txn API",
+            ),
+            (
+                "ROLLBACK",
+                "SQL transactions are not supported in V1; use the Txn API",
+            ),
             ("PRAGMA", "PRAGMA is not supported"),
         ] {
             if self.is_kw(kw) {
                 return Err(self.err_at(msg));
             }
         }
-        Err(self.err_at("expected SELECT, INSERT, UPDATE, DELETE or CREATE"))
+        Err(self.err_at("expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP or ALTER"))
+    }
+
+    // --- DROP ----------------------------------------------------------------
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        if self.eat_kw("TABLE") {
+            let if_exists = self.parse_if_exists()?;
+            let name = self.ident("table name")?;
+            if self.eat_kw("CASCADE") || self.eat_kw("RESTRICT") {
+                return Err(self.err_at(
+                    "CASCADE/RESTRICT are not supported; there are no foreign keys in V1",
+                ));
+            }
+            return Ok(Statement::DropTable { name, if_exists });
+        }
+        if self.eat_kw("INDEX") {
+            let if_exists = self.parse_if_exists()?;
+            // Index names are not stored (CREATE INDEX accepts and derives
+            // them), so an index is identified the same way it is created.
+            if !self.eat_kw("ON") {
+                let _name = self.ident("index name or ON")?;
+                if !self.eat_kw("ON") {
+                    return Err(self.err_at(
+                        "indexes are identified by their column: DROP INDEX ON table (column)",
+                    ));
+                }
+            }
+            let table = self.ident("table name")?;
+            self.expect(&Tok::LParen, "'(' — DROP INDEX ON table (column)")?;
+            let column = self.ident("column name")?;
+            if self.eat(&Tok::Comma) {
+                return Err(self.err_at("multi-column indexes are not supported in V1"));
+            }
+            self.expect(&Tok::RParen, "')'")?;
+            return Ok(Statement::DropIndex {
+                table,
+                column,
+                if_exists,
+            });
+        }
+        for (kw, msg) in [
+            (
+                "DATABASE",
+                "there is no DROP DATABASE: delete the database directory",
+            ),
+            ("SCHEMA", "there are no schemas in V1"),
+            ("VIEW", "views are not supported in V1"),
+            ("TRIGGER", "triggers are not supported in V1"),
+        ] {
+            if self.is_kw(kw) {
+                return Err(self.err_at(msg));
+            }
+        }
+        Err(self.err_at("expected TABLE or INDEX after DROP"))
+    }
+
+    fn parse_if_exists(&mut self) -> Result<bool> {
+        if self.eat_kw("IF") {
+            self.expect_kw("EXISTS")?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    // --- ALTER ---------------------------------------------------------------
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        if self.is_kw("INDEX") || self.is_kw("VIEW") || self.is_kw("DATABASE") {
+            return Err(self.err_at("only ALTER TABLE is supported"));
+        }
+        self.expect_kw("TABLE")?;
+        let table = self.ident("table name")?;
+
+        if self.eat_kw("RENAME") {
+            if self.eat_kw("TO") {
+                let to = self.ident("new table name")?;
+                return Ok(Statement::RenameTable { table, to });
+            }
+            self.eat_kw("COLUMN"); // optional
+            let column = self.ident("column name")?;
+            self.expect_kw("TO")?;
+            let to = self.ident("new column name")?;
+            return Ok(Statement::RenameColumn { table, column, to });
+        }
+
+        if self.eat_kw("ADD") {
+            if self.is_kw("CONSTRAINT") || self.is_kw("PRIMARY") || self.is_kw("FOREIGN") {
+                return Err(self.err_at("table constraints are not supported in V1"));
+            }
+            self.eat_kw("COLUMN"); // optional
+            let column = self.parse_column_def()?;
+            return Ok(Statement::AddColumn { table, column });
+        }
+
+        if self.eat_kw("DROP") {
+            if self.is_kw("CONSTRAINT") {
+                return Err(self.err_at("table constraints are not supported in V1"));
+            }
+            self.eat_kw("COLUMN"); // optional
+            let if_exists = self.parse_if_exists()?;
+            let column = self.ident("column name")?;
+            return Ok(Statement::DropColumn {
+                table,
+                column,
+                if_exists,
+            });
+        }
+
+        if self.is_kw("ALTER") || self.is_kw("MODIFY") {
+            return Err(self.err_at(
+                "changing a column's type or nullability is not supported: add the new column, \
+                 copy the values with UPDATE, then drop the old one",
+            ));
+        }
+        Err(self.err_at("expected ADD, DROP or RENAME after ALTER TABLE <name>"))
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -172,30 +345,7 @@ impl Parser {
                     "table constraints are not supported in V1; the primary key is the implicit 'id' (text ULID)",
                 ));
             }
-            let col_name = self.ident("column name")?;
-            let (ty, dim) = self.parse_type()?;
-            let mut not_null = false;
-            loop {
-                if self.eat_kw("NOT") {
-                    self.expect_kw("NULL")?;
-                    not_null = true;
-                } else if self.is_kw("PRIMARY") {
-                    return Err(self.err_at(
-                        "PRIMARY KEY is not supported; the primary key is the implicit 'id' (text ULID)",
-                    ));
-                } else if self.is_kw("DEFAULT") {
-                    return Err(self.err_at("DEFAULT is not supported in V1"));
-                } else if self.is_kw("REFERENCES") {
-                    return Err(self.err_at("foreign keys are not supported in V1"));
-                } else if self.is_kw("UNIQUE") {
-                    return Err(self.err_at(
-                        "inline UNIQUE is not supported; use CREATE UNIQUE INDEX",
-                    ));
-                } else {
-                    break;
-                }
-            }
-            columns.push(ColumnDef { name: col_name, ty, not_null, dim });
+            columns.push(self.parse_column_def()?);
             if self.eat(&Tok::Comma) {
                 continue;
             }
@@ -205,11 +355,50 @@ impl Parser {
         Ok(Statement::CreateTable { name, columns })
     }
 
+    /// `name type [NOT NULL] [DEFAULT literal]`, in any order of the two
+    /// trailing clauses. Shared by CREATE TABLE and ALTER TABLE ADD COLUMN.
+    fn parse_column_def(&mut self) -> Result<ColumnDef> {
+        let name = self.ident("column name")?;
+        let (ty, dim) = self.parse_type()?;
+        let mut not_null = false;
+        let mut default = None;
+        loop {
+            if self.eat_kw("NOT") {
+                self.expect_kw("NULL")?;
+                not_null = true;
+            } else if self.eat_kw("DEFAULT") {
+                if default.is_some() {
+                    return Err(self.err_at("duplicate DEFAULT clause"));
+                }
+                default = Some(self.parse_literal()?);
+            } else if self.is_kw("PRIMARY") {
+                return Err(self.err_at(
+                    "PRIMARY KEY is not supported; the primary key is the implicit 'id' (text ULID)",
+                ));
+            } else if self.is_kw("REFERENCES") {
+                return Err(self.err_at("foreign keys are not supported in V1"));
+            } else if self.is_kw("UNIQUE") {
+                return Err(self.err_at("inline UNIQUE is not supported; use CREATE UNIQUE INDEX"));
+            } else if self.is_kw("CHECK") || self.is_kw("GENERATED") || self.is_kw("COLLATE") {
+                return Err(self.err_at("column constraints are not supported in V1"));
+            } else {
+                break;
+            }
+        }
+        Ok(ColumnDef {
+            name,
+            ty,
+            not_null,
+            dim,
+            default,
+        })
+    }
+
     fn parse_type(&mut self) -> Result<(ColumnType, Option<usize>)> {
         let word = self.ident("column type")?;
         let ty = match word.to_ascii_lowercase().as_str() {
             "bool" => ColumnType::Bool,
-            "int64" => ColumnType::Int64,
+            "int" | "integer" | "bigint" | "int64" => ColumnType::Int64,
             "float64" => ColumnType::Float64,
             "text" => ColumnType::Text,
             "blob" => ColumnType::Blob,
@@ -226,8 +415,10 @@ impl Parser {
                 }
                 return Ok((ColumnType::Vector, Some(dim)));
             }
-            "int" | "integer" | "bigint" | "smallint" => {
-                return Err(Error::Sql(format!("unknown type '{word}': use int64")))
+            "smallint" | "int32" => {
+                return Err(Error::Sql(format!(
+                    "unknown type '{word}': use int (stored as int64)"
+                )))
             }
             "real" | "double" | "float" => {
                 return Err(Error::Sql(format!("unknown type '{word}': use float64")))
@@ -243,7 +434,7 @@ impl Parser {
             "boolean" => return Err(Error::Sql("unknown type 'boolean': use bool".into())),
             _ => {
                 return Err(Error::Sql(format!(
-                    "unknown type '{word}': V1 types are bool, int64, float64, text, blob, timestamp, date, time, json, vector(N)"
+                    "unknown type '{word}': V1 types are bool, int (int64), float64, text, blob, timestamp, date, time, json, vector(N)"
                 )))
             }
         };
@@ -269,21 +460,26 @@ impl Parser {
             return Err(self.err_at("multi-column indexes are not supported in V1"));
         }
         self.expect(&Tok::RParen, "')'")?;
-        Ok(Statement::CreateIndex { table, column, unique })
+        Ok(Statement::CreateIndex {
+            table,
+            column,
+            unique,
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_kw("INTO")?;
         let table = self.ident("table name")?;
-        self.expect(&Tok::LParen, "'(' with a column list (required in V1)")?;
         let mut columns = Vec::new();
-        loop {
-            columns.push(self.ident("column name")?);
-            if self.eat(&Tok::Comma) {
-                continue;
+        if self.eat(&Tok::LParen) {
+            loop {
+                columns.push(self.ident("column name")?);
+                if self.eat(&Tok::Comma) {
+                    continue;
+                }
+                self.expect(&Tok::RParen, "')' or ','")?;
+                break;
             }
-            self.expect(&Tok::RParen, "')' or ','")?;
-            break;
         }
         if self.is_kw("SELECT") {
             return Err(self.err_at("INSERT ... SELECT is not supported in V1"));
@@ -301,7 +497,7 @@ impl Parser {
                 self.expect(&Tok::RParen, "')' or ','")?;
                 break;
             }
-            if row.len() != columns.len() {
+            if !columns.is_empty() && row.len() != columns.len() {
                 return Err(Error::Sql(format!(
                     "row has {} values but {} columns were listed",
                     row.len(),
@@ -318,7 +514,11 @@ impl Parser {
                 "RETURNING is not supported in V1; INSERT already reports the generated ids",
             ));
         }
-        Ok(Statement::Insert { table, columns, rows })
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
     }
 
     fn parse_update(&mut self) -> Result<Statement> {
@@ -341,14 +541,21 @@ impl Parser {
             }
         }
         let where_clause = self.parse_optional_where()?;
-        Ok(Statement::Update { table, sets, where_clause })
+        Ok(Statement::Update {
+            table,
+            sets,
+            where_clause,
+        })
     }
 
     fn parse_delete(&mut self) -> Result<Statement> {
         self.expect_kw("FROM")?;
         let table = self.ident("table name")?;
         let where_clause = self.parse_optional_where()?;
-        Ok(Statement::Delete { table, where_clause })
+        Ok(Statement::Delete {
+            table,
+            where_clause,
+        })
     }
 
     fn parse_select(&mut self) -> Result<Statement> {
@@ -455,6 +662,12 @@ impl Parser {
                     ));
                 }
                 let col = self.parse_column_ref()?;
+                if self.peek().map(|t| &t.tok) == Some(&Tok::LParen) {
+                    return Err(self.err_at(
+                        "functions are not supported in ORDER BY; to rank by vector similarity \
+                         use search_vector (Rust API or bindings)",
+                    ));
+                }
                 let desc = if self.eat_kw("DESC") {
                     true
                 } else {
@@ -470,9 +683,9 @@ impl Parser {
         let mut limit = None;
         let mut offset = None;
         if self.eat_kw("LIMIT") {
-            limit = Some(self.parse_uint("LIMIT")?);
+            limit = Some(self.parse_limit_value("LIMIT")?);
             if self.eat_kw("OFFSET") {
-                offset = Some(self.parse_uint("OFFSET")?);
+                offset = Some(self.parse_limit_value("OFFSET")?);
             }
         }
         Ok(Statement::Select(Box::new(SelectStmt {
@@ -491,7 +704,10 @@ impl Parser {
     /// Detects `count(`/`sum(`/`avg(`/`min(`/`max(` at the cursor without
     /// consuming anything.
     fn peek_agg_call(&self) -> Option<AggFunc> {
-        let Some(Lexed { tok: Tok::Ident(w), .. }) = self.peek() else {
+        let Some(Lexed {
+            tok: Tok::Ident(w), ..
+        }) = self.peek()
+        else {
             return None;
         };
         if self.peek2().map(|t| &t.tok) != Some(&Tok::LParen) {
@@ -528,10 +744,34 @@ impl Parser {
 
     fn parse_uint(&mut self, what: &str) -> Result<u64> {
         match self.next() {
-            Some(Lexed { tok: Tok::Int(n), .. }) if n >= 0 => Ok(n as u64),
+            Some(Lexed {
+                tok: Tok::Int(n), ..
+            }) if n >= 0 => Ok(n as u64),
             _ => {
                 self.pos = self.pos.saturating_sub(1);
                 Err(self.err_at(&format!("{what} expects a non-negative integer")))
+            }
+        }
+    }
+
+    fn parse_limit_value(&mut self, what: &str) -> Result<LimitValue> {
+        match self.next() {
+            Some(Lexed {
+                tok: Tok::Int(n), ..
+            }) if n >= 0 => Ok(LimitValue::Literal(n as u64)),
+            Some(Lexed {
+                tok: Tok::PositionalParam,
+                ..
+            }) => Ok(LimitValue::PositionalParam),
+            Some(Lexed {
+                tok: Tok::NamedParam(name),
+                ..
+            }) => Ok(LimitValue::NamedParam(name)),
+            _ => {
+                self.pos = self.pos.saturating_sub(1);
+                Err(self.err_at(&format!(
+                    "{what} expects a non-negative integer or parameter"
+                )))
             }
         }
     }
@@ -543,7 +783,10 @@ impl Parser {
         let name = self.ident("table name")?;
         let alias = if self.eat_kw("AS") {
             Some(self.ident("alias")?)
-        } else if let Some(Lexed { tok: Tok::Ident(w), .. }) = self.peek() {
+        } else if let Some(Lexed {
+            tok: Tok::Ident(w), ..
+        }) = self.peek()
+        {
             if RESERVED.iter().any(|r| w.eq_ignore_ascii_case(r)) {
                 None
             } else {
@@ -615,7 +858,10 @@ impl Parser {
     fn parse_predicate(&mut self, depth: u32, allow_agg: bool) -> Result<Expr> {
         self.guard(depth)?;
         if self.peek().map(|t| &t.tok) == Some(&Tok::LParen) {
-            if let Some(Lexed { tok: Tok::Ident(w), .. }) = self.peek2() {
+            if let Some(Lexed {
+                tok: Tok::Ident(w), ..
+            }) = self.peek2()
+            {
                 if w.eq_ignore_ascii_case("SELECT") {
                     return Err(self.err_at("subqueries are not supported in V1"));
                 }
@@ -641,7 +887,10 @@ impl Parser {
         }
         let negated_in = if self.is_kw("NOT") {
             // lookahead: NOT IN
-            if let Some(Lexed { tok: Tok::Ident(w), .. }) = self.peek2() {
+            if let Some(Lexed {
+                tok: Tok::Ident(w), ..
+            }) = self.peek2()
+            {
                 if w.eq_ignore_ascii_case("IN") {
                     self.pos += 2;
                     true
@@ -695,15 +944,19 @@ impl Parser {
             self.expect(&Tok::RParen, "')' or ','")?;
             break;
         }
-        Ok(Expr::InList { col, list, negated: negated_in })
+        Ok(Expr::InList {
+            col,
+            list,
+            negated: negated_in,
+        })
     }
 
     fn parse_operand(&mut self, allow_agg: bool) -> Result<Operand> {
         if let Some(func) = self.peek_agg_call() {
             if !allow_agg {
-                return Err(self.err_at(
-                    "aggregates are only allowed in the SELECT list and HAVING",
-                ));
+                return Err(
+                    self.err_at("aggregates are only allowed in the SELECT list and HAVING")
+                );
             }
             self.pos += 1;
             let (func, arg) = self.parse_agg_call(func)?;
@@ -740,27 +993,57 @@ impl Parser {
                 return Err(self.err_at("qualified star (t.*) is not supported in V1"));
             }
             let column = self.ident("column name after '.'")?;
-            Ok(ColumnRef { table: Some(first), column })
+            Ok(ColumnRef {
+                table: Some(first),
+                column,
+            })
         } else {
-            Ok(ColumnRef { table: None, column: first })
+            Ok(ColumnRef {
+                table: None,
+                column: first,
+            })
         }
     }
 
     fn parse_literal(&mut self) -> Result<Literal> {
         match self.next() {
-            Some(Lexed { tok: Tok::Int(n), .. }) => Ok(Literal::Int(n)),
-            Some(Lexed { tok: Tok::Float(f), .. }) => Ok(Literal::Float(f)),
-            Some(Lexed { tok: Tok::Str(s), .. }) => Ok(Literal::Str(s)),
-            Some(Lexed { tok: Tok::Blob(b), .. }) => Ok(Literal::Blob(b)),
-            Some(Lexed { tok: Tok::Minus, .. }) => match self.next() {
-                Some(Lexed { tok: Tok::Int(n), .. }) => Ok(Literal::Int(-n)),
-                Some(Lexed { tok: Tok::Float(f), .. }) => Ok(Literal::Float(-f)),
+            Some(Lexed {
+                tok: Tok::Int(n), ..
+            }) => Ok(Literal::Int(n)),
+            Some(Lexed {
+                tok: Tok::Float(f), ..
+            }) => Ok(Literal::Float(f)),
+            Some(Lexed {
+                tok: Tok::Str(s), ..
+            }) => Ok(Literal::Str(s)),
+            Some(Lexed {
+                tok: Tok::Blob(b), ..
+            }) => Ok(Literal::Blob(b)),
+            Some(Lexed {
+                tok: Tok::PositionalParam,
+                ..
+            }) => Ok(Literal::PositionalParam),
+            Some(Lexed {
+                tok: Tok::NamedParam(name),
+                ..
+            }) => Ok(Literal::NamedParam(name)),
+            Some(Lexed {
+                tok: Tok::Minus, ..
+            }) => match self.next() {
+                Some(Lexed {
+                    tok: Tok::Int(n), ..
+                }) => Ok(Literal::Int(-n)),
+                Some(Lexed {
+                    tok: Tok::Float(f), ..
+                }) => Ok(Literal::Float(-f)),
                 _ => {
                     self.pos = self.pos.saturating_sub(1);
                     Err(self.err_at("expected a number after '-'"))
                 }
             },
-            Some(Lexed { tok: Tok::Ident(w), .. }) => {
+            Some(Lexed {
+                tok: Tok::Ident(w), ..
+            }) => {
                 if w.eq_ignore_ascii_case("TRUE") {
                     Ok(Literal::Bool(true))
                 } else if w.eq_ignore_ascii_case("FALSE") {

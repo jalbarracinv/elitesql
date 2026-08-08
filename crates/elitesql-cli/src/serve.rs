@@ -7,7 +7,7 @@
 //! connection is served by its own thread over one shared `Db`.
 //!
 //! Protocol (one JSON object per line, response per request in order):
-//!   -> {"op":"query","sql":"SELECT ..."}
+//!   -> {"op":"query","sql":"SELECT ...","params"?: [...] | {...}}
 //!   -> {"op":"search_vector","table":...,"column":...,"vector":[...],...}
 //!   -> {"op":"checkpoint"} | {"op":"compact"} | {"op":"ping"}
 //!   <- {"ok":true,"result":...}
@@ -23,10 +23,11 @@ use serde_json::{json, Value as J};
 pub fn serve(db: Db, socket_path: &str) -> Result<(), String> {
     // A stale socket file from a previous run would block the bind.
     if std::fs::metadata(socket_path).is_ok() {
-        std::fs::remove_file(socket_path).map_err(|e| format!("cannot remove stale socket: {e}"))?;
+        std::fs::remove_file(socket_path)
+            .map_err(|e| format!("cannot remove stale socket: {e}"))?;
     }
-    let listener = UnixListener::bind(socket_path)
-        .map_err(|e| format!("cannot bind {socket_path}: {e}"))?;
+    let listener =
+        UnixListener::bind(socket_path).map_err(|e| format!("cannot bind {socket_path}: {e}"))?;
     eprintln!("elitesql serve: listening on {socket_path}");
     let db = Arc::new(db);
     for conn in listener.incoming() {
@@ -65,12 +66,23 @@ fn handle_request(db: &Db, line: &str) -> J {
         Err(e) => return json!({"ok": false, "code": 8, "error": format!("bad request json: {e}")}),
     };
     let id = request.get("id").cloned();
-    let op = request.get("op").and_then(|o| o.as_str()).unwrap_or_default();
+    let op = request
+        .get("op")
+        .and_then(|o| o.as_str())
+        .unwrap_or_default();
     let result = match op {
         "ping" => Ok(json!("pong")),
         "query" => match request.get("sql").and_then(|s| s.as_str()) {
-            Some(sql) => db.query(sql).map(|out| jsonio::output_to_json(&out)),
-            None => Err(elitesql_core::Error::InvalidArgument("missing 'sql'".into())),
+            Some(sql) => request
+                .get("params")
+                .map_or_else(
+                    || db.query(sql),
+                    |params| jsonio::query_with_params_json(db, sql, params),
+                )
+                .map(|out| jsonio::output_to_json(&out)),
+            None => Err(elitesql_core::Error::InvalidArgument(
+                "missing 'sql'".into(),
+            )),
         },
         "search_vector" => jsonio::search_vector_json(db, &request),
         "create_vector_index" => jsonio::create_vector_index_json(db, &request),
@@ -91,4 +103,41 @@ fn handle_request(db: &Db, line: &str) -> J {
         obj.insert("id".into(), id);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_query_binds_positional_and_named_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("sidecar-params.esql")).unwrap();
+        db.query("CREATE TABLE docs (name text NOT NULL, payload blob NOT NULL)")
+            .unwrap();
+
+        let inserted = handle_request(
+            &db,
+            &json!({
+                "op": "query",
+                "sql": "INSERT INTO docs (name, payload) VALUES (%s, %s)",
+                "params": ["x' OR TRUE --", {"$t": "blob", "hex": "00ff"}]
+            })
+            .to_string(),
+        );
+        assert_eq!(inserted["ok"], true);
+
+        let selected = handle_request(
+            &db,
+            &json!({
+                "op": "query",
+                "sql": "SELECT name, payload FROM docs WHERE name = %(name)s LIMIT %(limit)s",
+                "params": {"name": "x' OR TRUE --", "limit": 1}
+            })
+            .to_string(),
+        );
+        assert_eq!(selected["ok"], true);
+        assert_eq!(selected["result"]["rows"][0][0], "x' OR TRUE --");
+        assert_eq!(selected["result"]["rows"][0][1]["$t"], "blob");
+    }
 }

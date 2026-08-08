@@ -1,0 +1,4 @@
+profile,rows,engine,load_mode,ingest_wall_seconds,final_checkpoint_seconds,maintenance_drain_seconds,total_load_seconds,rows_per_second,point_read_us,full_scan_seconds,disk_mib,logical_total_mib,query_peak_mib,index_delta_peak_mib,maintenance_peak_mib,max_rss_bytes,peak_footprint_bytes
+optimized-default,10000000,EliteSQL,transactions,21.525,0.086,1.009,22.620,442096,11.969,0.793,2248.86,128,16.00,22.81,32.00,,
+optimized-ingest-profile,10000000,EliteSQL,transactions,17.828,0.091,0.879,18.798,531982,21.969,0.827,2248.85,256,16.00,62.73,64.00,,
+optimized-sqlite,10000000,SQLite,transactions,11.370,2.293,0.000,13.663,731916,69.058,1.126,1520.11,,,,,,

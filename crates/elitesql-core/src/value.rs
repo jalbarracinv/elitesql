@@ -232,7 +232,7 @@ pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
 // Values are encoded as a 1-byte tag followed by a type-specific payload.
 // Variable-length payloads carry a u32 little-endian length prefix.
 
-const TAG_NULL: u8 = 0;
+pub(crate) const TAG_NULL: u8 = 0;
 const TAG_BOOL: u8 = 1;
 const TAG_INT64: u8 = 2;
 const TAG_FLOAT64: u8 = 3;
@@ -312,7 +312,10 @@ pub(crate) fn read_blob_file(dir: &std::path::Path, r: &BlobRef) -> Result<Vec<u
         )));
     }
     if crc32fast::hash(content) != crc {
-        return Err(Error::Corrupt(format!("blob chunk {}: content corrupt", r.name)));
+        return Err(Error::Corrupt(format!(
+            "blob chunk {}: content corrupt",
+            r.name
+        )));
     }
     Ok(content.to_vec())
 }
@@ -372,7 +375,11 @@ pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
 
 /// Decode one tagged value. `blobs` is the directory used to resolve
 /// out-of-line blob references; contexts without one fail on such refs.
-pub(crate) fn decode_value(buf: &[u8], pos: &mut usize, blobs: Option<&std::path::Path>) -> Result<Value> {
+pub(crate) fn decode_value(
+    buf: &[u8],
+    pos: &mut usize,
+    blobs: Option<&std::path::Path>,
+) -> Result<Value> {
     let tag = read_u8(buf, pos)?;
     match tag {
         TAG_NULL => Ok(Value::Null),
@@ -395,7 +402,10 @@ pub(crate) fn decode_value(buf: &[u8], pos: &mut usize, blobs: Option<&std::path
         }
         TAG_VECTOR => {
             let count = read_u32(buf, pos)? as usize;
-            if count.checked_mul(4).is_none_or(|bytes| *pos + bytes > buf.len()) {
+            if count
+                .checked_mul(4)
+                .is_none_or(|bytes| *pos + bytes > buf.len())
+            {
                 return Err(Error::Corrupt("truncated vector value".into()));
             }
             let mut v = Vec::with_capacity(count);
@@ -417,6 +427,74 @@ pub(crate) fn decode_value(buf: &[u8], pos: &mut usize, blobs: Option<&std::path
         }
         other => Err(Error::Corrupt(format!("unknown value tag {other}"))),
     }
+}
+
+/// Compare one encoded value without materializing owned strings, blobs, or
+/// vectors. The representation remains an implementation detail: callers get
+/// exactly the same equality semantics as `decode_value`, including float
+/// NaN and signed-zero behavior. Complex or out-of-line values deliberately
+/// fall back to the regular decoder.
+pub(crate) fn encoded_value_eq(
+    buf: &[u8],
+    pos: &mut usize,
+    expected: &Value,
+    blobs: Option<&std::path::Path>,
+) -> Result<bool> {
+    let start = *pos;
+    let tag = read_u8(buf, pos)?;
+    let matched = match (tag, expected) {
+        (TAG_NULL, Value::Null) => Some(true),
+        (TAG_BOOL, Value::Bool(expected)) => Some((read_u8(buf, pos)? != 0) == *expected),
+        (TAG_INT64, Value::Int64(expected)) => {
+            Some(i64::from_le_bytes(read_array(buf, pos)?) == *expected)
+        }
+        (TAG_FLOAT64, Value::Float64(expected)) => {
+            Some(f64::from_le_bytes(read_array(buf, pos)?) == *expected)
+        }
+        (TAG_TEXT, Value::Text(expected)) => {
+            let bytes = read_len_prefixed(buf, pos)?;
+            let actual = std::str::from_utf8(bytes)
+                .map_err(|_| Error::Corrupt("invalid utf8 in text value".into()))?;
+            Some(actual == expected)
+        }
+        (TAG_BLOB, Value::Blob(expected)) => Some(read_len_prefixed(buf, pos)? == expected),
+        (TAG_TIMESTAMP, Value::Timestamp(expected)) => {
+            Some(i64::from_le_bytes(read_array(buf, pos)?) == *expected)
+        }
+        (TAG_DATE, Value::Date(expected)) => {
+            Some(i32::from_le_bytes(read_array(buf, pos)?) == *expected)
+        }
+        (TAG_TIME, Value::Time(expected)) => {
+            Some(i64::from_le_bytes(read_array(buf, pos)?) == *expected)
+        }
+        (TAG_VECTOR, Value::Vector(expected)) => {
+            let count = read_u32(buf, pos)? as usize;
+            let bytes = count
+                .checked_mul(4)
+                .ok_or_else(|| Error::Corrupt("length overflow".into()))?;
+            if pos.checked_add(bytes).is_none_or(|end| end > buf.len()) {
+                return Err(Error::Corrupt("truncated vector value".into()));
+            }
+            if count != expected.len() {
+                *pos += bytes;
+                Some(false)
+            } else {
+                let mut equal = true;
+                for wanted in expected {
+                    let actual = f32::from_le_bytes(read_array(buf, pos)?);
+                    equal &= actual == *wanted;
+                }
+                Some(equal)
+            }
+        }
+        _ => None,
+    };
+    if let Some(matched) = matched {
+        return Ok(matched);
+    }
+
+    *pos = start;
+    Ok(decode_value(buf, pos, blobs)? == *expected)
 }
 
 /// Skip one tagged value without materializing it; collects blob references

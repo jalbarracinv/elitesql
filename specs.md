@@ -43,6 +43,67 @@ Technical pitch:
 SQLite-fast reads, better concurrent writes, native ANN.
 ```
 
+## Resource philosophy
+
+**"Lite" is a resource contract, not just a packaging or deployment property.**
+
+EliteSQL must be prudent with memory, disk and background CPU. An embedded
+database should not assume server-class resources, and it should not maximize
+throughput by silently retaining every derived structure in memory. When the
+canonical dataset or an index is larger than RAM, the engine should remain
+usable with an explicit and understandable latency tradeoff rather than fail
+because the whole structure must be materialized.
+
+Resource principles:
+
+- Prefer compact layouts, paging, read-only `mmap` and bounded caches before
+  adding lossy transformations.
+- Make resident memory follow the active working set where practical, not the
+  total logical database size.
+- Avoid duplicate full-size representations of canonical data unless a
+  measured performance benefit justifies their cost.
+- Treat steady-state memory and peak memory during open, recovery, index build
+  and compaction as separate design constraints. A low steady RSS does not
+  excuse a startup or maintenance spike that can exhaust an embedded device.
+- Give indexes and background work explicit memory budgets or bounded modes as
+  they mature. Under pressure, degrade predictably through paging, smaller
+  caches or slower execution; do not depend on an eventual out-of-memory kill.
+- Apply the same contract to traditional queries. Scans and projections run in
+  batches; blocking operators such as `ORDER BY`, `GROUP BY`, `DISTINCT` and
+  joins must use top-k, partitioning or temporary spill files when their
+  working set exceeds the query budget.
+- Do not require callers to materialize unbounded result sets. Provide cursors
+  or batch APIs with backpressure; convenience APIs that return all rows may
+  necessarily retain the caller-owned result, but must not also retain a full
+  duplicate execution representation.
+- Account for concurrent queries, indexes and maintenance under a database-wide
+  budget. A per-query limit is the first enforcement boundary, not permission
+  for every concurrent operator to consume that amount independently.
+- Keep canonical values exact. Quantization, compression or other
+  quality-changing techniques must be explicit, measurable and optional.
+- Do not trade away crash safety, deterministic behavior or search quality
+  silently in the name of a smaller footprint.
+
+This does not mean every byte must stay on disk. Small and hot structures may
+be fully resident when that is the best tradeoff. It means full residency is a
+conscious policy choice, not an accidental consequence of the implementation.
+
+Reference performance acceptance targets:
+
+- On matched durability and data, traditional SQL operations should remain
+  within 2x SQLite end-to-end; a result close to the boundary must be repeated
+  and include deferred maintenance rather than hiding it after timing.
+- EliteSQL should beat SQLite where its architecture is differentiated:
+  sustained concurrent-writer throughput, bounded worst lock tails, native ANN
+  search, and the specialized sorted bulk path.
+- Vector search should maintain ANN recall@10 of at least 0.95 at the selected
+  quality profile and report latency together with corpus size and dimension.
+- Logical pools are hard admission boundaries. Engine-owned heap must not grow
+  with total database size merely because a query, checkpoint or index is
+  large; use paging, streaming, spill or a pre-publication `MemoryLimit`.
+- Clean reclaimable mmap residency is reported separately from dirty/physical
+  footprint. Neither RSS alone nor logical counters alone prove compliance.
+
 ## V1 scope
 
 EliteSQL must be an embedded operational database for real applications, not a complete SQL engine.
@@ -93,6 +154,7 @@ update(table, id, patch)
 delete(table, id)
 scan(table, filter)
 query(statement)
+query_params(statement, positional_values | named_values)
 search_vector(table, column, vector, top_k, filter?)
 search_hybrid(table, text?, vector?, filter?, top_k)
 begin()
@@ -107,7 +169,7 @@ compact()
 Final recommended list:
 
 - `bool`
-- `int64`
+- `int` (signed 64-bit; `integer`, `bigint`, and `int64` are aliases)
 - `float64`
 - `text`
 - `blob`
@@ -125,7 +187,7 @@ Optional for V1.1:
 
 Types avoided in V1:
 
-- Separate `smallint`, `int32`, `bigint`. `int64` is enough.
+- Separate `smallint` and `int32`. The single 64-bit integer type is enough; `bigint` is accepted only as an alias.
 - `varchar(n)`. `text` is enough.
 - `char`, `nchar`, `nvarchar`.
 - `interval`.
@@ -134,7 +196,8 @@ Types avoided in V1:
 
 ## Query model
 
-EliteSQL may have a small SQL dialect or a structured API. If SQL exists, it must stay deliberately limited.
+EliteSQL has a small SQL dialect and a structured Rust API. The dialect stays
+deliberately limited.
 
 Supported:
 
@@ -144,12 +207,25 @@ Supported:
 - `DELETE`
 - `WHERE` with simple filters.
 - Basic `ORDER BY`.
-- `LIMIT`.
+- `LIMIT` and `OFFSET`, as non-negative literals or bound parameters.
 - `INNER JOIN`.
 - `LEFT JOIN`.
 - `RIGHT JOIN`.
 - Vector search through an explicit function.
 - Basic aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) with simple `GROUP BY`/`HAVING` (V1.1, plan Phase 2.5).
+
+Parameter contract:
+
+- SQL and parameter values travel separately through every public binding.
+- Positional `?` and `%s`, and named `%(name)s`, are parsed as placeholder AST
+  nodes and bound only after parsing. Placeholder-looking text inside literals
+  or comments is never treated as a parameter.
+- Values retain their logical types; bindings must not quote, escape or
+  interpolate them into the SQL string.
+- Positional counts and named keys match exactly. Missing, extra or mixed-style
+  parameters are errors; a named placeholder may be reused.
+- Parameters are accepted anywhere the dialect accepts a literal, including
+  writes, predicates, `IN`, defaults, `LIMIT` and `OFFSET`.
 
 Supported joins:
 
@@ -379,11 +455,97 @@ Performance decisions:
 - Fast recovery using manifest + incremental WAL replay.
 - Large blobs kept out of the transactional critical path.
 
+Memory efficiency is part of performance, not a secondary optimization. Major
+benchmarks and index changes must report, where relevant:
+
+- steady resident/physical memory;
+- peak memory during open, build, recovery and compaction;
+- peak working memory per SQL operator and per concurrent query workload;
+- spill bytes/files and the latency introduced by spilling;
+- bytes per record or vector and total derived-index size;
+- cold-cache and warm-cache latency;
+- the quality metric associated with any memory tradeoff (for example ANN
+  recall when quantization is enabled).
+
+Optimizations should be evaluated on datasets both below and above the chosen
+memory budget. A benchmark that fits entirely in RAM does not by itself prove
+that an index is appropriate for a lightweight embedded database.
+
+Current implementation of this contract:
+
+- Each `Db` has a validated global envelope split into concurrent-query,
+  mutable-index and maintenance pools plus an unallocatable emergency reserve.
+  RAII permits apply backpressure across every clone/client; metrics expose
+  current/peak use, waits and consolidations.
+- Scans and cursor reads decode bounded batches. `ORDER BY` and
+  high-cardinality `GROUP BY` create and merge bounded sorted runs. Temporary
+  spill files are removed on success and error.
+- The MVCC primary directory is a set of immutable, paged, checksummed `mmap`
+  runs plus an active WAL delta. On primary-only workloads, an automatic
+  checkpoint freezes that delta in O(1), immediately opens a new active
+  generation, and writes the frozen generation on a dedicated background
+  thread. Reads merge both generations until publication. The worker retains
+  one maintenance-pool permit for the frozen heap and its bounded writer,
+  preventing this overlap from becoming an unaccounted memory copy. It copies
+  only WAL records after the freeze boundary into the next WAL before the
+  manifest swap, so commits made during the flush remain recoverable. Explicit
+  checkpoint, DDL, compaction and shutdown are barriers. Workloads with
+  equality, BM25 or vector deltas currently keep the synchronous checkpoint
+  path until those operations carry an equivalent MVCC freeze boundary. Groups of
+  sixteen same-level primary runs are merged by a background worker; disjoint
+  V2 ranges copy their checksummed pages without entry-by-entry reconstruction.
+  The stable base is rewritten only by canonical data compaction. The atomic
+  run manifest is tied to the exact segment set and catalog table epochs, not
+  only the commit number. Paged format V2 stores one heap offset per page and
+  leaves keys/file contents in mmap. Checkpoint snapshots intern table names,
+  store IDs contiguously and build the primary run directly from captured
+  segment offsets instead of mutating and rescanning the delta.
+  Writable startup rebuilds stale/missing run state through bounded external
+  runs rather than a database-sized resident map.
+- Equality and BM25 indexes use immutable versioned operation runs plus bounded
+  mutable deltas. Additions and tombstones are keyed by `(value,id)` or
+  `(term,id)`; eight same-level runs merge in the background, retaining only
+  the newest operation per key. Hot-key pagination uses one cursor per run and
+  stops at the requested batch size. BM25 also persists exact document-count
+  and total-token metadata and merges posting streams into an exact bounded
+  top-k.
+- HNSW V4 stores vectors, labels, and adjacency lists in a sectioned file
+  queried directly through `mmap`; post-open graph deltas freeze into mmap
+  overlays when the index pool is pressured. Vector candidate growth is capped
+  by the admitted query budget.
+- Vector dimensionality does not change this policy: 256-, 768- and
+  1000+-dimensional canonical values stay exact. PCA or another lossy reduction
+  is not required for residency; optional int8 quantization is a separately
+  measurable quality/size choice.
+- Transaction staging interns each touched table/schema, preserves insertion
+  position and skips sorting for monotonic primary-key batches. A cached
+  snapshot high-watermark avoids a shared-state lock per append while commit
+  validation remains authoritative for concurrent conflicts.
+- `DbOptions::ingest_performance()` is an explicit bounded 256 MiB deployment
+  profile (64 MiB query, delta and maintenance pools; 64 MiB memtable target).
+  It does not replace the lightweight 128 MiB default.
+- Unindexed equality joins use recursive Grace partitioning and spill. A skewed
+  partition uses bounded block probing, including outer-join match state on
+  disk.
+- Transactions are size-checked before durability, and primary compaction
+  streams the replacement segment, paged directory and blob-reference set
+  under the maintenance admission instead of materializing full copies.
+- `bulk_insert_sorted` streams strictly increasing explicit IDs into one
+  canonical segment and primary run, publishes the batch atomically, and
+  requires derived indexes to be built afterward.
+
 Known limits:
 
-- Large joins without an index will be expensive.
+- Primary level promotion still adds variable drain latency and about 1.53 GiB
+  of read-plus-write traffic for 533 MiB of checkpoint runs in the reference
+  10M transactional load. Further write-amplification reduction remains useful.
+- With four to eight writers, EliteSQL wins throughput and worst-tail latency
+  but its p99 transaction latency remains above SQLite in the reference run.
+- Large joins without an index trade RAM for partitioning and temporary I/O.
 - Massive updates generate garbage until compaction.
 - Synchronous vector indexing can slow down commits.
+- A single HNSW graph build must fit the configured maintenance pool; EliteSQL
+  returns `MemoryLimit` instead of exceeding it.
 - Huge blobs must be handled through chunks.
 
 ## Implementation language
@@ -416,6 +578,10 @@ Reasoning:
 - It reduces memory risks in a complex engine.
 - It has a good ecosystem for mmap, parsers, serialization, concurrency, SIMD and FFI.
 - A C ABI enables universal integration.
+- SQL values cross every binding separately from statement text. The parser
+  represents placeholders explicitly and the executor binds typed values only
+  after parsing; bindings must never implement parameters with string
+  substitution.
 
 ## Conceptual C API
 
@@ -427,6 +593,8 @@ elitesql_status elitesql_close(elitesql_handle *db);
 
 elitesql_status elitesql_exec(elitesql_handle *db, const char *statement);
 elitesql_status elitesql_query(elitesql_handle *db, const char *statement, elitesql_result **result);
+elitesql_status elitesql_query_params(elitesql_handle *db, const char *statement,
+                                      const char *params_json, elitesql_result **result);
 
 elitesql_status elitesql_begin(elitesql_handle *db, elitesql_txn **txn);
 elitesql_status elitesql_commit(elitesql_txn *txn);
@@ -508,9 +676,23 @@ elitesql_status elitesql_search_vector(
 - WASM.
 - Optional local-first sync.
 
+### Cross-cutting: bounded resources and safe parameters
+
+- One validated database-wide memory envelope with query, mutable-index and
+  maintenance pools plus an emergency reserve.
+- Paged read-only `mmap` runs with bounded deltas and leveled background
+  promotion for primary, equality and BM25; immutable mmap graph overlays for
+  HNSW.
+- Batched scans/cursors and spill-capable sort, aggregation and equality joins.
+- Typed positional and named SQL parameters in Rust, C, Python, Node and the
+  sidecar protocol; no string substitution.
+
 ## Design principles
 
 - Keep the engine small.
+- Be conservative with memory; "embedded" must not mean "loads everything".
+- Optimize for a bounded working set and make full residency an explicit
+  tradeoff.
 - Prefer predictable operations over magic.
 - Make the common easy and the advanced explicit.
 - Do not chase full SQL compatibility.

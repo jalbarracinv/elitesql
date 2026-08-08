@@ -14,11 +14,18 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::mem::size_of;
+use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 
-use crate::db::{Db, Record};
+use crate::db::{Db, Record, Snapshot};
 use crate::error::{Error, Result};
+use crate::memory::MemoryPermit;
 use crate::schema::TableSchema;
-use crate::value::{encode_value, ColumnType, Value};
+use crate::value::{decode_value, encode_value, ColumnType, Value};
+use ulid::Ulid;
 
 use super::ast::*;
 use super::parser;
@@ -39,45 +46,524 @@ pub enum QueryOutput {
     None,
 }
 
-const INDEX_JOIN_MAX_PROBE: usize = 1024;
+/// Snapshot-consistent, bounded-memory rows for a streaming SELECT.
+///
+/// The initial implementation accepts the naturally streaming subset: one
+/// table, WHERE, projection, OFFSET and LIMIT, without ORDER BY/GROUP BY/JOIN.
+/// Blocking operators continue to use [`Db::query`] and its bounded spill
+/// machinery until their cursor form is available.
+pub struct QueryCursor<'db> {
+    _memory: MemoryPermit,
+    db: &'db Db,
+    snapshot: Snapshot,
+    table: String,
+    batch_rows: usize,
+    after_id: Option<String>,
+    batch: std::vec::IntoIter<(String, Record)>,
+    predicates: Vec<RExpr>,
+    extract: Vec<(usize, String)>,
+    columns: Vec<String>,
+    offset_remaining: usize,
+    limit_remaining: Option<usize>,
+    done: bool,
+}
+
+impl QueryCursor<'_> {
+    /// Output column names, available before consuming the first row.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// Pull at most `max_rows` rows. This convenience method preserves the
+    /// same bounded behavior as calling `Iterator::next` repeatedly.
+    pub fn next_batch(&mut self, max_rows: usize) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::with_capacity(max_rows.min(self.batch_rows));
+        while rows.len() < max_rows {
+            match self.next() {
+                Some(Ok(row)) => rows.push(row),
+                Some(Err(error)) => return Err(error),
+                None => break,
+            }
+        }
+        Ok(rows)
+    }
+}
+
+impl Iterator for QueryCursor<'_> {
+    type Item = Result<Vec<Value>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.limit_remaining == Some(0) {
+            self.done = true;
+            return None;
+        }
+        loop {
+            if let Some((_, record)) = self.batch.next() {
+                let row = vec![Some(record)];
+                match eval_all(&row, &self.predicates) {
+                    Err(error) => {
+                        self.done = true;
+                        return Some(Err(error));
+                    }
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                }
+                if self.offset_remaining > 0 {
+                    self.offset_remaining -= 1;
+                    continue;
+                }
+                if let Some(remaining) = self.limit_remaining.as_mut() {
+                    *remaining -= 1;
+                }
+                return Some(Ok(project_row(&row, &self.extract)));
+            }
+
+            let next_batch = match self.db.scan_batch_at_unbudgeted(
+                &self.snapshot,
+                &self.table,
+                self.after_id.as_deref(),
+                self.batch_rows,
+            ) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            };
+            let Some(last_id) = next_batch.last().map(|(id, _)| id.clone()) else {
+                self.done = true;
+                return None;
+            };
+            self.after_id = Some(last_id);
+            self.batch = next_batch.into_iter();
+        }
+    }
+}
+
 const WRITE_RETRIES: usize = 3;
 
 pub(crate) fn execute(db: &Db, sql: &str) -> Result<QueryOutput> {
-    match parser::parse(sql)? {
+    execute_positional(db, sql, &[])
+}
+
+pub(crate) fn execute_positional(db: &Db, sql: &str, params: &[Value]) -> Result<QueryOutput> {
+    let mut statement = parser::parse(sql)?;
+    bind_statement(&mut statement, SuppliedParams::Positional(params))?;
+    execute_statement(db, statement)
+}
+
+pub(crate) fn execute_named(db: &Db, sql: &str, params: &Record) -> Result<QueryOutput> {
+    let mut statement = parser::parse(sql)?;
+    bind_statement(&mut statement, SuppliedParams::Named(params))?;
+    execute_statement(db, statement)
+}
+
+fn execute_statement(db: &Db, statement: Statement) -> Result<QueryOutput> {
+    match statement {
         Statement::CreateTable { name, columns } => {
             let mut cols = Vec::with_capacity(columns.len());
             for c in columns {
-                let mut col = match c.dim {
-                    Some(dim) => crate::schema::Column::vector(c.name, dim),
-                    None => crate::schema::Column::new(c.name, c.ty),
-                };
-                if c.not_null {
-                    col = col.not_null();
-                }
-                cols.push(col);
+                cols.push(column_def_to_column(c)?);
             }
             db.create_table(TableSchema::new(name, cols))?;
             Ok(QueryOutput::None)
         }
-        Statement::CreateIndex { table, column, unique } => {
+        Statement::CreateIndex {
+            table,
+            column,
+            unique,
+        } => {
             db.create_index(&table, &column, unique)?;
             Ok(QueryOutput::None)
         }
-        Statement::Insert { table, columns, rows } => exec_insert(db, &table, &columns, &rows),
-        Statement::Select(stmt) => exec_select(db, &stmt),
-        Statement::Update { table, sets, where_clause } => {
-            exec_update(db, &table, &sets, where_clause.as_ref())
+        Statement::DropTable { name, if_exists } => {
+            match db.drop_table(&name) {
+                Err(Error::TableNotFound(_)) if if_exists => {}
+                other => other?,
+            }
+            Ok(QueryOutput::None)
         }
-        Statement::Delete { table, where_clause } => {
-            exec_delete(db, &table, where_clause.as_ref())
+        Statement::DropIndex {
+            table,
+            column,
+            if_exists,
+        } => {
+            match db.drop_index(&table, &column) {
+                Err(Error::IndexNotFound { .. }) if if_exists => {}
+                other => other?,
+            }
+            Ok(QueryOutput::None)
+        }
+        Statement::AddColumn { table, column } => {
+            db.add_column(&table, column_def_to_column(column)?)?;
+            Ok(QueryOutput::None)
+        }
+        Statement::DropColumn {
+            table,
+            column,
+            if_exists,
+        } => {
+            match db.drop_column(&table, &column) {
+                Err(Error::ColumnNotFound { .. }) if if_exists => {}
+                other => other?,
+            }
+            Ok(QueryOutput::None)
+        }
+        Statement::RenameTable { table, to } => {
+            db.rename_table(&table, &to)?;
+            Ok(QueryOutput::None)
+        }
+        Statement::RenameColumn { table, column, to } => {
+            db.rename_column(&table, &column, &to)?;
+            Ok(QueryOutput::None)
+        }
+        Statement::Insert {
+            table,
+            columns,
+            rows,
+        } => exec_insert(db, &table, &columns, &rows),
+        Statement::Select(stmt) => exec_select(db, &stmt),
+        Statement::Update {
+            table,
+            sets,
+            where_clause,
+        } => exec_update(db, &table, &sets, where_clause.as_ref()),
+        Statement::Delete {
+            table,
+            where_clause,
+        } => exec_delete(db, &table, where_clause.as_ref()),
+    }
+}
+
+pub(crate) fn execute_cursor<'db>(db: &'db Db, sql: &str) -> Result<QueryCursor<'db>> {
+    execute_cursor_positional(db, sql, &[])
+}
+
+pub(crate) fn execute_cursor_positional<'db>(
+    db: &'db Db,
+    sql: &str,
+    params: &[Value],
+) -> Result<QueryCursor<'db>> {
+    execute_cursor_with(db, sql, SuppliedParams::Positional(params))
+}
+
+pub(crate) fn execute_cursor_named<'db>(
+    db: &'db Db,
+    sql: &str,
+    params: &Record,
+) -> Result<QueryCursor<'db>> {
+    execute_cursor_with(db, sql, SuppliedParams::Named(params))
+}
+
+fn execute_cursor_with<'db>(
+    db: &'db Db,
+    sql: &str,
+    params: SuppliedParams<'_>,
+) -> Result<QueryCursor<'db>> {
+    let memory_permit = db.acquire_query_memory();
+    let mut statement = parser::parse(sql)?;
+    bind_statement(&mut statement, params)?;
+    let Statement::Select(stmt) = statement else {
+        return Err(Error::Sql(
+            "query_cursor requires a SELECT statement".into(),
+        ));
+    };
+    if !stmt.joins.is_empty() {
+        return Err(Error::Sql(
+            "streaming JOIN cursors are not implemented yet; use query()".into(),
+        ));
+    }
+    if !stmt.order_by.is_empty() {
+        return Err(Error::Sql(
+            "streaming ORDER BY cursors are not implemented yet; use query() with spill".into(),
+        ));
+    }
+    if !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || stmt
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Aggregate { .. }))
+    {
+        return Err(Error::Sql(
+            "streaming aggregate cursors are not implemented yet; use query()".into(),
+        ));
+    }
+
+    let schema = db
+        .table_schema(&stmt.from.name)
+        .ok_or_else(|| Error::TableNotFound(stmt.from.name.clone()))?;
+    let tables = vec![TableCtx {
+        label: stmt
+            .from
+            .alias
+            .clone()
+            .unwrap_or_else(|| stmt.from.name.clone()),
+        schema,
+    }];
+    let mut predicates = Vec::new();
+    if let Some(expr) = &stmt.where_clause {
+        collect_conjuncts(resolve_expr(&tables, expr)?, &mut predicates);
+    }
+    let (columns, extract) = projection_plan(&tables, &stmt.projection)?;
+    let memory = db.memory_options();
+    let batch_rows = memory
+        .scan_batch_rows
+        .min((memory.query_working_bytes / 1024).max(1));
+    Ok(QueryCursor {
+        _memory: memory_permit,
+        db,
+        snapshot: db.snapshot(),
+        table: stmt.from.name,
+        batch_rows,
+        after_id: None,
+        batch: Vec::new().into_iter(),
+        predicates,
+        extract,
+        columns,
+        offset_remaining: limit_to_usize(stmt.offset.as_ref()).unwrap_or(0),
+        limit_remaining: limit_to_usize(stmt.limit.as_ref()),
+        done: false,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum SuppliedParams<'a> {
+    Positional(&'a [Value]),
+    Named(&'a Record),
+}
+
+struct Binder<'a> {
+    supplied: SuppliedParams<'a>,
+    positional_index: usize,
+    named_used: HashSet<String>,
+}
+
+fn bind_statement(statement: &mut Statement, supplied: SuppliedParams<'_>) -> Result<()> {
+    let mut binder = Binder {
+        supplied,
+        positional_index: 0,
+        named_used: HashSet::new(),
+    };
+    match statement {
+        Statement::CreateTable { columns, .. } => {
+            for column in columns {
+                binder.bind_optional_literal(&mut column.default)?;
+            }
+        }
+        Statement::Insert { rows, .. } => {
+            for row in rows {
+                for literal in row {
+                    binder.bind_literal(literal)?;
+                }
+            }
+        }
+        Statement::Select(select) => {
+            binder.bind_optional_expr(&mut select.where_clause)?;
+            binder.bind_optional_expr(&mut select.having)?;
+            binder.bind_optional_limit(&mut select.limit)?;
+            binder.bind_optional_limit(&mut select.offset)?;
+        }
+        Statement::Update {
+            sets, where_clause, ..
+        } => {
+            for (_, literal) in sets {
+                binder.bind_literal(literal)?;
+            }
+            binder.bind_optional_expr(where_clause)?;
+        }
+        Statement::Delete { where_clause, .. } => binder.bind_optional_expr(where_clause)?,
+        Statement::AddColumn { column, .. } => {
+            binder.bind_optional_literal(&mut column.default)?;
+        }
+        Statement::CreateIndex { .. }
+        | Statement::DropTable { .. }
+        | Statement::DropIndex { .. }
+        | Statement::DropColumn { .. }
+        | Statement::RenameTable { .. }
+        | Statement::RenameColumn { .. } => {}
+    }
+    binder.finish()
+}
+
+impl Binder<'_> {
+    fn take_positional(&mut self) -> Result<Value> {
+        let SuppliedParams::Positional(values) = self.supplied else {
+            return Err(Error::InvalidArgument(
+                "SQL uses positional placeholders but named parameters were supplied".into(),
+            ));
+        };
+        let Some(value) = values.get(self.positional_index) else {
+            return Err(Error::InvalidArgument(format!(
+                "missing positional SQL parameter {}",
+                self.positional_index + 1
+            )));
+        };
+        self.positional_index += 1;
+        Ok(value.clone())
+    }
+
+    fn take_named(&mut self, name: &str) -> Result<Value> {
+        let SuppliedParams::Named(values) = self.supplied else {
+            return Err(Error::InvalidArgument(format!(
+                "SQL uses named placeholder %({name})s but positional parameters were supplied"
+            )));
+        };
+        let Some(value) = values.get(name) else {
+            return Err(Error::InvalidArgument(format!(
+                "missing named SQL parameter '{name}'"
+            )));
+        };
+        self.named_used.insert(name.to_owned());
+        Ok(value.clone())
+    }
+
+    fn bind_literal(&mut self, literal: &mut Literal) -> Result<()> {
+        let value = match literal {
+            Literal::PositionalParam => Some(self.take_positional()?),
+            Literal::NamedParam(name) => {
+                let name = name.clone();
+                Some(self.take_named(&name)?)
+            }
+            _ => None,
+        };
+        if let Some(value) = value {
+            *literal = Literal::Bound(value);
+        }
+        Ok(())
+    }
+
+    fn bind_optional_literal(&mut self, literal: &mut Option<Literal>) -> Result<()> {
+        if let Some(literal) = literal {
+            self.bind_literal(literal)?;
+        }
+        Ok(())
+    }
+
+    fn bind_optional_limit(&mut self, limit: &mut Option<LimitValue>) -> Result<()> {
+        let Some(limit) = limit else { return Ok(()) };
+        let value = match limit {
+            LimitValue::PositionalParam => Some(self.take_positional()?),
+            LimitValue::NamedParam(name) => {
+                let name = name.clone();
+                Some(self.take_named(&name)?)
+            }
+            LimitValue::Literal(_) => None,
+        };
+        if let Some(value) = value {
+            let Value::Int64(value) = value else {
+                return Err(Error::InvalidArgument(
+                    "LIMIT/OFFSET parameter must be a non-negative int64".into(),
+                ));
+            };
+            let value = u64::try_from(value).map_err(|_| {
+                Error::InvalidArgument("LIMIT/OFFSET parameter must be non-negative".into())
+            })?;
+            *limit = LimitValue::Literal(value);
+        }
+        Ok(())
+    }
+
+    fn bind_optional_expr(&mut self, expr: &mut Option<Expr>) -> Result<()> {
+        if let Some(expr) = expr {
+            self.bind_expr(expr)?;
+        }
+        Ok(())
+    }
+
+    fn bind_expr(&mut self, expr: &mut Expr) -> Result<()> {
+        match expr {
+            Expr::Cmp { left, right, .. } => {
+                self.bind_operand(left)?;
+                self.bind_operand(right)?;
+            }
+            Expr::IsNull { .. } => {}
+            Expr::InList { list, .. } => {
+                for literal in list {
+                    self.bind_literal(literal)?;
+                }
+            }
+            Expr::And(left, right) | Expr::Or(left, right) => {
+                self.bind_expr(left)?;
+                self.bind_expr(right)?;
+            }
+            Expr::Not(inner) => self.bind_expr(inner)?,
+        }
+        Ok(())
+    }
+
+    fn bind_operand(&mut self, operand: &mut Operand) -> Result<()> {
+        if let Operand::Lit(literal) = operand {
+            self.bind_literal(literal)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        match self.supplied {
+            SuppliedParams::Positional(values) if self.positional_index != values.len() => {
+                Err(Error::InvalidArgument(format!(
+                    "{} unused positional SQL parameter(s)",
+                    values.len() - self.positional_index
+                )))
+            }
+            SuppliedParams::Named(values) => {
+                let unused: Vec<_> = values
+                    .keys()
+                    .filter(|name| !self.named_used.contains(*name))
+                    .cloned()
+                    .collect();
+                if unused.is_empty() {
+                    Ok(())
+                } else {
+                    Err(Error::InvalidArgument(format!(
+                        "unused named SQL parameter(s): {}",
+                        unused.join(", ")
+                    )))
+                }
+            }
+            _ => Ok(()),
         }
     }
+}
+
+fn limit_to_usize(limit: Option<&LimitValue>) -> Option<usize> {
+    match limit {
+        Some(LimitValue::Literal(value)) => Some(usize::try_from(*value).unwrap_or(usize::MAX)),
+        Some(LimitValue::PositionalParam | LimitValue::NamedParam(_)) => {
+            unreachable!("parameters are bound before execution")
+        }
+        None => None,
+    }
+}
+
+/// Turn a parsed column definition into a schema column, coercing a DEFAULT
+/// literal to the column's type so the catalog stores a typed value.
+fn column_def_to_column(c: ColumnDef) -> Result<crate::schema::Column> {
+    let mut col = match c.dim {
+        Some(dim) => crate::schema::Column::vector(c.name.clone(), dim),
+        None => crate::schema::Column::new(c.name.clone(), c.ty),
+    };
+    if c.not_null {
+        col = col.not_null();
+    }
+    if let Some(lit) = &c.default {
+        let value = match lit {
+            Literal::Null => Value::Null,
+            other => literal_to_value(other, c.ty, &c.name)?,
+        };
+        col = col.with_default(&value);
+    }
+    Ok(col)
 }
 
 // --- literals ------------------------------------------------------------------
 
 /// Schema-aware coercion for INSERT/UPDATE SET values.
 fn literal_to_value(lit: &Literal, ty: ColumnType, col: &str) -> Result<Value> {
+    if let Literal::Bound(value) = lit {
+        return bound_value_for_column(value, ty, col);
+    }
     let out = match (lit, ty) {
         (Literal::Null, _) => Value::Null,
         (Literal::Bool(b), ColumnType::Bool) => Value::Bool(*b),
@@ -125,6 +611,9 @@ fn literal_to_value(lit: &Literal, ty: ColumnType, col: &str) -> Result<Value> {
             Value::Time(*n)
         }
         (Literal::Blob(b), ColumnType::Blob) => Value::Blob(b.clone()),
+        (Literal::PositionalParam | Literal::NamedParam(_) | Literal::Bound(_), _) => {
+            unreachable!("parameters are bound before execution")
+        }
         _ => {
             return Err(Error::Sql(format!(
                 "literal {lit:?} is not valid for column '{col}' of type {ty}"
@@ -132,6 +621,53 @@ fn literal_to_value(lit: &Literal, ty: ColumnType, col: &str) -> Result<Value> {
         }
     };
     Ok(out)
+}
+
+fn bound_value_for_column(value: &Value, ty: ColumnType, col: &str) -> Result<Value> {
+    if value.is_null() || value.matches(ty) {
+        return Ok(value.clone());
+    }
+    let converted = match (value, ty) {
+        (Value::Int64(value), ColumnType::Float64) => Some(Value::Float64(*value as f64)),
+        (Value::Int64(value), ColumnType::Timestamp) => Some(Value::Timestamp(*value)),
+        (Value::Int64(value), ColumnType::Date) => {
+            Some(Value::Date(i32::try_from(*value).map_err(|_| {
+                Error::Sql(format!("date parameter out of range for '{col}'"))
+            })?))
+        }
+        (Value::Int64(value), ColumnType::Time) if (0..86_400_000_000).contains(value) => {
+            Some(Value::Time(*value))
+        }
+        (Value::Text(value), ColumnType::Timestamp) => Value::parse_timestamp(value),
+        (Value::Text(value), ColumnType::Date) => Value::parse_date(value),
+        (Value::Text(value), ColumnType::Time) => Value::parse_time(value),
+        (Value::Text(value), ColumnType::Json) => {
+            Some(Value::Json(serde_json::Value::String(value.clone())))
+        }
+        (Value::Bool(value), ColumnType::Json) => Some(Value::Json((*value).into())),
+        (Value::Int64(value), ColumnType::Json) => Some(Value::Json((*value).into())),
+        (Value::Float64(value), ColumnType::Json) => {
+            serde_json::Number::from_f64(*value).map(|number| Value::Json(number.into()))
+        }
+        (Value::Json(serde_json::Value::Array(values)), ColumnType::Vector) => {
+            let mut vector = Vec::with_capacity(values.len());
+            for component in values {
+                let Some(component) = component.as_f64() else {
+                    return Err(Error::Sql(format!(
+                        "vector parameter for '{col}' contains a non-numeric component"
+                    )));
+                };
+                vector.push(component as f32);
+            }
+            Some(Value::Vector(vector))
+        }
+        _ => None,
+    };
+    converted.ok_or_else(|| {
+        Error::Sql(format!(
+            "parameter value {value:?} is not valid for column '{col}' of type {ty}"
+        ))
+    })
 }
 
 /// Context-free conversion for WHERE comparisons.
@@ -143,6 +679,10 @@ fn literal_to_plain_value(lit: &Literal) -> Value {
         Literal::Float(f) => Value::Float64(*f),
         Literal::Str(s) => Value::Text(s.clone()),
         Literal::Blob(b) => Value::Blob(b.clone()),
+        Literal::Bound(value) => value.clone(),
+        Literal::PositionalParam | Literal::NamedParam(_) => {
+            unreachable!("parameters are bound before expression resolution")
+        }
     }
 }
 
@@ -250,9 +790,20 @@ enum RVal {
 
 #[derive(Debug, Clone)]
 enum RExpr {
-    Cmp { left: RVal, op: CmpOp, right: RVal },
-    IsNull { col: (usize, String), negated: bool },
-    InList { col: (usize, String), list: Vec<Value>, negated: bool },
+    Cmp {
+        left: RVal,
+        op: CmpOp,
+        right: RVal,
+    },
+    IsNull {
+        col: (usize, String),
+        negated: bool,
+    },
+    InList {
+        col: (usize, String),
+        list: Vec<Value>,
+        negated: bool,
+    },
     And(Box<RExpr>, Box<RExpr>),
     Or(Box<RExpr>, Box<RExpr>),
     Not(Box<RExpr>),
@@ -491,9 +1042,9 @@ fn single_table_of(e: &RExpr) -> Option<usize> {
     }
 }
 
-/// Coerce a plain value to a column's type for index lookups.
+/// Coerce a plain value to a column's type for equality lookups.
 /// Returns None when the coercion is lossy or impossible (fall back to scan).
-fn coerce_for_index(v: &Value, ty: ColumnType) -> Option<Value> {
+fn coerce_for_lookup(v: &Value, ty: ColumnType) -> Option<Value> {
     match (v, ty) {
         (Value::Int64(n), ColumnType::Timestamp) => Some(Value::Timestamp(*n)),
         (Value::Int64(n), ColumnType::Float64) => Some(Value::Float64(*n as f64)),
@@ -510,7 +1061,14 @@ fn coerce_for_index(v: &Value, ty: ColumnType) -> Option<Value> {
 fn fetch_table(db: &Db, ctx: &TableCtx, ti: usize, conjuncts: &[RExpr]) -> Result<Vec<Record>> {
     let mut candidates: Option<Vec<Record>> = None;
     for c in conjuncts {
-        let RExpr::Cmp { left, op: CmpOp::Eq, right } = c else { continue };
+        let RExpr::Cmp {
+            left,
+            op: CmpOp::Eq,
+            right,
+        } = c
+        else {
+            continue;
+        };
         let (col, val) = match (left, right) {
             (RVal::Col(i, name), RVal::Val(v)) if *i == ti => (name, v),
             (RVal::Val(v), RVal::Col(i, name)) if *i == ti => (name, v),
@@ -525,22 +1083,30 @@ fn fetch_table(db: &Db, ctx: &TableCtx, ti: usize, conjuncts: &[RExpr]) -> Resul
                 candidates = Some(Vec::new());
                 break;
             };
-            candidates = Some(db.get(&ctx.schema.name, id)?.into_iter().collect());
+            candidates = Some(
+                db.get_unbudgeted(&ctx.schema.name, id)?
+                    .into_iter()
+                    .collect(),
+            );
             break;
         }
-        let indexed = ctx.schema.indexes.iter().any(|d| &d.column == col);
-        if indexed {
-            let ty = ctx.schema.column(col).expect("resolved").ty;
-            if let Some(key) = coerce_for_index(val, ty) {
-                let hits = db.find_eq(&ctx.schema.name, col, &key)?;
-                candidates = Some(hits.into_iter().map(|(_, r)| r).collect());
-                break;
-            }
+        let ty = ctx.schema.column(col).expect("resolved").ty;
+        if let Some(key) = coerce_for_lookup(val, ty) {
+            // find_eq selects a secondary index when one exists and otherwise
+            // uses the segment-streaming equality scan. Either path narrows
+            // the rows before the remaining conjuncts are evaluated.
+            let hits = db.find_eq_unbudgeted(&ctx.schema.name, col, &key)?;
+            candidates = Some(hits.into_iter().map(|(_, r)| r).collect());
+            break;
         }
     }
     let rows = match candidates {
         Some(rows) => rows,
-        None => db.scan(&ctx.schema.name)?.into_iter().map(|(_, r)| r).collect(),
+        None => db
+            .scan_unbudgeted(&ctx.schema.name)?
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect(),
     };
     // Apply every conjunct (re-checking the driving one is harmless).
     let mut out = Vec::with_capacity(rows.len());
@@ -587,6 +1153,886 @@ fn join_key(v: &Value) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+#[derive(Debug)]
+struct SortedOutputRow {
+    keys: Vec<Value>,
+    values: Vec<Value>,
+    sequence: u64,
+}
+
+fn compare_sorted_rows(a: &SortedOutputRow, b: &SortedOutputRow, desc: &[bool]) -> Ordering {
+    for ((av, bv), descending) in a.keys.iter().zip(&b.keys).zip(desc) {
+        let ord = sort_cmp(av, bv);
+        if ord != Ordering::Equal {
+            return if *descending { ord.reverse() } else { ord };
+        }
+    }
+    a.sequence.cmp(&b.sequence)
+}
+
+fn value_heap_bytes(value: &Value) -> usize {
+    size_of::<Value>()
+        + match value {
+            Value::Text(s) => s.capacity(),
+            Value::Blob(b) => b.capacity(),
+            Value::Vector(v) => v.capacity() * size_of::<f32>(),
+            Value::Json(v) => v.to_string().len(),
+            _ => 0,
+        }
+}
+
+fn sorted_row_bytes(row: &SortedOutputRow) -> usize {
+    size_of::<SortedOutputRow>()
+        + row.keys.capacity() * size_of::<Value>()
+        + row.values.capacity() * size_of::<Value>()
+        + row.keys.iter().map(value_heap_bytes).sum::<usize>()
+        + row.values.iter().map(value_heap_bytes).sum::<usize>()
+}
+
+/// Owns spill paths so every early-return/error path removes its temporary
+/// files. Files are intentionally outside the database format and never need
+/// recovery.
+struct SpillFiles(Vec<PathBuf>);
+
+impl Drop for SpillFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+struct SpillSorter<'a> {
+    db: &'a Db,
+    budget: usize,
+    keep: Option<usize>,
+    desc: Vec<bool>,
+    buffer: Vec<SortedOutputRow>,
+    buffer_bytes: usize,
+    spill_dir: PathBuf,
+    runs: SpillFiles,
+}
+
+impl<'a> SpillSorter<'a> {
+    fn new(db: &'a Db, desc: Vec<bool>, keep: Option<usize>) -> Result<Self> {
+        let memory = db.memory_options();
+        let spill_dir = memory
+            .spill_directory
+            .unwrap_or_else(|| std::env::temp_dir().join("elitesql-query-spill"));
+        Ok(Self {
+            db,
+            budget: memory.query_working_bytes,
+            keep,
+            desc,
+            buffer: Vec::new(),
+            buffer_bytes: 0,
+            spill_dir,
+            runs: SpillFiles(Vec::new()),
+        })
+    }
+
+    fn push(&mut self, row: SortedOutputRow) -> Result<()> {
+        let bytes = sorted_row_bytes(&row);
+        // One oversized row is allowed through by itself: the operator never
+        // creates a second full-size copy before flushing it.
+        if !self.buffer.is_empty() && self.buffer_bytes.saturating_add(bytes) > self.budget {
+            self.flush_run()?;
+        }
+        self.buffer_bytes = self.buffer_bytes.saturating_add(bytes);
+        self.buffer.push(row);
+        self.db.record_query_buffer(self.buffer_bytes);
+        if self.buffer_bytes >= self.budget {
+            self.flush_run()?;
+        }
+        Ok(())
+    }
+
+    fn sort_and_prune(&mut self) {
+        self.buffer
+            .sort_by(|a, b| compare_sorted_rows(a, b, &self.desc));
+        if let Some(keep) = self.keep {
+            self.buffer.truncate(keep);
+        }
+    }
+
+    fn flush_run(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.sort_and_prune();
+        fs::create_dir_all(&self.spill_dir)?;
+        let path = self.spill_dir.join(format!("query-{}.run", Ulid::new()));
+        let file = File::create(&path)?;
+        let mut writer = BufWriter::new(file);
+        for row in &self.buffer {
+            write_sorted_row(&mut writer, row)?;
+        }
+        writer.flush()?;
+        let bytes = writer.get_ref().metadata()?.len();
+        self.db.record_query_spill(bytes);
+        self.runs.0.push(path);
+        self.buffer.clear();
+        self.buffer_bytes = 0;
+        Ok(())
+    }
+
+    fn finish(mut self, offset: usize, limit: Option<usize>) -> Result<Vec<Vec<Value>>> {
+        let mut out = Vec::with_capacity(limit.unwrap_or(0).min(4096));
+        self.for_each_sorted(offset, limit, |row| {
+            out.push(row.values);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    fn for_each_sorted(
+        &mut self,
+        offset: usize,
+        limit: Option<usize>,
+        mut visit: impl FnMut(SortedOutputRow) -> Result<()>,
+    ) -> Result<()> {
+        if self.runs.0.is_empty() {
+            self.sort_and_prune();
+            let take = limit.unwrap_or(usize::MAX);
+            for row in self.buffer.drain(..).skip(offset).take(take) {
+                visit(row)?;
+            }
+            return Ok(());
+        }
+        self.flush_run()?;
+
+        let mut readers: Vec<SpillRunReader> = self
+            .runs
+            .0
+            .iter()
+            .map(SpillRunReader::open)
+            .collect::<Result<_>>()?;
+        let mut heads: Vec<Option<SortedOutputRow>> = readers
+            .iter_mut()
+            .map(SpillRunReader::next_row)
+            .collect::<Result<_>>()?;
+        let take = limit.unwrap_or(usize::MAX);
+        let stop = offset.saturating_add(take);
+        let mut seen = 0usize;
+        while seen < stop {
+            let next = heads
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| row.as_ref().map(|r| (i, r)))
+                .min_by(|(_, a), (_, b)| compare_sorted_rows(a, b, &self.desc))
+                .map(|(i, _)| i);
+            let Some(run) = next else { break };
+            let row = heads[run].take().expect("selected run has a row");
+            if seen >= offset {
+                visit(row)?;
+            }
+            seen += 1;
+            heads[run] = readers[run].next_row()?;
+        }
+        Ok(())
+    }
+}
+
+struct SpillRunReader {
+    reader: BufReader<File>,
+}
+
+impl SpillRunReader {
+    fn open(path: &PathBuf) -> Result<Self> {
+        Ok(Self {
+            reader: BufReader::new(File::open(path)?),
+        })
+    }
+
+    fn next_row(&mut self) -> Result<Option<SortedOutputRow>> {
+        let mut len_bytes = [0u8; 4];
+        let mut read = 0usize;
+        while read < len_bytes.len() {
+            let n = self.reader.read(&mut len_bytes[read..])?;
+            if n == 0 {
+                if read == 0 {
+                    return Ok(None);
+                }
+                return Err(Error::Corrupt("truncated query spill frame".into()));
+            }
+            read += n;
+        }
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        let mut body = vec![0u8; len];
+        self.reader.read_exact(&mut body)?;
+        decode_sorted_row(&body).map(Some)
+    }
+}
+
+fn write_sorted_row(writer: &mut impl Write, row: &SortedOutputRow) -> Result<()> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&row.sequence.to_le_bytes());
+    body.extend_from_slice(&(row.keys.len() as u32).to_le_bytes());
+    for value in &row.keys {
+        encode_value(&mut body, value);
+    }
+    body.extend_from_slice(&(row.values.len() as u32).to_le_bytes());
+    for value in &row.values {
+        encode_value(&mut body, value);
+    }
+    let len = u32::try_from(body.len())
+        .map_err(|_| Error::Sql("one query row is too large to spill".into()))?;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(&body)?;
+    Ok(())
+}
+
+fn decode_sorted_row(body: &[u8]) -> Result<SortedOutputRow> {
+    let mut pos = 0usize;
+    let sequence = read_spill_u64(body, &mut pos)?;
+    let key_count = read_spill_u32(body, &mut pos)? as usize;
+    let mut keys = Vec::with_capacity(key_count);
+    for _ in 0..key_count {
+        keys.push(decode_value(body, &mut pos, None)?);
+    }
+    let value_count = read_spill_u32(body, &mut pos)? as usize;
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        values.push(decode_value(body, &mut pos, None)?);
+    }
+    if pos != body.len() {
+        return Err(Error::Corrupt(
+            "query spill frame has trailing bytes".into(),
+        ));
+    }
+    Ok(SortedOutputRow {
+        keys,
+        values,
+        sequence,
+    })
+}
+
+fn read_spill_u32(buf: &[u8], pos: &mut usize) -> Result<u32> {
+    let bytes: [u8; 4] = buf
+        .get(*pos..pos.saturating_add(4))
+        .ok_or_else(|| Error::Corrupt("truncated query spill frame".into()))?
+        .try_into()
+        .expect("four bytes");
+    *pos += 4;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_spill_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
+    let bytes: [u8; 8] = buf
+        .get(*pos..pos.saturating_add(8))
+        .ok_or_else(|| Error::Corrupt("truncated query spill frame".into()))?
+        .try_into()
+        .expect("eight bytes");
+    *pos += 8;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn record_heap_bytes(record: &Record) -> usize {
+    size_of::<Record>()
+        + record
+            .iter()
+            .map(|(name, value)| name.capacity() + value_heap_bytes(value))
+            .sum::<usize>()
+}
+
+fn exec_row_heap_bytes(row: &ExecRow) -> usize {
+    size_of::<ExecRow>()
+        + row.capacity() * size_of::<Option<Record>>()
+        + row
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(record_heap_bytes)
+            .sum::<usize>()
+}
+
+fn encode_spill_record(record: &Record, out: &mut Vec<u8>) -> Result<()> {
+    let count = u32::try_from(record.len())
+        .map_err(|_| Error::Sql("too many columns in temporary query row".into()))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for (name, value) in record {
+        let len = u32::try_from(name.len())
+            .map_err(|_| Error::Sql("column name too large for temporary query row".into()))?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        encode_value(out, value);
+    }
+    Ok(())
+}
+
+fn decode_spill_record(buf: &[u8], pos: &mut usize) -> Result<Record> {
+    let count = read_spill_u32(buf, pos)? as usize;
+    let mut record = Record::new();
+    for _ in 0..count {
+        let len = read_spill_u32(buf, pos)? as usize;
+        let end = pos
+            .checked_add(len)
+            .filter(|end| *end <= buf.len())
+            .ok_or_else(|| Error::Corrupt("truncated query spill column".into()))?;
+        let name = std::str::from_utf8(&buf[*pos..end])
+            .map_err(|_| Error::Corrupt("invalid utf8 in query spill column".into()))?
+            .to_owned();
+        *pos = end;
+        record.insert(name, decode_value(buf, pos, None)?);
+    }
+    Ok(record)
+}
+
+fn write_spill_exec_row(writer: &mut File, row: &ExecRow) -> Result<u64> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(row.len() as u32).to_le_bytes());
+    for record in row {
+        match record {
+            Some(record) => {
+                body.push(1);
+                encode_spill_record(record, &mut body)?;
+            }
+            None => body.push(0),
+        }
+    }
+    write_spill_frame(writer, &body)
+}
+
+fn write_spill_record(writer: &mut File, record: &Record) -> Result<u64> {
+    let mut body = Vec::new();
+    encode_spill_record(record, &mut body)?;
+    write_spill_frame(writer, &body)
+}
+
+fn write_spill_frame(writer: &mut File, body: &[u8]) -> Result<u64> {
+    let len = u32::try_from(body.len())
+        .map_err(|_| Error::Sql("one query row is too large to spill".into()))?;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(body)?;
+    Ok(body.len() as u64 + 4)
+}
+
+struct SpillFrameReader {
+    reader: BufReader<File>,
+}
+
+impl SpillFrameReader {
+    fn open(path: &PathBuf) -> Result<Self> {
+        Ok(Self {
+            reader: BufReader::with_capacity(4096, File::open(path)?),
+        })
+    }
+
+    fn next_frame(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut len_bytes = [0u8; 4];
+        let mut read = 0usize;
+        while read < len_bytes.len() {
+            let n = self.reader.read(&mut len_bytes[read..])?;
+            if n == 0 {
+                if read == 0 {
+                    return Ok(None);
+                }
+                return Err(Error::Corrupt("truncated query spill frame".into()));
+            }
+            read += n;
+        }
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        let mut body = vec![0; len];
+        self.reader.read_exact(&mut body)?;
+        Ok(Some(body))
+    }
+
+    fn next_exec_row(&mut self) -> Result<Option<ExecRow>> {
+        let Some(body) = self.next_frame()? else {
+            return Ok(None);
+        };
+        let mut pos = 0usize;
+        let count = read_spill_u32(&body, &mut pos)? as usize;
+        let mut row = Vec::with_capacity(count);
+        for _ in 0..count {
+            let present = *body
+                .get(pos)
+                .ok_or_else(|| Error::Corrupt("truncated query spill row".into()))?;
+            pos += 1;
+            row.push(if present == 0 {
+                None
+            } else {
+                Some(decode_spill_record(&body, &mut pos)?)
+            });
+        }
+        if pos != body.len() {
+            return Err(Error::Corrupt("query spill row has trailing bytes".into()));
+        }
+        Ok(Some(row))
+    }
+
+    fn next_record(&mut self) -> Result<Option<Record>> {
+        let Some(body) = self.next_frame()? else {
+            return Ok(None);
+        };
+        let mut pos = 0usize;
+        let record = decode_spill_record(&body, &mut pos)?;
+        if pos != body.len() {
+            return Err(Error::Corrupt(
+                "query spill record has trailing bytes".into(),
+            ));
+        }
+        Ok(Some(record))
+    }
+}
+
+type ProjectionPlan = (Vec<String>, Vec<(usize, String)>);
+
+fn projection_plan(tables: &[TableCtx], projection: &[SelectItem]) -> Result<ProjectionPlan> {
+    let single = tables.len() == 1;
+    let mut columns = Vec::new();
+    let mut extract = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::Star => {
+                for (ti, table) in tables.iter().enumerate() {
+                    let prefix = if single {
+                        String::new()
+                    } else {
+                        format!("{}.", table.label)
+                    };
+                    columns.push(format!("{prefix}id"));
+                    extract.push((ti, "id".into()));
+                    for column in &table.schema.columns {
+                        columns.push(format!("{prefix}{}", column.name));
+                        extract.push((ti, column.name.clone()));
+                    }
+                }
+            }
+            SelectItem::Column { col, alias } => {
+                let (ti, name) = resolve_col(tables, col)?;
+                columns.push(alias.clone().unwrap_or_else(|| name.clone()));
+                extract.push((ti, name));
+            }
+            SelectItem::Aggregate { .. } => {
+                return Err(Error::Sql(
+                    "aggregate projection reached non-aggregate executor".into(),
+                ));
+            }
+        }
+    }
+    Ok((columns, extract))
+}
+
+fn project_row(row: &ExecRow, extract: &[(usize, String)]) -> Vec<Value> {
+    extract
+        .iter()
+        .map(|(ti, col)| col_value(row, *ti, col))
+        .collect()
+}
+
+enum TableDriver {
+    Id(String),
+    Equality(String, Value),
+    Scan,
+}
+
+fn table_driver(table: &TableCtx, ti: usize, predicates: &[RExpr]) -> TableDriver {
+    for predicate in predicates {
+        let RExpr::Cmp {
+            left,
+            op: CmpOp::Eq,
+            right,
+        } = predicate
+        else {
+            continue;
+        };
+        let (column, value) = match (left, right) {
+            (RVal::Col(index, column), RVal::Val(value)) if *index == ti => (column, value),
+            (RVal::Val(value), RVal::Col(index, column)) if *index == ti => (column, value),
+            _ => continue,
+        };
+        if column == "id" {
+            return match value {
+                Value::Text(id) => TableDriver::Id(id.clone()),
+                _ => TableDriver::Id(String::new()),
+            };
+        }
+        let ty = table.schema.column(column).expect("resolved column").ty;
+        if let Some(value) = coerce_for_lookup(value, ty) {
+            return TableDriver::Equality(column.clone(), value);
+        }
+    }
+    TableDriver::Scan
+}
+
+fn driven_batch(
+    db: &Db,
+    snapshot: &Snapshot,
+    table: &TableCtx,
+    driver: &TableDriver,
+    after_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(String, Record)>> {
+    match driver {
+        TableDriver::Id(id) => {
+            if id.is_empty() || after_id.is_some() {
+                return Ok(Vec::new());
+            }
+            Ok(db
+                .get_at_unbudgeted(snapshot, &table.schema.name, id)?
+                .map(|record| vec![(id.clone(), record)])
+                .unwrap_or_default())
+        }
+        TableDriver::Equality(column, value) => {
+            db.find_eq_batch_unbudgeted(&table.schema.name, column, value, after_id, limit)
+        }
+        TableDriver::Scan => {
+            db.scan_batch_at_unbudgeted(snapshot, &table.schema.name, after_id, limit)
+        }
+    }
+}
+
+/// The common single-table SELECT path is fully batched. It retains only one
+/// scan batch plus the caller-owned output; ORDER BY uses bounded sorted runs.
+fn exec_single_table_select(
+    db: &Db,
+    tables: &[TableCtx],
+    stmt: &SelectStmt,
+    pushed: &[RExpr],
+    residual: &[RExpr],
+) -> Result<QueryOutput> {
+    let (columns, extract) = projection_plan(tables, &stmt.projection)?;
+    let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
+    let limit = limit_to_usize(stmt.limit.as_ref());
+    if limit == Some(0) {
+        return Ok(QueryOutput::Rows {
+            columns,
+            rows: Vec::new(),
+        });
+    }
+
+    let order_keys: Vec<((usize, String), bool)> = stmt
+        .order_by
+        .iter()
+        .map(|(column, desc)| Ok((resolve_col(tables, column)?, *desc)))
+        .collect::<Result<_>>()?;
+    let mut sorter = if order_keys.is_empty() {
+        None
+    } else {
+        Some(SpillSorter::new(
+            db,
+            order_keys.iter().map(|(_, desc)| *desc).collect(),
+            limit.map(|n| offset.saturating_add(n)),
+        )?)
+    };
+    let memory = db.memory_options();
+    // Keep decoded scan batches proportional to the byte budget even when the
+    // configured row cap was chosen for small records.
+    let batch_rows = memory
+        .scan_batch_rows
+        .min((memory.query_working_bytes / 1024).max(1));
+    let snapshot = db.snapshot();
+    let driver = table_driver(&tables[0], 0, pushed);
+    let mut cursor: Option<String> = None;
+    let mut sequence = 0u64;
+    let mut skipped = 0usize;
+    let mut out = Vec::new();
+
+    loop {
+        let batch = driven_batch(
+            db,
+            &snapshot,
+            &tables[0],
+            &driver,
+            cursor.as_deref(),
+            batch_rows,
+        )?;
+        let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
+            break;
+        };
+        cursor = Some(last_id);
+        for (_, record) in batch {
+            let row = vec![Some(record)];
+            if !eval_all(&row, pushed)? || !eval_all(&row, residual)? {
+                continue;
+            }
+            if let Some(sorter) = sorter.as_mut() {
+                let keys = order_keys
+                    .iter()
+                    .map(|((ti, col), _)| col_value(&row, *ti, col))
+                    .collect();
+                sorter.push(SortedOutputRow {
+                    keys,
+                    values: project_row(&row, &extract),
+                    sequence,
+                })?;
+                sequence = sequence.saturating_add(1);
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            out.push(project_row(&row, &extract));
+            if limit.is_some_and(|n| out.len() == n) {
+                return Ok(QueryOutput::Rows { columns, rows: out });
+            }
+        }
+    }
+
+    let rows = match sorter {
+        Some(sorter) => sorter.finish(offset, limit)?,
+        None => out,
+    };
+    Ok(QueryOutput::Rows { columns, rows })
+}
+
+fn visit_single_table_rows(
+    db: &Db,
+    table: &TableCtx,
+    pushed: &[RExpr],
+    residual: &[RExpr],
+    mut visit: impl FnMut(&ExecRow) -> Result<()>,
+) -> Result<()> {
+    let memory = db.memory_options();
+    let batch_rows = memory
+        .scan_batch_rows
+        .min((memory.query_working_bytes / 1024).max(1));
+    let snapshot = db.snapshot();
+    let driver = table_driver(table, 0, pushed);
+    let mut cursor: Option<String> = None;
+    loop {
+        let batch = driven_batch(db, &snapshot, table, &driver, cursor.as_deref(), batch_rows)?;
+        let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
+            return Ok(());
+        };
+        cursor = Some(last_id);
+        for (_, record) in batch {
+            let row = vec![Some(record)];
+            if eval_all(&row, pushed)? && eval_all(&row, residual)? {
+                visit(&row)?;
+            }
+        }
+    }
+}
+
+fn visit_table_records(
+    db: &Db,
+    table: &TableCtx,
+    ti: usize,
+    predicates: &[RExpr],
+    mut visit: impl FnMut(Record) -> Result<()>,
+) -> Result<()> {
+    let memory = db.memory_options();
+    let batch_rows = memory
+        .scan_batch_rows
+        .min((memory.query_working_bytes / 1024).max(1));
+    let snapshot = db.snapshot();
+    let driver = table_driver(table, ti, predicates);
+    let mut cursor: Option<String> = None;
+    loop {
+        let batch = driven_batch(db, &snapshot, table, &driver, cursor.as_deref(), batch_rows)?;
+        let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
+            return Ok(());
+        };
+        cursor = Some(last_id);
+        for (_, record) in batch {
+            let row = single_row(ti, record);
+            if eval_all(&row, predicates)? {
+                visit(take_single(row, ti))?;
+            }
+        }
+    }
+}
+
+/// Bounded common JOIN path: stream the left side and probe an id/secondary
+/// index on the right. No joined `ExecRow` collection is retained.
+fn exec_single_indexed_join_select(
+    db: &Db,
+    tables: &[TableCtx],
+    stmt: &SelectStmt,
+    pushdown: &[Vec<RExpr>],
+    residual: &[RExpr],
+) -> Result<Option<QueryOutput>> {
+    let join = &stmt.joins[0];
+    if join.kind == JoinKind::Right {
+        return Ok(None);
+    }
+    let left = resolve_col(tables, &join.on.0)?;
+    let right = resolve_col(tables, &join.on.1)?;
+    let (existing, fresh) = if left.0 == 1 && right.0 == 0 {
+        (right, left)
+    } else if right.0 == 1 && left.0 == 0 {
+        (left, right)
+    } else {
+        return Err(Error::Sql(
+            "ON must join the new table with a previously listed table".into(),
+        ));
+    };
+    let right_indexed = fresh.1 == "id"
+        || tables[1]
+            .schema
+            .indexes
+            .iter()
+            .any(|index| index.column == fresh.1);
+    if !right_indexed {
+        return Ok(None);
+    }
+
+    let (columns, extract) = projection_plan(tables, &stmt.projection)?;
+    let order_keys: Vec<((usize, String), bool)> = stmt
+        .order_by
+        .iter()
+        .map(|(column, desc)| Ok((resolve_col(tables, column)?, *desc)))
+        .collect::<Result<_>>()?;
+    let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
+    let limit = limit_to_usize(stmt.limit.as_ref());
+    if limit == Some(0) {
+        return Ok(Some(QueryOutput::Rows {
+            columns,
+            rows: Vec::new(),
+        }));
+    }
+    let mut sorter = if order_keys.is_empty() {
+        None
+    } else {
+        Some(SpillSorter::new(
+            db,
+            order_keys.iter().map(|(_, desc)| *desc).collect(),
+            limit.map(|value| offset.saturating_add(value)),
+        )?)
+    };
+    let memory = db.memory_options();
+    let batch_rows = memory
+        .scan_batch_rows
+        .min((memory.query_working_bytes / 1024).max(1));
+    let snapshot = db.snapshot();
+    let left_driver = table_driver(&tables[0], 0, &pushdown[0]);
+    let mut left_cursor: Option<String> = None;
+    let mut output = Vec::new();
+    let mut skipped = 0usize;
+    let mut sequence = 0u64;
+    let mut complete = false;
+
+    while !complete {
+        let batch = driven_batch(
+            db,
+            &snapshot,
+            &tables[0],
+            &left_driver,
+            left_cursor.as_deref(),
+            batch_rows,
+        )?;
+        let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
+            break;
+        };
+        left_cursor = Some(last_id);
+        for (_, left_record) in batch {
+            let left_row = vec![Some(left_record)];
+            if !eval_all(&left_row, &pushdown[0])? {
+                continue;
+            }
+            let key = col_value(&left_row, existing.0, &existing.1);
+            let mut matched = false;
+            let mut right_cursor: Option<String> = None;
+            loop {
+                let matches = if key.is_null() {
+                    Vec::new()
+                } else if fresh.1 == "id" {
+                    if right_cursor.is_some() {
+                        Vec::new()
+                    } else if let Value::Text(id) = &key {
+                        db.get_at_unbudgeted(&snapshot, &tables[1].schema.name, id)?
+                            .map(|record| vec![(id.clone(), record)])
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    let ty = tables[1]
+                        .schema
+                        .column(&fresh.1)
+                        .expect("resolved column")
+                        .ty;
+                    match coerce_for_lookup(&key, ty) {
+                        Some(value) => db.find_eq_batch_unbudgeted(
+                            &tables[1].schema.name,
+                            &fresh.1,
+                            &value,
+                            right_cursor.as_deref(),
+                            batch_rows,
+                        )?,
+                        None => Vec::new(),
+                    }
+                };
+                let Some(last_right_id) = matches.last().map(|(id, _)| id.clone()) else {
+                    break;
+                };
+                right_cursor = Some(last_right_id);
+                for (_, right_record) in matches {
+                    let right_row = vec![None, Some(right_record)];
+                    if !eval_all(&right_row, &pushdown[1])? {
+                        continue;
+                    }
+                    matched = true;
+                    let row = vec![left_row[0].clone(), right_row[1].clone()];
+                    if !eval_all(&row, residual)? {
+                        continue;
+                    }
+                    if let Some(sorter) = sorter.as_mut() {
+                        sorter.push(SortedOutputRow {
+                            keys: order_keys
+                                .iter()
+                                .map(|((ti, column), _)| col_value(&row, *ti, column))
+                                .collect(),
+                            values: project_row(&row, &extract),
+                            sequence,
+                        })?;
+                        sequence = sequence.saturating_add(1);
+                    } else if skipped < offset {
+                        skipped += 1;
+                    } else {
+                        output.push(project_row(&row, &extract));
+                        if limit.is_some_and(|value| output.len() == value) {
+                            complete = true;
+                            break;
+                        }
+                    }
+                }
+                if complete || fresh.1 == "id" {
+                    break;
+                }
+            }
+            if complete {
+                break;
+            }
+            if !matched && join.kind == JoinKind::Left {
+                let row = vec![left_row[0].clone(), None];
+                if !eval_all(&row, residual)? {
+                    continue;
+                }
+                if let Some(sorter) = sorter.as_mut() {
+                    sorter.push(SortedOutputRow {
+                        keys: order_keys
+                            .iter()
+                            .map(|((ti, column), _)| col_value(&row, *ti, column))
+                            .collect(),
+                        values: project_row(&row, &extract),
+                        sequence,
+                    })?;
+                    sequence = sequence.saturating_add(1);
+                } else if skipped < offset {
+                    skipped += 1;
+                } else {
+                    output.push(project_row(&row, &extract));
+                    if limit.is_some_and(|value| output.len() == value) {
+                        complete = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(sorter) = sorter {
+        output = sorter.finish(offset, limit)?;
+    }
+    Ok(Some(QueryOutput::Rows {
+        columns,
+        rows: output,
+    }))
+}
+
 // --- SELECT -----------------------------------------------------------------------
 
 fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
@@ -597,7 +2043,10 @@ fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
             .table_schema(&tref.name)
             .ok_or_else(|| Error::TableNotFound(tref.name.clone()))?;
         let label = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
-        if tables.iter().any(|t: &TableCtx| t.label.eq_ignore_ascii_case(&label)) {
+        if tables
+            .iter()
+            .any(|t: &TableCtx| t.label.eq_ignore_ascii_case(&label))
+        {
             return Err(Error::Sql(format!("duplicate table alias '{label}'")));
         }
         tables.push(TableCtx { schema, label });
@@ -620,6 +2069,27 @@ fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
                 Some(ti) => pushdown[ti].push(c),
                 None => residual.push(c),
             }
+        }
+    }
+
+    let is_aggregate = stmt
+        .projection
+        .iter()
+        .any(|i| matches!(i, SelectItem::Aggregate { .. }))
+        || !stmt.group_by.is_empty()
+        || stmt.having.is_some();
+
+    if tables.len() == 1 {
+        if is_aggregate {
+            return exec_single_table_aggregate(db, &tables, stmt, &pushdown[0], &residual);
+        }
+        return exec_single_table_select(db, &tables, stmt, &pushdown[0], &residual);
+    }
+    if tables.len() == 2 && !is_aggregate {
+        if let Some(output) =
+            exec_single_indexed_join_select(db, &tables, stmt, &pushdown, &residual)?
+        {
+            return Ok(output);
         }
     }
 
@@ -666,83 +2136,46 @@ fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
 
     // Aggregate queries take their own path from here (grouping, HAVING,
     // ORDER BY over output names, LIMIT, projection).
-    let is_aggregate = stmt
-        .projection
-        .iter()
-        .any(|i| matches!(i, SelectItem::Aggregate { .. }))
-        || !stmt.group_by.is_empty()
-        || stmt.having.is_some();
     if is_aggregate {
         return exec_aggregate(&tables, rows, stmt);
     }
 
-    // ORDER BY.
-    if !stmt.order_by.is_empty() {
-        let keys: Vec<((usize, String), bool)> = stmt
-            .order_by
-            .iter()
-            .map(|(c, desc)| Ok((resolve_col(&tables, c)?, *desc)))
-            .collect::<Result<_>>()?;
-        rows.sort_by(|a, b| {
-            for ((ti, col), desc) in &keys {
-                let va = col_value(a, *ti, col);
-                let vb = col_value(b, *ti, col);
-                let ord = sort_cmp(&va, &vb);
-                if ord != Ordering::Equal {
-                    return if *desc { ord.reverse() } else { ord };
-                }
-            }
-            Ordering::Equal
-        });
-    }
-
-    // OFFSET / LIMIT.
-    let offset = stmt.offset.unwrap_or(0) as usize;
-    if offset > 0 {
-        rows = rows.into_iter().skip(offset).collect();
-    }
-    if let Some(limit) = stmt.limit {
-        rows.truncate(limit as usize);
-    }
-
-    // Projection.
-    let single = tables.len() == 1;
-    let mut columns: Vec<String> = Vec::new();
-    let mut extract: Vec<(usize, String)> = Vec::new();
-    for item in &stmt.projection {
-        match item {
-            SelectItem::Star => {
-                for (ti, t) in tables.iter().enumerate() {
-                    let prefix = if single { String::new() } else { format!("{}.", t.label) };
-                    columns.push(format!("{prefix}id"));
-                    extract.push((ti, "id".into()));
-                    for c in &t.schema.columns {
-                        columns.push(format!("{prefix}{}", c.name));
-                        extract.push((ti, c.name.clone()));
-                    }
-                }
-            }
-            SelectItem::Column { col, alias } => {
-                let (ti, name) = resolve_col(&tables, col)?;
-                let header = alias.clone().unwrap_or_else(|| name.clone());
-                columns.push(header);
-                extract.push((ti, name));
-            }
-            SelectItem::Aggregate { .. } => {
-                unreachable!("aggregate queries are handled by exec_aggregate")
-            }
-        }
-    }
-    let out_rows: Vec<Vec<Value>> = rows
+    let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
+    let limit = limit_to_usize(stmt.limit.as_ref());
+    let (columns, extract) = projection_plan(&tables, &stmt.projection)?;
+    let order_keys: Vec<((usize, String), bool)> = stmt
+        .order_by
         .iter()
-        .map(|row| {
-            extract
-                .iter()
-                .map(|(ti, col)| col_value(row, *ti, col))
-                .collect()
-        })
-        .collect();
-    Ok(QueryOutput::Rows { columns, rows: out_rows })
+        .map(|(column, desc)| Ok((resolve_col(&tables, column)?, *desc)))
+        .collect::<Result<_>>()?;
+    let out_rows = if order_keys.is_empty() {
+        rows.into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|row| project_row(&row, &extract))
+            .collect()
+    } else {
+        let mut sorter = SpillSorter::new(
+            db,
+            order_keys.iter().map(|(_, desc)| *desc).collect(),
+            limit.map(|value| offset.saturating_add(value)),
+        )?;
+        for (sequence, row) in rows.into_iter().enumerate() {
+            sorter.push(SortedOutputRow {
+                keys: order_keys
+                    .iter()
+                    .map(|((ti, column), _)| col_value(&row, *ti, column))
+                    .collect(),
+                values: project_row(&row, &extract),
+                sequence: sequence as u64,
+            })?;
+        }
+        sorter.finish(offset, limit)?
+    };
+    Ok(QueryOutput::Rows {
+        columns,
+        rows: out_rows,
+    })
 }
 
 // --- aggregation --------------------------------------------------------------
@@ -782,75 +2215,84 @@ impl AggState {
                 saw_any: false,
             },
             AggFunc::Avg => AggState::Avg { sum: 0.0, n: 0 },
-            AggFunc::Min => AggState::MinMax { best: None, is_min: true },
-            AggFunc::Max => AggState::MinMax { best: None, is_min: false },
+            AggFunc::Min => AggState::MinMax {
+                best: None,
+                is_min: true,
+            },
+            AggFunc::Max => AggState::MinMax {
+                best: None,
+                is_min: false,
+            },
         }
     }
 
     /// SQL NULL semantics: COUNT(col)/SUM/AVG/MIN/MAX ignore NULLs;
     /// COUNT(*) counts rows.
     fn update(&mut self, spec: &AggSpec, row: &ExecRow) -> Result<()> {
+        let value = spec
+            .arg
+            .as_ref()
+            .map(|(ti, col)| col_value(row, *ti, col))
+            .unwrap_or(Value::Null);
+        self.update_value(spec, &value)
+    }
+
+    fn update_value(&mut self, spec: &AggSpec, value: &Value) -> Result<()> {
         match self {
             AggState::Count(n) => match &spec.arg {
                 None => *n += 1,
                 Some((ti, col)) => {
-                    if !col_value(row, *ti, col).is_null() {
+                    let _ = (ti, col);
+                    if !value.is_null() {
                         *n += 1;
                     }
                 }
             },
-            AggState::Sum { ints, floats, saw_float, saw_any } => {
-                let (ti, col) = spec.arg.as_ref().expect("SUM has a column");
-                match col_value(row, *ti, col) {
-                    Value::Null => {}
-                    Value::Int64(x) => {
-                        *ints += x as i128;
-                        *saw_any = true;
-                    }
-                    Value::Float64(f) => {
-                        *floats += f;
-                        *saw_float = true;
-                        *saw_any = true;
-                    }
-                    other => {
-                        return Err(Error::Sql(format!("SUM over non-numeric value {other:?}")))
-                    }
+            AggState::Sum {
+                ints,
+                floats,
+                saw_float,
+                saw_any,
+            } => match value {
+                Value::Null => {}
+                Value::Int64(x) => {
+                    *ints += *x as i128;
+                    *saw_any = true;
                 }
-            }
-            AggState::Avg { sum, n } => {
-                let (ti, col) = spec.arg.as_ref().expect("AVG has a column");
-                match col_value(row, *ti, col) {
-                    Value::Null => {}
-                    Value::Int64(x) => {
-                        *sum += x as f64;
-                        *n += 1;
-                    }
-                    Value::Float64(f) => {
-                        *sum += f;
-                        *n += 1;
-                    }
-                    other => {
-                        return Err(Error::Sql(format!("AVG over non-numeric value {other:?}")))
-                    }
+                Value::Float64(f) => {
+                    *floats += *f;
+                    *saw_float = true;
+                    *saw_any = true;
                 }
-            }
+                other => return Err(Error::Sql(format!("SUM over non-numeric value {other:?}"))),
+            },
+            AggState::Avg { sum, n } => match value {
+                Value::Null => {}
+                Value::Int64(x) => {
+                    *sum += *x as f64;
+                    *n += 1;
+                }
+                Value::Float64(f) => {
+                    *sum += *f;
+                    *n += 1;
+                }
+                other => return Err(Error::Sql(format!("AVG over non-numeric value {other:?}"))),
+            },
             AggState::MinMax { best, is_min } => {
-                let (ti, col) = spec.arg.as_ref().expect("MIN/MAX have a column");
-                let v = col_value(row, *ti, col);
-                if v.is_null() {
+                if value.is_null() {
                     return Ok(());
                 }
                 match best {
-                    None => *best = Some(v),
+                    None => *best = Some(value.clone()),
                     Some(b) => {
-                        let ord = cmp_vals(b, &v).ok_or_else(|| not_comparable(b, &v))?;
+                        let ord = cmp_vals(b, value).ok_or_else(|| not_comparable(b, value))?;
                         let replace = if *is_min {
                             ord == Ordering::Greater
                         } else {
                             ord == Ordering::Less
                         };
                         if replace {
-                            *best = Some(v);
+                            *best = Some(value.clone());
                         }
                     }
                 }
@@ -862,7 +2304,12 @@ impl AggState {
     fn finish(self) -> Result<Value> {
         Ok(match self {
             AggState::Count(n) => Value::Int64(n as i64),
-            AggState::Sum { ints, floats, saw_float, saw_any } => {
+            AggState::Sum {
+                ints,
+                floats,
+                saw_float,
+                saw_any,
+            } => {
                 if !saw_any {
                     Value::Null
                 } else if saw_float {
@@ -985,7 +2432,13 @@ fn resolve_having_operand(
                 None => None,
             };
             validate_agg(tables, *func, &arg_r)?;
-            RVal::Agg(agg_index(aggs, AggSpec { func: *func, arg: arg_r }))
+            RVal::Agg(agg_index(
+                aggs,
+                AggSpec {
+                    func: *func,
+                    arg: arg_r,
+                },
+            ))
         }
     })
 }
@@ -995,9 +2448,267 @@ enum OutCol {
     Agg(usize),
 }
 
+#[allow(clippy::too_many_arguments)]
+fn queue_aggregate_group(
+    sorter: &mut SpillSorter<'_>,
+    group_cols: &[(usize, String)],
+    out_cols: &[OutCol],
+    having: Option<&RExpr>,
+    order_positions: &[(usize, bool)],
+    group_values: Vec<Value>,
+    states: Vec<AggState>,
+    first_sequence: u64,
+) -> Result<()> {
+    let aggregate_values: Vec<Value> = states
+        .into_iter()
+        .map(AggState::finish)
+        .collect::<Result<_>>()?;
+    if let Some(expr) = having {
+        let group_map: HashMap<(usize, String), Value> = group_cols
+            .iter()
+            .cloned()
+            .zip(group_values.iter().cloned())
+            .collect();
+        if !eval_ctx(&Vec::new(), expr, Some((&group_map, &aggregate_values)))? {
+            return Ok(());
+        }
+    }
+    let values: Vec<Value> = out_cols
+        .iter()
+        .map(|column| match column {
+            OutCol::Group(index) => group_values[*index].clone(),
+            OutCol::Agg(index) => aggregate_values[*index].clone(),
+        })
+        .collect();
+    let keys = if order_positions.is_empty() {
+        vec![Value::Int64(
+            i64::try_from(first_sequence).unwrap_or(i64::MAX),
+        )]
+    } else {
+        order_positions
+            .iter()
+            .map(|(position, _)| values[*position].clone())
+            .collect()
+    };
+    sorter.push(SortedOutputRow {
+        keys,
+        values,
+        sequence: first_sequence,
+    })
+}
+
+/// Sort-based aggregation for the single-table path. Input rows are streamed;
+/// GROUP BY keys are externally sorted under the query budget, so cardinality
+/// does not translate into an unbounded HashMap.
+fn exec_single_table_aggregate(
+    db: &Db,
+    tables: &[TableCtx],
+    stmt: &SelectStmt,
+    pushed: &[RExpr],
+    residual: &[RExpr],
+) -> Result<QueryOutput> {
+    let group_cols: Vec<(usize, String)> = stmt
+        .group_by
+        .iter()
+        .map(|column| resolve_col(tables, column))
+        .collect::<Result<_>>()?;
+    let group_set: HashSet<(usize, String)> = group_cols.iter().cloned().collect();
+    let mut specs = Vec::new();
+    let mut headers = Vec::new();
+    let mut out_cols = Vec::new();
+    for item in &stmt.projection {
+        match item {
+            SelectItem::Star => {
+                return Err(Error::Sql(
+                    "SELECT * cannot be combined with aggregates/GROUP BY; list columns explicitly"
+                        .into(),
+                ));
+            }
+            SelectItem::Column { col, alias } => {
+                let resolved = resolve_col(tables, col)?;
+                let Some(group_index) = group_cols.iter().position(|group| *group == resolved)
+                else {
+                    return Err(Error::Sql(format!(
+                        "column '{}' must appear in GROUP BY",
+                        col.column
+                    )));
+                };
+                headers.push(alias.clone().unwrap_or_else(|| resolved.1.clone()));
+                out_cols.push(OutCol::Group(group_index));
+            }
+            SelectItem::Aggregate { func, arg, alias } => {
+                let argument = match arg {
+                    Some(column) => Some(resolve_col(tables, column)?),
+                    None => None,
+                };
+                validate_agg(tables, *func, &argument)?;
+                let default = match &argument {
+                    Some((_, name)) => format!("{}({name})", func.name()),
+                    None => format!("{}(*)", func.name()),
+                };
+                let index = agg_index(
+                    &mut specs,
+                    AggSpec {
+                        func: *func,
+                        arg: argument,
+                    },
+                );
+                headers.push(alias.clone().unwrap_or(default));
+                out_cols.push(OutCol::Agg(index));
+            }
+        }
+    }
+    let having = match &stmt.having {
+        Some(expr) => Some(resolve_having_expr(tables, expr, &group_set, &mut specs)?),
+        None => None,
+    };
+    let order_positions: Vec<(usize, bool)> = stmt
+        .order_by
+        .iter()
+        .map(|(column, desc)| {
+            headers
+                .iter()
+                .position(|header| header.eq_ignore_ascii_case(&column.column))
+                .map(|position| (position, *desc))
+                .ok_or_else(|| {
+                    Error::Sql(format!(
+                        "in aggregate queries ORDER BY must reference an output column or alias; '{}' is neither",
+                        column.column
+                    ))
+                })
+        })
+        .collect::<Result<_>>()?;
+    let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
+    let limit = limit_to_usize(stmt.limit.as_ref());
+    let output_desc = if order_positions.is_empty() {
+        vec![false]
+    } else {
+        order_positions.iter().map(|(_, desc)| *desc).collect()
+    };
+    let mut output_sorter = SpillSorter::new(
+        db,
+        output_desc,
+        limit.map(|value| offset.saturating_add(value)),
+    )?;
+    let new_states = || {
+        specs
+            .iter()
+            .map(|spec| AggState::new(spec.func))
+            .collect::<Vec<_>>()
+    };
+
+    if group_cols.is_empty() {
+        let mut states = new_states();
+        visit_single_table_rows(db, &tables[0], pushed, residual, |row| {
+            for (index, spec) in specs.iter().enumerate() {
+                states[index].update(spec, row)?;
+            }
+            Ok(())
+        })?;
+        queue_aggregate_group(
+            &mut output_sorter,
+            &group_cols,
+            &out_cols,
+            having.as_ref(),
+            &order_positions,
+            Vec::new(),
+            states,
+            0,
+        )?;
+    } else {
+        let mut input_sorter = SpillSorter::new(db, vec![false], None)?;
+        let mut sequence = 0u64;
+        visit_single_table_rows(db, &tables[0], pushed, residual, |row| {
+            let group_values: Vec<Value> = group_cols
+                .iter()
+                .map(|(ti, column)| col_value(row, *ti, column))
+                .collect();
+            let mut encoded_key = Vec::new();
+            for value in &group_values {
+                encode_value(&mut encoded_key, value);
+            }
+            let mut values = Vec::with_capacity(1 + group_values.len() + specs.len());
+            values.push(Value::Blob(encoded_key.clone()));
+            values.extend(group_values);
+            values.extend(specs.iter().map(|spec| {
+                spec.arg
+                    .as_ref()
+                    .map(|(ti, column)| col_value(row, *ti, column))
+                    .unwrap_or(Value::Null)
+            }));
+            input_sorter.push(SortedOutputRow {
+                keys: vec![Value::Blob(encoded_key)],
+                values,
+                sequence,
+            })?;
+            sequence = sequence.saturating_add(1);
+            Ok(())
+        })?;
+
+        let mut current_key: Option<Vec<u8>> = None;
+        let mut current_groups = Vec::new();
+        let mut current_states: Option<Vec<AggState>> = None;
+        let mut first_sequence = 0u64;
+        input_sorter.for_each_sorted(0, None, |row| {
+            let mut values = row.values.into_iter();
+            let Value::Blob(key) = values.next().expect("group key present") else {
+                return Err(Error::Corrupt("invalid aggregate spill key".into()));
+            };
+            let group_values: Vec<Value> = values.by_ref().take(group_cols.len()).collect();
+            let inputs: Vec<Value> = values.collect();
+            if current_key.as_ref().is_some_and(|current| current != &key) {
+                queue_aggregate_group(
+                    &mut output_sorter,
+                    &group_cols,
+                    &out_cols,
+                    having.as_ref(),
+                    &order_positions,
+                    std::mem::take(&mut current_groups),
+                    current_states.take().expect("current aggregate states"),
+                    first_sequence,
+                )?;
+            }
+            if current_key.as_ref() != Some(&key) {
+                current_key = Some(key);
+                current_groups = group_values;
+                current_states = Some(new_states());
+                first_sequence = row.sequence;
+            }
+            let states = current_states
+                .as_mut()
+                .expect("aggregate states initialized");
+            for (index, spec) in specs.iter().enumerate() {
+                states[index].update_value(spec, &inputs[index])?;
+            }
+            Ok(())
+        })?;
+        if current_key.is_some() {
+            queue_aggregate_group(
+                &mut output_sorter,
+                &group_cols,
+                &out_cols,
+                having.as_ref(),
+                &order_positions,
+                current_groups,
+                current_states.expect("current aggregate states"),
+                first_sequence,
+            )?;
+        }
+    }
+
+    Ok(QueryOutput::Rows {
+        columns: headers,
+        rows: output_sorter.finish(offset, limit)?,
+    })
+}
+
 /// Hash aggregation with first-seen group order, HAVING over group columns
 /// and aggregates, ORDER BY over the output headers, then OFFSET/LIMIT.
-fn exec_aggregate(tables: &[TableCtx], rows: Vec<ExecRow>, stmt: &SelectStmt) -> Result<QueryOutput> {
+fn exec_aggregate(
+    tables: &[TableCtx],
+    rows: Vec<ExecRow>,
+    stmt: &SelectStmt,
+) -> Result<QueryOutput> {
     let group_cols: Vec<(usize, String)> = stmt
         .group_by
         .iter()
@@ -1037,7 +2748,13 @@ fn exec_aggregate(tables: &[TableCtx], rows: Vec<ExecRow>, stmt: &SelectStmt) ->
                     Some((_, name)) => format!("{}({name})", func.name()),
                     None => format!("{}(*)", func.name()),
                 };
-                let idx = agg_index(&mut specs, AggSpec { func: *func, arg: arg_r });
+                let idx = agg_index(
+                    &mut specs,
+                    AggSpec {
+                        func: *func,
+                        arg: arg_r,
+                    },
+                );
                 headers.push(alias.clone().unwrap_or(default));
                 out_cols.push(OutCol::Agg(idx));
             }
@@ -1136,14 +2853,380 @@ fn exec_aggregate(tables: &[TableCtx], rows: Vec<ExecRow>, stmt: &SelectStmt) ->
         });
     }
 
-    let offset = stmt.offset.unwrap_or(0) as usize;
+    let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
     if offset > 0 {
         out_rows = out_rows.into_iter().skip(offset).collect();
     }
-    if let Some(limit) = stmt.limit {
-        out_rows.truncate(limit as usize);
+    if let Some(limit) = limit_to_usize(stmt.limit.as_ref()) {
+        out_rows.truncate(limit);
     }
-    Ok(QueryOutput::Rows { columns: headers, rows: out_rows })
+    Ok(QueryOutput::Rows {
+        columns: headers,
+        rows: out_rows,
+    })
+}
+
+const GRACE_JOIN_PARTITIONS: usize = 16;
+const GRACE_JOIN_MAX_DEPTH: usize = 4;
+
+struct JoinPartitionSet {
+    left_paths: Vec<PathBuf>,
+    right_paths: Vec<PathBuf>,
+    left_files: Vec<File>,
+    right_files: Vec<File>,
+}
+
+struct GraceHashJoin<'a> {
+    db: &'a Db,
+    budget: usize,
+    spill_dir: PathBuf,
+    files: SpillFiles,
+    new_ti: usize,
+    existing: (usize, String),
+    new_col: &'a str,
+    kind: JoinKind,
+    out: Vec<ExecRow>,
+}
+
+impl<'a> GraceHashJoin<'a> {
+    fn new(
+        db: &'a Db,
+        new_ti: usize,
+        existing: (usize, String),
+        new_col: &'a str,
+        kind: JoinKind,
+    ) -> Self {
+        let memory = db.memory_options();
+        Self {
+            db,
+            budget: memory.query_working_bytes,
+            spill_dir: memory
+                .spill_directory
+                .unwrap_or_else(|| std::env::temp_dir().join("elitesql-query-spill")),
+            files: SpillFiles(Vec::new()),
+            new_ti,
+            existing,
+            new_col,
+            kind,
+            out: Vec::new(),
+        }
+    }
+
+    fn execute(
+        mut self,
+        left_rows: Vec<ExecRow>,
+        new_table: &TableCtx,
+        pushdown: &[RExpr],
+    ) -> Result<Vec<ExecRow>> {
+        fs::create_dir_all(&self.spill_dir)?;
+        let mut partitions = self.new_partition_set("root")?;
+        let mut left_bytes = vec![0u64; GRACE_JOIN_PARTITIONS];
+        for row in left_rows {
+            self.db.record_query_buffer(exec_row_heap_bytes(&row));
+            let key = join_key(&col_value(&row, self.existing.0, &self.existing.1));
+            let partition = grace_partition(key.as_deref(), 0);
+            left_bytes[partition] +=
+                write_spill_exec_row(&mut partitions.left_files[partition], &row)?;
+        }
+        let mut right_bytes = vec![0u64; GRACE_JOIN_PARTITIONS];
+        visit_table_records(self.db, new_table, self.new_ti, pushdown, |record| {
+            self.db.record_query_buffer(record_heap_bytes(&record));
+            let key = record.get(self.new_col).and_then(join_key);
+            let partition = grace_partition(key.as_deref(), 0);
+            right_bytes[partition] +=
+                write_spill_record(&mut partitions.right_files[partition], &record)?;
+            Ok(())
+        })?;
+        drop(partitions.left_files);
+        drop(partitions.right_files);
+        self.record_partition_stats(&left_bytes);
+        self.record_partition_stats(&right_bytes);
+
+        for (partition, &bytes) in right_bytes.iter().enumerate() {
+            self.process_partition(
+                &partitions.left_paths[partition],
+                &partitions.right_paths[partition],
+                0,
+                bytes,
+            )?;
+        }
+        Ok(self.out)
+    }
+
+    fn new_partition_set(&mut self, tag: &str) -> Result<JoinPartitionSet> {
+        let mut left_paths = Vec::with_capacity(GRACE_JOIN_PARTITIONS);
+        let mut right_paths = Vec::with_capacity(GRACE_JOIN_PARTITIONS);
+        let mut left_files = Vec::with_capacity(GRACE_JOIN_PARTITIONS);
+        let mut right_files = Vec::with_capacity(GRACE_JOIN_PARTITIONS);
+        let id = Ulid::new();
+        for partition in 0..GRACE_JOIN_PARTITIONS {
+            let left = self
+                .spill_dir
+                .join(format!("hash-{id}-{tag}-l-{partition:02}.run"));
+            let right = self
+                .spill_dir
+                .join(format!("hash-{id}-{tag}-r-{partition:02}.run"));
+            left_files.push(File::create(&left)?);
+            right_files.push(File::create(&right)?);
+            self.files.0.push(left.clone());
+            self.files.0.push(right.clone());
+            left_paths.push(left);
+            right_paths.push(right);
+        }
+        Ok(JoinPartitionSet {
+            left_paths,
+            right_paths,
+            left_files,
+            right_files,
+        })
+    }
+
+    fn record_partition_stats(&self, sizes: &[u64]) {
+        for &bytes in sizes {
+            if bytes > 0 {
+                self.db.record_query_spill(bytes);
+            }
+        }
+    }
+
+    fn process_partition(
+        &mut self,
+        left_path: &PathBuf,
+        right_path: &PathBuf,
+        depth: usize,
+        right_bytes: u64,
+    ) -> Result<()> {
+        let build_budget = (self.budget / 2).max(1);
+        if right_bytes as usize > build_budget {
+            if depth < GRACE_JOIN_MAX_DEPTH {
+                let (left, right, right_sizes) =
+                    self.repartition(left_path, right_path, depth + 1)?;
+                let largest = right_sizes.iter().copied().max().unwrap_or(0);
+                if largest < right_bytes {
+                    for partition in 0..GRACE_JOIN_PARTITIONS {
+                        self.process_partition(
+                            &left[partition],
+                            &right[partition],
+                            depth + 1,
+                            right_sizes[partition],
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
+            return self.process_skewed_partition(left_path, right_path);
+        }
+
+        let mut right_reader = SpillFrameReader::open(right_path)?;
+        let mut right_rows = Vec::new();
+        let mut estimated = 0usize;
+        while let Some(record) = right_reader.next_record()? {
+            estimated = estimated.saturating_add(record_heap_bytes(&record));
+            right_rows.push(record);
+        }
+        self.db.record_query_buffer(estimated);
+        if estimated > build_budget && right_rows.len() > 1 {
+            drop(right_rows);
+            return self.process_skewed_partition(left_path, right_path);
+        }
+        self.probe_loaded_partition(left_path, right_rows)
+    }
+
+    fn repartition(
+        &mut self,
+        left_path: &PathBuf,
+        right_path: &PathBuf,
+        depth: usize,
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<u64>)> {
+        let mut partitions = self.new_partition_set(&format!("d{depth}"))?;
+        let mut left_sizes = vec![0u64; GRACE_JOIN_PARTITIONS];
+        let mut reader = SpillFrameReader::open(left_path)?;
+        while let Some(row) = reader.next_exec_row()? {
+            let key = join_key(&col_value(&row, self.existing.0, &self.existing.1));
+            let partition = grace_partition(key.as_deref(), depth as u64);
+            left_sizes[partition] +=
+                write_spill_exec_row(&mut partitions.left_files[partition], &row)?;
+        }
+        let mut right_sizes = vec![0u64; GRACE_JOIN_PARTITIONS];
+        let mut reader = SpillFrameReader::open(right_path)?;
+        while let Some(record) = reader.next_record()? {
+            let key = record.get(self.new_col).and_then(join_key);
+            let partition = grace_partition(key.as_deref(), depth as u64);
+            right_sizes[partition] +=
+                write_spill_record(&mut partitions.right_files[partition], &record)?;
+        }
+        drop(partitions.left_files);
+        drop(partitions.right_files);
+        self.record_partition_stats(&left_sizes);
+        self.record_partition_stats(&right_sizes);
+        Ok((partitions.left_paths, partitions.right_paths, right_sizes))
+    }
+
+    fn probe_loaded_partition(
+        &mut self,
+        left_path: &PathBuf,
+        right_rows: Vec<Record>,
+    ) -> Result<()> {
+        let mut table_map: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for (index, record) in right_rows.iter().enumerate() {
+            if let Some(key) = record.get(self.new_col).and_then(join_key) {
+                table_map.entry(key).or_default().push(index);
+            }
+        }
+        let mut matched_right = vec![false; right_rows.len()];
+        let mut left_reader = SpillFrameReader::open(left_path)?;
+        while let Some(row) = left_reader.next_exec_row()? {
+            let key = join_key(&col_value(&row, self.existing.0, &self.existing.1));
+            match key.as_ref().and_then(|key| table_map.get(key)) {
+                Some(indices) if !indices.is_empty() => {
+                    for &index in indices {
+                        matched_right[index] = true;
+                        self.out.push(widen_join_row(
+                            &row,
+                            self.new_ti,
+                            Some(right_rows[index].clone()),
+                        ));
+                    }
+                }
+                _ if self.kind == JoinKind::Left => {
+                    self.out.push(widen_join_row(&row, self.new_ti, None));
+                }
+                _ => {}
+            }
+        }
+        if self.kind == JoinKind::Right {
+            for (index, record) in right_rows.into_iter().enumerate() {
+                if !matched_right[index] {
+                    self.out.push(unmatched_right_row(self.new_ti, record));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Degenerate-key fallback for a partition that cannot be made smaller by
+    /// hashing. The build side is read in bounded chunks and the probe side is
+    /// rescanned; outer-match flags live in a temporary file, not RAM.
+    fn process_skewed_partition(
+        &mut self,
+        left_path: &PathBuf,
+        right_path: &PathBuf,
+    ) -> Result<()> {
+        let matched_path = self
+            .spill_dir
+            .join(format!("hash-{}-matched.run", Ulid::new()));
+        self.files.0.push(matched_path.clone());
+        let matched_left = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&matched_path)?;
+        let left_count = count_spill_rows(left_path)?;
+        if self.kind == JoinKind::Left {
+            matched_left.set_len(left_count as u64)?;
+        }
+
+        let chunk_budget = (self.budget / 2).max(1);
+        let mut right_reader = SpillFrameReader::open(right_path)?;
+        let mut saw_right = false;
+        loop {
+            let mut chunk = Vec::new();
+            let mut bytes = 0usize;
+            while let Some(record) = right_reader.next_record()? {
+                saw_right = true;
+                bytes = bytes.saturating_add(record_heap_bytes(&record));
+                chunk.push(record);
+                if bytes >= chunk_budget {
+                    break;
+                }
+            }
+            if chunk.is_empty() {
+                break;
+            }
+            self.db.record_query_buffer(bytes);
+            let mut table_map: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+            for (index, record) in chunk.iter().enumerate() {
+                if let Some(key) = record.get(self.new_col).and_then(join_key) {
+                    table_map.entry(key).or_default().push(index);
+                }
+            }
+            let mut matched_right = vec![false; chunk.len()];
+            let mut left_reader = SpillFrameReader::open(left_path)?;
+            let mut ordinal = 0u64;
+            while let Some(row) = left_reader.next_exec_row()? {
+                let key = join_key(&col_value(&row, self.existing.0, &self.existing.1));
+                if let Some(indices) = key.as_ref().and_then(|key| table_map.get(key)) {
+                    if self.kind == JoinKind::Left {
+                        matched_left.write_all_at(&[1], ordinal)?;
+                    }
+                    for &index in indices {
+                        matched_right[index] = true;
+                        self.out.push(widen_join_row(
+                            &row,
+                            self.new_ti,
+                            Some(chunk[index].clone()),
+                        ));
+                    }
+                }
+                ordinal += 1;
+            }
+            if self.kind == JoinKind::Right {
+                for (index, record) in chunk.into_iter().enumerate() {
+                    if !matched_right[index] {
+                        self.out.push(unmatched_right_row(self.new_ti, record));
+                    }
+                }
+            }
+        }
+
+        if self.kind == JoinKind::Left {
+            let mut left_reader = SpillFrameReader::open(left_path)?;
+            let mut ordinal = 0u64;
+            let mut matched = [0u8; 1];
+            while let Some(row) = left_reader.next_exec_row()? {
+                matched_left.read_exact_at(&mut matched, ordinal)?;
+                if matched[0] == 0 {
+                    self.out.push(widen_join_row(&row, self.new_ti, None));
+                }
+                ordinal += 1;
+            }
+        } else if self.kind == JoinKind::Right && !saw_right {
+            // No right rows means there is nothing for a RIGHT JOIN to retain.
+        }
+        Ok(())
+    }
+}
+
+fn grace_partition(key: Option<&[u8]>, seed: u64) -> usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for &byte in key.unwrap_or(&[0xff]) {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    (hash as usize) & (GRACE_JOIN_PARTITIONS - 1)
+}
+
+fn count_spill_rows(path: &PathBuf) -> Result<usize> {
+    let mut reader = SpillFrameReader::open(path)?;
+    let mut count = 0usize;
+    while reader.next_frame()?.is_some() {
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn widen_join_row(row: &ExecRow, new_ti: usize, added: Option<Record>) -> ExecRow {
+    let mut widened = row.clone();
+    widened.resize(new_ti, None);
+    widened.push(added);
+    widened
+}
+
+fn unmatched_right_row(new_ti: usize, record: Record) -> ExecRow {
+    let mut row = vec![None; new_ti];
+    row.push(Some(record));
+    row
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1158,17 +3241,12 @@ fn exec_join(
     pushdown: &[RExpr],
 ) -> Result<Vec<ExecRow>> {
     let mut out: Vec<ExecRow> = Vec::new();
-    let widen = |row: &ExecRow, added: Option<Record>| -> ExecRow {
-        let mut r = row.clone();
-        r.resize(new_ti, None);
-        r.push(added);
-        r
-    };
 
-    let indexed = new_col == "id"
-        || new_table.schema.indexes.iter().any(|d| d.column == new_col);
-    let use_index_loop =
-        kind != JoinKind::Right && indexed && left_rows.len() <= INDEX_JOIN_MAX_PROBE;
+    let indexed = new_col == "id" || new_table.schema.indexes.iter().any(|d| d.column == new_col);
+    // Prefer the index nested-loop at every cardinality: unlike the hash path
+    // it does not materialize the complete right table and its hash map. The
+    // optimizer may later add a cost-based crossover constrained by memory.
+    let use_index_loop = kind != JoinKind::Right && indexed;
 
     if use_index_loop {
         for row in &left_rows {
@@ -1177,14 +3255,17 @@ fn exec_join(
                 Vec::new()
             } else if new_col == "id" {
                 match &key {
-                    Value::Text(id) => db.get(&new_table.schema.name, id)?.into_iter().collect(),
+                    Value::Text(id) => db
+                        .get_unbudgeted(&new_table.schema.name, id)?
+                        .into_iter()
+                        .collect(),
                     _ => Vec::new(),
                 }
             } else {
                 let ty = new_table.schema.column(new_col).expect("resolved").ty;
-                match coerce_for_index(&key, ty) {
+                match coerce_for_lookup(&key, ty) {
                     Some(k) => db
-                        .find_eq(&new_table.schema.name, new_col, &k)?
+                        .find_eq_unbudgeted(&new_table.schema.name, new_col, &k)?
                         .into_iter()
                         .map(|(_, r)| r)
                         .collect(),
@@ -1195,64 +3276,51 @@ fn exec_join(
             for m in matches {
                 let candidate = single_row(new_ti, m);
                 if eval_all(&candidate, pushdown)? {
-                    out.push(widen(row, candidate.into_iter().nth(new_ti).flatten()));
+                    out.push(widen_join_row(
+                        row,
+                        new_ti,
+                        candidate.into_iter().nth(new_ti).flatten(),
+                    ));
                     emitted = true;
                 }
             }
             if !emitted && kind == JoinKind::Left {
-                out.push(widen(row, None));
+                out.push(widen_join_row(row, new_ti, None));
             }
         }
         return Ok(out);
     }
 
-    // Hash join: build on the new table, probe with the accumulated rows.
-    let new_rows = fetch_table(db, new_table, new_ti, pushdown)?;
-    let mut table_map: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-    for (i, rec) in new_rows.iter().enumerate() {
-        if let Some(k) = rec.get(new_col).and_then(join_key) {
-            table_map.entry(k).or_default().push(i);
-        }
-    }
-    let mut matched_new: Vec<bool> = vec![false; new_rows.len()];
-    for row in &left_rows {
-        let key = col_value(row, existing.0, &existing.1);
-        let hits = join_key(&key).and_then(|k| table_map.get(&k));
-        match hits {
-            Some(indices) if !indices.is_empty() => {
-                for &i in indices {
-                    matched_new[i] = true;
-                    out.push(widen(row, Some(new_rows[i].clone())));
-                }
-            }
-            _ => {
-                if kind == JoinKind::Left {
-                    out.push(widen(row, None));
-                }
-            }
-        }
-    }
-    if kind == JoinKind::Right {
-        for (i, rec) in new_rows.into_iter().enumerate() {
-            if !matched_new[i] {
-                let mut row: ExecRow = vec![None; new_ti];
-                row.push(Some(rec));
-                out.push(row);
-            }
-        }
-    }
-    Ok(out)
+    GraceHashJoin::new(db, new_ti, existing, new_col, kind).execute(left_rows, new_table, pushdown)
 }
 
 // --- INSERT / UPDATE / DELETE ---------------------------------------------------------
 
-fn exec_insert(db: &Db, table: &str, columns: &[String], rows: &[Vec<Literal>]) -> Result<QueryOutput> {
+fn exec_insert(
+    db: &Db,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Literal>],
+) -> Result<QueryOutput> {
     let schema = db
         .table_schema(table)
         .ok_or_else(|| Error::TableNotFound(table.into()))?;
+    let inferred_columns;
+    let columns = if columns.is_empty() {
+        inferred_columns = schema
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        inferred_columns.as_slice()
+    } else {
+        columns
+    };
     for (i, c) in columns.iter().enumerate() {
         if c != "id" && schema.column(c).is_none() {
-            return Err(Error::Sql(format!("unknown column '{c}' in table '{table}'")));
+            return Err(Error::Sql(format!(
+                "unknown column '{c}' in table '{table}'"
+            )));
         }
         if columns[..i].iter().any(|prev| prev == c) {
             return Err(Error::Sql(format!("column '{c}' listed twice")));
@@ -1261,12 +3329,20 @@ fn exec_insert(db: &Db, table: &str, columns: &[String], rows: &[Vec<Literal>]) 
     let mut txn = db.begin();
     let mut ids = Vec::with_capacity(rows.len());
     for lits in rows {
+        if lits.len() != columns.len() {
+            return Err(Error::Sql(format!(
+                "row has {} values but table '{table}' has {} declared columns",
+                lits.len(),
+                columns.len()
+            )));
+        }
         let mut rec = Record::new();
         for (c, lit) in columns.iter().zip(lits) {
             let v = if c == "id" {
                 match lit {
                     Literal::Str(s) => Value::Text(s.clone()),
-                    _ => return Err(Error::Sql("id must be a text literal".into())),
+                    Literal::Bound(Value::Text(s)) => Value::Text(s.clone()),
+                    _ => return Err(Error::Sql("id must be a text value".into())),
                 }
             } else {
                 let ty = schema.column(c).expect("checked").ty;
@@ -1300,7 +3376,10 @@ fn exec_update(
             .ty;
         patch.insert(col.clone(), literal_to_value(lit, ty, col)?);
     }
-    let tables = [TableCtx { schema, label: table.to_owned() }];
+    let tables = [TableCtx {
+        schema,
+        label: table.to_owned(),
+    }];
     let conjuncts = resolve_where(&tables, where_clause)?;
 
     let mut last_err = None;
@@ -1309,7 +3388,9 @@ fn exec_update(
         let mut txn = db.begin();
         let mut count = 0u64;
         for rec in &matching {
-            let Some(Value::Text(id)) = rec.get("id") else { continue };
+            let Some(Value::Text(id)) = rec.get("id") else {
+                continue;
+            };
             match txn.update(table, id, patch.clone()) {
                 Ok(()) => count += 1,
                 Err(Error::RecordNotFound { .. }) => {} // deleted concurrently
@@ -1329,7 +3410,10 @@ fn exec_delete(db: &Db, table: &str, where_clause: Option<&Expr>) -> Result<Quer
     let schema = db
         .table_schema(table)
         .ok_or_else(|| Error::TableNotFound(table.into()))?;
-    let tables = [TableCtx { schema, label: table.to_owned() }];
+    let tables = [TableCtx {
+        schema,
+        label: table.to_owned(),
+    }];
     let conjuncts = resolve_where(&tables, where_clause)?;
 
     let mut last_err = None;
@@ -1338,7 +3422,9 @@ fn exec_delete(db: &Db, table: &str, where_clause: Option<&Expr>) -> Result<Quer
         let mut txn = db.begin();
         let mut count = 0u64;
         for rec in &matching {
-            let Some(Value::Text(id)) = rec.get("id") else { continue };
+            let Some(Value::Text(id)) = rec.get("id") else {
+                continue;
+            };
             if txn.delete(table, id)? {
                 count += 1;
             }

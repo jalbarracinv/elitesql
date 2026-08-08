@@ -15,5 +15,8 @@ mod exec;
 mod lexer;
 mod parser;
 
-pub use exec::QueryOutput;
-pub(crate) use exec::execute;
+pub(crate) use exec::{
+    execute, execute_cursor, execute_cursor_named, execute_cursor_positional, execute_named,
+    execute_positional,
+};
+pub use exec::{QueryCursor, QueryOutput};

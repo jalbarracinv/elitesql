@@ -12,8 +12,11 @@
 
 use std::hint::black_box;
 
-use elitesql_core::{Column, ColumnType, Db, DbOptions, Durability, Record, TableSchema, Value};
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use elitesql_core::{
+    AutoCompactionOptions, Column, ColumnType, Db, DbOptions, Durability, Record, TableSchema,
+    Value,
+};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -27,6 +30,7 @@ fn elitesql_new() -> (TempDir, Db) {
     let dir = tempfile::tempdir().unwrap();
     let opts = DbOptions {
         durability: Durability::Fast,
+        auto_compaction: AutoCompactionOptions::disabled(),
         ..DbOptions::default()
     };
     let db = Db::create_with(dir.path().join("bench.esql"), opts).unwrap();

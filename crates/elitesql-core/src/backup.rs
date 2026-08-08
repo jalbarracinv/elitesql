@@ -10,9 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::check::check;
-use crate::db::{
-    Db, DbOptions, BLOBS_DIR, CATALOG_FILE, LOCK_FILE, MARKER_FILE, SEGMENTS_DIR,
-};
+use crate::db::{Db, DbOptions, BLOBS_DIR, CATALOG_FILE, LOCK_FILE, MARKER_FILE, SEGMENTS_DIR};
+use crate::ddl::DDL_FILE;
 use crate::error::{Error, Result};
 use crate::manifest::fsync_dir;
 use crate::wal::{Durability, WAL_DIR};
@@ -135,6 +134,12 @@ pub fn restore(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<RestoreRe
         fs::create_dir_all(&partial)?;
         copy_file(src, &partial, MARKER_FILE)?;
         copy_file(src, &partial, CATALOG_FILE)?;
+        // A backup produced by `Db::backup` never has one, but a directory
+        // copied by other means can: carry it so the schema change is still
+        // completed when the restored database is opened.
+        if src.join(DDL_FILE).exists() {
+            copy_file(src, &partial, DDL_FILE)?;
+        }
         copy_file(src, &partial, "manifest")?;
         if src.join("manifest.prev").exists() {
             copy_file(src, &partial, "manifest.prev")?;

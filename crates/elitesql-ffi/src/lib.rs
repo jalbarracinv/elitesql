@@ -45,6 +45,18 @@ fn fail(e: &Error) -> u32 {
     e.code()
 }
 
+fn optional_usize(value: &serde_json::Value, key: &str) -> Result<Option<usize>, Error> {
+    let Some(raw) = value.get(key) else {
+        return Ok(None);
+    };
+    let number = raw
+        .as_u64()
+        .ok_or_else(|| Error::InvalidArgument(format!("memory.{key} must be an integer")))?;
+    usize::try_from(number)
+        .map(Some)
+        .map_err(|_| Error::InvalidArgument(format!("memory.{key} is too large")))
+}
+
 /// Wraps every entry point: catches panics, maps errors to codes.
 fn guard(f: impl FnOnce() -> Result<(), Error>) -> u32 {
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -106,7 +118,7 @@ pub unsafe extern "C" fn elitesql_free_string(s: *mut c_char) {
 }
 
 /// Open (creating if missing) a database. `options_json` may be NULL or a
-/// JSON object: {"durability": "safe"|"balanced"|"fast"}.
+/// JSON object: {"durability": "safe"|"balanced"|"fast", "memory"?: {...}}.
 ///
 /// # Safety
 /// `path`/`options_json` must be valid NUL-terminated strings; `out` valid.
@@ -137,6 +149,40 @@ pub unsafe extern "C" fn elitesql_open(
                 }
                 if let Some(ro) = j.get("read_only").and_then(|r| r.as_bool()) {
                     opts.read_only = ro;
+                }
+                if let Some(memory) = j.get("memory") {
+                    if !memory.is_object() {
+                        return Err(Error::InvalidArgument(
+                            "memory options must be an object".into(),
+                        ));
+                    }
+                    macro_rules! set_memory_usize {
+                        ($field:ident) => {
+                            if let Some(value) = optional_usize(memory, stringify!($field))? {
+                                opts.memory.$field = value;
+                            }
+                        };
+                    }
+                    set_memory_usize!(total_memory_bytes);
+                    set_memory_usize!(query_pool_bytes);
+                    set_memory_usize!(query_working_bytes);
+                    set_memory_usize!(index_delta_pool_bytes);
+                    set_memory_usize!(maintenance_pool_bytes);
+                    set_memory_usize!(reserved_memory_bytes);
+                    set_memory_usize!(scan_batch_rows);
+                    if let Some(directory) = memory.get("spill_directory") {
+                        opts.memory.spill_directory = if directory.is_null() {
+                            None
+                        } else {
+                            Some(std::path::PathBuf::from(directory.as_str().ok_or_else(
+                                || {
+                                    Error::InvalidArgument(
+                                        "memory.spill_directory must be a string or null".into(),
+                                    )
+                                },
+                            )?))
+                        };
+                    }
                 }
             }
         }
@@ -183,6 +229,30 @@ pub unsafe extern "C" fn elitesql_query(
         let handle = unsafe { db_ref(db)? };
         let sql = unsafe { cstr(sql)? };
         let out = handle.db.query(sql)?;
+        out_string(result_json, jsonio::output_to_json(&out).to_string())
+    })
+}
+
+/// Execute SQL with parameters supplied separately as a JSON array
+/// (positional `?`/`%s`) or object (named `%(name)s`). Native JSON scalars and
+/// the tagged EliteSQL value representation preserve parameter types.
+///
+/// # Safety
+/// All pointers must be valid; strings must be NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn elitesql_query_params(
+    db: *mut EliteSql,
+    sql: *const c_char,
+    params_json: *const c_char,
+    result_json: *mut *mut c_char,
+) -> u32 {
+    guard(|| {
+        let handle = unsafe { db_ref(db)? };
+        let sql = unsafe { cstr(sql)? };
+        let raw = unsafe { cstr(params_json)? };
+        let params: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| Error::InvalidArgument(format!("SQL params: {error}")))?;
+        let out = jsonio::query_with_params_json(&handle.db, sql, &params)?;
         out_string(result_json, jsonio::output_to_json(&out).to_string())
     })
 }
@@ -376,7 +446,10 @@ pub unsafe extern "C" fn elitesql_snapshot_scan(
             .iter()
             .map(|(_, r)| jsonio::record_to_json(r))
             .collect();
-        out_string(result_json, serde_json::json!({"rows": rows_json}).to_string())
+        out_string(
+            result_json,
+            serde_json::json!({"rows": rows_json}).to_string(),
+        )
     })
 }
 
@@ -411,10 +484,7 @@ pub unsafe extern "C" fn elitesql_compact(db: *mut EliteSql) -> u32 {
 /// # Safety
 /// `path` valid NUL-terminated UTF-8; `report_json` valid.
 #[no_mangle]
-pub unsafe extern "C" fn elitesql_check(
-    path: *const c_char,
-    report_json: *mut *mut c_char,
-) -> u32 {
+pub unsafe extern "C" fn elitesql_check(path: *const c_char, report_json: *mut *mut c_char) -> u32 {
     guard(|| {
         let path = unsafe { cstr(path)? };
         let report = elitesql_core::check(path)?;
@@ -454,4 +524,60 @@ pub unsafe extern "C" fn elitesql_repair(
         });
         out_string(report_json, j.to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn ffi_query_params_binds_tagged_values() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "elitesql-ffi-params-{}-{unique}",
+            std::process::id()
+        ));
+        let path_c = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let mut db = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { elitesql_open(path_c.as_ptr(), std::ptr::null(), &mut db) },
+            0
+        );
+
+        let create = CString::new("CREATE TABLE docs (name text, payload blob)").unwrap();
+        let mut output = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { elitesql_query(db, create.as_ptr(), &mut output) },
+            0
+        );
+        unsafe { elitesql_free_string(output) };
+
+        let insert = CString::new("INSERT INTO docs (name, payload) VALUES (%s, %s)").unwrap();
+        let params = CString::new(r#"["x' OR TRUE --",{"$t":"blob","hex":"00ff"}]"#).unwrap();
+        output = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { elitesql_query_params(db, insert.as_ptr(), params.as_ptr(), &mut output) },
+            0
+        );
+        unsafe { elitesql_free_string(output) };
+
+        let select = CString::new("SELECT name, payload FROM docs WHERE name = %(name)s").unwrap();
+        let params = CString::new(r#"{"name":"x' OR TRUE --"}"#).unwrap();
+        output = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { elitesql_query_params(db, select.as_ptr(), params.as_ptr(), &mut output) },
+            0
+        );
+        let result = unsafe { CStr::from_ptr(output) }.to_str().unwrap();
+        assert!(result.contains("x' OR TRUE --"), "{result}");
+        assert!(result.contains(r#""hex":"00ff""#), "{result}");
+        unsafe { elitesql_free_string(output) };
+
+        assert_eq!(unsafe { elitesql_close(db) }, 0);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }

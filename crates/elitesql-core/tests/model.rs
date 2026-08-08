@@ -49,17 +49,31 @@ fn assert_matches_model(db: &Db, model: &Model, ctx: &str) {
     let rows = db.scan("m").unwrap();
     assert_eq!(rows.len(), model.len(), "row count mismatch ({ctx})");
     for (id, rec) in rows {
-        let expected = model.get(&id).unwrap_or_else(|| panic!("unexpected id {id} ({ctx})"));
-        assert_eq!(rec["v"], Value::Int64(*expected), "value mismatch for {id} ({ctx})");
+        let expected = model
+            .get(&id)
+            .unwrap_or_else(|| panic!("unexpected id {id} ({ctx})"));
+        assert_eq!(
+            rec["v"],
+            Value::Int64(*expected),
+            "value mismatch for {id} ({ctx})"
+        );
     }
 }
 
 fn assert_matches_snapshot(db: &Db, snap: &Snapshot, model: &Model, ctx: &str) {
     let rows = db.scan_at(snap, "m").unwrap();
-    assert_eq!(rows.len(), model.len(), "snapshot row count mismatch ({ctx})");
+    assert_eq!(
+        rows.len(),
+        model.len(),
+        "snapshot row count mismatch ({ctx})"
+    );
     for (id, rec) in rows {
         let expected = model.get(&id).unwrap();
-        assert_eq!(rec["v"], Value::Int64(*expected), "snapshot mismatch for {id} ({ctx})");
+        assert_eq!(
+            rec["v"],
+            Value::Int64(*expected),
+            "snapshot mismatch for {id} ({ctx})"
+        );
     }
 }
 
@@ -170,7 +184,12 @@ fn engine_matches_model_under_random_workload() {
         // Final: full verification, then compaction, then reopen.
         assert_matches_model(&db, &model, &format!("seed {seed} final"));
         for (i, (snap, snap_model)) in snapshots.iter().enumerate() {
-            assert_matches_snapshot(&db, snap, snap_model, &format!("seed {seed} final snap {i}"));
+            assert_matches_snapshot(
+                &db,
+                snap,
+                snap_model,
+                &format!("seed {seed} final snap {i}"),
+            );
         }
         snapshots.clear();
         db.compact().unwrap();

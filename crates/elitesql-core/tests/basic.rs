@@ -65,13 +65,26 @@ fn roundtrip_all_types() {
 
 #[test]
 fn generated_ids_are_ulids_and_unique() {
-    let (_dir, db) = new_db();
+    let (dir, db) = new_db();
     let mut seen = std::collections::HashSet::new();
+    let mut previous = None;
     for i in 0..100 {
         let id = db.insert("docs", record("t", i)).unwrap();
         assert_eq!(id.len(), 26, "ULID canonical form is 26 chars: {id}");
-        assert!(seen.insert(id), "ids must be unique");
+        assert!(seen.insert(id.clone()), "ids must be unique");
+        if let Some(previous) = &previous {
+            assert!(previous < &id, "generated ids must increase monotonically");
+        }
+        previous = Some(id);
     }
+    let last_before_reopen = previous.unwrap();
+    drop(db);
+    let db = Db::open(dir.path().join("test.esql")).unwrap();
+    let after_reopen = db.insert("docs", record("after reopen", 101)).unwrap();
+    assert!(
+        last_before_reopen < after_reopen,
+        "monotonic ids survive reopen"
+    );
 }
 
 #[test]
@@ -111,10 +124,18 @@ fn update_patches_and_snapshots_see_old_versions() {
 
     let now = db.get("docs", &id).unwrap().unwrap();
     assert_eq!(now["score"], Value::Int64(99));
-    assert_eq!(now["title"], Value::Text("original".into()), "patch keeps other fields");
+    assert_eq!(
+        now["title"],
+        Value::Text("original".into()),
+        "patch keeps other fields"
+    );
 
     let then = db.get_at(&snap, "docs", &id).unwrap().unwrap();
-    assert_eq!(then["score"], Value::Int64(10), "snapshot sees the old version");
+    assert_eq!(
+        then["score"],
+        Value::Int64(10),
+        "snapshot sees the old version"
+    );
 }
 
 #[test]
@@ -152,9 +173,16 @@ fn reopen_rebuilds_state() {
 
     let db = Db::open(&path).unwrap();
     assert_eq!(db.tables(), vec!["docs".to_string()]);
-    assert!(db.get("docs", &ids[0]).unwrap().is_none(), "delete survives reopen");
+    assert!(
+        db.get("docs", &ids[0]).unwrap().is_none(),
+        "delete survives reopen"
+    );
     let updated = db.get("docs", &ids[1]).unwrap().unwrap();
-    assert_eq!(updated["score"], Value::Int64(1000), "update survives reopen");
+    assert_eq!(
+        updated["score"],
+        Value::Int64(1000),
+        "update survives reopen"
+    );
     assert_eq!(db.scan("docs").unwrap().len(), 49);
 
     // Version counter continues: snapshots taken after reopen see new writes.

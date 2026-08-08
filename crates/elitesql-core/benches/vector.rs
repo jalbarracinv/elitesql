@@ -13,11 +13,11 @@
 
 use std::hint::black_box;
 
-use elitesql_core::{
-    Column, ColumnType, Db, DbOptions, Durability, Record, TableSchema, Value,
-    VectorIndexOptions, VectorSearchOptions,
-};
 use criterion::{criterion_group, criterion_main, Criterion};
+use elitesql_core::{
+    AutoCompactionOptions, Column, ColumnType, Db, DbOptions, Durability, Record, TableSchema,
+    Value, VectorIndexOptions, VectorSearchOptions,
+};
 use tempfile::TempDir;
 
 const N: usize = 100_000;
@@ -75,6 +75,7 @@ fn build() -> (TempDir, Db, Vec<Vec<f32>>) {
     let dir = tempfile::tempdir().unwrap();
     let opts = DbOptions {
         durability: Durability::Fast,
+        auto_compaction: AutoCompactionOptions::disabled(),
         ..DbOptions::default()
     };
     let db = Db::create_with(dir.path().join("vec.esql"), opts).unwrap();
@@ -86,7 +87,8 @@ fn build() -> (TempDir, Db, Vec<Vec<f32>>) {
         ],
     ))
     .unwrap();
-    db.create_vector_index("docs", "embedding", VectorIndexOptions::default()).unwrap();
+    db.create_vector_index("docs", "embedding", VectorIndexOptions::default())
+        .unwrap();
 
     let mut gen = Clustered::new(0xABCDEF);
     let mut vectors = Vec::with_capacity(N);
@@ -141,7 +143,10 @@ fn bench_vector(c: &mut Criterion) {
         let recall = measure_recall(&db, &vectors, ef, 50);
         println!("recall@{K} (N={N}, dim={DIM}, ef_search={ef}): {recall:.4}");
         if ef == 128 {
-            assert!(recall >= 0.85, "recall@10 with ef=128 must be >= 0.85, got {recall}");
+            assert!(
+                recall >= 0.85,
+                "recall@10 with ef=128 must be >= 0.85, got {recall}"
+            );
         }
     }
 
@@ -168,10 +173,14 @@ fn bench_vector(c: &mut Criterion) {
     let t0 = std::time::Instant::now();
     let opts = DbOptions {
         durability: Durability::Fast,
+        auto_compaction: AutoCompactionOptions::disabled(),
         ..DbOptions::default()
     };
     let db = Db::open_with(dir.path().join("vec.esql"), opts).unwrap();
-    println!("open with persisted graph (N={N}, dim={DIM}): {:?}", t0.elapsed());
+    println!(
+        "open with persisted graph (N={N}, dim={DIM}): {:?}",
+        t0.elapsed()
+    );
     drop(db);
 }
 

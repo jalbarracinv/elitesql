@@ -44,7 +44,8 @@ fn salvage_recovers_valid_prefix_and_reports_damage() {
 
     {
         let db = Db::create(&src).unwrap();
-        db.query("CREATE TABLE docs (title text NOT NULL, score int64)").unwrap();
+        db.query("CREATE TABLE docs (title text NOT NULL, score int64)")
+            .unwrap();
         for i in 0..40 {
             db.query(&format!(
                 "INSERT INTO docs (id, title, score) VALUES ('d-{i:03}', 'doc {i}', {i})"
@@ -52,7 +53,8 @@ fn salvage_recovers_valid_prefix_and_reports_damage() {
             .unwrap();
         }
         db.query("DELETE FROM docs WHERE id = 'd-000'").unwrap();
-        db.query("UPDATE docs SET score = 999 WHERE id = 'd-001'").unwrap();
+        db.query("UPDATE docs SET score = 999 WHERE id = 'd-001'")
+            .unwrap();
         db.checkpoint().unwrap(); // everything into a segment
         for i in 40..50 {
             db.query(&format!(
@@ -77,10 +79,16 @@ fn salvage_recovers_valid_prefix_and_reports_damage() {
     // A normal open refuses (corrupt segment); salvage recovers the valid
     // prefix. Entries after the corruption point (which may include newer
     // versions, tombstones or updates) are lost — and REPORTED.
-    assert!(Db::open(&src).is_err(), "corrupt segment must fail normal open");
+    assert!(
+        Db::open(&src).is_err(),
+        "corrupt segment must fail normal open"
+    );
     let report = salvage(&src, &dst).unwrap();
     assert_eq!(report.tables, vec!["docs".to_string()]);
-    assert!(report.recovered_records > 20, "prefix + WAL should recover: {report:?}");
+    assert!(
+        report.recovered_records > 20,
+        "prefix + WAL should recover: {report:?}"
+    );
     assert!(
         report.notes.iter().any(|n| n.contains("discarded")),
         "damage must be reported, never silent: {:?}",
@@ -95,7 +103,11 @@ fn salvage_recovers_valid_prefix_and_reports_damage() {
     assert!(db.get("docs", "d-045").unwrap().is_some());
     drop(db);
     let check = elitesql_core::check(&dst).unwrap();
-    assert!(check.is_ok(), "salvaged db must validate: {:?}", check.errors);
+    assert!(
+        check.is_ok(),
+        "salvaged db must validate: {:?}",
+        check.errors
+    );
 }
 
 #[test]
@@ -106,7 +118,8 @@ fn salvage_preserves_updates_and_deletes_when_segments_are_intact() {
 
     {
         let db = Db::create(&src).unwrap();
-        db.query("CREATE TABLE docs (title text NOT NULL, score int64)").unwrap();
+        db.query("CREATE TABLE docs (title text NOT NULL, score int64)")
+            .unwrap();
         for i in 0..20 {
             db.query(&format!(
                 "INSERT INTO docs (id, title, score) VALUES ('d-{i:03}', 'doc {i}', {i})"
@@ -114,7 +127,8 @@ fn salvage_preserves_updates_and_deletes_when_segments_are_intact() {
             .unwrap();
         }
         db.query("DELETE FROM docs WHERE id = 'd-000'").unwrap();
-        db.query("UPDATE docs SET score = 999 WHERE id = 'd-001'").unwrap();
+        db.query("UPDATE docs SET score = 999 WHERE id = 'd-001'")
+            .unwrap();
         db.checkpoint().unwrap(); // segment now holds inserts + tombstone + update
         for i in 20..30 {
             db.query(&format!(
@@ -138,7 +152,10 @@ fn salvage_preserves_updates_and_deletes_when_segments_are_intact() {
     let report = salvage(&src, &dst).unwrap();
     let db = Db::open(&dst).unwrap();
     // Semantics from the intact segment hold exactly:
-    assert!(db.get("docs", "d-000").unwrap().is_none(), "tombstone respected");
+    assert!(
+        db.get("docs", "d-000").unwrap().is_none(),
+        "tombstone respected"
+    );
     assert_eq!(
         db.get("docs", "d-001").unwrap().unwrap()["score"],
         Value::Int64(999),
@@ -146,7 +163,10 @@ fn salvage_preserves_updates_and_deletes_when_segments_are_intact() {
     );
     assert_eq!(report.deleted_records, 1);
     // A prefix of the WAL-only records survived; the damage was reported.
-    assert!(db.get("docs", "d-020").unwrap().is_some(), "wal prefix survives");
+    assert!(
+        db.get("docs", "d-020").unwrap().is_some(),
+        "wal prefix survives"
+    );
     assert!(
         report.notes.iter().any(|n| n.contains("torn tail")),
         "wal damage must be reported: {:?}",
@@ -174,17 +194,41 @@ fn import_export_type_mapping() {
     let cases = vec![
         (serde_json::json!(5), T::Int64, Value::Int64(5)),
         (serde_json::json!(2.5), T::Float64, Value::Float64(2.5)),
-        (serde_json::json!("hola"), T::Text, Value::Text("hola".into())),
-        (serde_json::json!("2026-08-07"), T::Date, Value::parse_date("2026-08-07").unwrap()),
-        (serde_json::json!("09:30:00"), T::Time, Value::parse_time("09:30:00").unwrap()),
+        (
+            serde_json::json!("hola"),
+            T::Text,
+            Value::Text("hola".into()),
+        ),
+        (
+            serde_json::json!("2026-08-07"),
+            T::Date,
+            Value::parse_date("2026-08-07").unwrap(),
+        ),
+        (
+            serde_json::json!("09:30:00"),
+            T::Time,
+            Value::parse_time("09:30:00").unwrap(),
+        ),
         (
             serde_json::json!("2026-08-07 09:30:00"),
             T::Timestamp,
             Value::parse_timestamp("2026-08-07 09:30:00").unwrap(),
         ),
-        (serde_json::json!([1.0, 2.0]), T::Vector, Value::Vector(vec![1.0, 2.0])),
-        (serde_json::json!("00ff"), T::Blob, Value::Blob(vec![0, 255])),
-        (serde_json::json!({"a": 1}), T::Json, Value::Json(serde_json::json!({"a": 1}))),
+        (
+            serde_json::json!([1.0, 2.0]),
+            T::Vector,
+            Value::Vector(vec![1.0, 2.0]),
+        ),
+        (
+            serde_json::json!("00ff"),
+            T::Blob,
+            Value::Blob(vec![0, 255]),
+        ),
+        (
+            serde_json::json!({"a": 1}),
+            T::Json,
+            Value::Json(serde_json::json!({"a": 1})),
+        ),
     ];
     for (j, ty, expected) in cases {
         let got = jsonio::json_to_value_for_type(&j, ty).unwrap();

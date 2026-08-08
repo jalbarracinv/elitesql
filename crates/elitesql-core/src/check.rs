@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::db::{CATALOG_FILE, MARKER_FILE, SEGMENTS_DIR};
+use crate::ddl::{DdlIntent, DDL_FILE};
 use crate::error::Result;
 use crate::manifest::{Manifest, MANIFEST_FILE, MANIFEST_PREV_FILE};
 use crate::schema::Catalog;
@@ -33,14 +34,23 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
     let mut report = CheckReport::default();
 
     if !dir.join(MARKER_FILE).exists() {
-        report
-            .errors
-            .push(format!("missing {MARKER_FILE} marker: not a elitesql database"));
+        report.errors.push(format!(
+            "missing {MARKER_FILE} marker: not a elitesql database"
+        ));
         return Ok(report);
     }
 
     if let Err(e) = Catalog::load(&dir.join(CATALOG_FILE)) {
         report.errors.push(format!("catalog: {e}"));
+    }
+
+    match DdlIntent::load(dir) {
+        Ok(Some(intent)) => report.warnings.push(format!(
+            "schema change interrupted, completed on next read-write open: {}",
+            intent.describe()
+        )),
+        Ok(None) => {}
+        Err(e) => report.errors.push(format!("{DDL_FILE}: {e}")),
     }
 
     let manifest = match fs::read(dir.join(MANIFEST_FILE))
@@ -49,9 +59,9 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
     {
         Ok(m) => Some(m),
         Err(primary_err) => {
-            report
-                .warnings
-                .push(format!("primary manifest unusable ({primary_err}), trying manifest.prev"));
+            report.warnings.push(format!(
+                "primary manifest unusable ({primary_err}), trying manifest.prev"
+            ));
             match fs::read(dir.join(MANIFEST_PREV_FILE))
                 .map_err(|e| e.to_string())
                 .and_then(|b| Manifest::decode(&b).map_err(|e| e.to_string()))
@@ -83,7 +93,9 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
         let data = match fs::read(&seg_path) {
             Ok(d) => d,
             Err(e) => {
-                report.errors.push(format!("segment {name}: unreadable: {e}"));
+                report
+                    .errors
+                    .push(format!("segment {name}: unreadable: {e}"));
                 continue;
             }
         };
@@ -124,13 +136,14 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
             }
             // Out-of-line blob chunks referenced by this payload must exist
             // and validate (magic + length + crc).
-            let payload =
-                &data[e.payload_offset as usize..(e.payload_offset + e.payload_len as u64) as usize];
+            let payload = &data
+                [e.payload_offset as usize..(e.payload_offset + e.payload_len as u64) as usize];
             refs.clear();
             if crate::db::scan_payload_blob_refs(payload, &mut refs).is_err() {
-                report
-                    .errors
-                    .push(format!("segment {name}: unparseable payload for {}/{}", e.table, e.id));
+                report.errors.push(format!(
+                    "segment {name}: unparseable payload for {}/{}",
+                    e.table, e.id
+                ));
                 continue;
             }
             for r in &refs {
@@ -175,15 +188,18 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
                     continue;
                 }
                 if rec.version <= last && last != manifest.committed_version {
-                    report
-                        .errors
-                        .push(format!("wal {}: non-monotonic commit versions", manifest.wal_id));
+                    report.errors.push(format!(
+                        "wal {}: non-monotonic commit versions",
+                        manifest.wal_id
+                    ));
                     break;
                 }
                 last = rec.version;
                 for ch in &rec.changes {
                     if let Some(p) = &ch.payload {
-                        if let Err(e) = crate::db::decode_record(p, Some(&dir.join(crate::db::BLOBS_DIR))) {
+                        if let Err(e) =
+                            crate::db::decode_record(p, Some(&dir.join(crate::db::BLOBS_DIR)))
+                        {
                             report.errors.push(format!(
                                 "wal {}: bad payload for {}/{}: {e}",
                                 manifest.wal_id, ch.table, ch.id
@@ -194,9 +210,10 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            report
-                .warnings
-                .push(format!("wal {} missing (recreated on next open)", manifest.wal_id));
+            report.warnings.push(format!(
+                "wal {} missing (recreated on next open)",
+                manifest.wal_id
+            ));
         }
         Err(e) => report.errors.push(format!("wal {}: {e}", manifest.wal_id)),
     }

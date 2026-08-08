@@ -9,8 +9,14 @@ pub enum Error {
     Corrupt(String),
     TableExists(String),
     TableNotFound(String),
-    RecordNotFound { table: String, id: String },
-    DuplicateId { table: String, id: String },
+    RecordNotFound {
+        table: String,
+        id: String,
+    },
+    DuplicateId {
+        table: String,
+        id: String,
+    },
     /// The record or patch does not conform to the table schema.
     SchemaViolation(String),
     InvalidArgument(String),
@@ -21,11 +27,28 @@ pub enum Error {
     /// Another process holds the database lock.
     DatabaseLocked(String),
     /// A unique index rejected a duplicate value at commit.
-    UniqueViolation { table: String, column: String },
+    UniqueViolation {
+        table: String,
+        column: String,
+    },
     /// SQL parse or execution error, including features outside the V1 subset.
     Sql(String),
     /// The database was opened read-only; writes are rejected.
     ReadOnly,
+    /// The table exists but has no such column (DDL targeting a column).
+    ColumnNotFound {
+        table: String,
+        column: String,
+    },
+    /// No index of the requested kind exists on that column.
+    IndexNotFound {
+        table: String,
+        column: String,
+    },
+    /// One operation cannot fit in its configured database-wide memory pool.
+    /// Concurrent operations wait for permits; intrinsically oversized work
+    /// must use batching/streaming or a larger configured pool.
+    MemoryLimit(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -47,6 +70,9 @@ impl Error {
             Error::UniqueViolation { .. } => 11,
             Error::Sql(_) => 12,
             Error::ReadOnly => 13,
+            Error::ColumnNotFound { .. } => 14,
+            Error::IndexNotFound { .. } => 15,
+            Error::MemoryLimit(_) => 16,
         }
     }
 }
@@ -75,6 +101,13 @@ impl fmt::Display for Error {
             }
             Error::Sql(msg) => write!(f, "sql error: {msg}"),
             Error::ReadOnly => write!(f, "database opened read-only; writes are rejected"),
+            Error::ColumnNotFound { table, column } => {
+                write!(f, "column not found: {table}.{column}")
+            }
+            Error::IndexNotFound { table, column } => {
+                write!(f, "index not found on {table}.{column}")
+            }
+            Error::MemoryLimit(msg) => write!(f, "memory limit exceeded: {msg}"),
         }
     }
 }

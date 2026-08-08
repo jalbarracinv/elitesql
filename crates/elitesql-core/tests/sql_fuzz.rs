@@ -40,9 +40,12 @@ const CORPUS: &[&str] = &[
 fn setup() -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::create(dir.path().join("fuzz.esql")).unwrap();
-    db.query("CREATE TABLE docs (a int64, b float64, c text, d blob)").unwrap();
-    db.query("CREATE TABLE extra (doc_id text, b int64)").unwrap();
-    db.query("INSERT INTO docs (a, b, c) VALUES (1, 1.5, 'x'), (2, 2.5, 'y')").unwrap();
+    db.query("CREATE TABLE docs (a int64, b float64, c text, d blob)")
+        .unwrap();
+    db.query("CREATE TABLE extra (doc_id text, b int64)")
+        .unwrap();
+    db.query("INSERT INTO docs (a, b, c) VALUES (1, 1.5, 'x'), (2, 2.5, 'y')")
+        .unwrap();
     (dir, db)
 }
 
@@ -50,7 +53,8 @@ fn setup() -> (tempfile::TempDir, Db) {
 fn random_garbage_never_panics() {
     let (_d, db) = setup();
     let mut rng = XorShift(0xC0FFEE);
-    let charset: &[u8] = b"SELECTFROMWHEREINSERTUPDATEDELETEJOINONANDORNOT()*,.;'=<>!0123456789abc xyz_\"%+-";
+    let charset: &[u8] =
+        b"SELECTFROMWHEREINSERTUPDATEDELETEJOINONANDORNOT()*,.;'=<>!0123456789abc xyz_\"%+-";
     for _ in 0..3000 {
         let len = rng.below(120) as usize;
         let s: String = (0..len)
@@ -119,7 +123,8 @@ fn valid_corpus_still_valid_after_setup() {
     for sql in CORPUS {
         let _ = db.query(sql);
     }
-    db.query("INSERT INTO docs (a, c) VALUES (777, 'alive')").unwrap();
+    db.query("INSERT INTO docs (a, c) VALUES (777, 'alive')")
+        .unwrap();
     let out = db.query("SELECT c FROM docs WHERE a = 777").unwrap();
     match out {
         elitesql_core::QueryOutput::Rows { rows, .. } => {

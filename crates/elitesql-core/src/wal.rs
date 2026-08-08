@@ -62,7 +62,11 @@ pub(crate) fn encode_commit(version: u64, changes: &[(&str, &str, Option<&[u8]>)
     buf.extend_from_slice(&version.to_le_bytes());
     buf.extend_from_slice(&(changes.len() as u32).to_le_bytes());
     for (table, id, payload) in changes {
-        buf.push(if payload.is_some() { KIND_PUT } else { KIND_TOMBSTONE });
+        buf.push(if payload.is_some() {
+            KIND_PUT
+        } else {
+            KIND_TOMBSTONE
+        });
         buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
         buf.extend_from_slice(table.as_bytes());
         buf.extend_from_slice(&(id.len() as u16).to_le_bytes());

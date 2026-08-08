@@ -21,7 +21,7 @@ export class EliteSQLError extends Error {
 export class SidecarClient {
   static connect(socketPath: string): Promise<SidecarClient>;
   ping(): Promise<boolean>;
-  query(sql: string): Promise<QueryResult>;
+  query(sql: string, params?: unknown[] | Record<string, unknown>): Promise<QueryResult>;
   createVectorIndex(
     table: string,
     column: string,
@@ -56,3 +56,5 @@ export class SidecarClient {
 }
 
 export function decodeValue(v: unknown): unknown;
+export function encodeParam(v: unknown): unknown;
+export function encodeParams(v: unknown[] | Record<string, unknown>): unknown;

@@ -74,11 +74,24 @@ fn tagged_to_value(map: &Map<String, J>) -> Result<Value> {
     let tag = map.get("$t").and_then(|t| t.as_str()).unwrap_or_default();
     let bad = |msg: &str| Error::InvalidArgument(format!("invalid tagged value ({tag}): {msg}"));
     Ok(match tag {
+        "int64" => {
+            let repr = map
+                .get("v")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| bad("missing string v"))?;
+            Value::Int64(repr.parse().map_err(|_| bad("bad int64"))?)
+        }
         "blob" => {
-            let hex = map.get("hex").and_then(|h| h.as_str()).ok_or_else(|| bad("missing hex"))?;
+            let hex = map
+                .get("hex")
+                .and_then(|h| h.as_str())
+                .ok_or_else(|| bad("missing hex"))?;
             Value::Blob(hex_decode(hex).ok_or_else(|| bad("bad hex"))?)
         }
-        "timestamp" => match (map.get("us").and_then(|n| n.as_i64()), map.get("iso").and_then(|s| s.as_str())) {
+        "timestamp" => match (
+            map.get("us").and_then(|n| n.as_i64()),
+            map.get("iso").and_then(|s| s.as_str()),
+        ) {
             (Some(us), _) => Value::Timestamp(us),
             (None, Some(iso)) => Value::Timestamp(
                 parse_timestamp_str(iso.trim_end_matches('Z').trim())
@@ -86,19 +99,28 @@ fn tagged_to_value(map: &Map<String, J>) -> Result<Value> {
             ),
             _ => return Err(bad("missing us/iso")),
         },
-        "date" => match (map.get("days").and_then(|n| n.as_i64()), map.get("iso").and_then(|s| s.as_str())) {
+        "date" => match (
+            map.get("days").and_then(|n| n.as_i64()),
+            map.get("iso").and_then(|s| s.as_str()),
+        ) {
             (Some(days), _) => Value::Date(days as i32),
             (None, Some(iso)) => Value::Date(parse_date_str(iso).ok_or_else(|| bad("bad iso"))?),
             _ => return Err(bad("missing days/iso")),
         },
-        "time" => match (map.get("us").and_then(|n| n.as_i64()), map.get("iso").and_then(|s| s.as_str())) {
+        "time" => match (
+            map.get("us").and_then(|n| n.as_i64()),
+            map.get("iso").and_then(|s| s.as_str()),
+        ) {
             (Some(us), _) => Value::Time(us),
             (None, Some(iso)) => Value::Time(parse_time_str(iso).ok_or_else(|| bad("bad iso"))?),
             _ => return Err(bad("missing us/iso")),
         },
         "json" => Value::Json(map.get("v").cloned().ok_or_else(|| bad("missing v"))?),
         "vector" => {
-            let arr = map.get("v").and_then(|v| v.as_array()).ok_or_else(|| bad("missing v"))?;
+            let arr = map
+                .get("v")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| bad("missing v"))?;
             let mut out = Vec::with_capacity(arr.len());
             for x in arr {
                 out.push(x.as_f64().ok_or_else(|| bad("non-numeric component"))? as f32);
@@ -106,10 +128,17 @@ fn tagged_to_value(map: &Map<String, J>) -> Result<Value> {
             Value::Vector(out)
         }
         "float64" => {
-            let repr = map.get("repr").and_then(|r| r.as_str()).ok_or_else(|| bad("missing repr"))?;
+            let repr = map
+                .get("repr")
+                .and_then(|r| r.as_str())
+                .ok_or_else(|| bad("missing repr"))?;
             Value::Float64(repr.parse().map_err(|_| bad("bad repr"))?)
         }
-        other => return Err(Error::InvalidArgument(format!("unknown value tag '{other}'"))),
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "unknown value tag '{other}'"
+            )))
+        }
     })
 }
 
@@ -117,22 +146,27 @@ fn tagged_to_value(map: &Map<String, J>) -> Result<Value> {
 /// natural encodings ("2026-08-07" for a date column, a number for a
 /// timestamp, a bare array for a vector).
 pub fn json_to_value_for_type(j: &J, ty: ColumnType) -> Result<Value> {
-    let mismatch = |j: &J| {
-        Error::InvalidArgument(format!("value {j} is not valid for a {ty} column"))
-    };
+    let mismatch =
+        |j: &J| Error::InvalidArgument(format!("value {j} is not valid for a {ty} column"));
     if j.is_null() {
         return Ok(Value::Null);
     }
     let v = match (ty, j) {
         (ColumnType::Bool, J::Bool(b)) => Value::Bool(*b),
         (ColumnType::Int64, J::Number(n)) => Value::Int64(n.as_i64().ok_or_else(|| mismatch(j))?),
-        (ColumnType::Float64, J::Number(n)) => Value::Float64(n.as_f64().ok_or_else(|| mismatch(j))?),
+        (ColumnType::Float64, J::Number(n)) => {
+            Value::Float64(n.as_f64().ok_or_else(|| mismatch(j))?)
+        }
         (ColumnType::Text, J::String(s)) => Value::Text(s.clone()),
-        (ColumnType::Timestamp, J::Number(n)) => Value::Timestamp(n.as_i64().ok_or_else(|| mismatch(j))?),
+        (ColumnType::Timestamp, J::Number(n)) => {
+            Value::Timestamp(n.as_i64().ok_or_else(|| mismatch(j))?)
+        }
         (ColumnType::Timestamp, J::String(s)) => {
             Value::parse_timestamp(s.trim_end_matches('Z')).ok_or_else(|| mismatch(j))?
         }
-        (ColumnType::Date, J::Number(n)) => Value::Date(n.as_i64().ok_or_else(|| mismatch(j))? as i32),
+        (ColumnType::Date, J::Number(n)) => {
+            Value::Date(n.as_i64().ok_or_else(|| mismatch(j))? as i32)
+        }
         (ColumnType::Date, J::String(s)) => Value::parse_date(s).ok_or_else(|| mismatch(j))?,
         (ColumnType::Time, J::Number(n)) => Value::Time(n.as_i64().ok_or_else(|| mismatch(j))?),
         (ColumnType::Time, J::String(s)) => Value::parse_time(s).ok_or_else(|| mismatch(j))?,
@@ -185,6 +219,32 @@ pub fn output_to_json(out: &QueryOutput) -> J {
     }
 }
 
+/// Execute SQL with separately encoded positional (JSON array) or named
+/// (JSON object) parameters. Values use the same native/tagged representation
+/// as query results, so no SQL text interpolation is involved.
+pub fn query_with_params_json(db: &crate::Db, sql: &str, params: &J) -> Result<QueryOutput> {
+    match params {
+        J::Null => db.query(sql),
+        J::Array(values) => {
+            let values = values
+                .iter()
+                .map(json_to_value)
+                .collect::<Result<Vec<_>>>()?;
+            db.query_params(sql, &values)
+        }
+        J::Object(values) => {
+            let values = values
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), json_to_value(value)?)))
+                .collect::<Result<Record>>()?;
+            db.query_named_params(sql, &values)
+        }
+        _ => Err(Error::InvalidArgument(
+            "SQL parameters must be a JSON array, object, or null".into(),
+        )),
+    }
+}
+
 /// Create a vector index from a JSON params object (shared by the C ABI and
 /// the sidecar): {"table","column","metric"?: "cosine"|"dot"|"l2",
 /// "mode"?: "sync"|"async", "m"?, "ef_construction"?}.
@@ -203,9 +263,7 @@ pub fn create_vector_index_json(db: &crate::Db, params: &J) -> Result<J> {
         Some("cosine") => opts.metric = crate::VectorMetric::Cosine,
         Some("dot") => opts.metric = crate::VectorMetric::Dot,
         Some("l2") => opts.metric = crate::VectorMetric::L2,
-        Some(other) => {
-            return Err(Error::InvalidArgument(format!("unknown metric '{other}'")))
-        }
+        Some(other) => return Err(Error::InvalidArgument(format!("unknown metric '{other}'"))),
     }
     match params.get("mode").and_then(|m| m.as_str()) {
         None => {}
@@ -273,9 +331,7 @@ pub fn search_text_json(db: &crate::Db, params: &J) -> Result<J> {
     let hits = db.search_text(table, column, query, top_k, filter.as_ref())?;
     let hits_json: Vec<J> = hits
         .iter()
-        .map(|h| {
-            json!({"id": h.id, "score": h.score, "record": record_to_json(&h.record)})
-        })
+        .map(|h| json!({"id": h.id, "score": h.score, "record": record_to_json(&h.record)}))
         .collect();
     Ok(json!({ "hits": hits_json }))
 }
@@ -298,7 +354,10 @@ pub fn search_hybrid_json(db: &crate::Db, params: &J) -> Result<J> {
                 .ok_or_else(|| Error::InvalidArgument("text: missing 'query'".into()))?,
         )),
     };
-    let vector_data: Option<(&str, Vec<f32>)> = match params.get("vector").and_then(|v| v.as_object()) {
+    let vector_data: Option<(&str, Vec<f32>)> = match params
+        .get("vector")
+        .and_then(|v| v.as_object())
+    {
         None => None,
         Some(v) => {
             let column = v
@@ -320,15 +379,16 @@ pub fn search_hybrid_json(db: &crate::Db, params: &J) -> Result<J> {
         text,
         vector: vector_data.as_ref().map(|(c, v)| (*c, v.as_slice())),
         top_k: params.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize,
-        ef_search: params.get("ef_search").and_then(|v| v.as_u64()).map(|n| n as usize),
+        ef_search: params
+            .get("ef_search")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize),
         filter: filter_from_json(params)?,
     };
     let hits = db.search_hybrid(table, &query)?;
     let hits_json: Vec<J> = hits
         .iter()
-        .map(|h| {
-            json!({"id": h.id, "score": h.score, "record": record_to_json(&h.record)})
-        })
+        .map(|h| json!({"id": h.id, "score": h.score, "record": record_to_json(&h.record)}))
         .collect();
     Ok(json!({ "hits": hits_json }))
 }
@@ -355,7 +415,10 @@ pub fn search_vector_json(db: &crate::Db, params: &J) -> Result<J> {
         .ok_or_else(|| Error::InvalidArgument("non-numeric vector component".into()))?;
     let top_k = params.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let mut opts = crate::VectorSearchOptions {
-        ef_search: params.get("ef_search").and_then(|v| v.as_u64()).map(|n| n as usize),
+        ef_search: params
+            .get("ef_search")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize),
         filter: None,
     };
     if let Some(filter) = params.get("filter").and_then(|f| f.as_object()) {

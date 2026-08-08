@@ -18,12 +18,21 @@ with EliteSQL("app.esql") as db:
     db.query("CREATE TABLE notes (body text NOT NULL, emb vector(768))")
     db.create_text_index("notes", "body")
     db.create_vector_index("notes", "emb", quantized=True)
-    db.query("INSERT INTO notes (body, emb) VALUES ('hello world', '[...]')")
+    db.query("INSERT INTO notes (body, emb) VALUES (%s, %s)", ["hello world", embedding])
+    rows = db.query(
+        "SELECT * FROM notes WHERE body = %(body)s LIMIT %(limit)s",
+        {"body": "hello world", "limit": 10},
+    )
 
     hits = db.search_hybrid("notes", text=("body", "hello"), vector=("emb", embedding))
     with db.snapshot() as snap:
         rows = snap.scan("notes")   # stable read while others write
 ```
+
+`query(sql, params=None)` binds parameters without string interpolation.
+Sequences use `?` or `%s`; mappings use `%(name)s`. Supported Python values
+include `None`, booleans, signed 64-bit integers, floats, strings, bytes,
+`datetime`/`date`/`time`, JSON dicts/lists and numeric lists for vector columns.
 
 Wheel build: `python -m build --wheel` in this directory (requires
 `pip install build`). `libelitesql` ships separately or via `ELITESQL_LIB`.

@@ -26,6 +26,33 @@ pub(crate) enum Statement {
         table: String,
         where_clause: Option<Expr>,
     },
+    DropTable {
+        name: String,
+        if_exists: bool,
+    },
+    DropIndex {
+        table: String,
+        column: String,
+        if_exists: bool,
+    },
+    AddColumn {
+        table: String,
+        column: ColumnDef,
+    },
+    DropColumn {
+        table: String,
+        column: String,
+        if_exists: bool,
+    },
+    RenameTable {
+        table: String,
+        to: String,
+    },
+    RenameColumn {
+        table: String,
+        column: String,
+        to: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +62,9 @@ pub(crate) struct ColumnDef {
     pub not_null: bool,
     /// Dimension for `vector(N)` columns.
     pub dim: Option<usize>,
+    /// `DEFAULT <literal>`, used for omitted values and to backfill existing
+    /// records when the column is added to a table that already has rows.
+    pub default: Option<Literal>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,8 +76,8 @@ pub(crate) struct SelectStmt {
     pub group_by: Vec<ColumnRef>,
     pub having: Option<Expr>,
     pub order_by: Vec<(ColumnRef, bool)>, // bool = descending
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
+    pub limit: Option<LimitValue>,
+    pub offset: Option<LimitValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +151,19 @@ pub(crate) enum Literal {
     Float(f64),
     Str(String),
     Blob(Vec<u8>),
+    /// A positional `?` or `%s`, bound in lexical order before execution.
+    PositionalParam,
+    /// A DB-API-style named `%(name)s` placeholder.
+    NamedParam(String),
+    /// A typed value supplied separately from the SQL text.
+    Bound(crate::Value),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum LimitValue {
+    Literal(u64),
+    PositionalParam,
+    NamedParam(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +181,10 @@ pub(crate) enum Operand {
     Col(ColumnRef),
     Lit(Literal),
     /// Aggregate call; only legal in HAVING.
-    Agg { func: AggFunc, arg: Option<ColumnRef> },
+    Agg {
+        func: AggFunc,
+        arg: Option<ColumnRef>,
+    },
 }
 
 #[derive(Debug, Clone)]
