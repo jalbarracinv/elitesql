@@ -2,10 +2,14 @@
 //!
 //! Heuristic planning, no cost model: point lookup on `id`, secondary index
 //! on indexed equality, full scan otherwise. Single-table WHERE conjuncts are
-//! pushed below joins. Joins run as index nested-loop when the probe side is
-//! small and the join column is indexed (or is `id`), hash join otherwise.
-//! RIGHT JOIN is executed by preserving the new table's side, i.e. a LEFT
-//! JOIN with roles swapped.
+//! pushed below joins. Joins run as index nested-loop whenever the join column
+//! on the new side is indexed (or is `id`) and grace hash join otherwise; the
+//! choice is static, see `join_uses_index_loop`. RIGHT JOIN is executed by
+//! preserving the new table's side, i.e. a LEFT JOIN with roles swapped.
+//!
+//! Because planning is static and free of estimates, `EXPLAIN <select>`
+//! reports the plan the executor will actually run rather than a guess; both
+//! read their decisions from `table_driver` and `join_uses_index_loop`.
 //!
 //! Consistency: SELECT reads the latest committed state (read-committed);
 //! snapshot-consistent reads are available through the Rust API (`scan_at`).
@@ -223,6 +227,7 @@ fn execute_statement(db: &Db, statement: Statement) -> Result<QueryOutput> {
             rows,
         } => exec_insert(db, &table, &columns, &rows),
         Statement::Select(stmt) => exec_select(db, &stmt),
+        Statement::Explain(stmt) => explain_select(db, &stmt),
         Statement::Update {
             table,
             sets,
@@ -358,7 +363,7 @@ fn bind_statement(statement: &mut Statement, supplied: SuppliedParams<'_>) -> Re
                 }
             }
         }
-        Statement::Select(select) => {
+        Statement::Select(select) | Statement::Explain(select) => {
             binder.bind_optional_expr(&mut select.where_clause)?;
             binder.bind_optional_expr(&mut select.having)?;
             binder.bind_optional_limit(&mut select.limit)?;
@@ -935,20 +940,67 @@ fn ctx_col_value(row: &ExecRow, col: &(usize, String), having: Option<HavingCtx>
     }
 }
 
-/// Simplified two-valued logic: comparisons involving NULL are false.
-fn eval(row: &ExecRow, e: &RExpr) -> Result<bool> {
+/// SQL three-valued logic. A comparison against NULL is `Unknown`, not false,
+/// and only `True` keeps a row: `WHERE NOT col = 'x'` therefore drops NULL rows
+/// the way standard SQL requires, instead of admitting them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Truth {
+    True,
+    False,
+    Unknown,
+}
+
+impl Truth {
+    fn of(value: bool) -> Truth {
+        if value {
+            Truth::True
+        } else {
+            Truth::False
+        }
+    }
+
+    fn is_true(self) -> bool {
+        self == Truth::True
+    }
+
+    fn not(self) -> Truth {
+        match self {
+            Truth::True => Truth::False,
+            Truth::False => Truth::True,
+            Truth::Unknown => Truth::Unknown,
+        }
+    }
+
+    fn and(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::False, _) | (_, Truth::False) => Truth::False,
+            (Truth::Unknown, _) | (_, Truth::Unknown) => Truth::Unknown,
+            _ => Truth::True,
+        }
+    }
+
+    fn or(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::True, _) | (_, Truth::True) => Truth::True,
+            (Truth::Unknown, _) | (_, Truth::Unknown) => Truth::Unknown,
+            _ => Truth::False,
+        }
+    }
+}
+
+fn eval(row: &ExecRow, e: &RExpr) -> Result<Truth> {
     eval_ctx(row, e, None)
 }
 
-fn eval_ctx(row: &ExecRow, e: &RExpr, having: Option<HavingCtx>) -> Result<bool> {
+fn eval_ctx(row: &ExecRow, e: &RExpr, having: Option<HavingCtx>) -> Result<Truth> {
     Ok(match e {
         RExpr::Cmp { left, op, right } => {
             let a = rval_value(row, left, having);
             let b = rval_value(row, right, having);
             if a.is_null() || b.is_null() {
-                return Ok(false);
+                return Ok(Truth::Unknown);
             }
-            match op {
+            Truth::of(match op {
                 CmpOp::Eq | CmpOp::Neq => {
                     let eq = eq_vals(&a, &b).ok_or_else(|| not_comparable(&a, &b))?;
                     if *op == CmpOp::Eq {
@@ -967,20 +1019,23 @@ fn eval_ctx(row: &ExecRow, e: &RExpr, having: Option<HavingCtx>) -> Result<bool>
                         _ => unreachable!(),
                     }
                 }
-            }
+            })
         }
+        // IS NULL is the one test that always knows its answer.
         RExpr::IsNull { col, negated } => {
             let v = ctx_col_value(row, col, having);
-            v.is_null() != *negated
+            Truth::of(v.is_null() != *negated)
         }
         RExpr::InList { col, list, negated } => {
             let v = ctx_col_value(row, col, having);
             if v.is_null() {
-                return Ok(false);
+                return Ok(Truth::Unknown);
             }
             let mut hit = false;
+            let mut saw_null = false;
             for item in list {
                 if item.is_null() {
+                    saw_null = true;
                     continue;
                 }
                 if eq_vals(&v, item).ok_or_else(|| not_comparable(&v, item))? {
@@ -988,11 +1043,40 @@ fn eval_ctx(row: &ExecRow, e: &RExpr, having: Option<HavingCtx>) -> Result<bool>
                     break;
                 }
             }
-            hit != *negated
+            // No match plus a NULL in the list is Unknown, not false: the NULL
+            // might have been the match. This is what makes `NOT IN (1, NULL)`
+            // return nothing, as standard SQL requires.
+            let found = if hit {
+                Truth::True
+            } else if saw_null {
+                Truth::Unknown
+            } else {
+                Truth::False
+            };
+            if *negated {
+                found.not()
+            } else {
+                found
+            }
         }
-        RExpr::And(a, b) => eval_ctx(row, a, having)? && eval_ctx(row, b, having)?,
-        RExpr::Or(a, b) => eval_ctx(row, a, having)? || eval_ctx(row, b, having)?,
-        RExpr::Not(inner) => !eval_ctx(row, inner, having)?,
+        // Short-circuit on the decisive value, so a NULL-comparison branch
+        // never has to be evaluated (and cannot raise a comparison error) once
+        // the result is already settled.
+        RExpr::And(a, b) => {
+            let left = eval_ctx(row, a, having)?;
+            if left == Truth::False {
+                return Ok(Truth::False);
+            }
+            left.and(eval_ctx(row, b, having)?)
+        }
+        RExpr::Or(a, b) => {
+            let left = eval_ctx(row, a, having)?;
+            if left == Truth::True {
+                return Ok(Truth::True);
+            }
+            left.or(eval_ctx(row, b, having)?)
+        }
+        RExpr::Not(inner) => eval_ctx(row, inner, having)?.not(),
     })
 }
 
@@ -1056,53 +1140,25 @@ fn coerce_for_lookup(v: &Value, ty: ColumnType) -> Option<Value> {
     }
 }
 
-/// Fetch a table's rows applying its pushed-down conjuncts, choosing point
-/// lookup on id, indexed equality, or full scan.
+/// Fetch a table's rows applying its pushed-down conjuncts. The access path is
+/// `table_driver`'s decision, the same one the batched paths and `EXPLAIN` use;
+/// this variant materializes the whole result for the callers that need it.
 fn fetch_table(db: &Db, ctx: &TableCtx, ti: usize, conjuncts: &[RExpr]) -> Result<Vec<Record>> {
-    let mut candidates: Option<Vec<Record>> = None;
-    for c in conjuncts {
-        let RExpr::Cmp {
-            left,
-            op: CmpOp::Eq,
-            right,
-        } = c
-        else {
-            continue;
-        };
-        let (col, val) = match (left, right) {
-            (RVal::Col(i, name), RVal::Val(v)) if *i == ti => (name, v),
-            (RVal::Val(v), RVal::Col(i, name)) if *i == ti => (name, v),
-            _ => continue,
-        };
-        if val.is_null() {
-            candidates = Some(Vec::new());
-            break;
-        }
-        if col == "id" {
-            let Value::Text(id) = val else {
-                candidates = Some(Vec::new());
-                break;
-            };
-            candidates = Some(
-                db.get_unbudgeted(&ctx.schema.name, id)?
-                    .into_iter()
-                    .collect(),
-            );
-            break;
-        }
-        let ty = ctx.schema.column(col).expect("resolved").ty;
-        if let Some(key) = coerce_for_lookup(val, ty) {
-            // find_eq selects a secondary index when one exists and otherwise
-            // uses the segment-streaming equality scan. Either path narrows
-            // the rows before the remaining conjuncts are evaluated.
-            let hits = db.find_eq_unbudgeted(&ctx.schema.name, col, &key)?;
-            candidates = Some(hits.into_iter().map(|(_, r)| r).collect());
-            break;
-        }
-    }
-    let rows = match candidates {
-        Some(rows) => rows,
-        None => db
+    let rows = match table_driver(ctx, ti, conjuncts) {
+        TableDriver::Empty => Vec::new(),
+        TableDriver::Id(id) => db
+            .get_unbudgeted(&ctx.schema.name, &id)?
+            .into_iter()
+            .collect(),
+        // find_eq selects a secondary index when one exists and otherwise uses
+        // the segment-streaming equality scan. Either path narrows the rows
+        // before the remaining conjuncts are evaluated.
+        TableDriver::Equality(column, key) => db
+            .find_eq_unbudgeted(&ctx.schema.name, &column, &key)?
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect(),
+        TableDriver::Scan => db
             .scan_unbudgeted(&ctx.schema.name)?
             .into_iter()
             .map(|(_, r)| r)
@@ -1129,9 +1185,11 @@ fn take_single(mut row: ExecRow, ti: usize) -> Record {
     row[ti].take().expect("present")
 }
 
+/// A row survives a filter only when every conjunct is `True`; `Unknown` keeps
+/// nothing, which is what makes NULLs fall out of a WHERE clause.
 fn eval_all(row: &ExecRow, conjuncts: &[RExpr]) -> Result<bool> {
     for c in conjuncts {
-        if !eval(row, c)? {
+        if !eval(row, c)?.is_true() {
             return Ok(false);
         }
     }
@@ -1620,14 +1678,30 @@ fn project_row(row: &ExecRow, extract: &[(usize, String)]) -> Vec<Value> {
         .collect()
 }
 
+/// How a table's rows are produced. This is the whole access-path decision:
+/// every read path (batched SELECT, joins, UPDATE/DELETE) and `EXPLAIN` derive
+/// it from `table_driver`, so what EXPLAIN prints is what the executor runs.
 enum TableDriver {
+    /// The predicate cannot match any row, so nothing is read at all.
+    Empty,
     Id(String),
     Equality(String, Value),
     Scan,
 }
 
 fn table_driver(table: &TableCtx, ti: usize, predicates: &[RExpr]) -> TableDriver {
-    for predicate in predicates {
+    table_driver_at(table, ti, predicates).0
+}
+
+/// `table_driver` plus the index of the predicate that drove the choice.
+/// Execution re-checks every predicate anyway, so only `EXPLAIN` needs it — to
+/// avoid echoing the driving predicate as a redundant filter line.
+fn table_driver_at(
+    table: &TableCtx,
+    ti: usize,
+    predicates: &[RExpr],
+) -> (TableDriver, Option<usize>) {
+    for (position, predicate) in predicates.iter().enumerate() {
         let RExpr::Cmp {
             left,
             op: CmpOp::Eq,
@@ -1641,18 +1715,43 @@ fn table_driver(table: &TableCtx, ti: usize, predicates: &[RExpr]) -> TableDrive
             (RVal::Val(value), RVal::Col(index, column)) if *index == ti => (column, value),
             _ => continue,
         };
+        // `col = NULL` is never true, so no access path can produce a row.
+        // Answering without touching the table is both faster and what makes
+        // the plan honest about it.
+        if value.is_null() {
+            return (TableDriver::Empty, Some(position));
+        }
         if column == "id" {
             return match value {
-                Value::Text(id) => TableDriver::Id(id.clone()),
-                _ => TableDriver::Id(String::new()),
+                Value::Text(id) => (TableDriver::Id(id.clone()), Some(position)),
+                _ => (TableDriver::Empty, Some(position)),
             };
         }
         let ty = table.schema.column(column).expect("resolved column").ty;
         if let Some(value) = coerce_for_lookup(value, ty) {
-            return TableDriver::Equality(column.clone(), value);
+            return (TableDriver::Equality(column.clone(), value), Some(position));
         }
     }
-    TableDriver::Scan
+    (TableDriver::Scan, None)
+}
+
+fn has_secondary_index(table: &TableCtx, column: &str) -> bool {
+    table.schema.indexes.iter().any(|d| d.column == column)
+}
+
+/// True when `column` on `table` can be probed directly instead of scanned.
+fn column_is_probeable(table: &TableCtx, column: &str) -> bool {
+    column == "id" || has_secondary_index(table, column)
+}
+
+/// The join-strategy decision, shared by the executor and `EXPLAIN`.
+///
+/// Index nested-loop is preferred at every cardinality: unlike the hash path
+/// it does not materialize the complete right table and its hash map. The
+/// optimizer may later add a cost-based crossover constrained by memory.
+/// RIGHT JOIN always takes the hash path, which is what preserves its side.
+fn join_uses_index_loop(kind: JoinKind, new_table: &TableCtx, new_col: &str) -> bool {
+    kind != JoinKind::Right && column_is_probeable(new_table, new_col)
 }
 
 fn driven_batch(
@@ -1664,6 +1763,7 @@ fn driven_batch(
     limit: usize,
 ) -> Result<Vec<(String, Record)>> {
     match driver {
+        TableDriver::Empty => Ok(Vec::new()),
         TableDriver::Id(id) => {
             if id.is_empty() || after_id.is_some() {
                 return Ok(Vec::new());
@@ -1845,9 +1945,6 @@ fn exec_single_indexed_join_select(
     residual: &[RExpr],
 ) -> Result<Option<QueryOutput>> {
     let join = &stmt.joins[0];
-    if join.kind == JoinKind::Right {
-        return Ok(None);
-    }
     let left = resolve_col(tables, &join.on.0)?;
     let right = resolve_col(tables, &join.on.1)?;
     let (existing, fresh) = if left.0 == 1 && right.0 == 0 {
@@ -1859,13 +1956,7 @@ fn exec_single_indexed_join_select(
             "ON must join the new table with a previously listed table".into(),
         ));
     };
-    let right_indexed = fresh.1 == "id"
-        || tables[1]
-            .schema
-            .indexes
-            .iter()
-            .any(|index| index.column == fresh.1);
-    if !right_indexed {
+    if !join_uses_index_loop(join.kind, &tables[1], &fresh.1) {
         return Ok(None);
     }
 
@@ -2035,7 +2126,16 @@ fn exec_single_indexed_join_select(
 
 // --- SELECT -----------------------------------------------------------------------
 
-fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
+/// FROM/JOIN resolution plus the WHERE split into per-table pushdown and
+/// cross-table residual conjuncts. Shared by execution and `EXPLAIN`.
+struct ResolvedQuery {
+    tables: Vec<TableCtx>,
+    pushdown: Vec<Vec<RExpr>>,
+    residual: Vec<RExpr>,
+    is_aggregate: bool,
+}
+
+fn resolve_query(db: &Db, stmt: &SelectStmt) -> Result<ResolvedQuery> {
     // Resolve FROM + JOIN tables.
     let mut tables: Vec<TableCtx> = Vec::new();
     let mut load = |tref: &TableRef| -> Result<()> {
@@ -2078,6 +2178,22 @@ fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
         .any(|i| matches!(i, SelectItem::Aggregate { .. }))
         || !stmt.group_by.is_empty()
         || stmt.having.is_some();
+
+    Ok(ResolvedQuery {
+        tables,
+        pushdown,
+        residual,
+        is_aggregate,
+    })
+}
+
+fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
+    let ResolvedQuery {
+        tables,
+        pushdown,
+        residual,
+        is_aggregate,
+    } = resolve_query(db, stmt)?;
 
     if tables.len() == 1 {
         if is_aggregate {
@@ -2176,6 +2292,368 @@ fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
         columns,
         rows: out_rows,
     })
+}
+
+// --- EXPLAIN ------------------------------------------------------------------
+//
+// EXPLAIN re-derives the plan from the same functions the executor obeys
+// (`resolve_query`, `table_driver`, `join_uses_index_loop`, `aggregate_plan`)
+// and never runs the query. Planning carries no estimates, so every line is a
+// statement about what will happen, not a prediction.
+
+/// Long text values are elided: a plan line must stay readable in a terminal.
+const EXPLAIN_TEXT_LIMIT: usize = 32;
+
+fn explain_value(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".into(),
+        Value::Bool(v) => v.to_string(),
+        Value::Int64(v) => v.to_string(),
+        Value::Float64(v) => v.to_string(),
+        Value::Text(v) if v.chars().count() > EXPLAIN_TEXT_LIMIT => {
+            let head: String = v.chars().take(EXPLAIN_TEXT_LIMIT).collect();
+            format!("'{head}...'")
+        }
+        Value::Text(v) => format!("'{v}'"),
+        Value::Blob(v) => format!("blob[{} bytes]", v.len()),
+        Value::Timestamp(v) => format!("timestamp({v})"),
+        Value::Date(v) => format!("date({v})"),
+        Value::Time(v) => format!("time({v})"),
+        Value::Json(_) => "json".into(),
+        Value::Vector(v) => format!("vector[{}]", v.len()),
+    }
+}
+
+fn explain_col(tables: &[TableCtx], col: &(usize, String)) -> String {
+    format!("{}.{}", tables[col.0].label, col.1)
+}
+
+fn explain_op(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Eq => "=",
+        CmpOp::Neq => "<>",
+        CmpOp::Lt => "<",
+        CmpOp::Le => "<=",
+        CmpOp::Gt => ">",
+        CmpOp::Ge => ">=",
+    }
+}
+
+fn explain_rval(tables: &[TableCtx], aggs: &[String], value: &RVal) -> String {
+    match value {
+        RVal::Col(ti, column) => format!("{}.{column}", tables[*ti].label),
+        RVal::Val(v) => explain_value(v),
+        RVal::Agg(index) => aggs
+            .get(*index)
+            .cloned()
+            .unwrap_or_else(|| format!("agg#{index}")),
+    }
+}
+
+fn explain_expr(tables: &[TableCtx], aggs: &[String], expr: &RExpr) -> String {
+    match expr {
+        RExpr::Cmp { left, op, right } => format!(
+            "{} {} {}",
+            explain_rval(tables, aggs, left),
+            explain_op(*op),
+            explain_rval(tables, aggs, right)
+        ),
+        RExpr::IsNull { col, negated } => format!(
+            "{} IS {}NULL",
+            explain_col(tables, col),
+            if *negated { "NOT " } else { "" }
+        ),
+        RExpr::InList { col, list, negated } => format!(
+            "{} {}IN ({})",
+            explain_col(tables, col),
+            if *negated { "NOT " } else { "" },
+            list.iter()
+                .map(explain_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        RExpr::And(a, b) => format!(
+            "({} AND {})",
+            explain_expr(tables, aggs, a),
+            explain_expr(tables, aggs, b)
+        ),
+        RExpr::Or(a, b) => format!(
+            "({} OR {})",
+            explain_expr(tables, aggs, a),
+            explain_expr(tables, aggs, b)
+        ),
+        RExpr::Not(inner) => format!("NOT {}", explain_expr(tables, aggs, inner)),
+    }
+}
+
+/// Accumulates plan lines; `depth` is rendered as indentation so the result is
+/// a single text column that reads as a tree.
+struct PlanBuilder {
+    rows: Vec<Vec<Value>>,
+}
+
+impl PlanBuilder {
+    fn new() -> Self {
+        PlanBuilder { rows: Vec::new() }
+    }
+
+    fn line(&mut self, depth: usize, text: impl AsRef<str>) {
+        let mut out = "  ".repeat(depth);
+        out.push_str(text.as_ref());
+        self.rows.push(vec![Value::Text(out)]);
+    }
+
+    fn filters(&mut self, depth: usize, tables: &[TableCtx], conjuncts: &[RExpr]) {
+        for conjunct in conjuncts {
+            self.line(
+                depth,
+                format!("filter: {}", explain_expr(tables, &[], conjunct)),
+            );
+        }
+    }
+
+    fn finish(self) -> QueryOutput {
+        QueryOutput::Rows {
+            columns: vec!["plan".into()],
+            rows: self.rows,
+        }
+    }
+}
+
+/// The access path `table_driver` picked, named after the mechanism the storage
+/// layer will actually use.
+fn explain_access(
+    plan: &mut PlanBuilder,
+    depth: usize,
+    tables: &[TableCtx],
+    ti: usize,
+    pushed: &[RExpr],
+) {
+    let table = &tables[ti];
+    let label = &table.label;
+    let (driver, driving) = table_driver_at(table, ti, pushed);
+    let empty = matches!(driver, TableDriver::Empty);
+    let line = match driver {
+        TableDriver::Empty => {
+            format!("NO ACCESS {label}  (equality on NULL matches no row)")
+        }
+        TableDriver::Id(id) => format!("POINT LOOKUP {label}.id = '{id}'"),
+        TableDriver::Equality(column, value) if has_secondary_index(table, &column) => {
+            format!("INDEX LOOKUP {label}.{column} = {}", explain_value(&value))
+        }
+        // Without a secondary index find_eq walks the primary directory and
+        // filters, which costs a full scan however selective the predicate is.
+        TableDriver::Equality(column, value) => format!(
+            "SCAN {label}  (equality {column} = {}, no index)",
+            explain_value(&value)
+        ),
+        TableDriver::Scan => format!("SCAN {label}"),
+    };
+    plan.line(depth, line);
+    // Nothing is read on the empty path, so nothing is filtered either.
+    if empty {
+        return;
+    }
+    let remaining: Vec<RExpr> = pushed
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| Some(*position) != driving)
+        .map(|(_, predicate)| predicate.clone())
+        .collect();
+    plan.filters(depth + 1, tables, &remaining);
+}
+
+/// Emits the left-deep join tree with the outermost (last) join at the root.
+/// `joins` is how many of `stmt.joins` this subtree covers.
+fn explain_join_tree(
+    plan: &mut PlanBuilder,
+    depth: usize,
+    stmt: &SelectStmt,
+    tables: &[TableCtx],
+    pushdown: &[Vec<RExpr>],
+    joins: usize,
+    streamed: bool,
+) -> Result<()> {
+    let Some(index) = joins.checked_sub(1) else {
+        explain_access(plan, depth, tables, 0, &pushdown[0]);
+        return Ok(());
+    };
+    let join = &stmt.joins[index];
+    let new_ti = index + 1;
+    let left = resolve_col(tables, &join.on.0)?;
+    let right = resolve_col(tables, &join.on.1)?;
+    let (existing, fresh) = if left.0 == new_ti && right.0 < new_ti {
+        (right, left)
+    } else if right.0 == new_ti && left.0 < new_ti {
+        (left, right)
+    } else {
+        return Err(Error::Sql(
+            "ON must join the new table with a previously listed table".into(),
+        ));
+    };
+    let kind = match join.kind {
+        JoinKind::Inner => "INNER",
+        JoinKind::Left => "LEFT",
+        JoinKind::Right => "RIGHT",
+    };
+    let index_loop = join_uses_index_loop(join.kind, &tables[new_ti], &fresh.1);
+    let strategy = if index_loop {
+        "index nested-loop"
+    } else {
+        "grace hash join"
+    };
+    plan.line(depth, format!("JOIN {kind} ({strategy})"));
+    plan.line(
+        depth + 1,
+        format!(
+            "on: {} = {}",
+            explain_col(tables, &existing),
+            explain_col(tables, &fresh)
+        ),
+    );
+    if index_loop && streamed {
+        plan.line(depth + 1, "streamed: no joined rows are materialized");
+    }
+    explain_join_tree(plan, depth + 1, stmt, tables, pushdown, index, streamed)?;
+    if index_loop {
+        let probe = if fresh.1 == "id" {
+            format!(
+                "POINT LOOKUP {}.id = {}",
+                tables[new_ti].label,
+                explain_col(tables, &existing)
+            )
+        } else {
+            format!(
+                "INDEX PROBE {} = {}",
+                explain_col(tables, &fresh),
+                explain_col(tables, &existing)
+            )
+        };
+        plan.line(depth + 1, probe);
+        plan.filters(depth + 2, tables, &pushdown[new_ti]);
+    } else {
+        explain_access(plan, depth + 1, tables, new_ti, &pushdown[new_ti]);
+    }
+    Ok(())
+}
+
+fn explain_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
+    let ResolvedQuery {
+        tables,
+        pushdown,
+        residual,
+        is_aggregate,
+    } = resolve_query(db, stmt)?;
+
+    // Build the same plans execution builds, so EXPLAIN rejects exactly the
+    // queries that cannot run instead of printing a plan for one of them.
+    let aggregate = if is_aggregate {
+        let plan = aggregate_plan(&tables, stmt)?;
+        aggregate_order_positions(stmt, &plan.headers)?;
+        Some(plan)
+    } else {
+        projection_plan(&tables, &stmt.projection)?;
+        for (column, _) in &stmt.order_by {
+            resolve_col(&tables, column)?;
+        }
+        None
+    };
+    let agg_names: Vec<String> = match &aggregate {
+        Some(plan) => plan
+            .specs
+            .iter()
+            .map(|spec| match &spec.arg {
+                Some(col) => format!("{}({})", spec.func.name(), explain_col(&tables, col)),
+                None => format!("{}(*)", spec.func.name()),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let mut plan = PlanBuilder::new();
+    let mut depth = 0;
+
+    // Outermost operators first: LIMIT wraps the sort, which wraps grouping.
+    if stmt.limit.is_some() || stmt.offset.is_some() {
+        let mut line = String::from("LIMIT");
+        match limit_to_usize(stmt.limit.as_ref()) {
+            Some(n) => line.push_str(&format!(" {n}")),
+            None => line.push_str(" ALL"),
+        }
+        if let Some(offset) = limit_to_usize(stmt.offset.as_ref()) {
+            line.push_str(&format!(" OFFSET {offset}"));
+        }
+        plan.line(depth, line);
+        depth += 1;
+    }
+    if !stmt.order_by.is_empty() {
+        let keys: Vec<String> = stmt
+            .order_by
+            .iter()
+            .map(|(column, desc)| {
+                let name = match aggregate {
+                    // Aggregate ORDER BY addresses output columns by name.
+                    Some(_) => column.column.clone(),
+                    None => explain_col(&tables, &resolve_col(&tables, column)?),
+                };
+                Ok(format!("{name} {}", if *desc { "DESC" } else { "ASC" }))
+            })
+            .collect::<Result<_>>()?;
+        plan.line(depth, format!("SORT {}", keys.join(", ")));
+        plan.line(
+            depth + 1,
+            "external merge sort, spills to disk over the query budget",
+        );
+        depth += 1;
+    }
+    if let Some(aggregate) = &aggregate {
+        let line = if aggregate.group_cols.is_empty() {
+            "AGGREGATE (single group)".to_string()
+        } else {
+            format!(
+                "GROUP BY {}",
+                aggregate
+                    .group_cols
+                    .iter()
+                    .map(|col| explain_col(&tables, col))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        plan.line(depth, line);
+        if !agg_names.is_empty() {
+            plan.line(depth + 1, format!("aggregates: {}", agg_names.join(", ")));
+        }
+        if let Some(having) = &aggregate.having {
+            plan.line(
+                depth + 1,
+                format!("having: {}", explain_expr(&tables, &agg_names, having)),
+            );
+        }
+        depth += 1;
+    }
+
+    // Residual conjuncts span tables, so they are evaluated above the join.
+    for conjunct in &residual {
+        plan.line(
+            depth,
+            format!("filter: {}", explain_expr(&tables, &agg_names, conjunct)),
+        );
+    }
+
+    // The bounded streaming join path only handles a two-table, non-aggregate
+    // SELECT; see exec_select's dispatch.
+    let streamed = tables.len() == 2 && !is_aggregate;
+    explain_join_tree(
+        &mut plan,
+        depth,
+        stmt,
+        &tables,
+        &pushdown,
+        stmt.joins.len(),
+        streamed,
+    )?;
+    Ok(plan.finish())
 }
 
 // --- aggregation --------------------------------------------------------------
@@ -2448,65 +2926,19 @@ enum OutCol {
     Agg(usize),
 }
 
-#[allow(clippy::too_many_arguments)]
-fn queue_aggregate_group(
-    sorter: &mut SpillSorter<'_>,
-    group_cols: &[(usize, String)],
-    out_cols: &[OutCol],
-    having: Option<&RExpr>,
-    order_positions: &[(usize, bool)],
-    group_values: Vec<Value>,
-    states: Vec<AggState>,
-    first_sequence: u64,
-) -> Result<()> {
-    let aggregate_values: Vec<Value> = states
-        .into_iter()
-        .map(AggState::finish)
-        .collect::<Result<_>>()?;
-    if let Some(expr) = having {
-        let group_map: HashMap<(usize, String), Value> = group_cols
-            .iter()
-            .cloned()
-            .zip(group_values.iter().cloned())
-            .collect();
-        if !eval_ctx(&Vec::new(), expr, Some((&group_map, &aggregate_values)))? {
-            return Ok(());
-        }
-    }
-    let values: Vec<Value> = out_cols
-        .iter()
-        .map(|column| match column {
-            OutCol::Group(index) => group_values[*index].clone(),
-            OutCol::Agg(index) => aggregate_values[*index].clone(),
-        })
-        .collect();
-    let keys = if order_positions.is_empty() {
-        vec![Value::Int64(
-            i64::try_from(first_sequence).unwrap_or(i64::MAX),
-        )]
-    } else {
-        order_positions
-            .iter()
-            .map(|(position, _)| values[*position].clone())
-            .collect()
-    };
-    sorter.push(SortedOutputRow {
-        keys,
-        values,
-        sequence: first_sequence,
-    })
+/// Everything an aggregate query needs decided before any row is read: the
+/// GROUP BY keys, the validated projection, the deduplicated aggregate specs
+/// and the resolved HAVING. Both aggregate executors and `EXPLAIN` build it,
+/// so all three agree on which aggregate queries are legal.
+struct AggregatePlan {
+    group_cols: Vec<(usize, String)>,
+    specs: Vec<AggSpec>,
+    headers: Vec<String>,
+    out_cols: Vec<OutCol>,
+    having: Option<RExpr>,
 }
 
-/// Sort-based aggregation for the single-table path. Input rows are streamed;
-/// GROUP BY keys are externally sorted under the query budget, so cardinality
-/// does not translate into an unbounded HashMap.
-fn exec_single_table_aggregate(
-    db: &Db,
-    tables: &[TableCtx],
-    stmt: &SelectStmt,
-    pushed: &[RExpr],
-    residual: &[RExpr],
-) -> Result<QueryOutput> {
+fn aggregate_plan(tables: &[TableCtx], stmt: &SelectStmt) -> Result<AggregatePlan> {
     let group_cols: Vec<(usize, String)> = stmt
         .group_by
         .iter()
@@ -2562,8 +2994,18 @@ fn exec_single_table_aggregate(
         Some(expr) => Some(resolve_having_expr(tables, expr, &group_set, &mut specs)?),
         None => None,
     };
-    let order_positions: Vec<(usize, bool)> = stmt
-        .order_by
+    Ok(AggregatePlan {
+        group_cols,
+        specs,
+        headers,
+        out_cols,
+        having,
+    })
+}
+
+/// ORDER BY in an aggregate query addresses output columns, not input ones.
+fn aggregate_order_positions(stmt: &SelectStmt, headers: &[String]) -> Result<Vec<(usize, bool)>> {
+    stmt.order_by
         .iter()
         .map(|(column, desc)| {
             headers
@@ -2577,7 +3019,76 @@ fn exec_single_table_aggregate(
                     ))
                 })
         })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_aggregate_group(
+    sorter: &mut SpillSorter<'_>,
+    group_cols: &[(usize, String)],
+    out_cols: &[OutCol],
+    having: Option<&RExpr>,
+    order_positions: &[(usize, bool)],
+    group_values: Vec<Value>,
+    states: Vec<AggState>,
+    first_sequence: u64,
+) -> Result<()> {
+    let aggregate_values: Vec<Value> = states
+        .into_iter()
+        .map(AggState::finish)
         .collect::<Result<_>>()?;
+    if let Some(expr) = having {
+        let group_map: HashMap<(usize, String), Value> = group_cols
+            .iter()
+            .cloned()
+            .zip(group_values.iter().cloned())
+            .collect();
+        if !eval_ctx(&Vec::new(), expr, Some((&group_map, &aggregate_values)))?.is_true() {
+            return Ok(());
+        }
+    }
+    let values: Vec<Value> = out_cols
+        .iter()
+        .map(|column| match column {
+            OutCol::Group(index) => group_values[*index].clone(),
+            OutCol::Agg(index) => aggregate_values[*index].clone(),
+        })
+        .collect();
+    let keys = if order_positions.is_empty() {
+        vec![Value::Int64(
+            i64::try_from(first_sequence).unwrap_or(i64::MAX),
+        )]
+    } else {
+        order_positions
+            .iter()
+            .map(|(position, _)| values[*position].clone())
+            .collect()
+    };
+    sorter.push(SortedOutputRow {
+        keys,
+        values,
+        sequence: first_sequence,
+    })
+}
+
+/// Sort-based aggregation for the single-table path. Input rows are streamed;
+/// GROUP BY keys are externally sorted under the query budget, so cardinality
+/// does not translate into an unbounded HashMap.
+fn exec_single_table_aggregate(
+    db: &Db,
+    tables: &[TableCtx],
+    stmt: &SelectStmt,
+    pushed: &[RExpr],
+    residual: &[RExpr],
+) -> Result<QueryOutput> {
+    let AggregatePlan {
+        group_cols,
+        specs,
+        headers,
+        out_cols,
+        having,
+    } = aggregate_plan(tables, stmt)?;
+    let order_positions = aggregate_order_positions(stmt, &headers)?;
     let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
     let limit = limit_to_usize(stmt.limit.as_ref());
     let output_desc = if order_positions.is_empty() {
@@ -2709,61 +3220,13 @@ fn exec_aggregate(
     rows: Vec<ExecRow>,
     stmt: &SelectStmt,
 ) -> Result<QueryOutput> {
-    let group_cols: Vec<(usize, String)> = stmt
-        .group_by
-        .iter()
-        .map(|c| resolve_col(tables, c))
-        .collect::<Result<_>>()?;
-    let group_set: HashSet<(usize, String)> = group_cols.iter().cloned().collect();
-
-    let mut specs: Vec<AggSpec> = Vec::new();
-    let mut headers: Vec<String> = Vec::new();
-    let mut out_cols: Vec<OutCol> = Vec::new();
-    for item in &stmt.projection {
-        match item {
-            SelectItem::Star => {
-                return Err(Error::Sql(
-                    "SELECT * cannot be combined with aggregates/GROUP BY; list columns explicitly"
-                        .into(),
-                ))
-            }
-            SelectItem::Column { col, alias } => {
-                let rc = resolve_col(tables, col)?;
-                let Some(gi) = group_cols.iter().position(|g| *g == rc) else {
-                    return Err(Error::Sql(format!(
-                        "column '{}' must appear in GROUP BY",
-                        col.column
-                    )));
-                };
-                headers.push(alias.clone().unwrap_or_else(|| rc.1.clone()));
-                out_cols.push(OutCol::Group(gi));
-            }
-            SelectItem::Aggregate { func, arg, alias } => {
-                let arg_r = match arg {
-                    Some(c) => Some(resolve_col(tables, c)?),
-                    None => None,
-                };
-                validate_agg(tables, *func, &arg_r)?;
-                let default = match &arg_r {
-                    Some((_, name)) => format!("{}({name})", func.name()),
-                    None => format!("{}(*)", func.name()),
-                };
-                let idx = agg_index(
-                    &mut specs,
-                    AggSpec {
-                        func: *func,
-                        arg: arg_r,
-                    },
-                );
-                headers.push(alias.clone().unwrap_or(default));
-                out_cols.push(OutCol::Agg(idx));
-            }
-        }
-    }
-    let having_r = match &stmt.having {
-        Some(h) => Some(resolve_having_expr(tables, h, &group_set, &mut specs)?),
-        None => None,
-    };
+    let AggregatePlan {
+        group_cols,
+        specs,
+        headers,
+        out_cols,
+        having: having_r,
+    } = aggregate_plan(tables, stmt)?;
 
     // Group in first-seen order.
     let new_states = |specs: &[AggSpec]| -> Vec<AggState> {
@@ -2809,7 +3272,7 @@ fn exec_aggregate(
                 .zip(key_vals.iter().cloned())
                 .collect();
             let empty_row: ExecRow = Vec::new();
-            if !eval_ctx(&empty_row, h, Some((&group_map, &agg_vals)))? {
+            if !eval_ctx(&empty_row, h, Some((&group_map, &agg_vals)))?.is_true() {
                 continue;
             }
         }
@@ -3242,11 +3705,7 @@ fn exec_join(
 ) -> Result<Vec<ExecRow>> {
     let mut out: Vec<ExecRow> = Vec::new();
 
-    let indexed = new_col == "id" || new_table.schema.indexes.iter().any(|d| d.column == new_col);
-    // Prefer the index nested-loop at every cardinality: unlike the hash path
-    // it does not materialize the complete right table and its hash map. The
-    // optimizer may later add a cost-based crossover constrained by memory.
-    let use_index_loop = kind != JoinKind::Right && indexed;
+    let use_index_loop = join_uses_index_loop(kind, new_table, new_col);
 
     if use_index_loop {
         for row in &left_rows {

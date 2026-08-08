@@ -238,7 +238,8 @@ fn select_predicates() {
         q("SELECT name FROM users WHERE (age = 25 OR age = 30) AND name = 'bob'"),
         vec!["bob"]
     );
-    // Comparisons with NULL literals are false (two-valued logic).
+    // A comparison with a NULL literal is UNKNOWN, so it keeps nothing.
+    // Full three-valued semantics live in tests/sql_null_logic.rs.
     assert!(q("SELECT name FROM users WHERE email = NULL").is_empty());
     // Point lookup by id.
     assert_eq!(q("SELECT name FROM users WHERE id = 'u2'"), vec!["bob"]);
@@ -558,6 +559,36 @@ fn unsupported_features_fail_with_clear_errors() {
     );
     assert_sql_err(&db, "INSERT INTO users VALUES ('x')", "3 declared columns");
     assert_sql_err(&db, "SELECT nope FROM users", "unknown column");
+
+    // MySQL-isms a migrating user is likely to type: each names the
+    // alternative rather than reporting a generic parse failure.
+    assert_sql_err(
+        &db,
+        "INSERT INTO users (name) VALUES ('x') ON DUPLICATE KEY UPDATE name = 'y'",
+        "ON DUPLICATE KEY UPDATE",
+    );
+    assert_sql_err(
+        &db,
+        "REPLACE INTO users (name) VALUES ('x')",
+        "REPLACE INTO",
+    );
+    assert_sql_err(&db, "TRUNCATE TABLE users", "TRUNCATE");
+    assert_sql_err(
+        &db,
+        "SELECT name FROM users LIMIT 10, 20",
+        "LIMIT count OFFSET offset",
+    );
+    // The locking clause must be reported even where a table alias could
+    // otherwise swallow the keyword.
+    for sql in [
+        "SELECT name FROM users FOR UPDATE",
+        "SELECT name FROM users ORDER BY age LIMIT 1 FOR UPDATE",
+        "SELECT name FROM users LOCK IN SHARE MODE",
+    ] {
+        assert_sql_err(&db, sql, "row locking");
+    }
+    // Aliases that merely look like the new reserved words still work.
+    db.query("SELECT f.name FROM users f").unwrap();
     assert!(matches!(
         db.query("SELECT * FROM missing"),
         Err(Error::TableNotFound(_))

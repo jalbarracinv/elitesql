@@ -212,3 +212,46 @@ fn vectors_in_sql_reads_writes_and_refusals() {
         .to_string();
     assert!(err.contains("use search_vector"), "{err}");
 }
+
+/// manual.md — "EXPLAIN". The manual prints this plan verbatim; if the planner
+/// changes, the documented plan has to change with it.
+#[test]
+fn explain_prints_the_documented_join_plan() {
+    let (_d, db) = new_db();
+    db.query("CREATE TABLE users (name text, age int64)")
+        .unwrap();
+    db.query("CREATE TABLE orders (user_id text, total int64)")
+        .unwrap();
+    db.query("CREATE INDEX ON orders (user_id)").unwrap();
+
+    let QueryOutput::Rows { columns, rows } = db
+        .query(
+            "EXPLAIN SELECT u.name, o.total FROM users u
+             JOIN orders o ON o.user_id = u.id
+             WHERE u.age > 30 AND o.total > 100",
+        )
+        .unwrap()
+    else {
+        panic!("expected rows");
+    };
+    assert_eq!(columns, vec!["plan".to_string()]);
+    let plan: Vec<String> = rows
+        .into_iter()
+        .map(|row| match row.into_iter().next() {
+            Some(Value::Text(line)) => line,
+            other => panic!("expected a text plan line, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        plan,
+        [
+            "JOIN INNER (index nested-loop)",
+            "  on: u.id = o.user_id",
+            "  streamed: no joined rows are materialized",
+            "  SCAN u",
+            "    filter: u.age > 30",
+            "  INDEX PROBE o.user_id = u.id",
+            "    filter: o.total > 100",
+        ]
+    );
+}

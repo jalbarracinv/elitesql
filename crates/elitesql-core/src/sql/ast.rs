@@ -17,6 +17,8 @@ pub(crate) enum Statement {
         rows: Vec<Vec<Literal>>,
     },
     Select(Box<SelectStmt>),
+    /// `EXPLAIN <select>`: report the plan instead of running the query.
+    Explain(Box<SelectStmt>),
     Update {
         table: String,
         sets: Vec<(String, Literal)>,

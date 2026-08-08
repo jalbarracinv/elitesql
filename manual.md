@@ -79,6 +79,62 @@ timestamps, JSON, vectors, non-finite floats and lossless `int64`. Python maps
 its date/time classes directly; Node maps `Date` to a timestamp and `BigInt` to
 an exact `int64`.
 
+## Running SQL from another process, or another host
+
+A database directory is owned by **one process**. When other processes need it,
+or when the app runs on a different machine, that owner serves them:
+
+```bash
+elitesql serve app.esql /tmp/elitesql.sock     # same host
+elitesql serve app.esql --tcp 127.0.0.1:7070   # another host (needs a token)
+```
+
+```python
+db = SidecarClient("/tmp/elitesql.sock")                    # Unix socket
+db = SidecarClient(host="db-host", port=7070, token=tok)    # TCP
+db.query("SELECT name FROM users WHERE email = %s", ["ana@x.com"])
+```
+
+**The SQL behaves identically over either transport, and identically to the
+embedded API.** It is the same engine in the same process: the same dialect, the
+same MVCC and read-committed reads, the same automatic retry on UPDATE/DELETE,
+the same atomic multi-row INSERT, the same error codes. Nothing in this manual
+changes because a query arrived over a socket. Only three things differ, and
+none of them is a semantic difference:
+
+| | Unix socket | TCP |
+|---|---|---|
+| Authentication | filesystem permissions on the socket | a shared token, required |
+| Encryption | not applicable (never leaves the host) | none — use an SSH tunnel or a VPN |
+| Round trip | tens of microseconds | ~0.5 ms local, 10–50 ms across regions |
+
+The token handshake is sent by the clients themselves, on connect and on
+reconnect, so application code is the same for both transports.
+
+The latency line is the one to design around. A point lookup is ~4 µs, so over
+TCP the network costs about a hundred times more than the query. That does not
+change what a query *returns*, but it changes which shapes are sensible:
+prefer one query returning many rows over many queries returning one row each,
+and be wary of ORM N+1 patterns that were free when the engine was in-process.
+
+Current limits of the server mode, so you can tell what it is not:
+
+- **One database per server process.** There is no `USE db`; `serve` opens the
+  directory you name and serves that one. Several databases mean several
+  processes on different sockets or ports, each with its own memory budget.
+- **No TLS**, as above.
+- **No session transactions.** There is no `BEGIN`/`COMMIT` over the wire, the
+  same as in embedded SQL; multi-statement transactions use the Rust `Txn` API
+  in the process that owns the database.
+- **Connections are capped** (`--max-connections`, default 128) because each one
+  costs a thread. Past the cap the server answers with a refusal rather than
+  queueing.
+
+Never share a database directory over NFS or SMB instead of using the sidecar.
+Durability relies on `fsync` plus atomic `rename`, and immutable index bases are
+read through `mmap`; network filesystems provide neither reliably, and two
+machines writing the same directory is not the ownership model.
+
 ## Types and literals
 
 | Type | SQL literal | Example |
@@ -260,7 +316,16 @@ SELECT name FROM users WHERE (age < 18 OR age > 65) AND NOT name = 'admin'
 SELECT name FROM users WHERE id = 'u-admin'        -- direct point lookup
 ```
 
-NULL semantics (simplified two-valued logic): any comparison involving `NULL` is false. `email = NULL` never matches — use `email IS NULL`.
+NULL semantics: standard SQL three-valued logic, matching PostgreSQL and MySQL. A comparison involving `NULL` is `UNKNOWN` (neither true nor false), and a row is kept only when the predicate is `TRUE`.
+
+```sql
+WHERE email = NULL       -- never matches; use IS NULL
+WHERE NOT age = 30       -- drops rows where age IS NULL: NOT UNKNOWN is UNKNOWN
+WHERE age NOT IN (1, NULL)  -- always empty: the NULL might have been the match
+WHERE age = 30 OR age IS NULL   -- how to include NULLs deliberately
+```
+
+`IS NULL` / `IS NOT NULL` are the only tests that always return a definite answer. `AND`/`OR` follow the usual tables: `FALSE AND UNKNOWN` is `FALSE`, `TRUE OR UNKNOWN` is `TRUE`, and everything else touching `UNKNOWN` stays `UNKNOWN`. `HAVING` applies the same rule, so a group whose aggregate is `NULL` does not pass.
 
 ### ORDER BY, LIMIT, OFFSET
 
@@ -670,6 +735,45 @@ Heuristic, no cost model:
 
 Practical rule: **index your join columns** (`orders.user_id`) and your frequent lookup columns.
 
+## EXPLAIN
+
+`EXPLAIN <select>` prints the plan and does not run the query:
+
+```sql
+EXPLAIN SELECT u.name, o.total FROM users u
+JOIN orders o ON o.user_id = u.id
+WHERE u.age > 30 AND o.total > 100;
+```
+
+```
+JOIN INNER (index nested-loop)
+  on: u.id = o.user_id
+  streamed: no joined rows are materialized
+  SCAN u
+    filter: u.age > 30
+  INDEX PROBE o.user_id = u.id
+    filter: o.total > 100
+```
+
+Because planning is static and carries no estimates, the plan is not a prediction: the executor reads its access path and join strategy from the same functions EXPLAIN does. There are no row-count guesses to be wrong, and no `EXPLAIN ANALYZE` to contrast them with.
+
+The line that matters most is the access path, because the gap between them is five orders of magnitude (see [Reference performance](#reference-performance)):
+
+| Line | Meaning |
+|---|---|
+| `POINT LOOKUP t.id = '...'` | direct fetch by primary key |
+| `INDEX LOOKUP t.col = v` | secondary index on `col` |
+| `INDEX PROBE t.col = u.other` | per-row index probe, the inner side of an index nested-loop join |
+| `SCAN t` | full scan |
+| `SCAN t (equality col = v, no index)` | equality with **no index**: still a full scan — the one to go index |
+| `NO ACCESS t` | the predicate cannot match (`col = NULL`), so nothing is read |
+
+Operators above the access path — `LIMIT`, `SORT`, `GROUP BY`, `JOIN`, `filter:` — are listed outermost first, with their inputs indented underneath. `filter:` at the top level is a predicate spanning two tables, so it can only be evaluated after the join; `filter:` under an access path is pushed down to that table.
+
+`EXPLAIN` accepts only `SELECT`, and it validates the query exactly as execution does: an unknown column or a missing `GROUP BY` fails instead of printing a plan.
+
+Reading a plan you did not expect, the usual fixes are `CREATE INDEX` on the column in a `SCAN ... no index` line, and on the join column behind a `grace hash join`.
+
 ## Outside the V1 subset
 
 All of this fails with a clear error, never with surprise behavior:
@@ -686,6 +790,10 @@ All of this fails with a clear error, never with surprise behavior:
 | `DROP TABLE ... CASCADE` / `RESTRICT` | there are no foreign keys in V1, so there is nothing to cascade |
 | `BEGIN/COMMIT` in SQL | transactions via the Rust API: `db.begin()` |
 | `RETURNING` | INSERT already reports the ids |
+| `ON DUPLICATE KEY UPDATE`, `REPLACE INTO` | SELECT first, then INSERT or UPDATE inside a transaction |
+| `TRUNCATE TABLE` | `DELETE FROM table`, or `DROP TABLE` and recreate it |
+| `LIMIT offset, count` (MySQL order) | `LIMIT count OFFSET offset` — the operands swap |
+| `FOR UPDATE` / `LOCK IN SHARE MODE` | commits are optimistic; retry on `Error::Conflict` instead of locking rows |
 | Vector/text/hybrid search in SQL (`distance(...)`, `ORDER BY` a vector) | Rust API and bindings: `search_vector` (see [Vectors](#vectors-storing-and-searching-embeddings)), `search_text` (BM25) and `search_hybrid` (RRF); a SQL surface is left for a future phase |
 
 ## Reference performance

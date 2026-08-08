@@ -59,7 +59,15 @@ const RESERVED: &[&str] = &[
     "RENAME",
     "COLUMN",
     "DEFAULT",
+    // Not part of the dialect, but reserved so `FROM t FOR UPDATE` reports the
+    // locking clause instead of silently aliasing the table `for`.
+    "FOR",
+    "LOCK",
 ];
+
+fn is_select_kw(lexed: &Lexed) -> bool {
+    matches!(&lexed.tok, Tok::Ident(w) if w.eq_ignore_ascii_case("SELECT"))
+}
 
 pub(crate) fn parse(sql: &str) -> Result<Statement> {
     let toks = lex(sql)?;
@@ -105,8 +113,12 @@ impl Parser {
         }
     }
 
+    fn is(&self, tok: &Tok) -> bool {
+        self.peek().map(|t| &t.tok) == Some(tok)
+    }
+
     fn eat(&mut self, tok: &Tok) -> bool {
-        if self.peek().map(|t| &t.tok) == Some(tok) {
+        if self.is(tok) {
             self.pos += 1;
             true
         } else {
@@ -179,9 +191,30 @@ impl Parser {
         if self.eat_kw("ALTER") {
             return self.parse_alter();
         }
+        if self.eat_kw("EXPLAIN") {
+            // ANALYZE would have to run the query and count rows; the plan is
+            // static and estimate-free, so there is nothing to contrast yet.
+            if self.is_kw("ANALYZE") {
+                return Err(self.err_at("EXPLAIN ANALYZE is not supported; use EXPLAIN"));
+            }
+            if !self.eat_kw("SELECT") {
+                return Err(self.err_at("EXPLAIN is only supported for SELECT"));
+            }
+            let Statement::Select(select) = self.parse_select()? else {
+                unreachable!("parse_select returns Statement::Select");
+            };
+            return Ok(Statement::Explain(select));
+        }
         for (kw, msg) in [
             ("WITH", "CTEs (WITH) are not supported in V1"),
-            ("EXPLAIN", "EXPLAIN is not supported in V1"),
+            (
+                "REPLACE",
+                "REPLACE INTO is not supported; SELECT first, then INSERT or UPDATE inside a transaction",
+            ),
+            (
+                "TRUNCATE",
+                "TRUNCATE is not supported; use DELETE FROM table, or DROP TABLE and recreate it",
+            ),
             (
                 "BEGIN",
                 "SQL transactions are not supported in V1; use the Txn API",
@@ -514,6 +547,11 @@ impl Parser {
                 "RETURNING is not supported in V1; INSERT already reports the generated ids",
             ));
         }
+        if self.is_kw("ON") {
+            return Err(self.err_at(
+                "ON DUPLICATE KEY UPDATE is not supported in V1; SELECT first, then INSERT or UPDATE inside a transaction",
+            ));
+        }
         Ok(Statement::Insert {
             table,
             columns,
@@ -684,9 +722,23 @@ impl Parser {
         let mut offset = None;
         if self.eat_kw("LIMIT") {
             limit = Some(self.parse_limit_value("LIMIT")?);
+            // MySQL's `LIMIT offset, count`. The operands are also swapped, so
+            // saying "use OFFSET" without saying which is which invites a bug.
+            if self.is(&Tok::Comma) {
+                return Err(self.err_at(
+                    "LIMIT offset, count is not supported; use LIMIT count OFFSET offset (note the order swaps)",
+                ));
+            }
             if self.eat_kw("OFFSET") {
                 offset = Some(self.parse_limit_value("OFFSET")?);
             }
+        }
+        // Row locking has no meaning here: commits are optimistic and validated
+        // at commit time, so there is nothing to reserve up front.
+        if self.is_kw("FOR") || self.is_kw("LOCK") {
+            return Err(self.err_at(
+                "row locking (FOR UPDATE / LOCK IN SHARE MODE) is not supported; commits are optimistic, so retry on Error::Conflict instead",
+            ));
         }
         Ok(Statement::Select(Box::new(SelectStmt {
             projection,
@@ -980,6 +1032,11 @@ impl Parser {
                     }
                     Ok(Operand::Col(col))
                 }
+            }
+            // `(SELECT ...)` where a value belongs: name it, because
+            // "expected a literal value" does not tell a reader what is wrong.
+            Some(Tok::LParen) if self.peek2().is_some_and(is_select_kw) => {
+                Err(self.err_at("subqueries are not supported in V1; run two queries instead"))
             }
             _ => Ok(Operand::Lit(self.parse_literal()?)),
         }
