@@ -507,21 +507,57 @@ def repair(src: str | os.PathLike, dst: str | os.PathLike,
 
 
 class SidecarClient:
-    """Client for ``elitesql serve <db> <socket>`` — the multi-worker mode.
+    """Client for ``elitesql serve`` — the multi-worker and remote-host mode.
 
-    Each client owns one socket connection; it is thread-safe (a lock
-    serializes request/response pairs). Create one per worker process.
+    Two transports, matching the two ways the server can listen::
+
+        SidecarClient("/tmp/elitesql.sock")             # Unix socket, same host
+        SidecarClient(host="db", port=7070, token=tok)  # TCP, needs the token
+
+    A Unix socket is authenticated by filesystem permissions. TCP is not, so a
+    token is required and is sent as the first request on every connection,
+    including after a reconnect. The protocol is not encrypted: reach another
+    host through an SSH tunnel, a VPN or a private network.
+
+    Each client owns one connection; it is thread-safe (a lock serializes
+    request/response pairs). Create one per worker process.
     """
 
-    def __init__(self, socket_path: str | os.PathLike):
-        self._path = str(socket_path)
+    def __init__(self, socket_path: str | os.PathLike | None = None, *,
+                 host: Optional[str] = None, port: Optional[int] = None,
+                 token: Optional[str] = None, timeout: Optional[float] = None):
+        if (socket_path is None) == (host is None):
+            raise ValueError("pass either socket_path or host= and port=, not both")
+        if host is not None and port is None:
+            raise ValueError("host= also needs port=")
+        if host is not None and not token:
+            raise ValueError("a TCP sidecar requires token=")
+        self._path = str(socket_path) if socket_path is not None else None
+        self._host = host
+        self._port = port
+        self._token = token
+        self._timeout = timeout
         self._lock = threading.Lock()
         self._connect()
 
     def _connect(self) -> None:
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.connect(self._path)
+        if self._path is not None:
+            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            if self._timeout is not None:
+                self._sock.settimeout(self._timeout)
+            self._sock.connect(self._path)
+            self._file = self._sock.makefile("rwb")
+            return
+        self._sock = socket.create_connection((self._host, self._port), timeout=self._timeout)
+        # Nagle would add latency to the small request/response pairs this
+        # protocol is made of.
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._file = self._sock.makefile("rwb")
+        self._authenticate()
+
+    def _authenticate(self) -> None:
+        """Sent before anything else; the server refuses every other op first."""
+        self._call({"op": "auth", "token": self._token}, _locked=False)
 
     def close(self) -> None:
         try:
@@ -536,9 +572,16 @@ class SidecarClient:
     def __exit__(self, *_exc) -> None:
         self.close()
 
-    def _call(self, request: dict) -> Any:
+    def _call(self, request: dict, _locked: bool = True) -> Any:
         payload = (json.dumps(request) + "\n").encode()
-        with self._lock:
+        if _locked:
+            with self._lock:
+                self._file.write(payload)
+                self._file.flush()
+                line = self._file.readline()
+        else:
+            # The auth handshake runs inside _connect(), which already owns the
+            # connection; taking the lock again would deadlock a reconnect.
             self._file.write(payload)
             self._file.flush()
             line = self._file.readline()

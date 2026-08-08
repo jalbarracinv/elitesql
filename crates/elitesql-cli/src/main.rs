@@ -27,11 +27,22 @@ USAGE:
   elitesql export <db> <table>         records as JSON lines on stdout
   elitesql import <db> <table>         JSON lines from stdin into a table
   elitesql serve <db> <socket-path>    sidecar server over a Unix socket
+  elitesql serve <db> --tcp <addr>     sidecar server over TCP (needs a token)
   elitesql version
 
 OPTIONS:
   --durability safe|balanced|fast    (query/repl/import/serve; default safe)
   --read-only                        open without touching disk; writes fail
+
+SERVE OPTIONS:
+  --tcp <host:port>                  listen on TCP instead of a Unix socket
+  --token-file <path>                shared secret; required with --tcp
+  --max-connections <n>              concurrent connection cap (default 128)
+
+  A Unix socket is authenticated by filesystem permissions. TCP is not, so it
+  requires a token, read from --token-file or the ELITESQL_TOKEN environment
+  variable (never a flag, which `ps` would expose). Traffic is unencrypted:
+  bind loopback and use an SSH tunnel or a VPN to reach another host.
 ";
 
 const REPL_HELP: &str = "\
@@ -53,6 +64,7 @@ SUPPORTED STATEMENTS
   INSERT INTO table [(column, ...)] VALUES (...), (...);
   SELECT ... FROM ... [JOIN ...] [WHERE ...] [GROUP BY ...]
          [HAVING ...] [ORDER BY ...] [LIMIT ...] [OFFSET ...];
+  EXPLAIN SELECT ...;           Show the plan without running the query
   UPDATE table SET column = value [, ...] [WHERE ...];
   DELETE FROM table [WHERE ...];
   DROP TABLE [IF EXISTS] table;
@@ -122,7 +134,11 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         "query" => {
             let [db_path, sql] = take::<2>(&args)?;
             let db = open(&db_path, opts)?;
-            print_output(db.query(&sql).map_err(|e| e.to_string())?);
+            let out = db.query(&sql).map_err(|e| e.to_string())?;
+            match out {
+                QueryOutput::Rows { rows, .. } if is_explain(sql.trim()) => print_plan(&rows),
+                other => print_output(other),
+            }
             Ok(())
         }
         "repl" => {
@@ -222,16 +238,49 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             import(&db, &table)
         }
         "serve" => {
-            let [db_path, socket] = take::<2>(&args)?;
+            let mut args = args;
+            let tcp = take_option(&mut args, "--tcp")?;
+            let token_file = take_option(&mut args, "--token-file")?;
+            let max_connections = match take_option(&mut args, "--max-connections")? {
+                Some(value) => value
+                    .parse::<usize>()
+                    .map_err(|_| format!("--max-connections expects a number, got '{value}'"))?,
+                None => serve::ServeOptions::default().max_connections,
+            };
+            // A token on the command line is visible to every process on the
+            // host through `ps`, so it is read from a file or the environment.
+            let token = match token_file {
+                Some(path) => Some(
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| format!("cannot read token file '{path}': {e}"))?
+                        .trim()
+                        .to_string(),
+                ),
+                None => std::env::var("ELITESQL_TOKEN").ok(),
+            };
+            // args is ["serve", <db>] plus, without --tcp, the socket path.
+            let socket_path = if tcp.is_some() {
+                let [_] = take::<1>(&args).map_err(|_| {
+                    "with --tcp, 'serve' expects only the database path".to_string()
+                })?;
+                None
+            } else {
+                Some(take::<2>(&args)?[1].clone())
+            };
+            let db_path = args[1].clone();
             let db = open(&db_path, opts)?;
-            serve::serve(db, &socket)
+            serve::serve(
+                db,
+                serve::ServeOptions {
+                    socket_path,
+                    tcp,
+                    token,
+                    max_connections,
+                },
+            )
         }
         "version" => {
-            println!(
-                "EliteSQL version {} {}",
-                env!("CARGO_PKG_VERSION"),
-                env!("ELITESQL_BUILD_TIMESTAMP")
-            );
+            println!("{}", version_banner());
             Ok(())
         }
         "" | "help" | "--help" | "-h" => {
@@ -241,6 +290,19 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         path if args.len() == 1 => repl(path, opts),
         other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
     }
+}
+
+/// Removes `--name value` from `args` and returns the value.
+fn take_option(args: &mut Vec<String>, name: &str) -> Result<Option<String>, String> {
+    let Some(i) = args.iter().position(|a| a == name) else {
+        return Ok(None);
+    };
+    if i + 1 >= args.len() {
+        return Err(format!("{name} requires a value"));
+    }
+    let value = args[i + 1].clone();
+    args.drain(i..=i + 1);
+    Ok(Some(value))
 }
 
 /// Positional arguments after the subcommand, exactly N of them.
@@ -264,13 +326,21 @@ fn open(path: &str, opts: DbOptions) -> Result<Db, String> {
     }
 }
 
-fn repl(path: &str, opts: DbOptions) -> Result<(), String> {
-    let db = open(path, opts)?;
-    println!(
-        "EliteSQL version {} {}",
+/// Startup identity line. The `V<YYYYMMDD>` build tag leads because it is what
+/// answers "am I running the build I just made?" at a glance; the crate version
+/// and the exact UTC build time follow for when the day is not enough.
+fn version_banner() -> String {
+    format!(
+        "EliteSQL {} ({}, built {} UTC)",
+        env!("ELITESQL_BUILD_DATE"),
         env!("CARGO_PKG_VERSION"),
         env!("ELITESQL_BUILD_TIMESTAMP")
-    );
+    )
+}
+
+fn repl(path: &str, opts: DbOptions) -> Result<(), String> {
+    let db = open(path, opts)?;
+    println!("{}", version_banner());
     println!("Enter \".help\" for usage hints.");
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
@@ -312,6 +382,10 @@ fn execute_repl_statement(db: &Db, sql: &str) {
             mut columns,
             mut rows,
         }) => {
+            if is_explain(sql.trim()) {
+                print_plan(&rows);
+                return;
+            }
             if is_star_select(sql) && columns.first().map(String::as_str) == Some("id") {
                 columns.remove(0);
                 for row in &mut rows {
@@ -508,6 +582,25 @@ fn print_output(out: QueryOutput) {
 
 fn print_rows(columns: &[String], rows: &[Vec<Value>]) {
     println!("{}\n", render_table(columns, rows));
+}
+
+/// An EXPLAIN plan is a tree encoded as indented text: the box renderer would
+/// quote every line and centering would throw away the indentation that carries
+/// the structure, so print the lines verbatim instead.
+fn print_plan(rows: &[Vec<Value>]) {
+    for row in rows {
+        match row.first() {
+            Some(Value::Text(line)) => println!("{line}"),
+            other => println!("{}", other.map(short_value).unwrap_or_default()),
+        }
+    }
+    println!();
+}
+
+fn is_explain(sql: &str) -> bool {
+    sql.split_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("explain"))
 }
 
 fn render_table(columns: &[String], rows: &[Vec<Value>]) -> String {

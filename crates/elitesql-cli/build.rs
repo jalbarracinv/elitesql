@@ -2,6 +2,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    // Emitting any rerun-if directive replaces cargo's default "rerun when the
+    // package changed" heuristic, so the stamp would otherwise freeze at the
+    // first build. Watch the sources that actually go into the binary.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=../elitesql-core/src");
     let seconds = std::env::var("SOURCE_DATE_EPOCH")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
@@ -11,6 +16,9 @@ fn main() {
                 .unwrap_or_default()
                 .as_secs() as i64
         });
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
+    // Compact build tag, shown on startup so a stale binary is obvious.
+    println!("cargo:rustc-env=ELITESQL_BUILD_DATE=V{year:04}{month:02}{day:02}");
     println!(
         "cargo:rustc-env=ELITESQL_BUILD_TIMESTAMP={}",
         utc_timestamp(seconds)

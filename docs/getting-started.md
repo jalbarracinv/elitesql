@@ -118,6 +118,43 @@ await db.query('SELECT * FROM notes WHERE body = %s LIMIT %s', ['hello', 10]);
 
 Reproducible demo with gunicorn and 4 workers: `examples/gunicorn_demo/run_demo.sh`.
 
+### From another host: TCP
+
+Same protocol, different transport. A Unix socket is authenticated by
+filesystem permissions; a TCP port is not, so it requires a shared token:
+
+```bash
+export ELITESQL_TOKEN=$(openssl rand -hex 32)      # or --token-file <path>
+target/release/elitesql serve app.esql --tcp 127.0.0.1:7070
+```
+
+```python
+db = SidecarClient(host="db-host", port=7070, token=os.environ["ELITESQL_TOKEN"])
+```
+
+```js
+const db = await SidecarClient.connect({ host: 'db-host', port: 7070, token });
+```
+
+The clients send the handshake for you, on connect and on reconnect. The server
+refuses every request until it succeeds, so nothing reaches the engine
+unauthenticated.
+
+Traffic is **not encrypted**. Bind loopback and cross machines through a tunnel:
+
+```bash
+ssh -N -L 7070:127.0.0.1:7070 user@db-host
+```
+
+Expect the network to dominate: a point lookup is ~4 µs, a round trip is
+~0.5 ms locally and 10–50 ms across regions. Separate app and database only when
+you must, not to scale workers — several workers on one host is what the Unix
+socket already solves.
+
+Never put the database directory on NFS/SMB to share it: durability relies on
+`fsync` plus atomic `rename` and index bases are read through `mmap`, and network
+filesystems provide neither reliably.
+
 ## Durability
 
 | Mode | fsync | Loses on OS crash |

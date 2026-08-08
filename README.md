@@ -189,7 +189,7 @@ let hits = db.search_hybrid("notes", &HybridQuery {        // RRF: text + vector
 
 ### SQL
 
-The same engine exposes a deliberately small SQL dialect — full reference with examples in [manual.md](manual.md):
+The same engine exposes a deliberately small SQL dialect — full reference with examples in [manual.md](manual.md), and a migration guide for people arriving from MySQL in [mysql2elite.md](mysql2elite.md):
 
 ```rust
 use elitesql_core::{QueryOutput, Record, Value};
@@ -249,9 +249,13 @@ elitesql serve app.esql /tmp/elitesql.sock   # sidecar mode
 The interactive shell buffers SQL across lines until it finds a terminating
 `;` outside string literals, `--` comments, and `/* ... */` comments.
 
-## Multi-worker: the sidecar mode
+## Multi-worker and remote: the sidecar mode
 
-For multi-process deployments (gunicorn, PHP-FPM), a single process owns the engine and the workers connect over a Unix socket:
+A database directory is owned by **one process**. When several processes need it — or when the app runs on a different host — that process serves them: it owns the engine and answers a line-delimited JSON protocol, one thread per connection over a shared `Db`. Concurrency still comes from the engine: readers never block writers, writers only meet at commit.
+
+### Same host: Unix socket
+
+For multi-process deployments (gunicorn, PHP-FPM), the transport is a Unix socket, authenticated by filesystem permissions:
 
 ```bash
 elitesql serve app.esql /tmp/elitesql.sock
@@ -266,6 +270,47 @@ db.query("SELECT count(*) AS n FROM visits")
 ```
 
 Reproducible demo with real gunicorn (4 workers, concurrent visitors reading and writing without blocking): `examples/gunicorn_demo/run_demo.sh`.
+
+### Another host: TCP
+
+```bash
+export ELITESQL_TOKEN=$(openssl rand -hex 32)     # or --token-file <path>
+elitesql serve app.esql --tcp 127.0.0.1:7070
+```
+
+```python
+from elitesql import SidecarClient
+db = SidecarClient(host="127.0.0.1", port=7070, token=os.environ["ELITESQL_TOKEN"])
+db.query("SELECT count(*) AS n FROM visits")
+```
+
+```js
+const db = await SidecarClient.connect({ host: '127.0.0.1', port: 7070, token });
+```
+
+A Unix socket is authenticated by the filesystem; a TCP port is not, so it **requires a token**. The server refuses to start without one, and refuses every request — including `ping` — until a connection sends `{"op":"auth","token":"..."}`. Authentication is per connection, comparison is constant-time, and the token is read from `--token-file` or `ELITESQL_TOKEN`, never a flag, because `ps` would expose it to every user on the host.
+
+Two limits to plan around, neither of which the Unix socket had:
+
+- **No encryption.** Traffic and the token itself travel in cleartext. Bind loopback and cross machines through an SSH tunnel (`ssh -N -L 7070:127.0.0.1:7070 user@db-host`), a VPN, or a private network. The server warns on startup when the bind address is not loopback.
+- **Latency changes the performance profile.** A point lookup is ~4 µs; a network round trip is ~0.5 ms in a datacenter and 10–50 ms across regions. Over TCP the network dominates by orders of magnitude and the engine stops behaving like an embedded one. If you only need several workers, keep them on one host with the Unix socket.
+
+`--max-connections` (default 128) caps concurrent connections on **both** transports, since each one costs a thread; past the cap the server answers with a refusal instead of queueing.
+
+**Do not** put a database directory on NFS or SMB and open it from two machines. Durability relies on `fsync` plus atomic `rename`, and immutable index bases are read through `mmap`; network filesystems do not provide either reliably. The sidecar is the supported way to reach a database from elsewhere.
+
+### Same behavior, different transport
+
+The SQL is identical over a Unix socket, over TCP, and embedded: it is the same engine in the same process. Same dialect, same MVCC and read-committed reads, same automatic retry on UPDATE/DELETE, same atomic multi-row INSERT, same error codes. A query does not behave differently because it arrived over a socket — see [manual.md](manual.md#running-sql-from-another-process-or-another-host).
+
+What the server mode is **not**, so the boundaries are clear:
+
+- **One database per server process.** There is no `USE db` and no database listing: `serve` opens the directory you name and serves that one. Several databases mean several processes on different ports, each with its own memory budget — the memory governor is per-`Db`, so a single process serving many databases would break the bounded-footprint guarantee.
+- **No TLS.** The token and the data travel in cleartext; a tunnel or a private network is doing the encrypting.
+- **No session transactions.** No `BEGIN`/`COMMIT` over the wire, the same as embedded SQL. Multi-statement transactions use the Rust `Txn` API in the process that owns the database.
+- **No replication, no failover, no connection multiplexing.** One process owns the directory; if it is down, the database is unreachable.
+
+Use TCP when the app genuinely has to live on another machine — to give it separate resources, for instance. To scale workers, keep them on one host with the Unix socket and skip the network entirely.
 
 ## Bindings
 

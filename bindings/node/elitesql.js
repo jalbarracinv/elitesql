@@ -134,11 +134,40 @@ class SidecarClient {
     socket.on('close', () => this._failAll(new EliteSQLError(1, 'sidecar closed the connection')));
   }
 
-  static connect(socketPath) {
+  /**
+   * Connects to `elitesql serve`, over either transport:
+   *
+   *   SidecarClient.connect('/tmp/elitesql.sock')            // Unix socket
+   *   SidecarClient.connect({ host, port: 7070, token })     // TCP
+   *
+   * A Unix socket is authenticated by filesystem permissions. TCP is not, so
+   * the token is required and is sent as the first request on the connection.
+   * The protocol is not encrypted: reach another host through an SSH tunnel,
+   * a VPN or a private network.
+   */
+  static connect(target) {
+    const tcp = typeof target === 'object' && target !== null;
+    if (tcp && !target.token) {
+      return Promise.reject(new EliteSQLError(20, 'a TCP sidecar requires a token'));
+    }
     return new Promise((resolve, reject) => {
-      const socket = net.createConnection(socketPath);
-      socket.once('connect', () => resolve(new SidecarClient(socket)));
+      const socket = tcp
+        ? net.createConnection({ host: target.host ?? '127.0.0.1', port: target.port })
+        : net.createConnection(target);
       socket.once('error', reject);
+      socket.once('connect', async () => {
+        // Nagle would add latency to this protocol's small round trips.
+        if (tcp) socket.setNoDelay(true);
+        const client = new SidecarClient(socket);
+        if (!tcp) return resolve(client);
+        try {
+          await client._call({ op: 'auth', token: target.token });
+          resolve(client);
+        } catch (e) {
+          socket.destroy();
+          reject(e);
+        }
+      });
     });
   }
 
