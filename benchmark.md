@@ -12,9 +12,9 @@ copying already checksummed pages without decoding and rebuilding every entry.
 The current implementation also has a direct sorted bulk loader, streaming
 unindexed equality scans, compact mmap page directories, transaction-local
 table interning and allocation-light checkpoint snapshots. On the reference
-10M workload EliteSQL stays within 2x SQLite at the lightweight default and
-within 1.5x with the opt-in ingest profile. It beats SQLite for sorted bulk
-load, point lookup and the measured unindexed equality scan.
+10M workload EliteSQL stayed within 2x SQLite with the then-current lightweight
+default and within 1.5x with the former opt-in ingest profile. It beat SQLite
+for sorted bulk load, point lookup and the measured unindexed equality scan.
 
 Post-reference architectural change (2026-08-08): primary-only automatic
 checkpoints now freeze one bounded memtable generation and flush it on a
@@ -22,11 +22,11 @@ dedicated worker while later commits fill a fresh active generation. The
 frozen heap is charged to the maintenance pool, and manifest publication
 rotates only the complete WAL tail written after the freeze. Explicit
 checkpoint remains the end-to-end barrier used by this benchmark. A 1M-row
-release sanity run (`fast`, 10K rows/transaction, default 128 MiB) measured
-1.980 s ingest + 0.051 s final checkpoint = 2.031 s total, versus the prior
-2.044 s local result. That small 0.6% change is directional, not a replacement
-for the published 10M acceptance matrix; it shows the implementation is
-currently close to flush-throughput-bound at this scale.
+release sanity run (`fast`, 10K rows/transaction, former 128 MiB default)
+measured 1.980 s ingest + 0.051 s final checkpoint = 2.031 s total, versus the
+prior 2.044 s local result. That small 0.6% change is directional, not a
+replacement for the published 10M acceptance matrix; it shows the
+implementation was close to flush-throughput-bound at this scale.
 
 ## Reference environment and source state
 
@@ -44,10 +44,12 @@ with another measurement.
 
 ## How to read memory numbers
 
-EliteSQL's default logical envelope is 128 MiB: 64 MiB for concurrent queries,
-16 MiB admitted per query, 24 MiB for mutable index deltas, 32 MiB for
-maintenance, and an 8 MiB reserve. Clean file-backed `mmap` pages and values
-already returned to the caller are deliberately outside that accounting.
+The published 10M measurements used the former 128 MiB logical envelope:
+64 MiB for concurrent queries, 16 MiB admitted per query, 24 MiB for mutable
+index deltas, 32 MiB for maintenance, and an 8 MiB reserve. The current default
+is the 384/128/128 MiB profile measured in the vector restart section below.
+Clean file-backed `mmap` pages and values already returned to the caller are
+deliberately outside that accounting.
 
 Consequently, the configured envelope is not an RSS ceiling. macOS
 `/usr/bin/time -l` reports both maximum resident set size and peak physical
@@ -81,10 +83,10 @@ run promotions (`maintenance drain`) are reported separately; `total load`
 includes all three. Point reads follow 1,000 warmups. The full scan is the
 average of three unindexed equality lookups that each return one row.
 
-### 10M rows: optimized default-memory transactional path
+### 10M rows: optimized former-default transactional path
 
 Configuration: 10K rows/transaction, 10K point reads, three full scans and the
-default 128 MiB EliteSQL envelope.
+former 128 MiB EliteSQL envelope.
 
 | Engine | Ingest wall | Final checkpoint | Drain | Total load | Rows/s | Point read | Full scan | Disk |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -98,11 +100,12 @@ wall improved 8.3%. EliteSQL wrote 533.30 MiB of primary checkpoint runs; seven
 promotions read 477.84 MiB and wrote 477.83 MiB. The previous fanout-eight run
 performed 16 promotions and read/wrote 785 MiB in each direction.
 
-### 10M rows: opt-in 256 MiB ingest profile
+### 10M rows: former 256 MiB ingest profile
 
-`DbOptions::ingest_performance()` keeps query admission at 64 MiB but raises
-the mutable-index and maintenance pools to 64 MiB each and the memtable target
-to 64 MiB. It is opt-in; the lightweight default remains 128 MiB.
+At measurement time, `DbOptions::ingest_performance()` kept query admission at
+64 MiB and raised the mutable-index and maintenance pools to 64 MiB each and
+the memtable target to 64 MiB. The current preset is larger; this table remains
+the reproducible historical result for that exact former configuration.
 
 | Engine | Ingest wall | Final checkpoint | Drain | Total load | Rows/s | Point read | Full scan | Disk |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -261,6 +264,37 @@ Recall improved relative to the old publication, but latency regressed by
 roughly 4–5×. The mmap-native search path needs profiling for random page
 faults, repeated node decoding, allocations, and missing scratch-buffer reuse.
 
+### Memory sizing on AWS t3.large
+
+A focused restart harness in
+[`vector_memory.rs`](crates/elitesql-core/examples/vector_memory.rs) measured the
+same 100K-vector, 64-dimensional workload on an AWS `t3.large` (2 vCPU, 8 GiB
+RAM). It reports how many nodes reach the durable HNSW base before close and how
+many must be reconstructed during the next open.
+
+| Total | Index delta | Maintenance | Memtable | Durable nodes | Catch-up rows | Open | Max RSS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 MiB | 24 MiB | 32 MiB | 16 MiB | 20,000 | 80,000 | 101.503 s | 93 MiB |
+| 256 MiB | 64 MiB | 64 MiB | 64 MiB | 50,000 | 50,000 | 57.639 s | 144 MiB |
+| 304 MiB | 109 MiB | 109 MiB | 64 MiB | 90,000 | 10,000 | 6.385 s | 198 MiB |
+| 304 MiB | 110 MiB | 110 MiB | 64 MiB | 100,000 | 0 | 0.356 s | 196 MiB |
+| 320 MiB | 112 MiB | 112 MiB | 64 MiB | 100,000 | 0 | 0.347 s | 196 MiB |
+| 384 MiB | 128 MiB | 128 MiB | 64 MiB | 100,000 | 0 | 0.536 s | 196 MiB |
+
+The measured index-delta peak was 115,000,000 bytes (109.67 MiB), explaining
+the sharp boundary between 109 and 110 MiB. The exact 110 MiB minimum has less
+than 0.4 MiB of headroom, so the profile selected as the default on 2026-08-09
+is 384 MiB total, 128 MiB each for index delta and maintenance, and a 64 MiB
+memtable. It retains the complete 100K graph while using only about 196 MiB of
+observed process RSS. Re-run the harness when vector count, dimension, HNSW
+parameters, ID sizes or indexed metadata change.
+
+```bash
+cargo run --release --locked -p elitesql-core --example vector_memory -- \
+  --rows 100000 --total-mib 384 --index-mib 128 \
+  --maintenance-mib 128 --memtable-mib 64
+```
+
 ## Real multilingual ANN: Potion + MIRACL-es, 250K
 
 The reproducible example is
@@ -271,10 +305,10 @@ Model and dataset revisions are pinned in the script.
 
 ### Build memory boundary
 
-With the default 128 MiB total / 32 MiB maintenance configuration, insertion
-completed but HNSW construction was rejected with `Error::MemoryLimit`. This is
-the intended safe failure mode, but it means 250K cannot currently be built
-with defaults.
+With the former default 128 MiB total / 32 MiB maintenance configuration,
+insertion completed but HNSW construction was rejected with
+`Error::MemoryLimit`. This was the intended safe failure mode. The current
+384/128 MiB default has not yet been acceptance-tested on this 250K workload.
 
 The successful build used an explicit 640 MiB total envelope and 512 MiB
 maintenance pool:

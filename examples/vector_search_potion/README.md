@@ -44,10 +44,11 @@ python examples/vector_search_potion/miracl_search.py \
 
 El script conserva primero todos los candidatos juzgados —incluidos los negativos difíciles— y completa el tamaño solicitado con el primer fragmento fijado del corpus oficial. Así todas las consultas mantienen sus documentos relevantes dentro del índice.
 
-La configuración predeterminada de 128 MiB totales y 32 MiB de mantenimiento
-rechaza de forma segura la construcción HNSW de 250K con `MemoryLimit`. Los
-límites mayores del ejemplo son explícitos: no convierten el presupuesto
-predeterminado en una promesa de que esta construcción cabe en 128 MiB.
+La corrida publicada usó la configuración entonces predeterminada de 128 MiB
+totales y 32 MiB de mantenimiento, que rechazó de forma segura la construcción
+HNSW de 250K con `MemoryLimit`. El default actual de 384/128 MiB todavía no se
+ha validado con este corpus; los límites mayores del ejemplo siguen siendo
+explícitos.
 
 Para guardar resultados comparables entre configuraciones:
 

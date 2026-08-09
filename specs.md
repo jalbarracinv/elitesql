@@ -521,9 +521,12 @@ Current implementation of this contract:
   position and skips sorting for monotonic primary-key batches. A cached
   snapshot high-watermark avoids a shared-state lock per append while commit
   validation remains authoritative for concurrent conflicts.
-- `DbOptions::ingest_performance()` is an explicit bounded 256 MiB deployment
-  profile (64 MiB query, delta and maintenance pools; 64 MiB memtable target).
-  It does not replace the lightweight 128 MiB default.
+- The default deployment profile is a bounded 384 MiB envelope (64 MiB query,
+  128 MiB index-delta and maintenance pools; 64 MiB memtable target), sized to
+  retain the measured 100K x 64-dimensional HNSW graph across restart.
+- `DbOptions::ingest_performance()` is an explicit bounded 512 MiB deployment
+  profile (64 MiB query, 192 MiB index-delta and maintenance pools; 128 MiB
+  memtable target).
 - Unindexed equality joins use recursive Grace partitioning and spill. A skewed
   partition uses bounded block probing, including outer-join match state on
   disk.

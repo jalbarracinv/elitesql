@@ -17,16 +17,25 @@ fn rows(output: QueryOutput) -> Vec<Vec<Value>> {
 fn ingest_performance_profile_is_valid_and_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let options = DbOptions::ingest_performance();
-    assert_eq!(options.memtable_max_bytes, 64 * 1024 * 1024);
-    assert_eq!(options.memory.total_memory_bytes, 256 * 1024 * 1024);
-    assert_eq!(options.memory.index_delta_pool_bytes, 64 * 1024 * 1024);
-    assert_eq!(options.memory.maintenance_pool_bytes, 64 * 1024 * 1024);
+    assert_eq!(options.memtable_max_bytes, 128 * 1024 * 1024);
+    assert_eq!(options.memory.total_memory_bytes, 512 * 1024 * 1024);
+    assert_eq!(options.memory.index_delta_pool_bytes, 192 * 1024 * 1024);
+    assert_eq!(options.memory.maintenance_pool_bytes, 192 * 1024 * 1024);
 
     let db = Db::create_with(dir.path().join("profile.esql"), options).unwrap();
     let stats = db.global_memory_stats();
-    assert_eq!(stats.total_bytes, 256 * 1024 * 1024);
-    assert_eq!(stats.index_delta_capacity_bytes, 64 * 1024 * 1024);
-    assert_eq!(stats.maintenance_capacity_bytes, 64 * 1024 * 1024);
+    assert_eq!(stats.total_bytes, 512 * 1024 * 1024);
+    assert_eq!(stats.index_delta_capacity_bytes, 192 * 1024 * 1024);
+    assert_eq!(stats.maintenance_capacity_bytes, 192 * 1024 * 1024);
+}
+
+#[test]
+fn default_profile_matches_the_measured_vector_restart_budget() {
+    let options = DbOptions::default();
+    assert_eq!(options.memtable_max_bytes, 64 * 1024 * 1024);
+    assert_eq!(options.memory.total_memory_bytes, 384 * 1024 * 1024);
+    assert_eq!(options.memory.index_delta_pool_bytes, 128 * 1024 * 1024);
+    assert_eq!(options.memory.maintenance_pool_bytes, 128 * 1024 * 1024);
 }
 
 #[test]

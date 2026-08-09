@@ -404,10 +404,11 @@ let db = Db::open_or_create_with("app.esql", opts)?;
 
 ## Database-wide memory budget
 
-Every open database owns one shared governor. The default 128 MiB envelope is
-partitioned into a 64 MiB concurrent-query pool, a 24 MiB mutable-index pool,
-a 32 MiB maintenance pool and an 8 MiB emergency reserve. Clean file-backed
-`mmap` pages and result values already handed to the caller are not charged.
+Every open database owns one shared governor. The default 384 MiB envelope is
+partitioned into a 64 MiB concurrent-query pool, a 128 MiB mutable-index pool,
+a 128 MiB maintenance pool and an 8 MiB emergency reserve, with the remainder
+left as allocator/runtime headroom. Clean file-backed `mmap` pages and result
+values already handed to the caller are not charged.
 Traditional SQL queries are subject to a working-memory budget too. Scans run
 in batches; `ORDER BY` and high-cardinality `GROUP BY` spill temporary sorted
 runs, while unindexed equality joins use a partitioned Grace Hash Join with a
@@ -426,11 +427,11 @@ use elitesql_core::{DbOptions, MemoryOptions};
 
 let opts = DbOptions {
     memory: MemoryOptions {
-        total_memory_bytes: 128 * 1024 * 1024,
+        total_memory_bytes: 384 * 1024 * 1024,
         query_pool_bytes: 64 * 1024 * 1024,
         query_working_bytes: 16 * 1024 * 1024,
-        index_delta_pool_bytes: 24 * 1024 * 1024,
-        maintenance_pool_bytes: 32 * 1024 * 1024,
+        index_delta_pool_bytes: 128 * 1024 * 1024,
+        maintenance_pool_bytes: 128 * 1024 * 1024,
         reserved_memory_bytes: 8 * 1024 * 1024,
         scan_batch_rows: 512,
         spill_directory: None,
@@ -449,19 +450,19 @@ More memory can improve sustained ingest, but the useful knobs are workload
 specific. Raise `memtable_max_bytes` and `index_delta_pool_bytes` to publish
 fewer, larger deltas, and raise `maintenance_pool_bytes` when index construction
 or compaction needs a larger bounded workspace. Increasing the query pool does
-not accelerate inserts. Keep the 128 MiB default for lightweight deployments;
-configure a larger envelope explicitly on machines where faster bulk ingest is
-worth the extra working set.
+not accelerate inserts. The 384 MiB default was measured to retain a complete
+100K x 64-dimensional HNSW graph and avoid restart catch-up on an AWS
+`t3.large`; smaller deployments can explicitly select a tighter envelope.
 
-For the measured bounded 256 MiB ingest profile, use:
+For the larger 512 MiB ingest profile, use:
 
 ```rust
 let opts = DbOptions::ingest_performance();
 ```
 
-It keeps query admission at 64 MiB, assigns 64 MiB each to index deltas and
-maintenance, and uses a 64 MiB memtable target. It is a convenience preset, not
-an adaptive reservation or a new default.
+It keeps query admission at 64 MiB, assigns 192 MiB each to index deltas and
+maintenance, and uses a 128 MiB memtable target. It is a convenience preset,
+not an adaptive reservation.
 
 For an initial or append-only import whose explicit text IDs are already in
 strictly increasing order, `Db::bulk_insert_sorted(table, records)` is the
@@ -575,12 +576,12 @@ ELITESQL_FUZZ_ITERS=5000 cargo test --release --test corruption
 ## Performance
 
 Current measurements are deliberately published even where they are
-unfavorable. In the current 2026-08-08 Apple Silicon 10M-row runs, the
-default-memory transactional path completes in 22.620 s versus SQLite's
-13.663 s (1.66x SQLite, inside the 2x target). The opt-in
-`DbOptions::ingest_performance()` profile completes in 18.798 s (1.38x), while
-`Db::bulk_insert_sorted` completes in 9.968 s versus SQLite's 13.822 s.
-Subsequent point reads and the measured unindexed equality scan favor EliteSQL.
+unfavorable. The 2026-08-08 Apple Silicon 10M-row runs predate the current
+memory defaults: the former 128 MiB transactional profile completed in
+22.620 s versus SQLite's 13.663 s (1.66x SQLite, inside the 2x target), while
+the former 256 MiB ingest profile completed in 18.798 s (1.38x).
+`Db::bulk_insert_sorted` completed in 9.968 s versus SQLite's 13.822 s.
+Subsequent point reads and the measured unindexed equality scan favored EliteSQL.
 
 An isolated 10M transactional run stayed inside every logical pool
 (16/64 MiB query, 22.81/24 MiB delta and 32/32 MiB maintenance) and reported a
@@ -588,7 +589,8 @@ An isolated 10M transactional run stayed inside every logical pool
 clean file-backed mmap pages touched during the run; those pages are
 reclaimable and intentionally not equivalent to mandatory heap. Remaining
 performance work centers on synchronous checkpoint work and p99 commit latency
-with four to eight writers, not on increasing the 128 MiB default.
+with four to eight writers. Re-run the scale matrix for the current 384/512 MiB
+profiles before comparing them directly with those historical results.
 
 For reproducible comparisons at 1–10 million rows, use the single-run scalable benchmark:
 

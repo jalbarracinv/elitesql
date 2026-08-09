@@ -265,11 +265,12 @@ supported interfaces.
 
 Delivered:
 
-- `MemoryOptions` defines a 128 MiB default database envelope: 64 MiB shared
-  query pool, 16 MiB per-query working admission, 24 MiB mutable-index pool,
-  32 MiB maintenance pool and 8 MiB reserve. Configuration is validated before
-  opening; permits span all `Db` clones and sidecar clients, and scans decode
-  at most 512 records per batch by default.
+- `MemoryOptions` defines a 384 MiB default database envelope: 64 MiB shared
+  query pool, 16 MiB per-query working admission, 128 MiB mutable-index pool,
+  128 MiB maintenance pool and 8 MiB reserve, leaving the remainder as runtime
+  headroom. Configuration is validated before opening; permits span all `Db`
+  clones and sidecar clients, and scans decode at most 512 records per batch by
+  default.
 - `GlobalMemoryStats` and `QueryMemoryStats` expose current/peak pool use,
   waits, consolidations and spill activity. Work that can wait receives
   backpressure; an intrinsically oversized operation returns `MemoryLimit`
@@ -293,7 +294,7 @@ Delivered:
 
 Acceptance evidence:
 
-- 12 dedicated memory tests cover global backpressure, spill cleanup, bounded
+- 13 dedicated memory tests cover global backpressure, spill cleanup, bounded
   sort/group/join behavior, delta consolidation, recovery/index build and
   oversized-operation refusal.
 - 6 dedicated SQL parameter tests cover types, hostile SQL-looking text,
@@ -312,9 +313,9 @@ offset per page in heap. Unindexed equality scans walk canonical segments once
 and inspect only the resident delta afterward. A direct sorted bulk loader
 publishes one canonical segment and primary run atomically.
 
-Current 10M evidence after transaction/checkpoint/promotion optimization:
-transactional EliteSQL 22.620 s versus SQLite 13.663 s (1.66x) at the 128 MiB
-default, and 18.798 s (1.38x) with the opt-in 256 MiB ingest profile. Sorted
+The 2026-08-08 10M evidence after transaction/checkpoint/promotion optimization:
+transactional EliteSQL 22.620 s versus SQLite 13.663 s (1.66x) with the former
+128 MiB default, and 18.798 s (1.38x) with the former 256 MiB ingest profile. Sorted
 bulk EliteSQL remains 9.968 s versus SQLite 13.822 s; point reads and the
 measured scan favor EliteSQL. An isolated earlier default-memory run
 reported 65.56 MiB peak physical footprint while every logical pool stayed
@@ -355,8 +356,9 @@ Performance milestone status, in priority order:
 7. **Complete for transactional ingest.** Per-table staging interns schema and
    table names, monotonic batches skip sorting, a snapshot high-watermark avoids
    per-row shared locks, and checkpoints build primary runs directly from their
-   compact offset snapshot. The 256 MiB opt-in preset makes the measured tuning
-   reproducible without changing the 128 MiB default.
+   compact offset snapshot. The historical 256 MiB preset made that measured
+   tuning reproducible; the current defaults were raised after vector-restart
+   sizing on AWS.
 8. Profile HNSW V4 mmap traversal, decoding and allocation reuse before
    changing its format or reducing vector dimensionality.
 

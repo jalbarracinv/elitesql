@@ -356,11 +356,11 @@ use elitesql_core::{Db, DbOptions, MemoryOptions};
 
 let db = Db::open_with("app.esql", DbOptions {
     memory: MemoryOptions {
-        total_memory_bytes: 128 * 1024 * 1024,
+        total_memory_bytes: 384 * 1024 * 1024,
         query_pool_bytes: 64 * 1024 * 1024,
         query_working_bytes: 16 * 1024 * 1024,
-        index_delta_pool_bytes: 24 * 1024 * 1024,
-        maintenance_pool_bytes: 32 * 1024 * 1024,
+        index_delta_pool_bytes: 128 * 1024 * 1024,
+        maintenance_pool_bytes: 128 * 1024 * 1024,
         reserved_memory_bytes: 8 * 1024 * 1024,
         scan_batch_rows: 512,
         spill_directory: None,
@@ -457,9 +457,9 @@ work: `memtable_max_bytes` delays automatic checkpoints,
 `index_delta_pool_bytes` permits larger mutable index deltas, and
 `maintenance_pool_bytes` gives construction/merge work a larger bounded
 workspace. Increasing `query_pool_bytes` alone does not make inserts faster.
-The conservative 128 MiB profile remains the default; larger profiles are an
-explicit deployment choice, not a requirement for opening or querying an
-index.
+The default 384 MiB envelope assigns 128 MiB each to mutable indexes and
+maintenance. This retains the complete measured 100K x 64-dimensional HNSW
+graph across restart; smaller envelopes remain an explicit deployment choice.
 
 On a table without derived equality, text or vector indexes, crossing the
 memtable threshold freezes the current primary delta and flushes it on a
@@ -472,20 +472,21 @@ commit boundary and its later tail is copied into the newly published WAL, so
 the overlap does not weaken crash recovery. Derived-index workloads currently
 use the synchronous checkpoint path.
 
-For sustained transactional ingest on machines where a 256 MiB envelope is
-acceptable, use the measured preset:
+For sustained transactional ingest on machines where a 512 MiB envelope is
+acceptable, use the larger preset:
 
 ```rust
 let options = DbOptions::ingest_performance();
 let db = Db::open_with("app.esql", options)?;
 ```
 
-The preset retains the 64 MiB query pool, assigns 64 MiB each to mutable index
-deltas and maintenance, and raises the memtable target to 64 MiB. The 10M-row
-reference workload completed in 18.798 s with this profile versus 22.620 s at
-the 128 MiB default; it is intentionally opt-in.
+The preset retains the 64 MiB query pool, assigns 192 MiB each to mutable index
+deltas and maintenance, and raises the memtable target to 128 MiB. It is
+intentionally opt-in. The published 10M-row comparison used the former 256 MiB
+preset versus the former 128 MiB default and therefore does not measure these
+current profiles.
 
-The current isolated 10M-row reference run reached 16/64 MiB in the query
+The historical isolated 10M-row reference run reached 16/64 MiB in the query
 pool, 22.81/24 MiB in the index-delta pool and 32/32 MiB in maintenance. macOS
 reported a 65.56 MiB peak physical footprint. Max RSS was higher because clean
 mapped pages are counted when touched even though the OS can reclaim them.
@@ -868,9 +869,10 @@ Over 1M orders + 10K users (Apple Silicon, `cargo bench --bench sql`):
 
 An index remains the fastest plan for a frequent join. Without one, execution
 is memory-bounded but pays partitioning and temporary-I/O cost. These are
-query-only Criterion intervals. In the current 10M-row scale harness,
-transactional EliteSQL takes 22.620 s at the 128 MiB default versus SQLite's
-13.663 s; the 256 MiB ingest profile takes 18.798 s, and sorted bulk EliteSQL
-takes 9.968 s versus 13.822 s. Point reads and the measured unindexed equality
-scan favor EliteSQL. Run-promotion drain, memory evidence, raw runs and
-concurrent-writer tails are documented in [benchmark.md](benchmark.md).
+query-only Criterion intervals. In the 2026-08-08 10M-row scale harness,
+transactional EliteSQL took 22.620 s with the former 128 MiB default versus
+SQLite's 13.663 s; the former 256 MiB ingest profile took 18.798 s, and sorted
+bulk EliteSQL took 9.968 s versus 13.822 s. Point reads and the measured
+unindexed equality scan favored EliteSQL. Run-promotion drain, memory evidence,
+raw runs and concurrent-writer tails are documented in
+[benchmark.md](benchmark.md).

@@ -128,16 +128,16 @@ pub struct MemoryOptions {
 }
 
 impl MemoryOptions {
-    /// Opt-in 256 MiB profile for sustained transactional ingestion. Query
+    /// Opt-in 512 MiB profile for sustained transactional ingestion. Query
     /// memory stays conservative; the extra budget goes to larger mutable
-    /// deltas and maintenance batches, where scale benchmarks show benefit.
+    /// deltas and maintenance batches.
     pub fn ingest_performance() -> Self {
         Self {
-            total_memory_bytes: 256 * 1024 * 1024,
+            total_memory_bytes: 512 * 1024 * 1024,
             query_pool_bytes: 64 * 1024 * 1024,
             query_working_bytes: 16 * 1024 * 1024,
-            index_delta_pool_bytes: 64 * 1024 * 1024,
-            maintenance_pool_bytes: 64 * 1024 * 1024,
+            index_delta_pool_bytes: 192 * 1024 * 1024,
+            maintenance_pool_bytes: 192 * 1024 * 1024,
             reserved_memory_bytes: 8 * 1024 * 1024,
             scan_batch_rows: 512,
             spill_directory: None,
@@ -207,11 +207,11 @@ impl MemoryOptions {
 impl Default for MemoryOptions {
     fn default() -> Self {
         Self {
-            total_memory_bytes: 128 * 1024 * 1024,
+            total_memory_bytes: 384 * 1024 * 1024,
             query_pool_bytes: 64 * 1024 * 1024,
             query_working_bytes: 16 * 1024 * 1024,
-            index_delta_pool_bytes: 24 * 1024 * 1024,
-            maintenance_pool_bytes: 32 * 1024 * 1024,
+            index_delta_pool_bytes: 128 * 1024 * 1024,
+            maintenance_pool_bytes: 128 * 1024 * 1024,
             reserved_memory_bytes: 8 * 1024 * 1024,
             scan_batch_rows: 512,
             spill_directory: None,
@@ -292,11 +292,10 @@ impl Default for DbOptions {
     fn default() -> Self {
         DbOptions {
             durability: Durability::Safe,
-            // Use most of the default 24 MiB mutable-index pool before
-            // checkpointing while retaining headroom for keys and derived
-            // mutations. This reduces fsync/manifest frequency without
-            // increasing the 128 MiB database envelope.
-            memtable_max_bytes: 16 * 1024 * 1024,
+            // The measured 100K x 64-dimensional vector workload stays below
+            // the default 128 MiB mutable-index pool and publishes one complete
+            // restartable graph. A 64 MiB memtable avoids an earlier checkpoint.
+            memtable_max_bytes: 64 * 1024 * 1024,
             balanced_sync_interval_ms: 25,
             read_only: false,
             external_blob_threshold: 256 * 1024,
@@ -307,11 +306,11 @@ impl Default for DbOptions {
 }
 
 impl DbOptions {
-    /// Opt-in bounded profile for faster sustained ingestion. The lightweight
-    /// 128 MiB profile remains [`Default`].
+    /// Opt-in bounded profile for faster sustained ingestion. The 384 MiB
+    /// profile remains [`Default`].
     pub fn ingest_performance() -> Self {
         Self {
-            memtable_max_bytes: 64 * 1024 * 1024,
+            memtable_max_bytes: 128 * 1024 * 1024,
             memory: MemoryOptions::ingest_performance(),
             ..Self::default()
         }
