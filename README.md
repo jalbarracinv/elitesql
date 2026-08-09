@@ -76,20 +76,43 @@ See [stress-test.md](stress-test.md) for the workload and all options.
 
 ## Quick installation
 
-Requirements: [Rust](https://rustup.rs) 1.89 or newer.
+Requirements: [Rust](https://rustup.rs) 1.89 or newer. We recommend installing
+Rust with `rustup` instead of an operating-system package, which may provide an
+older version of Cargo:
 
 ```bash
-git clone <repo-url> elitesql
-cd elitesql
-cargo build --release
-cargo test          # full suite
-cargo bench         # benchmarks vs SQLite
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --default-toolchain 1.89.0 --profile minimal
+source "$HOME/.cargo/env"
+rustc --version
 ```
 
-To update (only when new release is available):
+Install the `elitesql` command:
+
+```bash
+git clone https://github.com/jalbarracinv/elitesql.git
+cd elitesql
+cargo install --locked --path crates/elitesql-cli
+elitesql --help
+```
+
+`cargo build --release` only creates `target/release/elitesql`; it does not add
+the command to your `PATH`. `cargo install` copies it to `~/.cargo/bin`, which
+`rustup` adds to your `PATH`.
+
+To update an existing installation when a new release is available:
+
 ```bash
 cd elitesql
-cargo install --path crates/elitesql-cli --force
+git pull --ff-only
+cargo install --locked --path crates/elitesql-cli --force
+```
+
+For development, run the test suite and benchmarks from the repository:
+
+```bash
+cargo test --locked
+cargo bench --locked
 ```
 
 To use it as a dependency in another Rust project:
