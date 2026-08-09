@@ -8,6 +8,7 @@ fn sqlite_style_repl_session() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("repl.esql");
     let mut child = Command::new(env!("CARGO_BIN_EXE_elitesql"))
+        .arg("--create")
         .arg(&path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -104,6 +105,7 @@ fn repl_waits_for_semicolons_outside_strings_and_comments() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("terminators.esql");
     let mut child = Command::new(env!("CARGO_BIN_EXE_elitesql"))
+        .arg("--create")
         .arg(&path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -169,6 +171,7 @@ fn repl_does_not_execute_an_unterminated_statement_at_eof() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("eof.esql");
     let mut child = Command::new(env!("CARGO_BIN_EXE_elitesql"))
+        .arg("--create")
         .arg(&path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -190,4 +193,61 @@ fn repl_does_not_execute_an_unterminated_statement_at_eof() {
 
     let db = Db::open(path).unwrap();
     assert!(db.table_schema("should_not_exist").is_none());
+}
+
+/// A single argument that is not a subcommand is read as a database path, so a
+/// mistyped subcommand used to leave a directory named after the typo. Opening
+/// no longer creates anything unless asked.
+#[test]
+fn opening_does_not_create_a_database_by_accident() {
+    let dir = tempfile::tempdir().unwrap();
+    let typo = dir.path().join("versio");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_elitesql"))
+        .arg(&typo)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(stderr.contains("--create"), "{stderr}");
+    assert!(!typo.exists(), "a refused open must leave nothing behind");
+
+    // Subcommands that open a database refuse the same way.
+    let output = Command::new(env!("CARGO_BIN_EXE_elitesql"))
+        .args(["query"])
+        .arg(&typo)
+        .arg("SELECT 1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!typo.exists());
+
+    // With --create it is created, and afterwards opening needs no flag.
+    let output = Command::new(env!("CARGO_BIN_EXE_elitesql"))
+        .arg("--create")
+        .args(["query"])
+        .arg(&typo)
+        .arg("CREATE TABLE t (a int)")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(typo.exists());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_elitesql"))
+        .args(["query"])
+        .arg(&typo)
+        .arg("SELECT a FROM t")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

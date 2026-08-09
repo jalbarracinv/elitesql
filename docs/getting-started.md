@@ -17,11 +17,17 @@ cargo test                              # full suite
 
 ```bash
 ESQL=target/release/elitesql
-$ESQL query app.esql "CREATE TABLE notes (body text NOT NULL, score int, day date)"
+$ESQL --create query app.esql "CREATE TABLE notes (body text NOT NULL, score int, day date)"
 $ESQL query app.esql "INSERT INTO notes (body, score, day) VALUES ('hello', 10, '2026-08-07')"
 $ESQL query app.esql "SELECT body, score FROM notes WHERE day >= '2026-01-01' ORDER BY score DESC"
 $ESQL app.esql                 # interactive shell; .help for shell commands
 ```
+
+`--create` is needed once, to bring the database into existence; afterwards
+opening it needs no flag. Opening never creates a database on its own, because
+a single argument that is not a subcommand is read as a path — so a mistyped
+subcommand (`elitesql versio`) would otherwise leave a database directory named
+after the typo in the working directory.
 
 Inside the shell, terminate SQL statements with `;`. Input may span multiple
 lines; semicolons inside strings or comments do not end the statement.

@@ -29,7 +29,7 @@ echo "==> building elitesql"
 cargo build --release -p elitesql-cli >/dev/null 2>&1
 
 echo "==> preparing schema"
-./target/release/elitesql query "$DB" \
+./target/release/elitesql --create query "$DB" \
   "CREATE TABLE visits (who text NOT NULL, worker_pid int64, at timestamp)" >/dev/null
 ./target/release/elitesql query "$DB" "CREATE INDEX ON visits (who)" >/dev/null
 

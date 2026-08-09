@@ -33,6 +33,10 @@ USAGE:
 OPTIONS:
   --durability safe|balanced|fast    (query/repl/import/serve; default safe)
   --read-only                        open without touching disk; writes fail
+  --create                           create the database if it does not exist
+
+  Opening never creates a database on its own: a mistyped subcommand is read
+  as a path, and would otherwise leave a directory named after the typo.
 
 SERVE OPTIONS:
   --tcp <host:port>                  listen on TCP instead of a Unix socket
@@ -123,6 +127,11 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         read_only = true;
         args.remove(i);
     }
+    let mut create = false;
+    if let Some(i) = args.iter().position(|a| a == "--create") {
+        create = true;
+        args.remove(i);
+    }
     let opts = DbOptions {
         durability,
         read_only,
@@ -133,7 +142,7 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
     match cmd.as_str() {
         "query" => {
             let [db_path, sql] = take::<2>(&args)?;
-            let db = open(&db_path, opts)?;
+            let db = open(&db_path, opts, create)?;
             let out = db.query(&sql).map_err(|e| e.to_string())?;
             match out {
                 QueryOutput::Rows { rows, .. } if is_explain(sql.trim()) => print_plan(&rows),
@@ -143,11 +152,11 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         }
         "repl" => {
             let [db_path] = take::<1>(&args)?;
-            repl(&db_path, opts)
+            repl(&db_path, opts, create)
         }
         "tables" => {
             let [db_path] = take::<1>(&args)?;
-            let db = open(&db_path, opts)?;
+            let db = open(&db_path, opts, create)?;
             for name in db.tables() {
                 let schema = db.table_schema(&name).expect("listed");
                 println!("{}", serde_json::to_string_pretty(&schema).unwrap());
@@ -172,14 +181,14 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         }
         "compact" => {
             let [db_path] = take::<1>(&args)?;
-            let db = open(&db_path, opts)?;
+            let db = open(&db_path, opts, create)?;
             db.compact().map_err(|e| e.to_string())?;
             println!("ok: compacted");
             Ok(())
         }
         "backup" => {
             let [db_path, dst] = take::<2>(&args)?;
-            let db = open(&db_path, opts)?;
+            let db = open(&db_path, opts, create)?;
             let report = db.backup(&dst).map_err(|e| e.to_string())?;
             let check = elitesql_core::check(&dst).map_err(|e| e.to_string())?;
             if !check.is_ok() {
@@ -223,7 +232,7 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         }
         "export" => {
             let [db_path, table] = take::<2>(&args)?;
-            let db = open(&db_path, opts)?;
+            let db = open(&db_path, opts, create)?;
             let rows = db.scan(&table).map_err(|e| e.to_string())?;
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
@@ -234,7 +243,7 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         }
         "import" => {
             let [db_path, table] = take::<2>(&args)?;
-            let db = open(&db_path, opts)?;
+            let db = open(&db_path, opts, create)?;
             import(&db, &table)
         }
         "serve" => {
@@ -268,7 +277,7 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 Some(take::<2>(&args)?[1].clone())
             };
             let db_path = args[1].clone();
-            let db = open(&db_path, opts)?;
+            let db = open(&db_path, opts, create)?;
             serve::serve(
                 db,
                 serve::ServeOptions {
@@ -287,7 +296,7 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             print!("{USAGE}");
             Ok(())
         }
-        path if args.len() == 1 => repl(path, opts),
+        path if args.len() == 1 => repl(path, opts, create),
         other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
     }
 }
@@ -318,12 +327,22 @@ fn take<const N: usize>(args: &[String]) -> Result<[String; N], String> {
     Ok(std::array::from_fn(|i| rest[i].clone()))
 }
 
-fn open(path: &str, opts: DbOptions) -> Result<Db, String> {
+/// Opens a database, creating it only when asked to.
+///
+/// A single argument that is not a known subcommand is treated as a database
+/// path, so a mistyped subcommand (`elitesql versio`) would otherwise create a
+/// directory named after the typo, silently and in the current working
+/// directory. Creation is therefore opt-in through `--create`.
+fn open(path: &str, opts: DbOptions, create: bool) -> Result<Db, String> {
     if opts.read_only {
-        Db::open_with(path, opts).map_err(|e| e.to_string())
-    } else {
-        Db::open_or_create_with(path, opts).map_err(|e| e.to_string())
+        return Db::open_with(path, opts).map_err(|e| e.to_string());
     }
+    if !create && !std::path::Path::new(path).exists() {
+        return Err(format!(
+            "'{path}' does not exist\n       to create it: elitesql --create {path}"
+        ));
+    }
+    Db::open_or_create_with(path, opts).map_err(|e| e.to_string())
 }
 
 /// Startup identity line. The `V<YYYYMMDD>` build tag leads because it is what
@@ -338,8 +357,8 @@ fn version_banner() -> String {
     )
 }
 
-fn repl(path: &str, opts: DbOptions) -> Result<(), String> {
-    let db = open(path, opts)?;
+fn repl(path: &str, opts: DbOptions, create: bool) -> Result<(), String> {
+    let db = open(path, opts, create)?;
     println!("{}", version_banner());
     println!("Enter \".help\" for usage hints.");
     let stdin = std::io::stdin();

@@ -37,6 +37,7 @@ fn start(dir: &std::path::Path, token: &str, extra: &[&str]) -> Server {
     let db = dir.join("serve.esql");
     let mut command = Command::new(binary());
     command
+        .arg("--create")
         .arg("serve")
         .arg(&db)
         .arg("--tcp")
@@ -78,6 +79,13 @@ impl Client {
     fn call(&mut self, request: serde_json::Value) -> serde_json::Value {
         writeln!(self.writer, "{request}").unwrap();
         self.writer.flush().unwrap();
+        self.read()
+    }
+
+    /// Reads one response without sending anything. The server pushes a
+    /// refusal on accept when the connection cap is reached, so a test that
+    /// wrote first would race the close that follows it.
+    fn read(&mut self) -> serde_json::Value {
         let mut line = String::new();
         self.reader.read_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad response {line:?}: {e}"))
@@ -183,9 +191,10 @@ fn the_connection_cap_refuses_instead_of_queueing() {
         held.push(c);
     }
 
-    // The third is answered with a refusal rather than left hanging.
+    // The third is answered with a refusal rather than left hanging. Both held
+    // connections completed a round trip, so the server has counted them.
     let mut extra = Client::connect(server.port);
-    let refusal = extra.call(serde_json::json!({"op": "ping"}));
+    let refusal = extra.read();
     assert_eq!(refusal["ok"], false, "{refusal}");
     assert!(
         refusal["error"]
@@ -228,6 +237,7 @@ impl Drop for UnixServer {
 /// temp dir because AF_UNIX paths are capped around 104 bytes.
 fn start_unix(socket: &std::path::Path, db: &std::path::Path) -> UnixServer {
     let child = Command::new(binary())
+        .arg("--create")
         .arg("serve")
         .arg(db)
         .arg(socket)

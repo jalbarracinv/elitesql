@@ -233,6 +233,7 @@ db.query_named_params(
 ```bash
 cargo build --release -p elitesql-cli     # produces target/release/elitesql
 
+elitesql --create app.esql               # create a new database (once)
 elitesql query app.esql "SELECT count(*) AS n FROM docs"
 elitesql app.esql                       # interactive shell (SQLite-style shorthand)
 elitesql repl app.esql                  # interactive shell (.exit to quit)
@@ -249,6 +250,11 @@ elitesql serve app.esql /tmp/elitesql.sock   # sidecar mode
 
 The interactive shell buffers SQL across lines until it finds a terminating
 `;` outside string literals, `--` comments, and `/* ... */` comments.
+
+Opening never creates a database on its own — `--create` does, once. A single
+argument that is not a subcommand is read as a database path, so without this a
+mistyped subcommand (`elitesql versio`) would silently leave a database
+directory named after the typo in the working directory.
 
 ## Multi-worker and remote: the sidecar mode
 
