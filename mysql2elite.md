@@ -29,17 +29,23 @@ analytical SQL with subqueries and CTEs.
 
 | MySQL | EliteSQL |
 |---|---|
-| `mysqld` daemon, port 3306 | no daemon; the engine is a library in your process |
-| connection string, user, password | a directory path: `Db::open_or_create("app.esql")` |
-| `GRANT` / users / roles | filesystem permissions on the directory |
-| connection pool | one `Db` handle, cloned and shared across threads |
+| `mysqld` daemon, port 3306 | by default no daemon at all — the engine is a library in your process. `elitesql serve --tcp <host:port>` puts it behind a port when the app runs elsewhere |
+| connection string, user, password | a directory path: `Db::open_or_create("app.esql")`, or host/port plus a shared token over TCP |
+| `GRANT` / users / roles | filesystem permissions on the directory; over TCP, one shared token — no users, no per-table grants |
+| TLS on the connection | none; use an SSH tunnel, a VPN or a private network |
+| connection pool | one `Db` handle, cloned and shared across threads. Over TCP, one client per worker |
 | `mysqldump` | `elitesql backup` (snapshot-consistent + verified) or `elitesql export` (JSON lines) |
-| replication | not available |
+| replication, failover | not available |
 
 The consequence that surprises people most: **one process owns the database**.
 Threads inside that process get real concurrency (readers never block writers;
 writers meet only at commit), but a second process opening the same directory
-read-write is not the deployment model.
+read-write is not the deployment model. That does not mean the app has to live
+on the same machine — it means whoever owns the directory serves everyone else,
+over a Unix socket or a port. Coming from MySQL the topology can look identical;
+what changed is that the database process is yours to run, one per database, and
+that the connection is a thin transport rather than the boundary the engine was
+designed around.
 
 For multi-worker setups (gunicorn, PHP-FPM, several services), run the sidecar:
 one process owns the engine and workers speak a line-delimited JSON protocol
@@ -90,7 +96,7 @@ which network filesystems provide reliably.
 | `INT`, `BIGINT`, `SMALLINT` | `int` | always signed 64-bit; `integer`/`bigint`/`int64` are aliases. There is no narrower integer |
 | `DECIMAL(10,2)`, `NUMERIC` | **none** | see *Money* below — this is the one type change that can corrupt values silently |
 | `FLOAT`, `DOUBLE` | `float64` | |
-| `VARCHAR(n)`, `CHAR(n)`, `TEXT` | `text` | no length limit, no charset, no collation |
+| `VARCHAR(n)`, `CHAR(n)`, `TEXT` | `text` | no length limit, no charset; always UTF-8. Collation is per-query, not per-column — see below |
 | `BLOB`, `VARBINARY` | `blob` | literal is hex: `X'DEADBEEF'` |
 | `DATETIME`, `TIMESTAMP` | `timestamp` | UTC microseconds; no timezone offsets |
 | `DATE` | `date` | |
@@ -310,6 +316,34 @@ exactly as in MySQL.
 Nothing to port in this section — it is here because NULL handling is where
 engines usually diverge, and this one does not.
 
+## 5b. Collation and character sets
+
+There is no `CHARACTER SET` and no per-column `COLLATE`: `text` is always UTF-8,
+and collation is a property of the query, not of the schema. That removes the
+whole `utf8` vs `utf8mb4` class of migration bug — there is one encoding and it
+is the right one.
+
+`ORDER BY` on text collates by default (base letter, then diacritic, then case),
+so it is alphabetical the way `utf8mb4_unicode_ci` is, without declaring
+anything. `ñ` is a letter of its own between `n` and `o`, matching
+`utf8mb4_spanish_ci` rather than the language-neutral default:
+
+```sql
+SELECT n FROM c ORDER BY n                  -- acción, arbol, Ávila, nube, ñu, Zebra
+SELECT n FROM c ORDER BY n COLLATE binary   -- raw UTF-8 bytes, like utf8mb4_bin
+```
+
+The difference that matters when porting: **collation never affects equality**.
+A MySQL `_ci` collation makes `WHERE name = 'ávila'` match `'Ávila'` and makes a
+unique index reject both spellings as duplicates. Here `=` and unique indexes
+always compare exact bytes, so:
+
+- case- and accent-insensitive lookups have to be done with a normalized column
+  you maintain and index (`nombre_norm`), not by declaring a collation;
+- a `UNIQUE` index that MySQL enforced case-insensitively will accept `'Ana'`
+  and `'ana'` as two rows here. This one changes data, silently — check every
+  unique index on a text column that relied on a `_ci` collation.
+
 ## 6. EXPLAIN
 
 `EXPLAIN SELECT ...` exists and is familiar in spirit, but the output is a plain
@@ -458,5 +492,7 @@ silently are the type conversions in step 1 — money above all.
 - [ ] `NOW()`/`CURRENT_TIMESTAMP` moved into the application
 - [ ] `LIKE` search replaced with BM25, or explicitly accepted as an app-side filter
 - [ ] `LIMIT a, b` rewritten as `LIMIT b OFFSET a`
+- [ ] Every `UNIQUE` index that relied on a `_ci` collation re-checked: equality
+      is byte-exact here, so case variants are no longer duplicates
 - [ ] Backup/restore switched to `elitesql backup`/`restore`
 - [ ] Deployment shape decided: single process or sidecar

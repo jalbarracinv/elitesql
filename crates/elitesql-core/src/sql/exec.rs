@@ -24,6 +24,7 @@ use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
+use crate::collate::Collation;
 use crate::db::{Db, Record, Snapshot};
 use crate::error::{Error, Result};
 use crate::memory::MemoryPermit;
@@ -751,7 +752,7 @@ fn eq_vals(a: &Value, b: &Value) -> Option<bool> {
 }
 
 /// Total order for ORDER BY: never fails, NULLs first, then by type family.
-fn sort_cmp(a: &Value, b: &Value) -> Ordering {
+fn sort_cmp(a: &Value, b: &Value, collation: Collation) -> Ordering {
     fn rank(v: &Value) -> u8 {
         match v {
             Value::Null => 0,
@@ -771,7 +772,7 @@ fn sort_cmp(a: &Value, b: &Value) -> Ordering {
     }
     match (a, b) {
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => collation.compare(x, y),
         (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
         (Value::Json(x), Value::Json(y)) => x.to_string().cmp(&y.to_string()),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
@@ -1218,11 +1219,28 @@ struct SortedOutputRow {
     sequence: u64,
 }
 
-fn compare_sorted_rows(a: &SortedOutputRow, b: &SortedOutputRow, desc: &[bool]) -> Ordering {
-    for ((av, bv), descending) in a.keys.iter().zip(&b.keys).zip(desc) {
-        let ord = sort_cmp(av, bv);
+/// How one ORDER BY key is compared: direction plus, for text, which
+/// collation decides the order.
+#[derive(Debug, Clone, Copy)]
+struct SortSpec {
+    desc: bool,
+    collation: Collation,
+}
+
+impl SortSpec {
+    fn ascending() -> SortSpec {
+        SortSpec {
+            desc: false,
+            collation: Collation::default(),
+        }
+    }
+}
+
+fn compare_sorted_rows(a: &SortedOutputRow, b: &SortedOutputRow, specs: &[SortSpec]) -> Ordering {
+    for ((av, bv), spec) in a.keys.iter().zip(&b.keys).zip(specs) {
+        let ord = sort_cmp(av, bv, spec.collation);
         if ord != Ordering::Equal {
-            return if *descending { ord.reverse() } else { ord };
+            return if spec.desc { ord.reverse() } else { ord };
         }
     }
     a.sequence.cmp(&b.sequence)
@@ -1264,7 +1282,7 @@ struct SpillSorter<'a> {
     db: &'a Db,
     budget: usize,
     keep: Option<usize>,
-    desc: Vec<bool>,
+    specs: Vec<SortSpec>,
     buffer: Vec<SortedOutputRow>,
     buffer_bytes: usize,
     spill_dir: PathBuf,
@@ -1272,7 +1290,7 @@ struct SpillSorter<'a> {
 }
 
 impl<'a> SpillSorter<'a> {
-    fn new(db: &'a Db, desc: Vec<bool>, keep: Option<usize>) -> Result<Self> {
+    fn new(db: &'a Db, specs: Vec<SortSpec>, keep: Option<usize>) -> Result<Self> {
         let memory = db.memory_options();
         let spill_dir = memory
             .spill_directory
@@ -1281,7 +1299,7 @@ impl<'a> SpillSorter<'a> {
             db,
             budget: memory.query_working_bytes,
             keep,
-            desc,
+            specs,
             buffer: Vec::new(),
             buffer_bytes: 0,
             spill_dir,
@@ -1307,7 +1325,7 @@ impl<'a> SpillSorter<'a> {
 
     fn sort_and_prune(&mut self) {
         self.buffer
-            .sort_by(|a, b| compare_sorted_rows(a, b, &self.desc));
+            .sort_by(|a, b| compare_sorted_rows(a, b, &self.specs));
         if let Some(keep) = self.keep {
             self.buffer.truncate(keep);
         }
@@ -1377,7 +1395,7 @@ impl<'a> SpillSorter<'a> {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, row)| row.as_ref().map(|r| (i, r)))
-                .min_by(|(_, a), (_, b)| compare_sorted_rows(a, b, &self.desc))
+                .min_by(|(_, a), (_, b)| compare_sorted_rows(a, b, &self.specs))
                 .map(|(i, _)| i);
             let Some(run) = next else { break };
             let row = heads[run].take().expect("selected run has a row");
@@ -1801,17 +1819,25 @@ fn exec_single_table_select(
         });
     }
 
-    let order_keys: Vec<((usize, String), bool)> = stmt
+    let order_keys: Vec<((usize, String), SortSpec)> = stmt
         .order_by
         .iter()
-        .map(|(column, desc)| Ok((resolve_col(tables, column)?, *desc)))
+        .map(|key| {
+            Ok((
+                resolve_col(tables, &key.column)?,
+                SortSpec {
+                    desc: key.desc,
+                    collation: key.collation,
+                },
+            ))
+        })
         .collect::<Result<_>>()?;
     let mut sorter = if order_keys.is_empty() {
         None
     } else {
         Some(SpillSorter::new(
             db,
-            order_keys.iter().map(|(_, desc)| *desc).collect(),
+            order_keys.iter().map(|(_, spec)| *spec).collect(),
             limit.map(|n| offset.saturating_add(n)),
         )?)
     };
@@ -1961,10 +1987,18 @@ fn exec_single_indexed_join_select(
     }
 
     let (columns, extract) = projection_plan(tables, &stmt.projection)?;
-    let order_keys: Vec<((usize, String), bool)> = stmt
+    let order_keys: Vec<((usize, String), SortSpec)> = stmt
         .order_by
         .iter()
-        .map(|(column, desc)| Ok((resolve_col(tables, column)?, *desc)))
+        .map(|key| {
+            Ok((
+                resolve_col(tables, &key.column)?,
+                SortSpec {
+                    desc: key.desc,
+                    collation: key.collation,
+                },
+            ))
+        })
         .collect::<Result<_>>()?;
     let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
     let limit = limit_to_usize(stmt.limit.as_ref());
@@ -1979,7 +2013,7 @@ fn exec_single_indexed_join_select(
     } else {
         Some(SpillSorter::new(
             db,
-            order_keys.iter().map(|(_, desc)| *desc).collect(),
+            order_keys.iter().map(|(_, spec)| *spec).collect(),
             limit.map(|value| offset.saturating_add(value)),
         )?)
     };
@@ -2259,10 +2293,18 @@ fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
     let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
     let limit = limit_to_usize(stmt.limit.as_ref());
     let (columns, extract) = projection_plan(&tables, &stmt.projection)?;
-    let order_keys: Vec<((usize, String), bool)> = stmt
+    let order_keys: Vec<((usize, String), SortSpec)> = stmt
         .order_by
         .iter()
-        .map(|(column, desc)| Ok((resolve_col(&tables, column)?, *desc)))
+        .map(|key| {
+            Ok((
+                resolve_col(&tables, &key.column)?,
+                SortSpec {
+                    desc: key.desc,
+                    collation: key.collation,
+                },
+            ))
+        })
         .collect::<Result<_>>()?;
     let out_rows = if order_keys.is_empty() {
         rows.into_iter()
@@ -2273,7 +2315,7 @@ fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
     } else {
         let mut sorter = SpillSorter::new(
             db,
-            order_keys.iter().map(|(_, desc)| *desc).collect(),
+            order_keys.iter().map(|(_, spec)| *spec).collect(),
             limit.map(|value| offset.saturating_add(value)),
         )?;
         for (sequence, row) in rows.into_iter().enumerate() {
@@ -2553,8 +2595,8 @@ fn explain_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
         Some(plan)
     } else {
         projection_plan(&tables, &stmt.projection)?;
-        for (column, _) in &stmt.order_by {
-            resolve_col(&tables, column)?;
+        for key in &stmt.order_by {
+            resolve_col(&tables, &key.column)?;
         }
         None
     };
@@ -2590,13 +2632,21 @@ fn explain_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
         let keys: Vec<String> = stmt
             .order_by
             .iter()
-            .map(|(column, desc)| {
+            .map(|key| {
                 let name = match aggregate {
                     // Aggregate ORDER BY addresses output columns by name.
-                    Some(_) => column.column.clone(),
-                    None => explain_col(&tables, &resolve_col(&tables, column)?),
+                    Some(_) => key.column.column.clone(),
+                    None => explain_col(&tables, &resolve_col(&tables, &key.column)?),
                 };
-                Ok(format!("{name} {}", if *desc { "DESC" } else { "ASC" }))
+                let direction = if key.desc { "DESC" } else { "ASC" };
+                // Only name the collation when it is not the default, so the
+                // common plan stays quiet.
+                let collation = if key.collation == Collation::default() {
+                    String::new()
+                } else {
+                    format!(" COLLATE {}", key.collation.name())
+                };
+                Ok(format!("{name} {direction}{collation}"))
             })
             .collect::<Result<_>>()?;
         plan.line(depth, format!("SORT {}", keys.join(", ")));
@@ -3004,18 +3054,29 @@ fn aggregate_plan(tables: &[TableCtx], stmt: &SelectStmt) -> Result<AggregatePla
 }
 
 /// ORDER BY in an aggregate query addresses output columns, not input ones.
-fn aggregate_order_positions(stmt: &SelectStmt, headers: &[String]) -> Result<Vec<(usize, bool)>> {
+fn aggregate_order_positions(
+    stmt: &SelectStmt,
+    headers: &[String],
+) -> Result<Vec<(usize, SortSpec)>> {
     stmt.order_by
         .iter()
-        .map(|(column, desc)| {
+        .map(|key| {
             headers
                 .iter()
-                .position(|header| header.eq_ignore_ascii_case(&column.column))
-                .map(|position| (position, *desc))
+                .position(|header| header.eq_ignore_ascii_case(&key.column.column))
+                .map(|position| {
+                    (
+                        position,
+                        SortSpec {
+                            desc: key.desc,
+                            collation: key.collation,
+                        },
+                    )
+                })
                 .ok_or_else(|| {
                     Error::Sql(format!(
                         "in aggregate queries ORDER BY must reference an output column or alias; '{}' is neither",
-                        column.column
+                        key.column.column
                     ))
                 })
         })
@@ -3028,7 +3089,7 @@ fn queue_aggregate_group(
     group_cols: &[(usize, String)],
     out_cols: &[OutCol],
     having: Option<&RExpr>,
-    order_positions: &[(usize, bool)],
+    order_positions: &[(usize, SortSpec)],
     group_values: Vec<Value>,
     states: Vec<AggState>,
     first_sequence: u64,
@@ -3091,14 +3152,14 @@ fn exec_single_table_aggregate(
     let order_positions = aggregate_order_positions(stmt, &headers)?;
     let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
     let limit = limit_to_usize(stmt.limit.as_ref());
-    let output_desc = if order_positions.is_empty() {
-        vec![false]
+    let output_specs = if order_positions.is_empty() {
+        vec![SortSpec::ascending()]
     } else {
-        order_positions.iter().map(|(_, desc)| *desc).collect()
+        order_positions.iter().map(|(_, spec)| *spec).collect()
     };
     let mut output_sorter = SpillSorter::new(
         db,
-        output_desc,
+        output_specs,
         limit.map(|value| offset.saturating_add(value)),
     )?;
     let new_states = || {
@@ -3127,7 +3188,7 @@ fn exec_single_table_aggregate(
             0,
         )?;
     } else {
-        let mut input_sorter = SpillSorter::new(db, vec![false], None)?;
+        let mut input_sorter = SpillSorter::new(db, vec![SortSpec::ascending()], None)?;
         let mut sequence = 0u64;
         visit_single_table_rows(db, &tables[0], pushed, residual, |row| {
             let group_values: Vec<Value> = group_cols
@@ -3289,27 +3350,35 @@ fn exec_aggregate(
 
     // ORDER BY references output headers (column names or aliases).
     if !stmt.order_by.is_empty() {
-        let keys: Vec<(usize, bool)> = stmt
+        let keys: Vec<(usize, SortSpec)> = stmt
             .order_by
             .iter()
-            .map(|(c, desc)| {
+            .map(|key| {
                 headers
                     .iter()
-                    .position(|h| h.eq_ignore_ascii_case(&c.column))
-                    .map(|pos| (pos, *desc))
+                    .position(|h| h.eq_ignore_ascii_case(&key.column.column))
+                    .map(|pos| {
+                        (
+                            pos,
+                            SortSpec {
+                                desc: key.desc,
+                                collation: key.collation,
+                            },
+                        )
+                    })
                     .ok_or_else(|| {
                         Error::Sql(format!(
                             "in aggregate queries ORDER BY must reference an output column or alias; '{}' is neither",
-                            c.column
+                            key.column.column
                         ))
                     })
             })
             .collect::<Result<_>>()?;
         out_rows.sort_by(|a, b| {
-            for (i, desc) in &keys {
-                let ord = sort_cmp(&a[*i], &b[*i]);
+            for (i, spec) in &keys {
+                let ord = sort_cmp(&a[*i], &b[*i], spec.collation);
                 if ord != Ordering::Equal {
-                    return if *desc { ord.reverse() } else { ord };
+                    return if spec.desc { ord.reverse() } else { ord };
                 }
             }
             Ordering::Equal

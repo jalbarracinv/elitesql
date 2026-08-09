@@ -706,13 +706,24 @@ impl Parser {
                          use search_vector (Rust API or bindings)",
                     ));
                 }
+                // `COLLATE` sits between the column and ASC/DESC in standard
+                // SQL, but accepting it on either side costs nothing and saves
+                // a parse error over word order.
+                let mut collation = self.parse_collation()?;
                 let desc = if self.eat_kw("DESC") {
                     true
                 } else {
                     self.eat_kw("ASC");
                     false
                 };
-                order_by.push((col, desc));
+                if collation.is_none() {
+                    collation = self.parse_collation()?;
+                }
+                order_by.push(OrderKey {
+                    column: col,
+                    desc,
+                    collation: collation.unwrap_or_default(),
+                });
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -1039,6 +1050,35 @@ impl Parser {
                 Err(self.err_at("subqueries are not supported in V1; run two queries instead"))
             }
             _ => Ok(Operand::Lit(self.parse_literal()?)),
+        }
+    }
+
+    /// `COLLATE <name>`, optionally quoted as a string the way MySQL writes it.
+    fn parse_collation(&mut self) -> Result<Option<crate::collate::Collation>> {
+        if !self.eat_kw("COLLATE") {
+            return Ok(None);
+        }
+        let name = match self.next() {
+            Some(Lexed {
+                tok: Tok::Ident(w), ..
+            }) => w,
+            Some(Lexed {
+                tok: Tok::Str(s), ..
+            }) => s,
+            _ => {
+                self.pos = self.pos.saturating_sub(1);
+                return Err(self.err_at("expected a collation name after COLLATE"));
+            }
+        };
+        match crate::collate::Collation::parse(&name) {
+            Some(collation) => Ok(Some(collation)),
+            None => {
+                self.pos = self.pos.saturating_sub(1);
+                Err(self.err_at(&format!(
+                    "unknown collation '{name}'; V1 has 'unicode' (base letter, then accent, \
+                     then case) and 'binary' (raw UTF-8 bytes)"
+                )))
+            }
         }
     }
 

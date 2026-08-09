@@ -339,3 +339,20 @@ fn planned_paths_return_the_same_rows_they_promise() {
     };
     assert!(rows.is_empty());
 }
+
+/// A non-default collation is named in the plan; the default stays quiet.
+#[test]
+fn the_plan_names_a_collation_only_when_it_is_not_the_default() {
+    let (_d, db) = seeded();
+    assert_eq!(
+        plan(&db, "EXPLAIN SELECT name FROM users ORDER BY name")[0],
+        "SORT users.name ASC"
+    );
+    assert_eq!(
+        plan(
+            &db,
+            "EXPLAIN SELECT name FROM users ORDER BY name COLLATE binary DESC"
+        )[0],
+        "SORT users.name DESC COLLATE binary"
+    );
+}

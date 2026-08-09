@@ -77,9 +77,17 @@ pub(crate) struct SelectStmt {
     pub where_clause: Option<Expr>,
     pub group_by: Vec<ColumnRef>,
     pub having: Option<Expr>,
-    pub order_by: Vec<(ColumnRef, bool)>, // bool = descending
+    pub order_by: Vec<OrderKey>,
     pub limit: Option<LimitValue>,
     pub offset: Option<LimitValue>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OrderKey {
+    pub column: ColumnRef,
+    pub desc: bool,
+    /// How text values compare. `COLLATE binary` restores raw byte order.
+    pub collation: crate::collate::Collation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

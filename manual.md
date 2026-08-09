@@ -385,6 +385,56 @@ buffer for the open handle.
 `NULL`s sort first. `LIMIT`/`OFFSET` apply after sorting and may be bound using
 `?`, `%s` or `%(name)s`; their value must be a non-negative `int64`.
 
+### Collation: how text is ordered
+
+`ORDER BY` on a `text` column is alphabetical, not byte order. UTF-8 byte order
+would be the wrong answer for anything a person reads: `ñ` and every accented
+vowel encode above `z`, and every uppercase ASCII letter encodes below every
+lowercase one.
+
+```sql
+SELECT n FROM c ORDER BY n
+-- acción, arbol, Ávila, nube, Ñandú, ñu, Zebra
+```
+
+The comparison has three levels, each consulted only when the previous one ties:
+
+1. **base letter** — accents removed and case folded, so `Ávila` sorts among the
+   a's instead of after `z`;
+2. **diacritic** — so `animo` and `ánimo` land next to each other;
+3. **case** — lowercase, then capitalized, then all caps.
+
+`ñ` is not treated as an accented `n`: it is a letter of its own between `n` and
+`o`, so `nube` sorts before `ñu`, as Spanish, Galician and Basque require. This
+is a deliberate departure from the language-neutral Unicode default, where `ñu`
+would come first.
+
+Two collations exist. Name one per key, on either side of `ASC`/`DESC`:
+
+| Collation | Order |
+|---|---|
+| `unicode` (default) | base letter, then diacritic, then case |
+| `binary` | raw UTF-8 bytes |
+
+```sql
+SELECT n FROM c ORDER BY n COLLATE binary          -- Zebra, arbol, Ávila, ñu
+SELECT a, b FROM t ORDER BY a, b COLLATE binary    -- one collation per key
+```
+
+What collation does **not** touch is equality. `=`, `IN`, `find_eq`, unique
+indexes and the secondary index all compare exact bytes, so `'Ávila' = 'avila'`
+is false and a unique index still rejects only exact duplicates. Ordering is a
+presentation question; identity is not, and making them disagree would let the
+SQL layer and the index reach different conclusions about the same row.
+
+Known limits, since a collation that quietly gets a language wrong is worse than
+one that says so: languages that give some *other* letter its own place in the
+alphabet are not tailored — Swedish, Danish and Norwegian sort `å ä ö` after
+`z`, Czech treats `ch` as one letter, Polish separates `ł`, Turkish separates
+dotless `ı`. Ligatures and `ß` compare as one letter rather than expanding
+(`ß` as `s`, not `ss`). Text outside the Latin scripts compares by code point:
+deterministic, but not linguistic.
+
 ## Memory and resource limits
 
 The three allocatable database-wide pools and the emergency reserve are shared

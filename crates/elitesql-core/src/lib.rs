@@ -49,6 +49,7 @@
 
 mod backup;
 mod check;
+mod collate;
 mod db;
 mod ddl;
 mod error;
@@ -68,6 +69,7 @@ mod wal;
 
 pub use backup::{restore, BackupReport, RestoreReport};
 pub use check::{check, CheckReport};
+pub use collate::Collation;
 pub use db::{
     AutoCompactionOptions, Db, DbOptions, HybridHit, HybridQuery, MaintenanceStats, MemoryOptions,
     QueryMemoryStats, Record, Snapshot, Txn,
