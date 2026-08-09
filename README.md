@@ -9,13 +9,15 @@
 > **A tiny operational database for AI-native apps.**
 > SQLite-fast reads, better concurrent writes, native ANN.
 
-EliteSQL is an **embedded** database engine (no server, no daemon, no ceremonial tuning) written in Rust. A database is a self-contained directory you can copy, back up and move. When several processes need it, or the app runs on another machine, the same binary can [serve it](#multi-worker-and-remote-the-sidecar-mode) over a socket or a port — a deployment option, not a requirement.
+EliteSQL is an **embedded** database engine (no enforced server, no daemon, no ceremonial tuning) written in Rust. A database is a self-contained directory you can copy, back up and move. When several processes need it, or the app runs on another machine, the same binary can [serve it](#multi-worker-and-remote-the-sidecar-mode) over a socket or a port — a deployment option, not a requirement.
 
-It does not compete with PostgreSQL: it competes against the complexity of operating this tower in a modern app:
+It does not compete with big db projects like PostgreSQL or MySQL: it competes against the complexity of operating this tower in a modern app:
 
 ```text
 SQLite + vector DB + cache + sync layer + files + embeddings metadata
 ```
+
+But also it delivers [strong performance](benchmark.md) enough to handle millions of records and thousands of concurrent operations.
 
 The promise is opening a single file and having records, JSON, blobs, indexes, ANN vector search, snapshots and sane concurrency inside:
 
