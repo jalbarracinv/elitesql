@@ -7,9 +7,10 @@ Two ways to use it:
   multiple Python threads genuinely run in parallel inside the Rust engine.
   One process owns the database (lock file); use threads or async within it.
 
-- ``SidecarClient``: connects to a ``elitesql serve <db> <socket>`` process
-  over a Unix socket. This is the deployment mode for gunicorn/uwsgi with
-  multiple workers: every worker talks to the single engine process.
+- ``SidecarClient``: connects to an ``elitesql serve`` process, over a Unix
+  socket (the deployment mode for gunicorn/uwsgi with multiple workers: every
+  worker talks to the single engine process) or over TCP with a token, when the
+  app runs on a different host than the database.
 
 Values: scalars map to Python natively; dates/times/timestamps arrive as
 ``datetime.date`` / ``datetime.time`` / ``datetime.datetime`` (UTC), blobs as

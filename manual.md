@@ -16,6 +16,16 @@ match db.query("SELECT name FROM users WHERE age > 30")? {
 }
 ```
 
+The same SQL runs from the CLI. `Db::open_or_create` creates a database from
+Rust, but the CLI never creates one just by opening a path — a single argument
+that is not a subcommand is read as a path, so a mistyped subcommand would
+otherwise leave a database named after the typo:
+
+```bash
+elitesql --create app.esql                          # once, to create it
+elitesql query app.esql "SELECT name FROM users"    # afterwards, no flag
+```
+
 General rules:
 
 - One statement per `query()` call.

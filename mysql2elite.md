@@ -414,6 +414,13 @@ use `bulk_insert_sorted` or larger batches instead.
 2. **Write the new DDL.** Drop `PRIMARY KEY`/`REFERENCES`/inline `UNIQUE`,
    convert money to integer minor units, turn each `UNIQUE` into
    `CREATE UNIQUE INDEX`, and keep one index per column you filter or join on.
+   The target database is created explicitly, once — the CLI never creates one
+   just by opening a path:
+
+   ```bash
+   elitesql --create app.esql
+   elitesql query app.esql "CREATE TABLE users (email text NOT NULL, ...)"
+   ```
 3. **Export from MySQL** as JSON lines, converting values as you go: decimals to
    integer cents, enums to text, datetimes to `'YYYY-MM-DD HH:MM:SS'` in UTC,
    and the old primary key into `legacy_id` if anything outside the database

@@ -1,8 +1,12 @@
 //! `elitesql` — the EliteSQL command line.
 //!
 //! Subcommands: query, repl, tables, check, compact, backup, restore, repair,
-//! export, import, serve (Unix-socket sidecar for multi-process deployments),
-//! version.
+//! export, import, serve (sidecar over a Unix socket for multi-process
+//! deployments, or over TCP for another host), version.
+//!
+//! Opening a database never creates it; `--create` does. A single argument that
+//! is not a subcommand is read as a path, so without that a mistyped subcommand
+//! would leave a database directory named after the typo.
 
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
