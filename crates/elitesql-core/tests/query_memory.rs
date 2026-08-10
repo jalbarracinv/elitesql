@@ -167,6 +167,45 @@ fn high_cardinality_group_by_uses_bounded_sorted_runs() {
 }
 
 #[test]
+fn count_distinct_spills_under_the_query_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let spill_dir = dir.path().join("distinct-spill");
+    let db = Db::create_with(
+        dir.path().join("distinct.esql"),
+        DbOptions {
+            memory: MemoryOptions {
+                query_working_bytes: 512,
+                scan_batch_rows: 4,
+                spill_directory: Some(spill_dir.clone()),
+                ..MemoryOptions::default()
+            },
+            ..DbOptions::default()
+        },
+    )
+    .unwrap();
+    db.query("CREATE TABLE events (actor text)").unwrap();
+    for n in 0..160 {
+        db.query(&format!(
+            "INSERT INTO events (id, actor) VALUES ('e-{n:03}', 'actor-{:03}')",
+            n % 80
+        ))
+        .unwrap();
+    }
+    db.query("INSERT INTO events (id, actor) VALUES ('null-row', NULL)")
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            db.query("SELECT count(DISTINCT actor) AS actors FROM events")
+                .unwrap()
+        ),
+        vec![vec![Value::Int64(80)]]
+    );
+    assert!(db.query_memory_stats().spill_files > 0);
+    assert!(spill_dir.read_dir().unwrap().next().is_none());
+}
+
+#[test]
 fn indexed_join_streams_probes_and_spills_only_the_sort() {
     let dir = tempfile::tempdir().unwrap();
     let spill_dir = dir.path().join("join-spill");

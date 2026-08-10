@@ -261,10 +261,8 @@ fn aggregate_errors_are_clear() {
         "SELECT region, count(*) FROM sales GROUP BY region ORDER BY count(*)",
         "alias",
     );
-    err(
-        "SELECT count(DISTINCT rep) FROM sales",
-        "DISTINCT inside aggregates",
-    );
+    let (_, distinct) = rows(db.query("SELECT count(DISTINCT rep) FROM sales").unwrap());
+    assert_eq!(distinct, vec![vec![Value::Int64(4)]]);
     err("SELECT sum(*) FROM sales", "only COUNT accepts *");
 }
 

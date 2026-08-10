@@ -146,6 +146,62 @@ fn txn_reads_from_stable_snapshot() {
 }
 
 #[test]
+fn transactional_sql_sees_staged_rows_and_commits_business_unit_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("sql-txn.esql")).unwrap();
+    db.query("CREATE TABLE users (user_id int AUTO_INCREMENT, credits int NOT NULL)")
+        .unwrap();
+    db.query("CREATE TABLE docs (owner_id int REFERENCES users(user_id), title text NOT NULL)")
+        .unwrap();
+    db.query("INSERT INTO users (credits) VALUES (10)").unwrap();
+
+    let mut tx = db.begin();
+    assert_eq!(
+        tx.query_params(
+            "UPDATE users SET credits = credits - %s WHERE user_id = %s AND credits >= %s",
+            &[Value::Int64(3), Value::Int64(1), Value::Int64(3)],
+        )
+        .unwrap(),
+        elitesql_core::QueryOutput::Affected(1)
+    );
+    let inserted = tx
+        .query_params(
+            "INSERT INTO docs (owner_id, title) VALUES (%s, %s) RETURNING owner_id, title",
+            &[Value::Int64(1), Value::Text("contract".into())],
+        )
+        .unwrap();
+    assert!(matches!(
+        inserted,
+        elitesql_core::QueryOutput::Rows { ref rows, .. }
+            if rows == &vec![vec![Value::Int64(1), Value::Text("contract".into())]]
+    ));
+    let selected = tx
+        .query("SELECT title FROM docs WHERE owner_id = 1")
+        .unwrap();
+    assert!(matches!(
+        selected,
+        elitesql_core::QueryOutput::Rows { ref rows, .. } if rows.len() == 1
+    ));
+    assert!(db.scan("docs").unwrap().is_empty());
+    tx.commit().unwrap();
+
+    assert_eq!(db.scan("docs").unwrap().len(), 1);
+    assert_eq!(db.scan("users").unwrap()[0].1["credits"], Value::Int64(7));
+}
+
+#[test]
+fn transactional_sql_rollback_discards_every_statement() {
+    let (_dir, db) = new_db();
+    let mut tx = db.begin();
+    tx.query("INSERT INTO docs (title, score, email) VALUES ('temporary', 1, NULL)")
+        .unwrap();
+    tx.query("UPDATE docs SET score = score + 1 WHERE title = 'temporary'")
+        .unwrap();
+    tx.rollback();
+    assert!(db.scan("docs").unwrap().is_empty());
+}
+
+#[test]
 fn concurrent_update_same_record_conflicts() {
     let (_dir, db) = new_db();
     let id = db.insert("docs", record("contended", 0)).unwrap();

@@ -598,6 +598,16 @@ fn print_output(out: QueryOutput) {
             }
             println!("({} inserted)", ids.len());
         }
+        QueryOutput::InsertedIdentity {
+            ids,
+            column,
+            values,
+        } => {
+            for (id, value) in ids.iter().zip(&values) {
+                println!("{id}\t{column}={value}");
+            }
+            println!("({} inserted)", ids.len());
+        }
         QueryOutput::Affected(n) => println!("({n} affected)"),
         QueryOutput::None => println!("ok"),
     }

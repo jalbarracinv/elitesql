@@ -8,6 +8,7 @@ use crate::segment::{KIND_PUT, KIND_TOMBSTONE};
 use crate::value::{read_u16, read_u32, read_u64, read_u8};
 
 pub(crate) const WAL_DIR: &str = "wal";
+const IDENTITY_META_TABLE: &str = "\0elitesql_identity";
 
 /// How aggressively commits are forced to stable storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,12 +56,21 @@ pub(crate) struct WalChange {
 pub(crate) struct WalRecord {
     pub version: u64,
     pub changes: Vec<WalChange>,
+    pub identity_high_water: Vec<(String, i64)>,
 }
 
-pub(crate) fn encode_commit(version: u64, changes: &[(&str, &str, Option<&[u8]>)]) -> Vec<u8> {
+pub(crate) fn encode_commit(
+    version: u64,
+    changes: &[(&str, &str, Option<&[u8]>)],
+    identity_high_water: &[(&str, i64)],
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
     buf.extend_from_slice(&version.to_le_bytes());
-    buf.extend_from_slice(&(changes.len() as u32).to_le_bytes());
+    let count = changes
+        .len()
+        .checked_add(identity_high_water.len())
+        .expect("WAL change count overflow");
+    buf.extend_from_slice(&(count as u32).to_le_bytes());
     for (table, id, payload) in changes {
         buf.push(if payload.is_some() {
             KIND_PUT
@@ -74,6 +84,15 @@ pub(crate) fn encode_commit(version: u64, changes: &[(&str, &str, Option<&[u8]>)
         let p = payload.unwrap_or(&[]);
         buf.extend_from_slice(&(p.len() as u32).to_le_bytes());
         buf.extend_from_slice(p);
+    }
+    for (table, value) in identity_high_water {
+        buf.push(KIND_PUT);
+        buf.extend_from_slice(&(IDENTITY_META_TABLE.len() as u16).to_le_bytes());
+        buf.extend_from_slice(IDENTITY_META_TABLE.as_bytes());
+        buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
+        buf.extend_from_slice(table.as_bytes());
+        buf.extend_from_slice(&(8u32).to_le_bytes());
+        buf.extend_from_slice(&value.to_le_bytes());
     }
     let crc = crc32fast::hash(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
@@ -121,6 +140,7 @@ fn parse_record(data: &[u8], pos: &mut usize, start: usize) -> Result<WalRecord>
         return Err(Error::Corrupt("wal: implausible change count".into()));
     }
     let mut changes = Vec::with_capacity(count.min(1024));
+    let mut identity_high_water = Vec::new();
     for _ in 0..count {
         let kind = read_u8(data, pos)?;
         if kind != KIND_PUT && kind != KIND_TOMBSTONE {
@@ -139,18 +159,37 @@ fn parse_record(data: &[u8], pos: &mut usize, start: usize) -> Result<WalRecord>
         if kind == KIND_TOMBSTONE && payload_len != 0 {
             return Err(Error::Corrupt("wal: tombstone with payload".into()));
         }
-        changes.push(WalChange {
-            table,
-            id,
-            payload: (kind == KIND_PUT).then(|| payload_bytes.to_vec()),
-        });
+        if table == IDENTITY_META_TABLE {
+            if kind != KIND_PUT || payload_len != 8 {
+                return Err(Error::Corrupt("wal: invalid identity metadata".into()));
+            }
+            let value = i64::from_le_bytes(
+                payload_bytes
+                    .try_into()
+                    .expect("identity payload length checked"),
+            );
+            if value < 1 {
+                return Err(Error::Corrupt("wal: invalid identity high-water".into()));
+            }
+            identity_high_water.push((id, value));
+        } else {
+            changes.push(WalChange {
+                table,
+                id,
+                payload: (kind == KIND_PUT).then(|| payload_bytes.to_vec()),
+            });
+        }
     }
     let crc_pos = *pos;
     let stored_crc = read_u32(data, pos)?;
     if crc32fast::hash(&data[start..crc_pos]) != stored_crc {
         return Err(Error::Corrupt("wal: record crc mismatch".into()));
     }
-    Ok(WalRecord { version, changes })
+    Ok(WalRecord {
+        version,
+        changes,
+        identity_high_water,
+    })
 }
 
 fn read_short_str(data: &[u8], pos: &mut usize) -> Result<String> {

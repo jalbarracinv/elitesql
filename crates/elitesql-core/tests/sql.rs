@@ -85,14 +85,21 @@ fn create_table_types_and_errors() {
 
     assert_sql_err(&db, "CREATE TABLE bad (x smallint)", "use int");
     assert_sql_err(&db, "CREATE TABLE bad (x int32)", "use int");
-    assert_sql_err(&db, "CREATE TABLE bad (x varchar)", "use text");
+    db.query("CREATE TABLE text_compat (short varchar(12), unlimited varchar, body longtext, state enum('draft', 'sent'))")
+        .unwrap();
+    let text_compat = db.table_schema("text_compat").unwrap();
+    assert_eq!(text_compat.columns[0].max_length, Some(12));
+    assert_eq!(
+        text_compat.columns[3].enum_values.as_deref(),
+        Some(["draft".to_owned(), "sent".to_owned()].as_slice())
+    );
     assert_sql_err(&db, "CREATE TABLE bad (x double)", "use float64");
     assert_sql_err(&db, "CREATE TABLE bad (x datetime)", "use timestamp");
     assert_sql_err(&db, "CREATE TABLE bad (x whatever)", "V1 types are");
     assert_sql_err(
         &db,
         "CREATE TABLE bad (x text PRIMARY KEY)",
-        "implicit 'id'",
+        "only supported on an AUTO_INCREMENT/IDENTITY",
     );
     assert_sql_err(
         &db,
@@ -503,10 +510,9 @@ fn unsupported_features_fail_with_clear_errors() {
     assert_sql_err(&db, "WITH x AS (SELECT 1) SELECT * FROM x", "CTEs");
     // Aggregates exist since Phase 2.5, but only in SELECT and HAVING.
     assert_sql_err(&db, "SELECT name FROM users WHERE COUNT(*) > 1", "HAVING");
-    assert_sql_err(
-        &db,
-        "SELECT COUNT(DISTINCT name) FROM users",
-        "DISTINCT inside aggregates",
+    assert_eq!(
+        rows(db.query("SELECT COUNT(DISTINCT name) FROM users").unwrap()).1,
+        vec![vec![Value::Int64(3)]]
     );
     assert_sql_err(&db, "SELECT SUM(*) FROM users", "only COUNT accepts *");
     assert_sql_err(

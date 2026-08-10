@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
@@ -21,7 +21,9 @@ use crate::paged::{
 use crate::run_manifest::{
     DerivedRunKind, DerivedRunManifest, DerivedRunMeta, PrimaryRunManifest, PrimaryRunMeta,
 };
-use crate::schema::{Catalog, Column, IndexDef, TableSchema, FORMAT_VERSION, ID_COLUMN};
+use crate::schema::{
+    Catalog, Column, IndexDef, ReferentialAction, TableSchema, FORMAT_VERSION, ID_COLUMN,
+};
 use crate::segment::{
     encode_entry_into, segment_file_name, validate_segment, visit_segment, KIND_PUT, KIND_TOMBSTONE,
 };
@@ -1603,6 +1605,9 @@ fn validate_secondary_run(index: &PagedIndex) -> Result<()> {
 struct State {
     catalog: Catalog,
     committed_version: u64,
+    /// Highest reserved integer identity per table. Committed values are
+    /// carried in the WAL and checkpoints copy the map into the manifest.
+    identity_high_water: HashMap<String, i64>,
     /// table -> id -> versions in ascending commit order.
     index: PrimaryIdx,
     /// Greatest primary key observed in the current table epoch. Keys above
@@ -1685,6 +1690,14 @@ impl State {
     }
 }
 
+fn identity_manifest(state: &State) -> BTreeMap<String, i64> {
+    state
+        .identity_high_water
+        .iter()
+        .map(|(table, value)| (table.clone(), *value))
+        .collect()
+}
+
 /// A vector waiting to be indexed in background (Async mode).
 struct VecJob {
     table: String,
@@ -1705,6 +1718,7 @@ struct FrozenCheckpointJob {
     segments: Vec<SegmentMeta>,
     next_segment_id: u32,
     catalog: Catalog,
+    identity_high_water: BTreeMap<String, i64>,
     old_primary_runs: Vec<PrimaryRunMeta>,
     first_primary_run: bool,
     wal_id: u32,
@@ -1898,6 +1912,7 @@ pub struct HybridHit {
 pub struct Txn {
     shared: Arc<Shared>,
     snapshot: Snapshot,
+    started_at: Instant,
     /// One interned table name/schema plus its staged operations. Keeping IDs
     /// in a per-table map avoids allocating and hashing the table name once
     /// per row during large transactions.
@@ -1921,6 +1936,9 @@ struct StagedOperation {
     /// linear time at commit instead of sorting every row by primary key.
     position: usize,
     operation: Option<Record>,
+    /// Transaction-visible value that was removed. Cascades need this even
+    /// when the row was inserted or updated earlier in the same transaction.
+    deleted_record: Option<Record>,
 }
 
 struct PreparedTable {
@@ -2170,6 +2188,7 @@ impl Db {
             state: RwLock::new(State {
                 catalog: Catalog::new(),
                 committed_version: 0,
+                identity_high_water: HashMap::new(),
                 index: PrimaryIdx::empty(),
                 table_high_ids: HashMap::new(),
                 superseded_segments: HashSet::new(),
@@ -2487,6 +2506,11 @@ impl Db {
         // Replay the WAL idempotently: only commits above the manifest
         // watermark apply; a torn tail is truncated (never in read-only).
         let mut committed_version = manifest.committed_version;
+        let mut identity_high_water: HashMap<String, i64> = manifest
+            .identity_high_water
+            .iter()
+            .map(|(table, value)| (table.clone(), *value))
+            .collect();
         let mut memtable_bytes = 0u64;
         let wal_file = wal_path(&dir, manifest.wal_id);
         if !wal_file.exists() && !ro {
@@ -2507,6 +2531,12 @@ impl Db {
         for rec in scan.records {
             if rec.version <= committed_version {
                 continue;
+            }
+            for (table, value) in rec.identity_high_water {
+                identity_high_water
+                    .entry(table)
+                    .and_modify(|high| *high = (*high).max(value))
+                    .or_insert(value);
             }
             for ch in rec.changes {
                 let kind = match ch.payload {
@@ -2639,6 +2669,7 @@ impl Db {
             state: RwLock::new(State {
                 catalog,
                 committed_version,
+                identity_high_water,
                 index: primary,
                 table_high_ids,
                 superseded_segments,
@@ -2719,6 +2750,39 @@ impl Db {
             return Err(Error::ReadOnly);
         }
         schema.validate()?;
+        if let Some(identity_name) = schema
+            .columns
+            .iter()
+            .find(|column| column.identity)
+            .map(|column| column.name.clone())
+        {
+            match schema
+                .indexes
+                .iter_mut()
+                .find(|index| index.column == identity_name)
+            {
+                Some(index) => index.unique = true,
+                None => schema.indexes.push(IndexDef {
+                    column: identity_name,
+                    unique: true,
+                }),
+            }
+        }
+        // A local equality index is part of the FK contract. It bounds parent
+        // delete checks and cascade discovery without requiring callers to
+        // remember a second DDL statement.
+        for foreign_key in &schema.foreign_keys {
+            if !schema
+                .indexes
+                .iter()
+                .any(|index| index.column == foreign_key.column)
+            {
+                schema.indexes.push(IndexDef {
+                    column: foreign_key.column.clone(),
+                    unique: false,
+                });
+            }
+        }
         let _cs = lock_commit_for_maintenance(&self.shared)?;
         let mut st = self.shared.state.write().unwrap();
         // This incarnation of the table only owns data committed from now on.
@@ -2727,6 +2791,61 @@ impl Db {
         schema.epoch = st.committed_version;
         if st.catalog.table(&schema.name).is_some() {
             return Err(Error::TableExists(schema.name));
+        }
+        for foreign_key in &schema.foreign_keys {
+            let target = if foreign_key.referenced_table == schema.name {
+                &schema
+            } else {
+                st.catalog
+                    .table(&foreign_key.referenced_table)
+                    .ok_or_else(|| {
+                        Error::SchemaViolation(format!(
+                            "foreign key {}.{} references unknown table '{}'",
+                            schema.name, foreign_key.column, foreign_key.referenced_table
+                        ))
+                    })?
+            };
+            let local_type = schema
+                .column(&foreign_key.column)
+                .expect("schema validation checked the local column")
+                .ty;
+            let referenced_type =
+                if foreign_key.referenced_column == ID_COLUMN && target.has_implicit_id() {
+                    ColumnType::Text
+                } else {
+                    target
+                        .column(&foreign_key.referenced_column)
+                        .ok_or_else(|| {
+                            Error::SchemaViolation(format!(
+                                "foreign key {}.{} references unknown column {}.{}",
+                                schema.name,
+                                foreign_key.column,
+                                foreign_key.referenced_table,
+                                foreign_key.referenced_column
+                            ))
+                        })?
+                        .ty
+                };
+            if local_type != referenced_type {
+                return Err(Error::SchemaViolation(format!(
+                    "foreign key {}.{} ({local_type}) does not match {}.{} ({referenced_type})",
+                    schema.name,
+                    foreign_key.column,
+                    foreign_key.referenced_table,
+                    foreign_key.referenced_column
+                )));
+            }
+            if !(foreign_key.referenced_column == ID_COLUMN && target.has_implicit_id())
+                && !target
+                    .indexes
+                    .iter()
+                    .any(|index| index.column == foreign_key.referenced_column && index.unique)
+            {
+                return Err(Error::SchemaViolation(format!(
+                    "foreign key target {}.{} must have a unique index",
+                    foreign_key.referenced_table, foreign_key.referenced_column
+                )));
+            }
         }
         for def in &schema.indexes {
             if schema.column(&def.column).is_none() {
@@ -3120,6 +3239,21 @@ impl Db {
             .catalog
             .table(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        if let Some((child, foreign_key)) = st.catalog.tables.iter().find_map(|child| {
+            if child.name == table {
+                return None;
+            }
+            child
+                .foreign_keys
+                .iter()
+                .find(|foreign_key| foreign_key.referenced_table == table)
+                .map(|foreign_key| (child, foreign_key))
+        }) {
+            return Err(Error::SchemaViolation(format!(
+                "cannot drop table '{table}': referenced by {}.{}",
+                child.name, foreign_key.column
+            )));
+        }
         let vector_columns: Vec<String> = schema
             .vector_indexes
             .iter()
@@ -3136,6 +3270,7 @@ impl Db {
         next.tables.retain(|t| t.name != table);
         next.save(&self.shared.dir.join(CATALOG_FILE))?;
         st.catalog = next;
+        st.identity_high_water.remove(table);
         // Immutable primary pages may keep unreachable keys until compaction;
         // dropping only the bounded mutable delta avoids materializing the
         // complete mmap-backed primary index in RAM.
@@ -3206,6 +3341,26 @@ impl Db {
                 table: table.into(),
                 column: column.into(),
             });
+        }
+        if kind == IndexKind::Secondary {
+            if schema
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.column == column)
+            {
+                return Err(Error::SchemaViolation(format!(
+                    "cannot drop index on {table}.{column}: required by a foreign key"
+                )));
+            }
+            if st.catalog.tables.iter().any(|child| {
+                child.foreign_keys.iter().any(|foreign_key| {
+                    foreign_key.referenced_table == table && foreign_key.referenced_column == column
+                })
+            }) {
+                return Err(Error::SchemaViolation(format!(
+                    "cannot drop unique index on {table}.{column}: it is a foreign key target"
+                )));
+            }
         }
         let mut next = st.catalog.clone();
         let schema = next.table_mut(table).expect("checked above");
@@ -3323,6 +3478,21 @@ impl Db {
                     column: column.into(),
                 });
             }
+            if schema
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.column == column)
+                || st.catalog.tables.iter().any(|child| {
+                    child.foreign_keys.iter().any(|foreign_key| {
+                        foreign_key.referenced_table == table
+                            && foreign_key.referenced_column == column
+                    })
+                })
+            {
+                return Err(Error::SchemaViolation(format!(
+                    "cannot drop {table}.{column}: it participates in a foreign key"
+                )));
+            }
             if schema.columns.len() == 1 {
                 return Err(Error::InvalidArgument(format!(
                     "{column} is the only column of {table}; drop the table instead"
@@ -3359,6 +3529,17 @@ impl Db {
             }
             if st.catalog.table(new_name).is_some() {
                 return Err(Error::TableExists(new_name.into()));
+            }
+            if st.catalog.tables.iter().any(|schema| {
+                (schema.name == table && !schema.foreign_keys.is_empty())
+                    || schema
+                        .foreign_keys
+                        .iter()
+                        .any(|foreign_key| foreign_key.referenced_table == table)
+            }) {
+                return Err(Error::SchemaViolation(format!(
+                    "cannot rename table '{table}' while it participates in a foreign key"
+                )));
             }
         }
         let intent = DdlIntent::RenameTable {
@@ -3404,6 +3585,21 @@ impl Db {
             if schema.column(new_name).is_some() {
                 return Err(Error::InvalidArgument(format!(
                     "column {table}.{new_name} already exists"
+                )));
+            }
+            if schema
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.column == column)
+                || st.catalog.tables.iter().any(|child| {
+                    child.foreign_keys.iter().any(|foreign_key| {
+                        foreign_key.referenced_table == table
+                            && foreign_key.referenced_column == column
+                    })
+                })
+            {
+                return Err(Error::SchemaViolation(format!(
+                    "cannot rename {table}.{column} while it participates in a foreign key"
                 )));
             }
         }
@@ -3948,6 +4144,7 @@ impl Db {
         Txn {
             shared: self.shared.clone(),
             snapshot: self.snapshot(),
+            started_at: Instant::now(),
             staged: Vec::new(),
             staged_bytes: 0,
         }
@@ -4211,11 +4408,16 @@ impl Db {
             id: next_segment_id,
             len: segment_bytes,
         });
+        let identity_high_water = {
+            let st = self.shared.state.read().unwrap();
+            identity_manifest(&st)
+        };
         if let Err(error) = (Manifest {
             format_version: FORMAT_VERSION,
             committed_version: version,
             segments: new_segments.clone(),
             wal_id: cs.wal().id,
+            identity_high_water,
         })
         .publish(&self.shared.dir)
         {
@@ -4397,7 +4599,8 @@ impl Db {
                 if let Some(last) = st.latest_owned(table, &id)? {
                     if !last.is_tombstone() {
                         let mut rec = read_record_kind(&st.blobs, &st.readers, &last.kind)?;
-                        rec.insert(ID_COLUMN.into(), Value::Text(id.clone()));
+                        rec.entry(ID_COLUMN.into())
+                            .or_insert_with(|| Value::Text(id.clone()));
                         out.push((id, rec));
                     }
                 }
@@ -4462,7 +4665,9 @@ impl Db {
                     continue;
                 }
                 let mut record = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-                record.insert(ID_COLUMN.into(), Value::Text(id.clone()));
+                record
+                    .entry(ID_COLUMN.into())
+                    .or_insert_with(|| Value::Text(id.clone()));
                 out.push((id, record));
             }
             return Ok(out);
@@ -4483,7 +4688,9 @@ impl Db {
             if record.get(column).unwrap_or(&Value::Null) != value {
                 return Ok(true);
             }
-            record.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+            record
+                .entry(ID_COLUMN.into())
+                .or_insert_with(|| Value::Text(id.to_owned()));
             out.push((id.to_owned(), record));
             if out.len() == limit {
                 return Ok(false);
@@ -4940,6 +5147,13 @@ impl Db {
             rw.apply_to_catalog(&mut next);
             next
         };
+        let identity_high_water: BTreeMap<String, i64> = {
+            let st = shared.state.read().unwrap();
+            st.identity_high_water
+                .iter()
+                .map(|(table, value)| (rw.output_table(table), *value))
+                .collect()
+        };
         let generation = primary_generation(committed_version, &new_segments, &new_catalog);
         primary_writer.set_dump_version(generation);
         primary_writer.finish()?;
@@ -4960,6 +5174,7 @@ impl Db {
             committed_version,
             segments: new_segments.clone(),
             wal_id: cs.wal().id,
+            identity_high_water: identity_high_water.clone(),
         }
         .publish(&shared.dir)?;
 
@@ -4977,6 +5192,7 @@ impl Db {
         {
             let mut st = shared.state.write().unwrap();
             st.catalog = new_catalog;
+            st.identity_high_water = identity_high_water.into_iter().collect();
             st.index = new_primary;
             st.table_high_ids = new_high_ids;
             st.superseded_segments = if new_segment_superseded && segment_position > 0 {
@@ -5062,6 +5278,7 @@ impl Txn {
         let staged_table = &mut self.staged[table_index].1;
         if let Some(existing) = staged_table.operations.get_mut(&id) {
             existing.operation = operation;
+            existing.deleted_record = None;
         } else {
             let position = staged_table.next_position;
             staged_table.next_position = staged_table.next_position.saturating_add(1);
@@ -5070,6 +5287,7 @@ impl Txn {
                 StagedOperation {
                     position,
                     operation,
+                    deleted_record: None,
                 },
             );
         }
@@ -5079,6 +5297,10 @@ impl Txn {
 
     pub fn snapshot_version(&self) -> u64 {
         self.snapshot.version
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
     }
 
     /// Cached schema lookup: clones from the catalog once per table.
@@ -5108,8 +5330,42 @@ impl Txn {
         Ok(&self.staged[table_index].1.schema)
     }
 
+    pub(crate) fn table_schema(&mut self, table: &str) -> Result<TableSchema> {
+        Ok(self.schema(table)?.clone())
+    }
+
+    /// Execute one SQL statement against this transaction's snapshot and
+    /// staged writes. DDL and multi-table/aggregate SELECT are deliberately
+    /// excluded from the transactional SQL surface.
+    pub fn query(&mut self, sql: &str) -> Result<crate::sql::QueryOutput> {
+        crate::sql::execute_txn(self, sql)
+    }
+
+    pub fn query_params(&mut self, sql: &str, params: &[Value]) -> Result<crate::sql::QueryOutput> {
+        crate::sql::execute_txn_positional(self, sql, params)
+    }
+
+    pub fn query_named(&mut self, sql: &str, params: &Record) -> Result<crate::sql::QueryOutput> {
+        crate::sql::execute_txn_named(self, sql, params)
+    }
+
     /// Read through this transaction: staged writes first, then the snapshot.
     pub fn get(&self, table: &str, id: &str) -> Result<Option<Record>> {
+        let has_implicit_id = self
+            .staged
+            .iter()
+            .find(|(name, _)| name == table)
+            .map(|(_, staged)| staged.schema.has_implicit_id())
+            .or_else(|| {
+                self.shared
+                    .state
+                    .read()
+                    .unwrap()
+                    .catalog
+                    .table(table)
+                    .map(TableSchema::has_implicit_id)
+            })
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
         match self
             .staged
             .iter()
@@ -5120,16 +5376,46 @@ impl Txn {
             Some(None) => Ok(None),
             Some(Some(rec)) => {
                 let mut rec = rec.clone();
-                rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+                if has_implicit_id {
+                    rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+                }
                 Ok(Some(rec))
             }
             None => shared_get_at(&self.shared, table, id, self.snapshot.version),
         }
     }
 
+    /// Scan through the transaction's stable snapshot with staged writes
+    /// overlaid. This is also the view used to discover cascade targets.
+    pub fn scan(&self, table: &str) -> Result<Vec<(String, Record)>> {
+        let mut rows: BTreeMap<String, Record> =
+            shared_scan_at(&self.shared, table, self.snapshot.version)?
+                .into_iter()
+                .collect();
+        if let Some((_, staged)) = self.staged.iter().find(|(name, _)| name == table) {
+            for (id, operation) in &staged.operations {
+                match &operation.operation {
+                    Some(record) => {
+                        let mut record = record.clone();
+                        if staged.schema.has_implicit_id() {
+                            record.insert(ID_COLUMN.into(), Value::Text(id.clone()));
+                        }
+                        rows.insert(id.clone(), record);
+                    }
+                    None => {
+                        rows.remove(id);
+                    }
+                }
+            }
+        }
+        Ok(rows.into_iter().collect())
+    }
+
     pub fn insert(&mut self, table: &str, record: Record) -> Result<String> {
-        let id = match record.get(ID_COLUMN) {
-            None => {
+        let mut record = record;
+        let schema = self.table_schema(table)?;
+        let id = match (schema.has_implicit_id(), record.get(ID_COLUMN)) {
+            (false, _) | (true, None) => {
                 let mut previous = self.shared.last_generated_id.lock().unwrap();
                 let candidate = Ulid::new();
                 let next = if candidate > *previous {
@@ -5142,7 +5428,7 @@ impl Txn {
                 *previous = next;
                 next.to_string()
             }
-            Some(Value::Text(s)) if !s.is_empty() => {
+            (true, Some(Value::Text(s))) if !s.is_empty() => {
                 if let Ok(explicit) = Ulid::from_string(s) {
                     let mut previous = self.shared.last_generated_id.lock().unwrap();
                     if explicit > *previous {
@@ -5151,15 +5437,37 @@ impl Txn {
                 }
                 s.clone()
             }
-            Some(Value::Text(_)) => {
+            (true, Some(Value::Text(_))) => {
                 return Err(Error::InvalidArgument("id must not be empty".into()))
             }
-            Some(_) => return Err(Error::SchemaViolation("id must be a text value".into())),
+            (true, Some(_)) => {
+                return Err(Error::SchemaViolation("id must be a text value".into()))
+            }
         };
-        let normalized = {
-            let schema = self.schema(table)?;
-            normalize_record(schema, record)?
-        };
+        let identity_name = schema
+            .columns
+            .iter()
+            .find(|column| column.identity)
+            .map(|column| column.name.clone());
+        if let Some(identity_name) = identity_name {
+            let explicit = match record.get(&identity_name) {
+                None => None,
+                Some(Value::Int64(value)) if *value >= 1 => Some(*value),
+                Some(Value::Int64(_)) => {
+                    return Err(Error::SchemaViolation(format!(
+                        "identity column '{identity_name}' requires a positive int"
+                    )))
+                }
+                Some(_) => {
+                    return Err(Error::SchemaViolation(format!(
+                        "identity column '{identity_name}' requires an int"
+                    )))
+                }
+            };
+            let generated = reserve_identity(&self.shared, table, explicit)?;
+            record.insert(identity_name, Value::Int64(generated));
+        }
+        let normalized = normalize_record(&schema, record)?;
         let exists = match self
             .staged
             .iter()
@@ -5204,17 +5512,42 @@ impl Txn {
     }
 
     pub fn update(&mut self, table: &str, id: &str, patch: Record) -> Result<()> {
-        if patch.contains_key(ID_COLUMN) {
+        self.schema(table)?; // cache + existence check
+        let has_implicit_id = self
+            .staged
+            .iter()
+            .find(|(name, _)| name == table)
+            .expect("schema was cached above")
+            .1
+            .schema
+            .has_implicit_id();
+        if has_implicit_id && patch.contains_key(ID_COLUMN) {
             return Err(Error::InvalidArgument(
                 "the primary key cannot be updated".into(),
             ));
         }
-        self.schema(table)?; // cache + existence check
+        {
+            let st = self.shared.state.read().unwrap();
+            for schema in &st.catalog.tables {
+                for foreign_key in &schema.foreign_keys {
+                    if foreign_key.referenced_table == table
+                        && patch.contains_key(&foreign_key.referenced_column)
+                    {
+                        return Err(Error::SchemaViolation(format!(
+                            "cannot update referenced key {table}.{}; ON UPDATE is not supported",
+                            foreign_key.referenced_column
+                        )));
+                    }
+                }
+            }
+        }
         let mut current = self.get(table, id)?.ok_or_else(|| Error::RecordNotFound {
             table: table.into(),
             id: id.into(),
         })?;
-        current.remove(ID_COLUMN);
+        if has_implicit_id {
+            current.remove(ID_COLUMN);
+        }
         let schema = &self
             .staged
             .iter()
@@ -5226,6 +5559,12 @@ impl Txn {
             let col = schema
                 .column(&name)
                 .ok_or_else(|| Error::SchemaViolation(format!("unknown column '{name}'")))?;
+            if col.identity {
+                return Err(Error::InvalidArgument(format!(
+                    "identity column '{}' cannot be updated",
+                    col.name
+                )));
+            }
             check_value(col, &value)?;
             current.insert(name, value);
         }
@@ -5234,33 +5573,121 @@ impl Txn {
 
     pub fn delete(&mut self, table: &str, id: &str) -> Result<bool> {
         self.schema(table)?;
-        let exists = match self
-            .staged
-            .iter()
-            .find(|(name, _)| name == table)
-            .and_then(|(_, staged)| staged.operations.get(id))
-            .map(|staged| &staged.operation)
-        {
-            Some(Some(_)) => true,
-            Some(None) => false,
-            None => exists_at(&self.shared, table, id, self.snapshot.version),
-        };
-        if !exists {
+        let Some(current) = self.get(table, id)? else {
             return Ok(false);
-        }
+        };
         self.stage(table, id.to_owned(), None)?;
+        let staged = self
+            .staged
+            .iter_mut()
+            .find(|(name, _)| name == table)
+            .and_then(|(_, staged)| staged.operations.get_mut(id))
+            .expect("delete was just staged");
+        staged.deleted_record = Some(current);
         Ok(true)
     }
 
     /// Validate optimistically and publish all staged writes as one atomic
     /// commit. Returns the commit version, or `Error::Conflict` if any
     /// touched record changed after this transaction began.
-    pub fn commit(self) -> Result<u64> {
+    pub fn commit(mut self) -> Result<u64> {
+        self.expand_delete_cascades()?;
         commit_staged(&self.shared, self.snapshot.version, self.staged)
     }
 
     /// Discard all staged writes.
     pub fn rollback(self) {}
+
+    fn expand_delete_cascades(&mut self) -> Result<()> {
+        const MAX_CASCADE_DEPTH: usize = 64;
+        const MAX_CASCADE_ROWS: usize = 100_000;
+
+        let catalog = self.shared.state.read().unwrap().catalog.clone();
+        let mut queue = VecDeque::new();
+        let mut visited = HashSet::new();
+        for (table, staged) in &self.staged {
+            for (id, operation) in &staged.operations {
+                if operation.operation.is_none() {
+                    if let Some(record) = &operation.deleted_record {
+                        queue.push_back((table.clone(), id.clone(), record.clone(), 0usize));
+                        visited.insert((table.clone(), id.clone()));
+                    }
+                }
+            }
+        }
+
+        while let Some((parent_table, _parent_id, parent_record, depth)) = queue.pop_front() {
+            if depth >= MAX_CASCADE_DEPTH {
+                return Err(Error::SchemaViolation(format!(
+                    "ON DELETE CASCADE exceeded maximum depth {MAX_CASCADE_DEPTH}"
+                )));
+            }
+            for child_schema in &catalog.tables {
+                for foreign_key in child_schema.foreign_keys.iter().filter(|foreign_key| {
+                    foreign_key.referenced_table == parent_table
+                        && foreign_key.on_delete == ReferentialAction::Cascade
+                }) {
+                    let Some(parent_value) = parent_record.get(&foreign_key.referenced_column)
+                    else {
+                        continue;
+                    };
+                    if parent_value.is_null() {
+                        continue;
+                    }
+                    let matches: Vec<_> = self
+                        .scan(&child_schema.name)?
+                        .into_iter()
+                        .filter(|(_, record)| record.get(&foreign_key.column) == Some(parent_value))
+                        .collect();
+                    for (child_id, child_record) in matches {
+                        let key = (child_schema.name.clone(), child_id.clone());
+                        if !visited.insert(key) {
+                            continue;
+                        }
+                        if visited.len() > MAX_CASCADE_ROWS {
+                            return Err(Error::MemoryLimit(format!(
+                                "ON DELETE CASCADE exceeds {MAX_CASCADE_ROWS} rows"
+                            )));
+                        }
+                        self.schema(&child_schema.name)?;
+                        self.stage(&child_schema.name, child_id.clone(), None)?;
+                        let operation = self
+                            .staged
+                            .iter_mut()
+                            .find(|(name, _)| name == &child_schema.name)
+                            .and_then(|(_, staged)| staged.operations.get_mut(&child_id))
+                            .expect("cascade delete was just staged");
+                        operation.deleted_record = Some(child_record.clone());
+                        queue.push_back((
+                            child_schema.name.clone(),
+                            child_id,
+                            child_record,
+                            depth + 1,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn reserve_identity(shared: &Shared, table: &str, explicit: Option<i64>) -> Result<i64> {
+    let mut st = shared.state.write().unwrap();
+    let high = st.identity_high_water.entry(table.to_owned()).or_insert(0);
+    match explicit {
+        Some(value) => {
+            *high = (*high).max(value);
+            Ok(value)
+        }
+        None => {
+            let next = high.checked_add(1).ok_or_else(|| {
+                Error::SchemaViolation(format!("identity sequence for '{table}' is exhausted"))
+            })?;
+            *high = next;
+            Ok(next)
+        }
+    }
 }
 
 fn staged_operation_bytes(table: &str, id: &str, operation: &Option<Record>) -> usize {
@@ -5584,13 +6011,16 @@ fn shared_get_at(
     max_version: u64,
 ) -> Result<Option<Record>> {
     let st = shared.state.read().unwrap();
-    if st.catalog.table(table).is_none() {
-        return Err(Error::TableNotFound(table.into()));
-    }
+    let schema = st
+        .catalog
+        .table(table)
+        .ok_or_else(|| Error::TableNotFound(table.into()))?;
     match st.visible_owned(table, id, max_version)? {
         Some(entry) if !entry.is_tombstone() => {
             let mut rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-            rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+            if schema.has_implicit_id() {
+                rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+            }
             Ok(Some(rec))
         }
         _ => Ok(None),
@@ -5599,11 +6029,11 @@ fn shared_get_at(
 
 fn shared_scan_at(shared: &Shared, table: &str, max_version: u64) -> Result<Vec<(String, Record)>> {
     let st = shared.state.read().unwrap();
-    let epoch = st
+    let schema = st
         .catalog
         .table(table)
-        .ok_or_else(|| Error::TableNotFound(table.into()))?
-        .epoch;
+        .ok_or_else(|| Error::TableNotFound(table.into()))?;
+    let epoch = schema.epoch;
     let mut out = Vec::new();
     st.index.visit_table(table, None, |id, versions| {
         if let Some(entry) = versions
@@ -5613,7 +6043,9 @@ fn shared_scan_at(shared: &Shared, table: &str, max_version: u64) -> Result<Vec<
         {
             if !entry.is_tombstone() {
                 let mut rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-                rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+                if schema.has_implicit_id() {
+                    rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+                }
                 out.push((id.to_owned(), rec));
             }
         }
@@ -5630,11 +6062,11 @@ fn shared_scan_batch_at(
     limit: usize,
 ) -> Result<Vec<(String, Record)>> {
     let st = shared.state.read().unwrap();
-    let epoch = st
+    let schema = st
         .catalog
         .table(table)
-        .ok_or_else(|| Error::TableNotFound(table.into()))?
-        .epoch;
+        .ok_or_else(|| Error::TableNotFound(table.into()))?;
+    let epoch = schema.epoch;
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -5651,7 +6083,9 @@ fn shared_scan_batch_at(
             return Ok(true);
         }
         let mut rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-        rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+        if schema.has_implicit_id() {
+            rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+        }
         out.push((id.to_owned(), rec));
         if out.len() == limit {
             return Ok(false);
@@ -5659,15 +6093,6 @@ fn shared_scan_batch_at(
         Ok(true)
     })?;
     Ok(out)
-}
-
-fn exists_at(shared: &Shared, table: &str, id: &str, max_version: u64) -> bool {
-    let st = shared.state.read().unwrap();
-    st.visible_owned(table, id, max_version)
-        .ok()
-        .flatten()
-        .map(|entry| !entry.is_tombstone())
-        .unwrap_or(false)
 }
 
 /// The optimistic commit path. Serialized by the commit mutex; readers are
@@ -5738,7 +6163,7 @@ fn commit_staged(
 
     let mut lock_wait = Duration::ZERO;
     let mut locked_prepare_time = Duration::ZERO;
-    let (mut cs, previous_entries, commit_version, incoming_index_bytes) = loop {
+    let (mut cs, previous_entries, commit_version, incoming_index_bytes, identity_high_water) = loop {
         let lock_started = Instant::now();
         let mut cs = shared.commit.lock().unwrap();
         lock_wait = lock_wait.saturating_add(lock_started.elapsed());
@@ -5748,7 +6173,7 @@ fn commit_staged(
         take_background_checkpoint_error(shared)?;
         let locked_prepare_started = Instant::now();
         let mut previous_entries: Vec<Vec<Option<VersionEntry>>> = Vec::with_capacity(staged.len());
-        let (commit_version, incoming_index_bytes) = {
+        let (commit_version, incoming_index_bytes, identity_high_water) = {
             let st = shared.state.read().unwrap();
             for table in &staged {
                 if st.catalog.table(&table.name) != Some(&table.schema) {
@@ -5779,9 +6204,20 @@ fn commit_staged(
                 previous_entries.push(table_previous);
             }
             validate_unique(&st, &staged)?;
+            validate_foreign_keys(&st, &staged)?;
+            let identity_high_water: Vec<(String, i64)> = staged
+                .iter()
+                .filter(|table| table.schema.columns.iter().any(|column| column.identity))
+                .filter_map(|table| {
+                    st.identity_high_water
+                        .get(&table.name)
+                        .map(|value| (table.name.clone(), *value))
+                })
+                .collect();
             (
                 st.committed_version + 1,
                 estimate_staged_index_bytes(&st, &staged)?,
+                identity_high_water,
             )
         };
         locked_prepare_time = locked_prepare_time.saturating_add(locked_prepare_started.elapsed());
@@ -5812,7 +6248,13 @@ fn commit_staged(
                 ));
             }
         }
-        break (cs, previous_entries, commit_version, incoming_index_bytes);
+        break (
+            cs,
+            previous_entries,
+            commit_version,
+            incoming_index_bytes,
+            identity_high_water,
+        );
     };
     let prepare_time = outside_prepare_time.saturating_add(locked_prepare_time);
     // Durability point: the WAL record is the commit.
@@ -5829,7 +6271,11 @@ fn commit_staged(
             })
         })
         .collect();
-    let bytes = encode_commit(commit_version, &wal_changes);
+    let identity_wal: Vec<(&str, i64)> = identity_high_water
+        .iter()
+        .map(|(table, value)| (table.as_str(), *value))
+        .collect();
+    let bytes = encode_commit(commit_version, &wal_changes, &identity_wal);
     cs.wal().append_commit(
         &bytes,
         shared.opts.durability,
@@ -6097,6 +6543,197 @@ fn validate_unique(st: &State, staged: &[PreparedTable]) -> Result<()> {
     Ok(())
 }
 
+fn prepared_change<'a>(
+    staged: &'a [PreparedTable],
+    table: &str,
+    id: &str,
+) -> Option<&'a PreparedChange> {
+    let table = staged.iter().find(|candidate| candidate.name == table)?;
+    table
+        .changes
+        .binary_search_by(|change| change.id.as_str().cmp(id))
+        .ok()
+        .map(|index| &table.changes[index])
+}
+
+/// Read one row from the state that would exist after `staged` is applied.
+/// The commit mutex is held by the caller, so this view cannot move beneath
+/// validation.
+fn final_record(
+    st: &State,
+    staged: &[PreparedTable],
+    table: &str,
+    id: &str,
+) -> Result<Option<Record>> {
+    let schema = st
+        .catalog
+        .table(table)
+        .ok_or_else(|| Error::TableNotFound(table.into()))?;
+    if let Some(change) = prepared_change(staged, table, id) {
+        return Ok(change.operation.as_ref().map(|record| {
+            let mut record = record.clone();
+            if schema.has_implicit_id() {
+                record.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+            }
+            record
+        }));
+    }
+    match st.latest_owned(table, id)? {
+        Some(entry) if entry.version > schema.epoch && !entry.is_tombstone() => {
+            let mut record = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
+            if schema.has_implicit_id() {
+                record.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+            }
+            Ok(Some(record))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn final_ids_matching(
+    st: &State,
+    staged: &[PreparedTable],
+    table: &str,
+    column: &str,
+    value: &Value,
+) -> Result<BTreeSet<String>> {
+    let mut candidates = BTreeSet::new();
+    let schema = st
+        .catalog
+        .table(table)
+        .ok_or_else(|| Error::TableNotFound(table.into()))?;
+    if column == ID_COLUMN && schema.has_implicit_id() {
+        if let Value::Text(id) = value {
+            candidates.insert(id.clone());
+        }
+    } else if let Some(index) = st.secondary.get(&(table.to_owned(), column.to_owned())) {
+        candidates.extend(index.ids(&index_key(value))?);
+    } else {
+        // Catalog validation normally guarantees an index for every FK side.
+        // Keep the fallback for old catalogs and recovery tooling.
+        st.index.visit_table(table, None, |id, _versions| {
+            candidates.insert(id.to_owned());
+            Ok(true)
+        })?;
+    }
+    if let Some(prepared) = staged.iter().find(|candidate| candidate.name == table) {
+        candidates.extend(prepared.changes.iter().map(|change| change.id.clone()));
+    }
+    let mut matching = BTreeSet::new();
+    for id in candidates {
+        if let Some(record) = final_record(st, staged, table, &id)? {
+            if record.get(column) == Some(value) {
+                matching.insert(id);
+            }
+        }
+    }
+    Ok(matching)
+}
+
+fn validate_foreign_keys(st: &State, staged: &[PreparedTable]) -> Result<()> {
+    if !st
+        .catalog
+        .tables
+        .iter()
+        .any(|schema| !schema.foreign_keys.is_empty())
+    {
+        return Ok(());
+    }
+
+    // Every new final child value must resolve to a parent in the same final
+    // view. This permits parent+child insertion in one transaction.
+    for table in staged {
+        for change in &table.changes {
+            let Some(record) = &change.operation else {
+                continue;
+            };
+            for foreign_key in &table.schema.foreign_keys {
+                let Some(value) = record.get(&foreign_key.column) else {
+                    continue;
+                };
+                if value.is_null() {
+                    continue;
+                }
+                if final_ids_matching(
+                    st,
+                    staged,
+                    &foreign_key.referenced_table,
+                    &foreign_key.referenced_column,
+                    value,
+                )?
+                .is_empty()
+                {
+                    return Err(Error::SchemaViolation(format!(
+                        "foreign key violation: {}.{} has no matching {}.{}",
+                        table.name,
+                        foreign_key.column,
+                        foreign_key.referenced_table,
+                        foreign_key.referenced_column
+                    )));
+                }
+            }
+        }
+    }
+
+    // Removing a referenced row is legal only if the final view has no
+    // children. A CASCADE miss means a child committed after the deleting
+    // transaction's snapshot; return Conflict so the normal retry path can
+    // rescan and delete it atomically.
+    for parent in staged {
+        for change in &parent.changes {
+            if change.operation.is_some() {
+                continue;
+            }
+            let Some(previous) = st.latest_owned(&parent.name, &change.id)? else {
+                continue;
+            };
+            if previous.is_tombstone() || previous.version <= parent.schema.epoch {
+                continue;
+            }
+            let mut old_record = read_record_kind(&st.blobs, &st.readers, &previous.kind)?;
+            if parent.schema.has_implicit_id() {
+                old_record.insert(ID_COLUMN.into(), Value::Text(change.id.clone()));
+            }
+            for child_schema in &st.catalog.tables {
+                for foreign_key in child_schema
+                    .foreign_keys
+                    .iter()
+                    .filter(|foreign_key| foreign_key.referenced_table == parent.name)
+                {
+                    let Some(old_value) = old_record.get(&foreign_key.referenced_column) else {
+                        continue;
+                    };
+                    let children = final_ids_matching(
+                        st,
+                        staged,
+                        &child_schema.name,
+                        &foreign_key.column,
+                        old_value,
+                    )?;
+                    if children.is_empty() {
+                        continue;
+                    }
+                    match foreign_key.on_delete {
+                        ReferentialAction::Restrict => {
+                            return Err(Error::SchemaViolation(format!(
+                                "cannot delete {}.{}: referenced by {}.{}",
+                                parent.name, change.id, child_schema.name, foreign_key.column
+                            )))
+                        }
+                        ReferentialAction::Cascade => {
+                            return Err(Error::Conflict(format!(
+                                "cascade for {}/{} must be retried after concurrent child change",
+                                parent.name, change.id
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Apply one committed change to the in-memory state, maintaining secondary
 /// and vector indexes (which track the latest committed state only). Async
 /// vector insertions are returned as jobs for the background thread.
@@ -6305,6 +6942,7 @@ fn schedule_frozen_checkpoint(
             segments: state.segments.clone(),
             next_segment_id: state.next_segment_id,
             catalog: state.catalog.clone(),
+            identity_high_water: identity_manifest(&state),
             old_primary_runs: state.index.run_metas(),
             first_primary_run: state.index.runs.is_empty(),
             wal_id: cs.wal().id,
@@ -6601,6 +7239,7 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
         committed_version: job.version,
         segments: new_segments.clone(),
         wal_id: new_wal_id,
+        identity_high_water: job.identity_high_water.clone(),
     }
     .publish(&shared.dir)?;
 
@@ -6664,6 +7303,7 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
         next_segment_id,
         new_segment_superseded,
         catalog,
+        identity_high_water,
         old_primary_runs,
         first_primary_run,
     ) = {
@@ -6740,6 +7380,7 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
             st.next_segment_id,
             new_segment_superseded,
             st.catalog.clone(),
+            identity_manifest(&st),
             st.index.run_metas(),
             st.index.runs.is_empty(),
         )
@@ -6886,6 +7527,7 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
         committed_version,
         segments: new_segments.clone(),
         wal_id: new_wal_id,
+        identity_high_water,
     }
     .publish(&shared.dir)?;
     let _ = fs::remove_file(wal_path(&shared.dir, cs.wal().id));
@@ -8065,7 +8707,8 @@ fn find_eq_via_primary_index(
         let rec = read_record_kind(&st.blobs, &st.readers, &last.kind)?;
         if rec.get(column) == Some(value) {
             let mut rec = rec;
-            rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+            rec.entry(ID_COLUMN.into())
+                .or_insert_with(|| Value::Text(id.to_owned()));
             out.push((id.to_owned(), rec));
         }
         Ok(true)
@@ -8133,7 +8776,8 @@ fn find_eq_streaming(
             };
             if encoded_record_column_eq(payload, &predicate, &st.blobs)? {
                 let mut rec = decode_record(payload, Some(&st.blobs))?;
-                rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+                rec.entry(ID_COLUMN.into())
+                    .or_insert_with(|| Value::Text(id.to_owned()));
                 out.push((id.to_owned(), rec));
             }
         }
@@ -8211,7 +8855,8 @@ fn scan_segment_for_eq(
             let id = std::str::from_utf8(id_bytes)
                 .map_err(|_| Error::Corrupt("invalid utf8 in segment record id".into()))?;
             let mut rec = decode_record(payload, Some(&st.blobs))?;
-            rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+            rec.entry(ID_COLUMN.into())
+                .or_insert_with(|| Value::Text(id.to_owned()));
             out.push((id.to_owned(), rec));
         }
 
@@ -8337,6 +8982,25 @@ fn check_value(col: &crate::schema::Column, value: &Value) -> Result<()> {
             )));
         }
     }
+    if let Value::Text(text) = value {
+        if let Some(max_length) = col.max_length {
+            let actual = text.chars().count();
+            if actual > max_length {
+                return Err(Error::SchemaViolation(format!(
+                    "column '{}' allows at most {max_length} characters, got {actual}",
+                    col.name
+                )));
+            }
+        }
+        if let Some(values) = &col.enum_values {
+            if !values.contains(text) {
+                return Err(Error::SchemaViolation(format!(
+                    "column '{}' does not allow enum value '{text}'",
+                    col.name
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -8344,7 +9008,13 @@ fn check_value(col: &crate::schema::Column, value: &Value) -> Result<()> {
 /// place: unknown columns rejected, missing columns become Null (or error
 /// when NOT NULL). No rebuild — the caller's allocations are reused.
 fn normalize_record(schema: &TableSchema, mut record: Record) -> Result<Record> {
-    record.remove(ID_COLUMN);
+    // In the traditional schema `id` is only a transport field for the
+    // physical ULID and is not encoded in the payload.  A declared `id`
+    // (for example `id int AUTO_INCREMENT PRIMARY KEY`) is an ordinary
+    // stored column and must survive normalization.
+    if schema.has_implicit_id() {
+        record.remove(ID_COLUMN);
+    }
     for name in record.keys() {
         if schema.column(name).is_none() {
             return Err(Error::SchemaViolation(format!("unknown column '{name}'")));

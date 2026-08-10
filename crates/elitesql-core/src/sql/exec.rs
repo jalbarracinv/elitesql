@@ -23,12 +23,13 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::collate::Collation;
-use crate::db::{Db, Record, Snapshot};
+use crate::db::{Db, Record, Snapshot, Txn};
 use crate::error::{Error, Result};
 use crate::memory::MemoryPermit;
-use crate::schema::TableSchema;
+use crate::schema::{TableSchema, ID_COLUMN};
 use crate::value::{decode_value, encode_value, ColumnType, Value};
 use ulid::Ulid;
 
@@ -45,6 +46,13 @@ pub enum QueryOutput {
     },
     /// INSERT: the primary keys of the new records (generated or provided).
     Inserted { ids: Vec<String> },
+    /// INSERT into a table with an integer identity. JSON transports retain
+    /// the legacy `inserted` field and add identity metadata/lastrowid.
+    InsertedIdentity {
+        ids: Vec<String>,
+        column: String,
+        values: Vec<i64>,
+    },
     /// UPDATE/DELETE: number of records affected.
     Affected(u64),
     /// DDL statements.
@@ -146,31 +154,98 @@ impl Iterator for QueryCursor<'_> {
 }
 
 const WRITE_RETRIES: usize = 3;
+/// Executor-only carrier for the opaque physical ULID. It is never parsed as
+/// SQL, projected, or persisted; mutation plans need it when a declared `id`
+/// shadows the old public physical-id alias.
+const PHYSICAL_ROW_ID: &str = "\u{0}elitesql-row-id";
+
+fn current_timestamp_micros() -> Result<i64> {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::Sql("system clock is before Unix epoch".into()))?
+        .as_micros();
+    i64::try_from(micros).map_err(|_| Error::Sql("current timestamp is out of range".into()))
+}
 
 pub(crate) fn execute(db: &Db, sql: &str) -> Result<QueryOutput> {
     execute_positional(db, sql, &[])
 }
 
 pub(crate) fn execute_positional(db: &Db, sql: &str, params: &[Value]) -> Result<QueryOutput> {
+    let statement_timestamp = current_timestamp_micros()?;
     let mut statement = parser::parse(sql)?;
-    bind_statement(&mut statement, SuppliedParams::Positional(params))?;
-    execute_statement(db, statement)
+    bind_statement(
+        &mut statement,
+        SuppliedParams::Positional(params),
+        statement_timestamp,
+    )?;
+    execute_statement(db, statement, statement_timestamp)
 }
 
 pub(crate) fn execute_named(db: &Db, sql: &str, params: &Record) -> Result<QueryOutput> {
+    let statement_timestamp = current_timestamp_micros()?;
     let mut statement = parser::parse(sql)?;
-    bind_statement(&mut statement, SuppliedParams::Named(params))?;
-    execute_statement(db, statement)
+    bind_statement(
+        &mut statement,
+        SuppliedParams::Named(params),
+        statement_timestamp,
+    )?;
+    execute_statement(db, statement, statement_timestamp)
 }
 
-fn execute_statement(db: &Db, statement: Statement) -> Result<QueryOutput> {
+pub(crate) fn execute_txn(txn: &mut Txn, sql: &str) -> Result<QueryOutput> {
+    execute_txn_positional(txn, sql, &[])
+}
+
+pub(crate) fn execute_txn_positional(
+    txn: &mut Txn,
+    sql: &str,
+    params: &[Value],
+) -> Result<QueryOutput> {
+    let statement_timestamp = current_timestamp_micros()?;
+    let mut statement = parser::parse(sql)?;
+    bind_statement(
+        &mut statement,
+        SuppliedParams::Positional(params),
+        statement_timestamp,
+    )?;
+    execute_txn_statement(txn, statement, statement_timestamp)
+}
+
+pub(crate) fn execute_txn_named(txn: &mut Txn, sql: &str, params: &Record) -> Result<QueryOutput> {
+    let statement_timestamp = current_timestamp_micros()?;
+    let mut statement = parser::parse(sql)?;
+    bind_statement(
+        &mut statement,
+        SuppliedParams::Named(params),
+        statement_timestamp,
+    )?;
+    execute_txn_statement(txn, statement, statement_timestamp)
+}
+
+fn execute_statement(
+    db: &Db,
+    statement: Statement,
+    statement_timestamp: i64,
+) -> Result<QueryOutput> {
     match statement {
         Statement::CreateTable { name, columns } => {
             let mut cols = Vec::with_capacity(columns.len());
+            let mut foreign_keys = Vec::new();
             for c in columns {
+                if c.name == ID_COLUMN && c.ty == ColumnType::Text && c.primary_key {
+                    // `id text PRIMARY KEY` merely exposes the physical key
+                    // that every table already owns; it is not stored twice.
+                    continue;
+                }
+                if let Some(foreign_key) = &c.foreign_key {
+                    foreign_keys.push(foreign_key.clone());
+                }
                 cols.push(column_def_to_column(c)?);
             }
-            db.create_table(TableSchema::new(name, cols))?;
+            let mut schema = TableSchema::new(name, cols);
+            schema.foreign_keys = foreign_keys;
+            db.create_table(schema)?;
             Ok(QueryOutput::None)
         }
         Statement::CreateIndex {
@@ -200,6 +275,12 @@ fn execute_statement(db: &Db, statement: Statement) -> Result<QueryOutput> {
             Ok(QueryOutput::None)
         }
         Statement::AddColumn { table, column } => {
+            if column.foreign_key.is_some() {
+                return Err(Error::Sql(
+                    "ALTER TABLE ADD COLUMN REFERENCES is not supported yet; declare the foreign key in CREATE TABLE"
+                        .into(),
+                ));
+            }
             db.add_column(&table, column_def_to_column(column)?)?;
             Ok(QueryOutput::None)
         }
@@ -226,7 +307,17 @@ fn execute_statement(db: &Db, statement: Statement) -> Result<QueryOutput> {
             table,
             columns,
             rows,
-        } => exec_insert(db, &table, &columns, &rows),
+            returning,
+            ignore_unique,
+        } => exec_insert(
+            db,
+            &table,
+            &columns,
+            &rows,
+            &returning,
+            statement_timestamp,
+            ignore_unique,
+        ),
         Statement::Select(stmt) => exec_select(db, &stmt),
         Statement::Explain(stmt) => explain_select(db, &stmt),
         Statement::Update {
@@ -238,6 +329,52 @@ fn execute_statement(db: &Db, statement: Statement) -> Result<QueryOutput> {
             table,
             where_clause,
         } => exec_delete(db, &table, where_clause.as_ref()),
+    }
+}
+
+fn execute_txn_statement(
+    txn: &mut Txn,
+    statement: Statement,
+    statement_timestamp: i64,
+) -> Result<QueryOutput> {
+    match statement {
+        Statement::Insert {
+            table,
+            columns,
+            rows,
+            returning,
+            ignore_unique,
+        } => {
+            if ignore_unique {
+                return Err(Error::Sql(
+                    "ON CONFLICT DO NOTHING is currently autocommit-only".into(),
+                ));
+            }
+            exec_insert_txn(
+                txn,
+                &table,
+                &columns,
+                &rows,
+                &returning,
+                statement_timestamp,
+            )
+        }
+        Statement::Update {
+            table,
+            sets,
+            where_clause,
+        } => exec_update_txn(txn, &table, &sets, where_clause.as_ref()),
+        Statement::Delete {
+            table,
+            where_clause,
+        } => exec_delete_txn(txn, &table, where_clause.as_ref()),
+        Statement::Select(statement) => exec_select_txn(txn, &statement),
+        Statement::Explain(_) => Err(Error::Sql(
+            "EXPLAIN is not available inside a transaction".into(),
+        )),
+        _ => Err(Error::Sql(
+            "DDL is not allowed inside a transaction; create the schema before BEGIN".into(),
+        )),
     }
 }
 
@@ -267,8 +404,9 @@ fn execute_cursor_with<'db>(
     params: SuppliedParams<'_>,
 ) -> Result<QueryCursor<'db>> {
     let memory_permit = db.acquire_query_memory();
+    let statement_timestamp = current_timestamp_micros()?;
     let mut statement = parser::parse(sql)?;
-    bind_statement(&mut statement, params)?;
+    bind_statement(&mut statement, params, statement_timestamp)?;
     let Statement::Select(stmt) = statement else {
         return Err(Error::Sql(
             "query_cursor requires a SELECT statement".into(),
@@ -343,18 +481,26 @@ struct Binder<'a> {
     supplied: SuppliedParams<'a>,
     positional_index: usize,
     named_used: HashSet<String>,
+    statement_timestamp: i64,
 }
 
-fn bind_statement(statement: &mut Statement, supplied: SuppliedParams<'_>) -> Result<()> {
+fn bind_statement(
+    statement: &mut Statement,
+    supplied: SuppliedParams<'_>,
+    statement_timestamp: i64,
+) -> Result<()> {
     let mut binder = Binder {
         supplied,
         positional_index: 0,
         named_used: HashSet::new(),
+        statement_timestamp,
     };
     match statement {
         Statement::CreateTable { columns, .. } => {
             for column in columns {
-                binder.bind_optional_literal(&mut column.default)?;
+                if !matches!(column.default, Some(Literal::CurrentTimestamp)) {
+                    binder.bind_optional_literal(&mut column.default)?;
+                }
             }
         }
         Statement::Insert { rows, .. } => {
@@ -373,14 +519,19 @@ fn bind_statement(statement: &mut Statement, supplied: SuppliedParams<'_>) -> Re
         Statement::Update {
             sets, where_clause, ..
         } => {
-            for (_, literal) in sets {
-                binder.bind_literal(literal)?;
+            for (_, value) in sets {
+                match value {
+                    SetValue::Literal(literal) => binder.bind_literal(literal)?,
+                    SetValue::Arithmetic { right, .. } => binder.bind_literal(right)?,
+                }
             }
             binder.bind_optional_expr(where_clause)?;
         }
         Statement::Delete { where_clause, .. } => binder.bind_optional_expr(where_clause)?,
         Statement::AddColumn { column, .. } => {
-            binder.bind_optional_literal(&mut column.default)?;
+            if !matches!(column.default, Some(Literal::CurrentTimestamp)) {
+                binder.bind_optional_literal(&mut column.default)?;
+            }
         }
         Statement::CreateIndex { .. }
         | Statement::DropTable { .. }
@@ -431,6 +582,7 @@ impl Binder<'_> {
                 let name = name.clone();
                 Some(self.take_named(&name)?)
             }
+            Literal::CurrentTimestamp => Some(Value::Timestamp(self.statement_timestamp)),
             _ => None,
         };
         if let Some(value) = value {
@@ -546,19 +698,34 @@ fn limit_to_usize(limit: Option<&LimitValue>) -> Option<usize> {
 /// Turn a parsed column definition into a schema column, coercing a DEFAULT
 /// literal to the column's type so the catalog stores a typed value.
 fn column_def_to_column(c: ColumnDef) -> Result<crate::schema::Column> {
-    let mut col = match c.dim {
-        Some(dim) => crate::schema::Column::vector(c.name.clone(), dim),
-        None => crate::schema::Column::new(c.name.clone(), c.ty),
+    let mut col = match (&c.enum_values, c.max_length, c.dim) {
+        (Some(values), _, _) => crate::schema::Column::enumeration(c.name.clone(), values.clone()),
+        (None, Some(max_length), _) => crate::schema::Column::varchar(c.name.clone(), max_length),
+        (None, None, Some(dim)) => crate::schema::Column::vector(c.name.clone(), dim),
+        (None, None, None) => crate::schema::Column::new(c.name.clone(), c.ty),
     };
     if c.not_null {
         col = col.not_null();
     }
     if let Some(lit) = &c.default {
-        let value = match lit {
-            Literal::Null => Value::Null,
-            other => literal_to_value(other, c.ty, &c.name)?,
-        };
-        col = col.with_default(&value);
+        if matches!(lit, Literal::CurrentTimestamp) {
+            if c.ty != ColumnType::Timestamp {
+                return Err(Error::Sql(format!(
+                    "CURRENT_TIMESTAMP default on '{}' requires a timestamp column",
+                    c.name
+                )));
+            }
+            col = col.with_current_timestamp_default();
+        } else {
+            let value = match lit {
+                Literal::Null => Value::Null,
+                other => literal_to_value(other, c.ty, &c.name)?,
+            };
+            col = col.with_default(&value);
+        }
+    }
+    if c.identity {
+        col = col.identity();
     }
     Ok(col)
 }
@@ -617,7 +784,13 @@ fn literal_to_value(lit: &Literal, ty: ColumnType, col: &str) -> Result<Value> {
             Value::Time(*n)
         }
         (Literal::Blob(b), ColumnType::Blob) => Value::Blob(b.clone()),
-        (Literal::PositionalParam | Literal::NamedParam(_) | Literal::Bound(_), _) => {
+        (
+            Literal::PositionalParam
+            | Literal::NamedParam(_)
+            | Literal::Bound(_)
+            | Literal::CurrentTimestamp,
+            _,
+        ) => {
             unreachable!("parameters are bound before execution")
         }
         _ => {
@@ -686,7 +859,7 @@ fn literal_to_plain_value(lit: &Literal) -> Value {
         Literal::Str(s) => Value::Text(s.clone()),
         Literal::Blob(b) => Value::Blob(b.clone()),
         Literal::Bound(value) => value.clone(),
-        Literal::PositionalParam | Literal::NamedParam(_) => {
+        Literal::PositionalParam | Literal::NamedParam(_) | Literal::CurrentTimestamp => {
             unreachable!("parameters are bound before expression resolution")
         }
     }
@@ -849,7 +1022,7 @@ fn resolve_col(tables: &[TableCtx], cref: &ColumnRef) -> Result<(usize, String)>
 }
 
 fn has_col(schema: &TableSchema, name: &str) -> bool {
-    name == "id" || schema.column(name).is_some()
+    schema.column(name).is_some() || (name == ID_COLUMN && schema.has_implicit_id())
 }
 
 fn check_col(schema: &TableSchema, name: &str) -> Result<()> {
@@ -1150,6 +1323,7 @@ fn fetch_table(db: &Db, ctx: &TableCtx, ti: usize, conjuncts: &[RExpr]) -> Resul
         TableDriver::Id(id) => db
             .get_unbudgeted(&ctx.schema.name, &id)?
             .into_iter()
+            .map(|record| (id.clone(), record))
             .collect(),
         // find_eq selects a secondary index when one exists and otherwise uses
         // the segment-streaming equality scan. Either path narrows the rows
@@ -1157,23 +1331,28 @@ fn fetch_table(db: &Db, ctx: &TableCtx, ti: usize, conjuncts: &[RExpr]) -> Resul
         TableDriver::Equality(column, key) => db
             .find_eq_unbudgeted(&ctx.schema.name, &column, &key)?
             .into_iter()
-            .map(|(_, r)| r)
             .collect(),
-        TableDriver::Scan => db
-            .scan_unbudgeted(&ctx.schema.name)?
-            .into_iter()
-            .map(|(_, r)| r)
-            .collect(),
+        TableDriver::Scan => db.scan_unbudgeted(&ctx.schema.name)?.into_iter().collect(),
     };
     // Apply every conjunct (re-checking the driving one is harmless).
     let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
+    for (id, mut r) in rows {
+        r.insert(PHYSICAL_ROW_ID.into(), Value::Text(id));
         let row: ExecRow = single_row(ti, r);
         if eval_all(&row, conjuncts)? {
             out.push(take_single(row, ti));
         }
     }
     Ok(out)
+}
+
+fn physical_row_id(record: &Record) -> Result<&str> {
+    match record.get(PHYSICAL_ROW_ID) {
+        Some(Value::Text(id)) => Ok(id),
+        _ => Err(Error::Corrupt(
+            "executor row is missing its physical id".into(),
+        )),
+    }
 }
 
 fn single_row(ti: usize, rec: Record) -> ExecRow {
@@ -1653,6 +1832,16 @@ impl SpillFrameReader {
 
 type ProjectionPlan = (Vec<String>, Vec<(usize, String)>);
 
+fn implicit_id_and_declared_columns(schema: &TableSchema) -> Vec<String> {
+    let mut columns =
+        Vec::with_capacity(schema.columns.len() + usize::from(schema.has_implicit_id()));
+    if schema.has_implicit_id() {
+        columns.push(ID_COLUMN.to_owned());
+    }
+    columns.extend(schema.columns.iter().map(|column| column.name.clone()));
+    columns
+}
+
 fn projection_plan(tables: &[TableCtx], projection: &[SelectItem]) -> Result<ProjectionPlan> {
     let single = tables.len() == 1;
     let mut columns = Vec::new();
@@ -1666,8 +1855,10 @@ fn projection_plan(tables: &[TableCtx], projection: &[SelectItem]) -> Result<Pro
                     } else {
                         format!("{}.", table.label)
                     };
-                    columns.push(format!("{prefix}id"));
-                    extract.push((ti, "id".into()));
+                    if table.schema.has_implicit_id() {
+                        columns.push(format!("{prefix}id"));
+                        extract.push((ti, "id".into()));
+                    }
                     for column in &table.schema.columns {
                         columns.push(format!("{prefix}{}", column.name));
                         extract.push((ti, column.name.clone()));
@@ -1739,7 +1930,7 @@ fn table_driver_at(
         if value.is_null() {
             return (TableDriver::Empty, Some(position));
         }
-        if column == "id" {
+        if column == ID_COLUMN && table.schema.has_implicit_id() {
             return match value {
                 Value::Text(id) => (TableDriver::Id(id.clone()), Some(position)),
                 _ => (TableDriver::Empty, Some(position)),
@@ -1759,7 +1950,7 @@ fn has_secondary_index(table: &TableCtx, column: &str) -> bool {
 
 /// True when `column` on `table` can be probed directly instead of scanned.
 fn column_is_probeable(table: &TableCtx, column: &str) -> bool {
-    column == "id" || has_secondary_index(table, column)
+    (column == ID_COLUMN && table.schema.has_implicit_id()) || has_secondary_index(table, column)
 }
 
 /// The join-strategy decision, shared by the executor and `EXPLAIN`.
@@ -2053,7 +2244,7 @@ fn exec_single_indexed_join_select(
             loop {
                 let matches = if key.is_null() {
                     Vec::new()
-                } else if fresh.1 == "id" {
+                } else if fresh.1 == ID_COLUMN && tables[1].schema.has_implicit_id() {
                     if right_cursor.is_some() {
                         Vec::new()
                     } else if let Value::Text(id) = &key {
@@ -2114,7 +2305,7 @@ fn exec_single_indexed_join_select(
                         }
                     }
                 }
-                if complete || fresh.1 == "id" {
+                if complete || (fresh.1 == ID_COLUMN && tables[1].schema.has_implicit_id()) {
                     break;
                 }
             }
@@ -2558,7 +2749,7 @@ fn explain_join_tree(
     }
     explain_join_tree(plan, depth + 1, stmt, tables, pushdown, index, streamed)?;
     if index_loop {
-        let probe = if fresh.1 == "id" {
+        let probe = if fresh.1 == ID_COLUMN && tables[new_ti].schema.has_implicit_id() {
             format!(
                 "POINT LOOKUP {}.id = {}",
                 tables[new_ti].label,
@@ -2712,10 +2903,12 @@ fn explain_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
 struct AggSpec {
     func: AggFunc,
     arg: Option<(usize, String)>,
+    distinct: bool,
 }
 
 enum AggState {
     Count(u64),
+    CountDistinct(HashSet<Vec<u8>>),
     Sum {
         ints: i128,
         floats: f64,
@@ -2733,8 +2926,9 @@ enum AggState {
 }
 
 impl AggState {
-    fn new(func: AggFunc) -> AggState {
-        match func {
+    fn new(spec: &AggSpec) -> AggState {
+        match spec.func {
+            AggFunc::Count if spec.distinct => AggState::CountDistinct(HashSet::new()),
             AggFunc::Count => AggState::Count(0),
             AggFunc::Sum => AggState::Sum {
                 ints: 0,
@@ -2776,6 +2970,13 @@ impl AggState {
                     }
                 }
             },
+            AggState::CountDistinct(values) => {
+                if !value.is_null() {
+                    let mut encoded = Vec::new();
+                    encode_value(&mut encoded, value);
+                    values.insert(encoded);
+                }
+            }
             AggState::Sum {
                 ints,
                 floats,
@@ -2832,6 +3033,7 @@ impl AggState {
     fn finish(self) -> Result<Value> {
         Ok(match self {
             AggState::Count(n) => Value::Int64(n as i64),
+            AggState::CountDistinct(values) => Value::Int64(values.len() as i64),
             AggState::Sum {
                 ints,
                 floats,
@@ -2872,7 +3074,7 @@ fn agg_index(aggs: &mut Vec<AggSpec>, spec: AggSpec) -> usize {
 }
 
 fn col_type(tables: &[TableCtx], ti: usize, col: &str) -> ColumnType {
-    if col == "id" {
+    if col == ID_COLUMN && tables[ti].schema.has_implicit_id() {
         ColumnType::Text
     } else {
         tables[ti].schema.column(col).expect("resolved").ty
@@ -2954,7 +3156,11 @@ fn resolve_having_operand(
             RVal::Col(rc.0, rc.1)
         }
         Operand::Lit(l) => RVal::Val(literal_to_plain_value(l)),
-        Operand::Agg { func, arg } => {
+        Operand::Agg {
+            func,
+            arg,
+            distinct,
+        } => {
             let arg_r = match arg {
                 Some(c) => Some(resolve_col(tables, c)?),
                 None => None,
@@ -2965,6 +3171,7 @@ fn resolve_having_operand(
                 AggSpec {
                     func: *func,
                     arg: arg_r,
+                    distinct: *distinct,
                 },
             ))
         }
@@ -3018,13 +3225,21 @@ fn aggregate_plan(tables: &[TableCtx], stmt: &SelectStmt) -> Result<AggregatePla
                 headers.push(alias.clone().unwrap_or_else(|| resolved.1.clone()));
                 out_cols.push(OutCol::Group(group_index));
             }
-            SelectItem::Aggregate { func, arg, alias } => {
+            SelectItem::Aggregate {
+                func,
+                arg,
+                distinct,
+                alias,
+            } => {
                 let argument = match arg {
                     Some(column) => Some(resolve_col(tables, column)?),
                     None => None,
                 };
                 validate_agg(tables, *func, &argument)?;
                 let default = match &argument {
+                    Some((_, name)) if *distinct => {
+                        format!("{}(distinct {name})", func.name())
+                    }
                     Some((_, name)) => format!("{}({name})", func.name()),
                     None => format!("{}(*)", func.name()),
                 };
@@ -3033,6 +3248,7 @@ fn aggregate_plan(tables: &[TableCtx], stmt: &SelectStmt) -> Result<AggregatePla
                     AggSpec {
                         func: *func,
                         arg: argument,
+                        distinct: *distinct,
                     },
                 );
                 headers.push(alias.clone().unwrap_or(default));
@@ -3162,21 +3378,66 @@ fn exec_single_table_aggregate(
         output_specs,
         limit.map(|value| offset.saturating_add(value)),
     )?;
-    let new_states = || {
-        specs
-            .iter()
-            .map(|spec| AggState::new(spec.func))
-            .collect::<Vec<_>>()
-    };
+    let new_states = || specs.iter().map(AggState::new).collect::<Vec<_>>();
 
     if group_cols.is_empty() {
         let mut states = new_states();
-        visit_single_table_rows(db, &tables[0], pushed, residual, |row| {
+        if specs.iter().any(|spec| spec.distinct) {
+            // Global COUNT(DISTINCT) is externally sorted, so cardinality is
+            // bounded by the query spill budget instead of a RAM hash set.
+            let mut distinct_sorter = SpillSorter::new(db, vec![SortSpec::ascending()], None)?;
+            let mut sequence = 0u64;
+            visit_single_table_rows(db, &tables[0], pushed, residual, |row| {
+                for (index, spec) in specs.iter().enumerate() {
+                    if spec.distinct {
+                        let (table_index, column) =
+                            spec.arg.as_ref().expect("DISTINCT has an argument");
+                        let value = col_value(row, *table_index, column);
+                        if value.is_null() {
+                            continue;
+                        }
+                        let mut key = (index as u64).to_be_bytes().to_vec();
+                        encode_value(&mut key, &value);
+                        distinct_sorter.push(SortedOutputRow {
+                            keys: vec![Value::Blob(key.clone())],
+                            values: vec![Value::Int64(index as i64)],
+                            sequence,
+                        })?;
+                        sequence = sequence.saturating_add(1);
+                    } else {
+                        states[index].update(spec, row)?;
+                    }
+                }
+                Ok(())
+            })?;
+            let mut previous: Option<Vec<u8>> = None;
+            let mut counts = vec![0u64; specs.len()];
+            distinct_sorter.for_each_sorted(0, None, |row| {
+                let Value::Blob(key) = &row.keys[0] else {
+                    return Err(Error::Corrupt("invalid DISTINCT spill key".into()));
+                };
+                if previous.as_ref() != Some(key) {
+                    let Value::Int64(index) = row.values[0] else {
+                        return Err(Error::Corrupt("invalid DISTINCT aggregate index".into()));
+                    };
+                    counts[index as usize] = counts[index as usize].saturating_add(1);
+                    previous = Some(key.clone());
+                }
+                Ok(())
+            })?;
             for (index, spec) in specs.iter().enumerate() {
-                states[index].update(spec, row)?;
+                if spec.distinct {
+                    states[index] = AggState::Count(counts[index]);
+                }
             }
-            Ok(())
-        })?;
+        } else {
+            visit_single_table_rows(db, &tables[0], pushed, residual, |row| {
+                for (index, spec) in specs.iter().enumerate() {
+                    states[index].update(spec, row)?;
+                }
+                Ok(())
+            })?;
+        }
         queue_aggregate_group(
             &mut output_sorter,
             &group_cols,
@@ -3290,9 +3551,8 @@ fn exec_aggregate(
     } = aggregate_plan(tables, stmt)?;
 
     // Group in first-seen order.
-    let new_states = |specs: &[AggSpec]| -> Vec<AggState> {
-        specs.iter().map(|s| AggState::new(s.func)).collect()
-    };
+    let new_states =
+        |specs: &[AggSpec]| -> Vec<AggState> { specs.iter().map(AggState::new).collect() };
     let mut order: Vec<Vec<u8>> = Vec::new();
     let mut groups: HashMap<Vec<u8>, (Vec<Value>, Vec<AggState>)> = HashMap::new();
     if group_cols.is_empty() {
@@ -3781,7 +4041,7 @@ fn exec_join(
             let key = col_value(row, existing.0, &existing.1);
             let matches: Vec<Record> = if key.is_null() {
                 Vec::new()
-            } else if new_col == "id" {
+            } else if new_col == ID_COLUMN && new_table.schema.has_implicit_id() {
                 match &key {
                     Value::Text(id) => db
                         .get_unbudgeted(&new_table.schema.name, id)?
@@ -3829,15 +4089,106 @@ fn exec_insert(
     table: &str,
     columns: &[String],
     rows: &[Vec<Literal>],
+    returning: &[String],
+    statement_timestamp: i64,
+    ignore_unique: bool,
+) -> Result<QueryOutput> {
+    if ignore_unique {
+        return exec_insert_ignore_unique(db, table, columns, rows, returning, statement_timestamp);
+    }
+    let mut txn = db.begin();
+    let output = exec_insert_txn(
+        &mut txn,
+        table,
+        columns,
+        rows,
+        returning,
+        statement_timestamp,
+    )?;
+    txn.commit()?;
+    Ok(output)
+}
+
+fn exec_insert_ignore_unique(
+    db: &Db,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Literal>],
+    returning: &[String],
+    statement_timestamp: i64,
 ) -> Result<QueryOutput> {
     let schema = db
         .table_schema(table)
         .ok_or_else(|| Error::TableNotFound(table.into()))?;
+    let returning_columns = if returning.len() == 1 && returning[0] == "*" {
+        implicit_id_and_declared_columns(&schema)
+    } else {
+        returning.to_vec()
+    };
+    let identity_column = schema
+        .columns
+        .iter()
+        .find(|column| column.identity)
+        .map(|column| column.name.clone());
+    let mut ids = Vec::new();
+    let mut identity_values = Vec::new();
+    let mut returned_rows = Vec::new();
+    for row in rows {
+        match exec_insert(
+            db,
+            table,
+            columns,
+            std::slice::from_ref(row),
+            returning,
+            statement_timestamp,
+            false,
+        ) {
+            Ok(QueryOutput::Inserted { ids: inserted }) => ids.extend(inserted),
+            Ok(QueryOutput::InsertedIdentity {
+                ids: inserted,
+                values,
+                ..
+            }) => {
+                ids.extend(inserted);
+                identity_values.extend(values);
+            }
+            Ok(QueryOutput::Rows { rows, .. }) => returned_rows.extend(rows),
+            Ok(other) => unreachable!("INSERT returned {other:?}"),
+            Err(Error::UniqueViolation { .. } | Error::DuplicateId { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if !returning_columns.is_empty() {
+        Ok(QueryOutput::Rows {
+            columns: returning_columns,
+            rows: returned_rows,
+        })
+    } else if let Some(column) = identity_column {
+        Ok(QueryOutput::InsertedIdentity {
+            ids,
+            column,
+            values: identity_values,
+        })
+    } else {
+        Ok(QueryOutput::Inserted { ids })
+    }
+}
+
+fn exec_insert_txn(
+    txn: &mut Txn,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Literal>],
+    returning: &[String],
+    statement_timestamp: i64,
+) -> Result<QueryOutput> {
+    let schema = txn.table_schema(table)?;
     let inferred_columns;
     let columns = if columns.is_empty() {
         inferred_columns = schema
             .columns
             .iter()
+            .filter(|column| !column.identity)
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
         inferred_columns.as_slice()
@@ -3845,7 +4196,7 @@ fn exec_insert(
         columns
     };
     for (i, c) in columns.iter().enumerate() {
-        if c != "id" && schema.column(c).is_none() {
+        if !has_col(&schema, c) {
             return Err(Error::Sql(format!(
                 "unknown column '{c}' in table '{table}'"
             )));
@@ -3854,8 +4205,26 @@ fn exec_insert(
             return Err(Error::Sql(format!("column '{c}' listed twice")));
         }
     }
-    let mut txn = db.begin();
+    let returning_columns = if returning.len() == 1 && returning[0] == "*" {
+        implicit_id_and_declared_columns(&schema)
+    } else {
+        returning.to_vec()
+    };
+    for column in &returning_columns {
+        if !has_col(&schema, column) {
+            return Err(Error::Sql(format!(
+                "unknown RETURNING column '{column}' in table '{table}'"
+            )));
+        }
+    }
     let mut ids = Vec::with_capacity(rows.len());
+    let mut returned_rows = Vec::with_capacity(rows.len());
+    let identity_column = schema
+        .columns
+        .iter()
+        .find(|column| column.identity)
+        .map(|column| column.name.clone());
+    let mut identity_values = Vec::with_capacity(rows.len());
     for lits in rows {
         if lits.len() != columns.len() {
             return Err(Error::Sql(format!(
@@ -3866,7 +4235,7 @@ fn exec_insert(
         }
         let mut rec = Record::new();
         for (c, lit) in columns.iter().zip(lits) {
-            let v = if c == "id" {
+            let v = if c == ID_COLUMN && schema.has_implicit_id() {
                 match lit {
                     Literal::Str(s) => Value::Text(s.clone()),
                     Literal::Bound(Value::Text(s)) => Value::Text(s.clone()),
@@ -3878,31 +4247,95 @@ fn exec_insert(
             };
             rec.insert(c.clone(), v);
         }
-        ids.push(txn.insert(table, rec)?);
+        for column in &schema.columns {
+            if column.default_current_timestamp && !rec.contains_key(&column.name) {
+                rec.insert(column.name.clone(), Value::Timestamp(statement_timestamp));
+            }
+        }
+        let id = txn.insert(table, rec)?;
+        if !returning_columns.is_empty() || identity_column.is_some() {
+            let inserted = txn
+                .get(table, &id)?
+                .expect("a staged insert is visible to its transaction");
+            if let Some(identity_column) = &identity_column {
+                let Value::Int64(value) = inserted[identity_column] else {
+                    unreachable!("identity normalization always writes an int")
+                };
+                identity_values.push(value);
+            }
+            if !returning_columns.is_empty() {
+                returned_rows.push(
+                    returning_columns
+                        .iter()
+                        .map(|column| inserted[column].clone())
+                        .collect(),
+                );
+            }
+        }
+        ids.push(id);
     }
-    txn.commit()?;
-    Ok(QueryOutput::Inserted { ids })
+    if returning_columns.is_empty() {
+        match identity_column {
+            Some(column) => Ok(QueryOutput::InsertedIdentity {
+                ids,
+                column,
+                values: identity_values,
+            }),
+            None => Ok(QueryOutput::Inserted { ids }),
+        }
+    } else {
+        Ok(QueryOutput::Rows {
+            columns: returning_columns,
+            rows: returned_rows,
+        })
+    }
 }
 
 fn exec_update(
     db: &Db,
     table: &str,
-    sets: &[(String, Literal)],
+    sets: &[(String, SetValue)],
     where_clause: Option<&Expr>,
 ) -> Result<QueryOutput> {
     let schema = db
         .table_schema(table)
         .ok_or_else(|| Error::TableNotFound(table.into()))?;
-    let mut patch = Record::new();
-    for (col, lit) in sets {
-        if col == "id" {
+    for (col, value) in sets {
+        if col == ID_COLUMN && schema.has_implicit_id() {
             return Err(Error::Sql("the primary key cannot be updated".into()));
         }
-        let ty = schema
+        let target = schema
             .column(col)
-            .ok_or_else(|| Error::Sql(format!("unknown column '{col}' in table '{table}'")))?
-            .ty;
-        patch.insert(col.clone(), literal_to_value(lit, ty, col)?);
+            .ok_or_else(|| Error::Sql(format!("unknown column '{col}' in table '{table}'")))?;
+        if target.identity {
+            return Err(Error::InvalidArgument(format!(
+                "identity column '{}' cannot be updated",
+                target.name
+            )));
+        }
+        match value {
+            SetValue::Literal(literal) => {
+                literal_to_value(literal, target.ty, col)?;
+            }
+            SetValue::Arithmetic {
+                column,
+                op: _,
+                right,
+            } => {
+                if column != col {
+                    return Err(Error::Sql(format!(
+                        "SET arithmetic must update a column from itself: use {col} = {col} <op> value"
+                    )));
+                }
+                if !matches!(target.ty, ColumnType::Int64 | ColumnType::Float64) {
+                    return Err(Error::Sql(format!(
+                        "arithmetic requires a numeric column; '{col}' is {}",
+                        target.ty
+                    )));
+                }
+                literal_to_value(right, target.ty, col)?;
+            }
+        }
     }
     let tables = [TableCtx {
         schema,
@@ -3916,10 +4349,23 @@ fn exec_update(
         let mut txn = db.begin();
         let mut count = 0u64;
         for rec in &matching {
-            let Some(Value::Text(id)) = rec.get("id") else {
-                continue;
-            };
-            match txn.update(table, id, patch.clone()) {
+            let id = physical_row_id(rec)?;
+            let mut patch = Record::new();
+            for (column, set) in sets {
+                let target = tables[0].schema.column(column).expect("validated above");
+                let value = match set {
+                    SetValue::Literal(literal) => literal_to_value(literal, target.ty, column)?,
+                    SetValue::Arithmetic { op, right, .. } => {
+                        let left = rec.get(column).ok_or_else(|| {
+                            Error::Corrupt(format!("record is missing declared column '{column}'"))
+                        })?;
+                        let right = literal_to_value(right, target.ty, column)?;
+                        arithmetic_value(left, &right, *op, column)?
+                    }
+                };
+                patch.insert(column.clone(), value);
+            }
+            match txn.update(table, id, patch) {
                 Ok(()) => count += 1,
                 Err(Error::RecordNotFound { .. }) => {} // deleted concurrently
                 Err(e) => return Err(e),
@@ -3932,6 +4378,270 @@ fn exec_update(
         }
     }
     Err(last_err.expect("retries ran"))
+}
+
+fn arithmetic_value(left: &Value, right: &Value, op: ArithmeticOp, column: &str) -> Result<Value> {
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+    match (left, right) {
+        (Value::Int64(left), Value::Int64(right)) => {
+            let value = match op {
+                ArithmeticOp::Add => left.checked_add(*right),
+                ArithmeticOp::Subtract => left.checked_sub(*right),
+                ArithmeticOp::Multiply => left.checked_mul(*right),
+                ArithmeticOp::Divide if *right == 0 => {
+                    return Err(Error::Sql(format!(
+                        "division by zero while updating '{column}'"
+                    )))
+                }
+                ArithmeticOp::Divide => left.checked_div(*right),
+            }
+            .ok_or_else(|| Error::Sql(format!("int64 overflow while updating '{column}'")))?;
+            Ok(Value::Int64(value))
+        }
+        (Value::Float64(left), Value::Float64(right)) => {
+            if matches!(op, ArithmeticOp::Divide) && *right == 0.0 {
+                return Err(Error::Sql(format!(
+                    "division by zero while updating '{column}'"
+                )));
+            }
+            let value = match op {
+                ArithmeticOp::Add => left + right,
+                ArithmeticOp::Subtract => left - right,
+                ArithmeticOp::Multiply => left * right,
+                ArithmeticOp::Divide => left / right,
+            };
+            if !value.is_finite() {
+                return Err(Error::Sql(format!(
+                    "float64 overflow while updating '{column}'"
+                )));
+            }
+            Ok(Value::Float64(value))
+        }
+        _ => Err(Error::Sql(format!(
+            "arithmetic requires matching numeric values for '{column}'"
+        ))),
+    }
+}
+
+fn validate_txn_sets(schema: &TableSchema, table: &str, sets: &[(String, SetValue)]) -> Result<()> {
+    for (column, set) in sets {
+        if column == ID_COLUMN && schema.has_implicit_id() {
+            return Err(Error::Sql("the primary key cannot be updated".into()));
+        }
+        let target = schema
+            .column(column)
+            .ok_or_else(|| Error::Sql(format!("unknown column '{column}' in table '{table}'")))?;
+        if target.identity {
+            return Err(Error::InvalidArgument(format!(
+                "identity column '{}' cannot be updated",
+                target.name
+            )));
+        }
+        match set {
+            SetValue::Literal(literal) => {
+                literal_to_value(literal, target.ty, column)?;
+            }
+            SetValue::Arithmetic {
+                column: source,
+                right,
+                ..
+            } => {
+                if source != column {
+                    return Err(Error::Sql(format!(
+                        "SET arithmetic must update a column from itself: use {column} = {column} <op> value"
+                    )));
+                }
+                if !matches!(target.ty, ColumnType::Int64 | ColumnType::Float64) {
+                    return Err(Error::Sql(format!(
+                        "arithmetic requires a numeric column; '{column}' is {}",
+                        target.ty
+                    )));
+                }
+                literal_to_value(right, target.ty, column)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn exec_update_txn(
+    txn: &mut Txn,
+    table: &str,
+    sets: &[(String, SetValue)],
+    where_clause: Option<&Expr>,
+) -> Result<QueryOutput> {
+    let schema = txn.table_schema(table)?;
+    validate_txn_sets(&schema, table, sets)?;
+    let tables = [TableCtx {
+        schema,
+        label: table.to_owned(),
+    }];
+    let predicates = resolve_where(&tables, where_clause)?;
+    let matching: Vec<Record> = txn
+        .scan(table)?
+        .into_iter()
+        .map(|(_, record)| record)
+        .filter_map(|record| {
+            let row = vec![Some(record.clone())];
+            match eval_all(&row, &predicates) {
+                Ok(true) => Some(Ok(record)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<_>>()?;
+    let mut affected = 0u64;
+    for record in matching {
+        let Value::Text(id) = &record[ID_COLUMN] else {
+            return Err(Error::Corrupt("record has non-text id".into()));
+        };
+        let mut patch = Record::new();
+        for (column, set) in sets {
+            let target = tables[0].schema.column(column).expect("validated above");
+            let value = match set {
+                SetValue::Literal(literal) => literal_to_value(literal, target.ty, column)?,
+                SetValue::Arithmetic { op, right, .. } => arithmetic_value(
+                    record.get(column).ok_or_else(|| {
+                        Error::Corrupt(format!("record is missing declared column '{column}'"))
+                    })?,
+                    &literal_to_value(right, target.ty, column)?,
+                    *op,
+                    column,
+                )?,
+            };
+            patch.insert(column.clone(), value);
+        }
+        txn.update(table, id, patch)?;
+        affected += 1;
+    }
+    Ok(QueryOutput::Affected(affected))
+}
+
+fn exec_delete_txn(txn: &mut Txn, table: &str, where_clause: Option<&Expr>) -> Result<QueryOutput> {
+    let schema = txn.table_schema(table)?;
+    let tables = [TableCtx {
+        schema,
+        label: table.to_owned(),
+    }];
+    let predicates = resolve_where(&tables, where_clause)?;
+    let ids: Vec<String> = txn
+        .scan(table)?
+        .into_iter()
+        .filter_map(|(id, record)| {
+            let row = vec![Some(record)];
+            match eval_all(&row, &predicates) {
+                Ok(true) => Some(Ok(id)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<_>>()?;
+    let mut affected = 0u64;
+    for id in ids {
+        if txn.delete(table, &id)? {
+            affected += 1;
+        }
+    }
+    Ok(QueryOutput::Affected(affected))
+}
+
+fn exec_select_txn(txn: &mut Txn, statement: &SelectStmt) -> Result<QueryOutput> {
+    if !statement.joins.is_empty()
+        || !statement.group_by.is_empty()
+        || statement.having.is_some()
+        || statement
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Aggregate { .. }))
+    {
+        return Err(Error::Sql(
+            "transactional SELECT currently supports one table without aggregates".into(),
+        ));
+    }
+    let schema = txn.table_schema(&statement.from.name)?;
+    let tables = [TableCtx {
+        schema: schema.clone(),
+        label: statement
+            .from
+            .alias
+            .clone()
+            .unwrap_or_else(|| statement.from.name.clone()),
+    }];
+    let predicates = resolve_where(&tables, statement.where_clause.as_ref())?;
+    let mut records: Vec<Record> = txn
+        .scan(&statement.from.name)?
+        .into_iter()
+        .map(|(_, record)| record)
+        .filter_map(|record| {
+            let row = vec![Some(record.clone())];
+            match eval_all(&row, &predicates) {
+                Ok(true) => Some(Ok(record)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<_>>()?;
+    let order: Vec<_> = statement
+        .order_by
+        .iter()
+        .map(|key| {
+            let (table_index, column) = resolve_col(&tables, &key.column)?;
+            debug_assert_eq!(table_index, 0);
+            Ok((column, key.desc, key.collation))
+        })
+        .collect::<Result<_>>()?;
+    records.sort_by(|left, right| {
+        for (column, desc, collation) in &order {
+            let ordering = sort_cmp(
+                left.get(column).unwrap_or(&Value::Null),
+                right.get(column).unwrap_or(&Value::Null),
+                *collation,
+            );
+            if ordering != Ordering::Equal {
+                return if *desc { ordering.reverse() } else { ordering };
+            }
+        }
+        Ordering::Equal
+    });
+
+    let mut columns = Vec::new();
+    let mut projection = Vec::new();
+    for item in &statement.projection {
+        match item {
+            SelectItem::Star => {
+                if schema.has_implicit_id() {
+                    columns.push(ID_COLUMN.into());
+                    projection.push(ID_COLUMN.to_owned());
+                }
+                for column in &schema.columns {
+                    columns.push(column.name.clone());
+                    projection.push(column.name.clone());
+                }
+            }
+            SelectItem::Column { col, alias } => {
+                resolve_col(&tables, col)?;
+                columns.push(alias.clone().unwrap_or_else(|| col.column.clone()));
+                projection.push(col.column.clone());
+            }
+            SelectItem::Aggregate { .. } => unreachable!("rejected above"),
+        }
+    }
+    let offset = limit_to_usize(statement.offset.as_ref()).unwrap_or(0);
+    let limit = limit_to_usize(statement.limit.as_ref()).unwrap_or(usize::MAX);
+    let rows = records
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|record| {
+            projection
+                .iter()
+                .map(|column| record.get(column).cloned().unwrap_or(Value::Null))
+                .collect()
+        })
+        .collect();
+    Ok(QueryOutput::Rows { columns, rows })
 }
 
 fn exec_delete(db: &Db, table: &str, where_clause: Option<&Expr>) -> Result<QueryOutput> {
@@ -3950,9 +4660,7 @@ fn exec_delete(db: &Db, table: &str, where_clause: Option<&Expr>) -> Result<Quer
         let mut txn = db.begin();
         let mut count = 0u64;
         for rec in &matching {
-            let Some(Value::Text(id)) = rec.get("id") else {
-                continue;
-            };
+            let id = physical_row_id(rec)?;
             if txn.delete(table, id)? {
                 count += 1;
             }

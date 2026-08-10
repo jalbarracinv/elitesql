@@ -26,6 +26,10 @@ pub struct EliteSqlSnapshot {
     snap: elitesql_core::Snapshot,
 }
 
+pub struct EliteSqlTxn {
+    txn: Option<elitesql_core::Txn>,
+}
+
 const PANIC_CODE: u32 = 100;
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
@@ -93,6 +97,16 @@ unsafe fn db_ref<'a>(db: *mut EliteSql) -> Result<&'a EliteSql, Error> {
         return Err(Error::InvalidArgument("null database handle".into()));
     }
     Ok(unsafe { &*db })
+}
+
+unsafe fn txn_ref<'a>(txn: *mut EliteSqlTxn) -> Result<&'a mut elitesql_core::Txn, Error> {
+    if txn.is_null() {
+        return Err(Error::InvalidArgument("null transaction handle".into()));
+    }
+    unsafe { &mut *txn }
+        .txn
+        .as_mut()
+        .ok_or_else(|| Error::InvalidArgument("transaction is already closed".into()))
 }
 
 /// Version string of the library. Static; do not free.
@@ -254,6 +268,166 @@ pub unsafe extern "C" fn elitesql_query_params(
             .map_err(|error| Error::InvalidArgument(format!("SQL params: {error}")))?;
         let out = jsonio::query_with_params_json(&handle.db, sql, &params)?;
         out_string(result_json, jsonio::output_to_json(&out).to_string())
+    })
+}
+
+/// Begin a multi-operation transaction. The returned handle owns a stable
+/// snapshot and must be committed, rolled back or closed exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn elitesql_txn_begin(db: *mut EliteSql, out: *mut *mut EliteSqlTxn) -> u32 {
+    guard(|| {
+        let handle = unsafe { db_ref(db)? };
+        if out.is_null() {
+            return Err(Error::InvalidArgument("null output pointer".into()));
+        }
+        unsafe {
+            *out = Box::into_raw(Box::new(EliteSqlTxn {
+                txn: Some(handle.db.begin()),
+            }))
+        };
+        Ok(())
+    })
+}
+
+/// Execute one parameterized SQL statement against a transaction's staged
+/// view. `params_json` is an array, object or null, exactly like
+/// `elitesql_query_params`.
+#[no_mangle]
+pub unsafe extern "C" fn elitesql_txn_query_params(
+    txn: *mut EliteSqlTxn,
+    sql: *const c_char,
+    params_json: *const c_char,
+    result_json: *mut *mut c_char,
+) -> u32 {
+    guard(|| {
+        let sql = unsafe { cstr(sql)? };
+        let raw = unsafe { cstr(params_json)? };
+        let params: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| Error::InvalidArgument(format!("SQL params: {error}")))?;
+        let out = jsonio::query_txn_with_params_json(unsafe { txn_ref(txn)? }, sql, &params)?;
+        out_string(result_json, jsonio::output_to_json(&out).to_string())
+    })
+}
+
+/// Insert one record inside a transaction. Result contains both the physical
+/// ULID and the normalized record, including any generated identity column.
+#[no_mangle]
+pub unsafe extern "C" fn elitesql_txn_insert(
+    txn: *mut EliteSqlTxn,
+    table: *const c_char,
+    record_json: *const c_char,
+    result_json: *mut *mut c_char,
+) -> u32 {
+    guard(|| {
+        let txn = unsafe { txn_ref(txn)? };
+        let table = unsafe { cstr(table)? };
+        let raw = unsafe { cstr(record_json)? };
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| Error::InvalidArgument(format!("record: {error}")))?;
+        let id = txn.insert(table, jsonio::json_to_record(&value)?)?;
+        let record = txn
+            .get(table, &id)?
+            .expect("a staged insert is visible in its transaction");
+        out_string(
+            result_json,
+            serde_json::json!({"id": id, "record": jsonio::record_to_json(&record)}).to_string(),
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn elitesql_txn_get(
+    txn: *mut EliteSqlTxn,
+    table: *const c_char,
+    id: *const c_char,
+    result_json: *mut *mut c_char,
+) -> u32 {
+    guard(|| {
+        let txn = unsafe { txn_ref(txn)? };
+        let record = txn.get(unsafe { cstr(table)? }, unsafe { cstr(id)? })?;
+        out_string(
+            result_json,
+            serde_json::json!({"record": record.as_ref().map(jsonio::record_to_json)}).to_string(),
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn elitesql_txn_update(
+    txn: *mut EliteSqlTxn,
+    table: *const c_char,
+    id: *const c_char,
+    patch_json: *const c_char,
+) -> u32 {
+    guard(|| {
+        let txn = unsafe { txn_ref(txn)? };
+        let value: serde_json::Value = serde_json::from_str(unsafe { cstr(patch_json)? })
+            .map_err(|error| Error::InvalidArgument(format!("patch: {error}")))?;
+        txn.update(
+            unsafe { cstr(table)? },
+            unsafe { cstr(id)? },
+            jsonio::json_to_record(&value)?,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn elitesql_txn_delete(
+    txn: *mut EliteSqlTxn,
+    table: *const c_char,
+    id: *const c_char,
+    deleted: *mut bool,
+) -> u32 {
+    guard(|| {
+        if deleted.is_null() {
+            return Err(Error::InvalidArgument("null output pointer".into()));
+        }
+        let value =
+            unsafe { txn_ref(txn)? }.delete(unsafe { cstr(table)? }, unsafe { cstr(id)? })?;
+        unsafe { *deleted = value };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn elitesql_txn_commit(
+    txn: *mut EliteSqlTxn,
+    committed_version: *mut u64,
+) -> u32 {
+    guard(|| {
+        if txn.is_null() || committed_version.is_null() {
+            return Err(Error::InvalidArgument("null pointer".into()));
+        }
+        let transaction = unsafe { &mut *txn }
+            .txn
+            .take()
+            .ok_or_else(|| Error::InvalidArgument("transaction is already closed".into()))?;
+        unsafe { *committed_version = transaction.commit()? };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn elitesql_txn_rollback(txn: *mut EliteSqlTxn) -> u32 {
+    guard(|| {
+        if txn.is_null() {
+            return Err(Error::InvalidArgument("null transaction handle".into()));
+        }
+        if let Some(transaction) = unsafe { &mut *txn }.txn.take() {
+            transaction.rollback();
+        }
+        Ok(())
+    })
+}
+
+/// Free the transaction handle. An open transaction is rolled back by drop.
+#[no_mangle]
+pub unsafe extern "C" fn elitesql_txn_close(txn: *mut EliteSqlTxn) -> u32 {
+    guard(|| {
+        if !txn.is_null() {
+            unsafe { drop(Box::from_raw(txn)) };
+        }
+        Ok(())
     })
 }
 
@@ -575,6 +749,81 @@ mod tests {
         let result = unsafe { CStr::from_ptr(output) }.to_str().unwrap();
         assert!(result.contains("x' OR TRUE --"), "{result}");
         assert!(result.contains(r#""hex":"00ff""#), "{result}");
+        unsafe { elitesql_free_string(output) };
+
+        assert_eq!(unsafe { elitesql_close(db) }, 0);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn ffi_transaction_is_atomic_and_returns_generated_identity() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("elitesql-ffi-txn-{}-{unique}", std::process::id()));
+        let path_c = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let mut db = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { elitesql_open(path_c.as_ptr(), std::ptr::null(), &mut db) },
+            0
+        );
+        let create = CString::new(
+            "CREATE TABLE docs (doc_id int AUTO_INCREMENT, title text NOT NULL, done bool NOT NULL)",
+        )
+        .unwrap();
+        let mut output = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { elitesql_query(db, create.as_ptr(), &mut output) },
+            0
+        );
+        unsafe { elitesql_free_string(output) };
+
+        let mut txn = std::ptr::null_mut();
+        assert_eq!(unsafe { elitesql_txn_begin(db, &mut txn) }, 0);
+        let table = CString::new("docs").unwrap();
+        let insert_sql =
+            CString::new("INSERT INTO docs (title, done) VALUES (%s, %s) RETURNING id, doc_id")
+                .unwrap();
+        let insert_params = CString::new(r#"["contract",false]"#).unwrap();
+        output = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                elitesql_txn_query_params(
+                    txn,
+                    insert_sql.as_ptr(),
+                    insert_params.as_ptr(),
+                    &mut output,
+                )
+            },
+            0
+        );
+        let inserted: serde_json::Value =
+            serde_json::from_str(unsafe { CStr::from_ptr(output) }.to_str().unwrap()).unwrap();
+        assert_eq!(inserted["rows"][0][1], 1);
+        let id = CString::new(inserted["rows"][0][0].as_str().unwrap()).unwrap();
+        unsafe { elitesql_free_string(output) };
+
+        let patch = CString::new(r#"{"done":true}"#).unwrap();
+        assert_eq!(
+            unsafe { elitesql_txn_update(txn, table.as_ptr(), id.as_ptr(), patch.as_ptr()) },
+            0
+        );
+        let mut version = 0;
+        assert_eq!(unsafe { elitesql_txn_commit(txn, &mut version) }, 0);
+        assert!(version > 0);
+        assert_eq!(unsafe { elitesql_txn_close(txn) }, 0);
+
+        let select = CString::new("SELECT doc_id, done FROM docs").unwrap();
+        output = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { elitesql_query(db, select.as_ptr(), &mut output) },
+            0
+        );
+        let selected: serde_json::Value =
+            serde_json::from_str(unsafe { CStr::from_ptr(output) }.to_str().unwrap()).unwrap();
+        assert_eq!(selected["rows"][0], serde_json::json!([1, true]));
         unsafe { elitesql_free_string(output) };
 
         assert_eq!(unsafe { elitesql_close(db) }, 0);

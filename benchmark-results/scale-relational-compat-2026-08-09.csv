@@ -1,0 +1,3 @@
+profile,rows,engine,load_mode,ingest_wall_seconds,final_checkpoint_seconds,maintenance_drain_seconds,total_load_seconds,rows_per_second,point_read_us,full_scan_seconds,disk_mib,logical_total_mib,query_peak_mib,index_delta_peak_mib,maintenance_peak_mib,max_rss_bytes,peak_footprint_bytes
+relational-compat-former-default,10000000,EliteSQL,transactions,22.888,0.110,1.051,24.049,415816,67.092,1.189,2248.86,128,16.00,22.81,32.00,,
+relational-compat-sqlite,10000000,SQLite,transactions,11.613,4.057,0.000,15.670,638171,84.450,1.298,1520.11,,,,,,

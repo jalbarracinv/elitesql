@@ -26,13 +26,15 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use elitesql_core::{jsonio, Db};
+use elitesql_core::{jsonio, Db, Error, Txn};
 use serde_json::{json, Value as J};
 
 /// Protocol-level error code for authentication, outside the engine's range
 /// (`Error::code()` currently returns 1..=16) so clients can tell them apart.
 const AUTH_ERROR_CODE: u32 = 20;
+const SIDECAR_TXN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct ServeOptions {
     /// Unix socket path to bind, when serving locally.
@@ -221,12 +223,13 @@ fn handle_connection<S: Stream>(db: Arc<Db>, stream: S, auth: Auth) {
     });
     let mut writer = BufWriter::new(stream);
     let mut authenticated = matches!(auth, Auth::Trusted);
+    let mut txn = None;
     for line in reader.lines() {
         let Ok(line) = line else { return };
         if line.trim().is_empty() {
             continue;
         }
-        let response = dispatch(&db, &line, &auth, &mut authenticated);
+        let response = dispatch_with_txn(&db, &line, &auth, &mut authenticated, &mut txn);
         if writeln!(writer, "{response}").is_err() || writer.flush().is_err() {
             return;
         }
@@ -236,7 +239,19 @@ fn handle_connection<S: Stream>(db: Arc<Db>, stream: S, auth: Auth) {
 /// Applies the connection's auth state, then runs the request. Everything
 /// before a successful `auth` on an untrusted transport is refused, so no
 /// unauthenticated caller reaches the engine — not even `ping`.
+#[cfg(test)]
 fn dispatch(db: &Db, line: &str, auth: &Auth, authenticated: &mut bool) -> J {
+    let mut txn = None;
+    dispatch_with_txn(db, line, auth, authenticated, &mut txn)
+}
+
+fn dispatch_with_txn(
+    db: &Db,
+    line: &str,
+    auth: &Auth,
+    authenticated: &mut bool,
+    txn: &mut Option<Txn>,
+) -> J {
     let request: J = match serde_json::from_str(line) {
         Ok(j) => j,
         Err(e) => return json!({"ok": false, "code": 8, "error": format!("bad request json: {e}")}),
@@ -280,16 +295,41 @@ fn dispatch(db: &Db, line: &str, auth: &Auth, authenticated: &mut bool) -> J {
             "authentication required: send {\"op\":\"auth\",\"token\":...} first",
         );
     }
-    handle_request(db, request, id)
+    handle_request(db, request, id, txn)
 }
 
-fn handle_request(db: &Db, request: J, id: Option<J>) -> J {
+fn handle_request(db: &Db, request: J, id: Option<J>, txn: &mut Option<Txn>) -> J {
     let op = request
         .get("op")
         .and_then(|o| o.as_str())
         .unwrap_or_default();
+    let required_string = |key: &str| {
+        request
+            .get(key)
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| Error::InvalidArgument(format!("missing '{key}'")))
+    };
+    if txn
+        .as_ref()
+        .is_some_and(|transaction| transaction.elapsed() > SIDECAR_TXN_TIMEOUT)
+    {
+        // Dropping Txn is rollback: no WAL entry has been published.
+        txn.take();
+        let mut response = json!({
+            "ok": false,
+            "code": 8,
+            "error": "transaction exceeded the 30 second sidecar deadline and was rolled back"
+        });
+        if let (Some(id), Some(object)) = (id, response.as_object_mut()) {
+            object.insert("id".into(), id);
+        }
+        return response;
+    }
     let result = match op {
         "ping" => Ok(json!("pong")),
+        "query" if txn.is_some() => Err(Error::InvalidArgument(
+            "an explicit transaction is active; use query_in_txn or commit/rollback".into(),
+        )),
         "query" => match request.get("sql").and_then(|s| s.as_str()) {
             Some(sql) => request
                 .get("params")
@@ -307,6 +347,79 @@ fn handle_request(db: &Db, request: J, id: Option<J>) -> J {
         "search_text" => jsonio::search_text_json(db, &request),
         "create_text_index" => jsonio::create_text_index_json(db, &request),
         "search_hybrid" => jsonio::search_hybrid_json(db, &request),
+        "begin" => {
+            if txn.is_some() {
+                Err(Error::InvalidArgument(
+                    "a transaction is already active on this connection".into(),
+                ))
+            } else {
+                *txn = Some(db.begin());
+                Ok(json!(true))
+            }
+        }
+        "query_in_txn" => (|| {
+            let sql = required_string("sql")?;
+            let transaction = txn
+                .as_mut()
+                .ok_or_else(|| Error::InvalidArgument("no active transaction".into()))?;
+            let output = match request.get("params") {
+                Some(params) => jsonio::query_txn_with_params_json(transaction, sql, params),
+                None => transaction.query(sql),
+            }?;
+            Ok(jsonio::output_to_json(&output))
+        })(),
+        "txn_insert" => (|| {
+            let table = required_string("table")?;
+            let record = request
+                .get("record")
+                .ok_or_else(|| Error::InvalidArgument("missing 'record'".into()))?;
+            let transaction = txn
+                .as_mut()
+                .ok_or_else(|| Error::InvalidArgument("no active transaction".into()))?;
+            let id = transaction.insert(table, jsonio::json_to_record(record)?)?;
+            let inserted = transaction
+                .get(table, &id)?
+                .expect("staged insert is visible in its transaction");
+            Ok(json!({"id": id, "record": jsonio::record_to_json(&inserted)}))
+        })(),
+        "txn_get" => (|| {
+            let transaction = txn
+                .as_mut()
+                .ok_or_else(|| Error::InvalidArgument("no active transaction".into()))?;
+            let record = transaction.get(required_string("table")?, required_string("id")?)?;
+            Ok(json!({"record": record.as_ref().map(jsonio::record_to_json)}))
+        })(),
+        "txn_update" => (|| {
+            let patch = request
+                .get("patch")
+                .ok_or_else(|| Error::InvalidArgument("missing 'patch'".into()))?;
+            txn.as_mut()
+                .ok_or_else(|| Error::InvalidArgument("no active transaction".into()))?
+                .update(
+                    required_string("table")?,
+                    required_string("id")?,
+                    jsonio::json_to_record(patch)?,
+                )?;
+            Ok(json!(true))
+        })(),
+        "txn_delete" => (|| {
+            let deleted = txn
+                .as_mut()
+                .ok_or_else(|| Error::InvalidArgument("no active transaction".into()))?
+                .delete(required_string("table")?, required_string("id")?)?;
+            Ok(json!(deleted))
+        })(),
+        "commit" => match txn.take() {
+            Some(transaction) => transaction.commit().map(|version| json!(version)),
+            None => Err(Error::InvalidArgument("no active transaction".into())),
+        },
+        "rollback" => match txn.take() {
+            Some(transaction) => {
+                transaction.rollback();
+                Ok(json!(true))
+            }
+            None => Err(Error::InvalidArgument("no active transaction".into())),
+        },
         "checkpoint" => db.checkpoint().map(|()| json!(true)),
         "compact" => db.compact().map(|()| json!(true)),
         other => Err(elitesql_core::Error::InvalidArgument(format!(
@@ -326,6 +439,14 @@ fn handle_request(db: &Db, request: J, id: Option<J>) -> J {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn socket_call(writer: &mut UnixStream, reader: &mut BufReader<UnixStream>, request: J) -> J {
+        writeln!(writer, "{request}").unwrap();
+        writer.flush().unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
 
     /// A request on a Unix-socket-style connection, which starts trusted.
     fn trusted(db: &Db, request: J) -> J {
@@ -361,6 +482,199 @@ mod tests {
         assert_eq!(selected["ok"], true);
         assert_eq!(selected["result"]["rows"][0][0], "x' OR TRUE --");
         assert_eq!(selected["result"]["rows"][0][1]["$t"], "blob");
+    }
+
+    #[test]
+    fn sidecar_connection_transaction_is_atomic_and_returns_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("sidecar-txn.esql")).unwrap();
+        db.query(
+            "CREATE TABLE docs (doc_id int AUTO_INCREMENT, title text NOT NULL, done bool NOT NULL)",
+        )
+        .unwrap();
+        let mut authenticated = true;
+        let mut txn = None;
+        let call = |request: J, authenticated: &mut bool, txn: &mut Option<Txn>| {
+            dispatch_with_txn(
+                &db,
+                &request.to_string(),
+                &Auth::Trusted,
+                authenticated,
+                txn,
+            )
+        };
+
+        assert_eq!(
+            call(json!({"op": "begin"}), &mut authenticated, &mut txn)["ok"],
+            true
+        );
+        let inserted = call(
+            json!({
+                "op": "query_in_txn",
+                "sql": "INSERT INTO docs (title, done) VALUES (%s, %s) RETURNING id, doc_id",
+                "params": ["contract", false]
+            }),
+            &mut authenticated,
+            &mut txn,
+        );
+        assert_eq!(inserted["result"]["rows"][0][1], 1);
+        let id = inserted["result"]["rows"][0][0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            call(
+                json!({
+                    "op": "txn_update", "table": "docs", "id": id,
+                    "patch": {"done": true}
+                }),
+                &mut authenticated,
+                &mut txn,
+            )["ok"],
+            true
+        );
+        assert!(
+            db.scan("docs").unwrap().is_empty(),
+            "uncommitted row leaked"
+        );
+        assert_eq!(
+            call(json!({"op": "commit"}), &mut authenticated, &mut txn)["ok"],
+            true
+        );
+        let selected = db.query("SELECT doc_id, done FROM docs").unwrap();
+        assert_eq!(
+            jsonio::output_to_json(&selected)["rows"][0],
+            json!([1, true])
+        );
+
+        call(json!({"op": "begin"}), &mut authenticated, &mut txn);
+        call(
+            json!({
+                "op": "txn_insert", "table": "docs",
+                "record": {"title": "rollback", "done": false}
+            }),
+            &mut authenticated,
+            &mut txn,
+        );
+        call(json!({"op": "rollback"}), &mut authenticated, &mut txn);
+        assert_eq!(db.scan("docs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sidecar_disconnect_rolls_back_active_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::create(dir.path().join("disconnect.esql")).unwrap());
+        db.query("CREATE TABLE docs (title text NOT NULL)").unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let served = db.clone();
+        let worker = std::thread::spawn(move || handle_connection(served, server, Auth::Trusted));
+        let mut responses = BufReader::new(client.try_clone().unwrap());
+
+        writeln!(client, "{}", json!({"op": "begin"})).unwrap();
+        client.flush().unwrap();
+        let mut line = String::new();
+        responses.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<J>(&line).unwrap()["ok"], true);
+
+        writeln!(
+            client,
+            "{}",
+            json!({
+                "op": "query_in_txn",
+                "sql": "INSERT INTO docs (title) VALUES ('must rollback')"
+            })
+        )
+        .unwrap();
+        client.flush().unwrap();
+        line.clear();
+        responses.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<J>(&line).unwrap()["ok"], true);
+        drop(responses);
+        drop(client);
+        worker.join().unwrap();
+        assert!(db.scan("docs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn four_sidecar_workers_keep_credit_and_document_commits_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            Db::create_with(
+                dir.path().join("workers.esql"),
+                elitesql_core::DbOptions {
+                    durability: elitesql_core::Durability::Fast,
+                    ..elitesql_core::DbOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        db.query("CREATE TABLE users (user_id int AUTO_INCREMENT, credits int NOT NULL)")
+            .unwrap();
+        db.query("CREATE TABLE docs (owner_id int REFERENCES users(user_id), worker int NOT NULL)")
+            .unwrap();
+        db.query("INSERT INTO users (credits) VALUES (1000)")
+            .unwrap();
+
+        let mut app_workers = Vec::new();
+        let mut server_workers = Vec::new();
+        for worker_id in 0..4 {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            let served = db.clone();
+            server_workers.push(std::thread::spawn(move || {
+                handle_connection(served, server, Auth::Trusted)
+            }));
+            app_workers.push(std::thread::spawn(move || {
+                let mut reader = BufReader::new(client.try_clone().unwrap());
+                let mut committed = 0usize;
+                while committed < 250 {
+                    assert_eq!(
+                        socket_call(&mut client, &mut reader, json!({"op": "begin"}))["ok"],
+                        true
+                    );
+                    let charged = socket_call(
+                        &mut client,
+                        &mut reader,
+                        json!({
+                            "op": "query_in_txn",
+                            "sql": "UPDATE users SET credits = credits - 1 WHERE user_id = 1 AND credits >= 1"
+                        }),
+                    );
+                    assert_eq!(charged["result"]["affected"], 1);
+                    let inserted = socket_call(
+                        &mut client,
+                        &mut reader,
+                        json!({
+                            "op": "query_in_txn",
+                            "sql": "INSERT INTO docs (owner_id, worker) VALUES (1, %s)",
+                            "params": [worker_id]
+                        }),
+                    );
+                    assert_eq!(inserted["ok"], true);
+                    let commit = socket_call(
+                        &mut client,
+                        &mut reader,
+                        json!({"op": "commit"}),
+                    );
+                    if commit["ok"] == true {
+                        committed += 1;
+                    } else {
+                        assert_eq!(commit["code"], 9, "unexpected commit error: {commit}");
+                    }
+                }
+            }));
+        }
+        for worker in app_workers {
+            worker.join().unwrap();
+        }
+        for worker in server_workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(db.scan("docs").unwrap().len(), 1000);
+        assert_eq!(
+            db.scan("users").unwrap()[0].1["credits"],
+            elitesql_core::Value::Int64(0)
+        );
     }
 
     fn token_db() -> (tempfile::TempDir, Db, Auth) {

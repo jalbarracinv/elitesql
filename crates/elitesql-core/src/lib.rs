@@ -77,7 +77,7 @@ pub use db::{
 pub use error::{Error, Result};
 pub use memory::GlobalMemoryStats;
 pub use repair::{salvage, SalvageReport};
-pub use schema::{Column, IndexDef, TableSchema};
+pub use schema::{Column, ForeignKeyDef, IndexDef, ReferentialAction, TableSchema};
 pub use sql::{QueryCursor, QueryOutput};
 pub use text::{TextHit, TextIndexDef};
 pub use value::{ColumnType, Value};

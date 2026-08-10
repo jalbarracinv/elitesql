@@ -12,18 +12,21 @@ MySQL is a **server** you connect to, with a large SQL surface, pessimistic
 locking and a schema layer that can express constraints (foreign keys, checks,
 enums, exact decimals). EliteSQL is an **embedded engine**: a self-contained
 directory your process opens, with a deliberately small SQL subset, optimistic
-MVCC commits, and a schema layer that expresses types and uniqueness only.
+MVCC commits, and a schema layer that now covers one-column foreign keys,
+integer identities, validated enums and uniqueness, but not checks or exact
+decimals.
 Everything MySQL does that EliteSQL does not is not hidden — it is rejected at
 parse time with a message that names the alternative. The migration work is
 therefore mostly mechanical, and concentrated in three places: **money and
-enums** (types), **transaction retries** (concurrency), and **whatever your ORM
-generates** (SQL surface).
+unsupported types**, **transaction retries** (concurrency), and **whatever your
+ORM generates** (SQL surface).
 
 Before starting, be honest about fit. EliteSQL is the right target for an
 operational app's working set: records, filters, joins on indexed keys,
 aggregates, JSON, blobs, plus vector/text search. It is the wrong target if you
-depend on foreign keys, stored procedures, triggers, window functions, or
-analytical SQL with subqueries and CTEs.
+depend on composite foreign keys or adding them later with `ALTER TABLE`,
+stored procedures, triggers, window functions, or analytical SQL with
+subqueries and CTEs.
 
 ## 1. Deployment: there is no server
 
@@ -61,6 +64,12 @@ with SidecarClient("/tmp/elitesql.sock") as db:
     db.query("SELECT name FROM users WHERE email = %s", ["ana@x.com"])
 ```
 
+The sidecar supports connection-bound transactions. Use
+`with db.transaction() as tx:` in Python (or `begin`, `query_in_txn`, `commit`
+and `rollback` in the protocol). A disconnect or the 30-second transaction
+deadline rolls the transaction back; application-level conflict retries must
+rerun the complete callback.
+
 If the app genuinely runs on a **different host** — the shape MySQL made normal
 — the same sidecar listens on TCP, with a required token:
 
@@ -96,13 +105,13 @@ which network filesystems provide reliably.
 | `INT`, `BIGINT`, `SMALLINT` | `int` | always signed 64-bit; `integer`/`bigint`/`int64` are aliases. There is no narrower integer |
 | `DECIMAL(10,2)`, `NUMERIC` | **none** | see *Money* below — this is the one type change that can corrupt values silently |
 | `FLOAT`, `DOUBLE` | `float64` | |
-| `VARCHAR(n)`, `CHAR(n)`, `TEXT` | `text` | no length limit, no charset; always UTF-8. Collation is per-query, not per-column — see below |
+| `VARCHAR(n)`, `TEXT`, `LONGTEXT` | `varchar(n)`, `text`, `longtext` | UTF-8; `varchar(n)` enforces Unicode length |
 | `BLOB`, `VARBINARY` | `blob` | literal is hex: `X'DEADBEEF'` |
 | `DATETIME`, `TIMESTAMP` | `timestamp` | UTC microseconds; no timezone offsets |
 | `DATE` | `date` | |
 | `TIME` | `time` | |
 | `JSON` | `json` | |
-| `ENUM('a','b')` | `text` | validate in the application, or use a lookup table |
+| `ENUM('a','b')` | `enum('a','b')` | stored as text and validated by the engine |
 | `SET(...)` | `json` | |
 | `UUID`/`CHAR(36)` PK | the implicit `id` | see *Primary keys* |
 | — | `vector(N)` | new: ANN search as a first-class type |
@@ -110,11 +119,10 @@ which network filesystems provide reliably.
 Unknown types fail loudly rather than being coerced:
 
 ```
-CREATE TABLE u (s varchar(50))
-  -> unknown type 'varchar': use text
 CREATE TABLE u (price decimal(10,2))
   -> unknown type 'decimal': V1 types are bool, int (int64), float64, text,
-     blob, timestamp, date, time, json, vector(N)
+     varchar(N), longtext, enum(...), blob, timestamp, date, time, json,
+     vector(N)
 ```
 
 ### Money — read this before migrating a billing table
@@ -136,9 +144,9 @@ the integer the source of truth for arithmetic and comparisons.
 
 ### Primary keys and AUTO_INCREMENT
 
-Every table has an implicit `id text` column you never declare. Omit it on
-INSERT and the engine generates a ULID (26 chars, time-sortable); supply it and
-it is used as given. It cannot be changed by UPDATE.
+Every table has an internal physical ULID (26 chars, time-sortable). When no
+`id` is declared, SQL exposes it as an implicit `id text`; when `id` is
+declared, it is an ordinary SQL column.
 
 ```sql
 -- MySQL
@@ -150,35 +158,34 @@ CREATE TABLE users (
 
 -- EliteSQL
 CREATE TABLE users (
-  email      text NOT NULL,
-  created_at timestamp NOT NULL          -- the app supplies the value
+  id         int AUTO_INCREMENT PRIMARY KEY,
+  email      varchar(255) NOT NULL,
+  created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX ON users (email);
 ```
 
 What this means in practice:
 
-- **Numeric ids become text.** If other systems, URLs or exported reports depend
-  on integer ids, keep the old value in its own column (`legacy_id int`) and
-  index it. Do not try to make `id` numeric — it is text by construction.
-- **ULIDs are time-sortable**, so `ORDER BY id` approximates insertion order,
-  which covers many uses of `ORDER BY id` on an auto-increment key.
-- **There is no `LAST_INSERT_ID()`**. INSERT returns the ids directly:
-  `QueryOutput::Inserted { ids }` in Rust, `{"inserted": [...]}` from `query()`
-  in Python and the sidecar.
-- `PRIMARY KEY`, `REFERENCES` and inline `UNIQUE` are not accepted in
-  `CREATE TABLE`; uniqueness is `CREATE UNIQUE INDEX`.
+- **Use the familiar `id` identity directly.** The physical ULID remains an
+  internal storage key, while existing native APIs return it for direct record
+  operations.
+- Use `INSERT ... RETURNING id`; the Python cursor also sets
+  `lastrowid` to the first generated identity.
+- `PRIMARY KEY` is accepted on an identity. One-column `REFERENCES` supports
+  `ON DELETE RESTRICT` and `CASCADE`; inline `UNIQUE` remains
+  `CREATE UNIQUE INDEX`.
 
-### Constraints that do not exist
+### Constraints: supported subset
 
 | MySQL | What to do |
 |---|---|
-| `FOREIGN KEY ... ON DELETE CASCADE` | enforce in the application; delete children explicitly, ideally in one `Txn` |
+| inline `REFERENCES ... ON DELETE CASCADE/RESTRICT` | supported for one column targeting `id` or a unique indexed column |
 | `CHECK (...)` | validate in the application |
-| `ENUM` | `text` + application validation |
+| `ENUM` | supported and engine-validated |
 | `NOT NULL` | supported |
 | `UNIQUE` | `CREATE UNIQUE INDEX` — validated at every commit, NULLs excluded |
-| `DEFAULT CURRENT_TIMESTAMP` | not available: `DEFAULT` takes a literal only, so the app supplies timestamps |
+| `DEFAULT CURRENT_TIMESTAMP` | supported; one UTC value per statement |
 
 ### Indexes
 
@@ -207,24 +214,27 @@ find every inconsistency you have.
 
 ## 3. Queries: what to rewrite
 
-Everything in this table fails at parse time, not at runtime:
+This table distinguishes syntax that carries over from syntax that still needs
+a rewrite. Unsupported forms fail explicitly rather than changing semantics:
 
 | MySQL | EliteSQL | Rewrite |
 |---|---|---|
 | `LIKE 'a%'` | `LIKE is not supported in V1` | BM25 text search (section 8), or filter in the app |
 | `BETWEEN 1 AND 5` | `BETWEEN is not supported in V1; use >= AND <=` | `n >= 1 AND n <= 5` |
 | `DISTINCT` | `DISTINCT is not supported in V1` | deduplicate in the app |
-| `COUNT(DISTINCT x)` | `DISTINCT inside aggregates is not supported in V1` | collect and count in the app |
+| `COUNT(DISTINCT x)` | supported | global form spills under the query memory budget |
 | subqueries | `subqueries are not supported in V1` | run two queries |
 | `WITH` / CTEs | `CTEs (WITH) are not supported in V1` | run two queries |
 | `UNION` | `UNION is not supported in V1` | concatenate in the app |
 | `INSERT ... SELECT` | `INSERT ... SELECT is not supported in V1` | SELECT, then batch INSERT |
-| `NOW()`, `DATE()`, `CONCAT()`, `GROUP_CONCAT()` | `functions are not supported in V1 (aggregates: COUNT, SUM, AVG, MIN, MAX)` | compute in the app |
-| `age + 1` in a projection | arithmetic is not supported | compute in the app |
+| `NOW()` / `CURRENT_TIMESTAMP` | supported | one UTC timestamp per statement |
+| `DATE()`, `CONCAT()`, `GROUP_CONCAT()` | not supported | compute in the app |
+| `age + 1` in a projection | projection arithmetic is not supported | compute in the app; self-column arithmetic is supported in `UPDATE SET` |
 | `INDEX (a, b)` | `multi-column indexes are not supported in V1` | index the more selective column |
 | `CROSS JOIN` | `CROSS JOIN is not supported in V1` | two queries + merge |
 | `FULL OUTER JOIN` | not supported | two queries + merge |
-| `RETURNING` | `RETURNING is not supported in V1` | INSERT already returns the ids |
+| `INSERT ... RETURNING col, ...` | supported | use it for generated identities; UPDATE/DELETE RETURNING remain unsupported |
+| `INSERT IGNORE` / `ON CONFLICT DO NOTHING` | supported | suppresses only physical-id and unique-index conflicts |
 | `ON DUPLICATE KEY UPDATE` | `ON DUPLICATE KEY UPDATE is not supported in V1` | SELECT then INSERT/UPDATE inside a `Txn` |
 | `REPLACE INTO` | `REPLACE INTO is not supported` | same |
 | `TRUNCATE TABLE` | `TRUNCATE is not supported` | `DELETE FROM table`, or drop and recreate |
@@ -262,11 +272,12 @@ touched the same records first, the commit returns `Error::Conflict` and **your
 code must retry**.
 
 ```rust
-// There is no BEGIN/COMMIT in SQL:
-//   BEGIN -> SQL transactions are not supported in V1; use the Txn API
 let mut txn = db.begin();
-txn.insert("orders", order)?;
-txn.update("stock", &sku, updated)?;
+txn.query_params("INSERT INTO orders (user_id) VALUES (%s)", &[user_id])?;
+txn.query_params(
+    "UPDATE stock SET available = available - 1 WHERE sku = %s AND available >= 1",
+    &[sku],
+)?;
 match txn.commit() {
     Ok(_) => {}
     Err(elitesql_core::Error::Conflict(_)) => { /* rebuild and retry */ }
@@ -385,9 +396,9 @@ one. Full details in [manual.md](manual.md#explain).
 literals (`+05:00` is not accepted) and no session timezone: the engine stores
 instants, and presentation belongs to the application.
 
-- No `NOW()`, `CURDATE()`, `DATE_ADD()`, `DATEDIFF()`. The app computes the
-  values and passes them as parameters.
-- No `DEFAULT CURRENT_TIMESTAMP`; set `created_at` explicitly on INSERT.
+- `NOW()` and `CURRENT_TIMESTAMP` are supported and stable per statement,
+  including `DEFAULT CURRENT_TIMESTAMP`.
+- `CURDATE()`, `DATE_ADD()` and `DATEDIFF()` remain application-side.
 - Date arithmetic is trivial outside SQL because of the representation: `date`
   is days since epoch (subtract for a day count), `time` and `timestamp` are
   microseconds.
@@ -442,12 +453,13 @@ use `bulk_insert_sorted` or larger batches instead.
 ## 10. A migration recipe
 
 1. **Inventory the schema.** For each table, list the columns MySQL types that
-   have no direct target: `DECIMAL`, `ENUM`, `SET`, foreign keys, composite
-   indexes, `AUTO_INCREMENT` ids consumed outside the database. Decide each one
+   have no direct target: `DECIMAL`, `SET`, composite indexes and unsupported
+   query constructs. Decide each one
    before writing any code; these are the only genuinely irreversible choices.
-2. **Write the new DDL.** Drop `PRIMARY KEY`/`REFERENCES`/inline `UNIQUE`,
-   convert money to integer minor units, turn each `UNIQUE` into
-   `CREATE UNIQUE INDEX`, and keep one index per column you filter or join on.
+2. **Write the new DDL.** Keep one integer identity when existing APIs require
+   it, declare one-column `REFERENCES` while tables are empty, convert money to
+   integer minor units, turn each inline `UNIQUE` into `CREATE UNIQUE INDEX`,
+   and keep one index per column you filter or join on.
    The target database is created explicitly, once — the CLI never creates one
    just by opening a path:
 
@@ -456,9 +468,9 @@ use `bulk_insert_sorted` or larger batches instead.
    elitesql query app.esql "CREATE TABLE users (email text NOT NULL, ...)"
    ```
 3. **Export from MySQL** as JSON lines, converting values as you go: decimals to
-   integer cents, enums to text, datetimes to `'YYYY-MM-DD HH:MM:SS'` in UTC,
-   and the old primary key into `legacy_id` if anything outside the database
-   references it.
+   integer cents and datetimes to `'YYYY-MM-DD HH:MM:SS'` in UTC. Load old
+   integer identities explicitly; the persisted high-water advances to the
+   maximum imported value.
 4. **Load.** `elitesql import app.esql table` reads JSON lines from stdin, so
    `mysql -e '...' | convert.py | elitesql import app.esql users` works as a
    pipeline. Create the indexes *after* loading. For a large append-only table
@@ -484,12 +496,12 @@ silently are the type conversions in step 1 — money above all.
 
 - [ ] No `DECIMAL` mapped to `float64`; money is integer minor units
 - [ ] Every `UNIQUE` became a `CREATE UNIQUE INDEX`
-- [ ] Foreign-key cascades reimplemented in application code
+- [ ] One-column foreign keys declared and orphan-free before import
 - [ ] Composite indexes reconsidered, and verified with `EXPLAIN`
 - [ ] Identifier casing normalized (case-sensitive now)
 - [ ] Every multi-step transaction wrapped in a conflict-retry loop
 - [ ] `SELECT ... FOR UPDATE` call sites redesigned
-- [ ] `NOW()`/`CURRENT_TIMESTAMP` moved into the application
+- [ ] Remaining unsupported date functions moved into the application
 - [ ] `LIKE` search replaced with BM25, or explicitly accepted as an app-side filter
 - [ ] `LIMIT a, b` rewritten as `LIMIT b OFFSET a`
 - [ ] Every `UNIQUE` index that relied on a `_ci` collation re-checked: equality

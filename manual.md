@@ -81,6 +81,49 @@ Python values retain their types: `None`, `bool`, signed 64-bit `int`, `float`,
 numeric lists for vector columns. A parameter such as `"x' OR TRUE --"` is a
 text value, not executable SQL.
 
+For ports from PyMySQL/mysqlclient, `EliteSQL`, `SidecarClient` and their
+transaction objects expose a small buffered DB-API-style cursor:
+
+```python
+cursor = db.cursor()
+cursor.execute(
+    "INSERT INTO users (name, email) VALUES (%s, %s)",
+    [name, email],
+)
+generated_user_id = cursor.lastrowid
+
+cursor.execute("SELECT user_id, name FROM users WHERE email = %s", [email])
+one = cursor.fetchone()
+rest = cursor.fetchall()
+```
+
+It provides `execute`, `executemany`, `fetchone`, `fetchmany`, `fetchall`,
+`rowcount`, `description` and `lastrowid`. Results are buffered; use the native
+Rust streaming cursor for an unbounded result. `lastrowid` is the first
+generated integer identity, or the first physical text id when the table has
+no identity.
+
+Multi-statement SQL is opened through the API, not by sending bare
+`BEGIN`/`COMMIT` strings:
+
+```python
+def create_document(tx):
+    tx.query("UPDATE accounts SET credits = credits - 1 "
+             "WHERE user_id = %s AND credits >= 1", [user_id])
+    return tx.query(
+        "INSERT INTO documents (owner_id, title) VALUES (%s, %s) "
+        "RETURNING document_id",
+        [user_id, title],
+    )
+
+result = db.run_transaction(create_document, retries=3)
+```
+
+`run_transaction` retries only conflict code 9 and therefore requires a fully
+re-executable callback with no email, webhook, payment or other external side
+effect. Use `with db.transaction() as tx:` when retry policy is managed by the
+application.
+
 The embedded C ABI uses `elitesql_query_params` with a JSON array (positional)
 or object (named). The sidecar accepts the same value in the optional `params`
 field, and both Python's `SidecarClient` and Node's `query(sql, params)` encode
@@ -133,9 +176,10 @@ Current limits of the server mode, so you can tell what it is not:
   directory you name and serves that one. Several databases mean several
   processes on different sockets or ports, each with its own memory budget.
 - **No TLS**, as above.
-- **No session transactions.** There is no `BEGIN`/`COMMIT` over the wire, the
-  same as in embedded SQL; multi-statement transactions use the Rust `Txn` API
-  in the process that owns the database.
+- **Transactions are explicit and connection-bound.** Use `begin`,
+  `query_in_txn`, `commit` and `rollback`, or the Python
+  `SidecarClient.transaction()` wrapper. Disconnect and the 30-second remote
+  deadline roll the transaction back.
 - **Connections are capped** (`--max-connections`, default 128) because each one
   costs a thread. Past the cap the server answers with a refusal rather than
   queueing.
@@ -153,6 +197,9 @@ machines writing the same directory is not the ownership model.
 | `int` | 64-bit integer | `42`, `-7` |
 | `float64` | decimal or integer | `3.14`, `3` |
 | `text` | single-quoted string | `'hello'`, `'it''s ok'` (escape `''`) |
+| `varchar(N)` | single-quoted string | stored as text; Unicode length is enforced |
+| `longtext` | single-quoted string | alias of `text` |
+| `enum('a','b')` | one declared string | stored as text; allowed values are enforced |
 | `blob` | hex literal | `X'DEADBEEF'` |
 | `timestamp` | string `'YYYY-MM-DD HH:MM:SS[.ffffff]'` (UTC) or integer (Unix microseconds) | `'2026-08-07 09:30:00'` |
 | `date` | string `'YYYY-MM-DD'` (days since epoch internally) | `'2026-08-07'` |
@@ -178,16 +225,22 @@ Automatic coercions: an integer is valid for `float64` and `timestamp` columns. 
 
 ## The implicit primary key
 
-Every table has an `id` column of type `text` that is **not declared**. If you don't provide it on INSERT, the engine generates a [ULID](https://github.com/ulid/spec) (26 characters, time-sortable). You may provide it explicitly, and it cannot be changed with UPDATE.
+Every table has an immutable physical [ULID](https://github.com/ulid/spec)
+(26 characters, time-sortable). When a table does not declare `id`, SQL exposes
+that ULID as its implicit `id text`. A table may instead declare its own `id`,
+including `id int AUTO_INCREMENT PRIMARY KEY`; in that case `id` is the normal
+declared SQL column and the physical ULID remains internal.
 
 ## CREATE TABLE
 
 ```sql
 CREATE TABLE users (
+  id        int AUTO_INCREMENT PRIMARY KEY,
   name      text NOT NULL,
-  email     text,
+  email     varchar(255),
   age       int,
-  plan      text NOT NULL DEFAULT 'free',
+  plan      enum('free', 'pro') NOT NULL DEFAULT 'free',
+  created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   prefs     json,
   embedding vector(768)
 )
@@ -195,9 +248,22 @@ CREATE TABLE users (
 
 - Columns are nullable by default; `NOT NULL` to require a value.
 - `DEFAULT <literal>` supplies the value when a write omits the column. A `NOT NULL` column with a `DEFAULT` may therefore be omitted on INSERT; without one it is required.
-- There is no `PRIMARY KEY` (it's the implicit `id`), no `REFERENCES`, no inline `UNIQUE` (use `CREATE UNIQUE INDEX`).
+- An `int` `AUTO_INCREMENT`/`GENERATED BY DEFAULT AS IDENTITY` column may be
+  named `id`; `PRIMARY KEY` on that identity is accepted as MySQL-compatible
+  spelling and creates a unique index. Its physical ULID remains internal.
+- Generated identities start at 1, are positive and monotonic, but may contain
+  gaps after rollback or conflict. Explicit imported values advance the
+  durable high-water mark; deletes never cause reuse.
+- Inline one-column `REFERENCES parent(unique_column)` supports `ON DELETE
+  RESTRICT` (default) and `CASCADE`; the local index is created automatically.
+  The target must be the implicit `id` or have a unique index, matching the
+  child type. Nullable references accept `NULL`; self-references and cascading
+  chains are supported. FK-required indexes and referenced schema objects
+  cannot be dropped or renamed accidentally. Inline `UNIQUE` remains
+  `CREATE UNIQUE INDEX`.
 - `int` is the recommended integer spelling. `integer`, `bigint`, and `int64` are aliases for the same signed 64-bit type; they have identical storage and behavior. `smallint` and `int32` are not separate types.
-- Other type names are exact: for example, `varchar` fails with an error pointing to `text`.
+- `varchar(N)`, `varchar`, `longtext` and `enum(...)` are compatibility text
+  types; other unknown type names fail explicitly.
 
 ## CREATE INDEX
 
@@ -292,6 +358,10 @@ thresholds and runs immediately. Advanced callers can tune
 ```sql
 INSERT INTO users (name, email, age) VALUES ('ana', 'ana@x.com', 30)
 
+-- MySQL-compatible duplicate suppression and generated-value retrieval:
+INSERT IGNORE INTO users (name, email) VALUES ('ana', 'ana@x.com')
+  RETURNING user_id, id
+
 -- Multi-row: one atomic commit. Returns the ids in order.
 INSERT INTO users (name, age) VALUES ('bob', 25), ('eva', 41)
 
@@ -304,8 +374,13 @@ INSERT INTO users VALUES ('ana', 'ana@x.com', 30, NULL, NULL)
 
 - The column list is recommended in application code because it remains stable when a schema evolves. If omitted, values map to every declared column in declaration order; the implicit `id` is not included and is still generated automatically.
 - Unlisted columns take their `DEFAULT`, or `NULL` when they have none (an error if they are `NOT NULL` without a default).
-- Returns `QueryOutput::Inserted { ids }` with the generated ULIDs or the provided ids.
-- `INSERT ... SELECT` and `RETURNING` are not supported.
+- Returns `QueryOutput::Inserted { ids }` with the generated ULIDs or provided
+  ids. With `RETURNING`, it instead returns the requested columns as rows.
+- `INSERT IGNORE` and `ON CONFLICT DO NOTHING` suppress only duplicate physical
+  ids and unique-index conflicts. Other schema, foreign-key and type errors are
+  still reported. A multi-row statement keeps the rows that do not conflict.
+- `INSERT ... SELECT` is not supported. `RETURNING` is supported only for
+  `INSERT`, not for `UPDATE` or `DELETE`.
 
 ## SELECT
 
@@ -590,6 +665,8 @@ GROUP BY g.country
 NULL semantics (standard SQL):
 
 - `COUNT(*)` counts rows; `COUNT(col)` ignores NULLs.
+- `COUNT(DISTINCT col)` ignores NULLs and uses the bounded external sorter for
+  a global aggregate.
 - `SUM`/`AVG`/`MIN`/`MAX` ignore NULLs; over an empty set they return NULL.
 - NULLs group together in GROUP BY.
 - An integer `SUM` overflows with an explicit error (no wrapping); mixing `int` and `float64` promotes to `float64`. `AVG` always returns `float64`.
@@ -601,16 +678,18 @@ Rules:
 - HAVING may only reference grouped columns and aggregates (the aggregate does not need to appear in the SELECT).
 - In aggregate queries, ORDER BY references output names or aliases (`ORDER BY total DESC`), not function calls: give the aggregate an alias.
 - Aggregates live only in SELECT and HAVING (in WHERE, use... HAVING).
-- Not supported: `COUNT(DISTINCT ...)`, nested aggregates, expressions inside aggregates.
+- Not supported: nested aggregates and general expressions inside aggregates.
 
 ## UPDATE
 
 ```sql
 UPDATE users SET age = 31 WHERE id = 'u-admin'
 UPDATE users SET email = NULL, age = 0 WHERE age > 100
+UPDATE users SET credits = credits - 1 WHERE user_id = 7 AND credits >= 1
 ```
 
-- `SET` accepts literals only (no `SET age = age + 1`; compute in the application).
+- `SET` accepts literals and self-column numeric `+`, `-`, `*`, `/` with
+  checked overflow and division by zero.
 - Without `WHERE` it affects every row.
 - Returns `QueryOutput::Affected(n)`.
 
@@ -841,17 +920,17 @@ All of this fails with a clear error, never with surprise behavior:
 
 | Not supported | Alternative |
 |---|---|
-| `COUNT(DISTINCT ...)`, nested aggregates | deduplicate/compute in the application |
+| Nested aggregates | compute in the application |
 | Subqueries, CTEs (`WITH`), `UNION` | rewrite as separate queries |
 | `FULL OUTER JOIN`, `CROSS JOIN` | two queries + merge in the app |
-| Arithmetic (`age + 1`) and functions | compute in the application |
+| Arithmetic outside `UPDATE SET`; arbitrary functions | compute in the application |
 | `LIKE`, `BETWEEN` | `BETWEEN` → `>= AND <=`; text search: `db.create_text_index` + `db.search_text` (BM25, Rust API/bindings) |
 | `DISTINCT` | deduplicate in the app |
 | `ALTER COLUMN` / `MODIFY` (type or nullability changes) | add the new column, copy with `UPDATE`, drop the old one |
-| `DROP TABLE ... CASCADE` / `RESTRICT` | there are no foreign keys in V1, so there is nothing to cascade |
-| `BEGIN/COMMIT` in SQL | transactions via the Rust API: `db.begin()` |
-| `RETURNING` | INSERT already reports the ids |
-| `ON DUPLICATE KEY UPDATE`, `REPLACE INTO` | SELECT first, then INSERT or UPDATE inside a transaction |
+| `ALTER TABLE ... ADD/DROP FOREIGN KEY` | declare one-column references when creating empty tables |
+| Bare `BEGIN/COMMIT` in stateless SQL | `Txn::query`, Python `transaction()`, or sidecar `query_in_txn` |
+| `UPDATE/DELETE ... RETURNING` | only `INSERT ... RETURNING` is implemented |
+| `ON DUPLICATE KEY UPDATE`, `REPLACE INTO` | `ON CONFLICT DO NOTHING`/`INSERT IGNORE` only suppress uniqueness conflicts; otherwise use a transaction |
 | `TRUNCATE TABLE` | `DELETE FROM table`, or `DROP TABLE` and recreate it |
 | `LIMIT offset, count` (MySQL order) | `LIMIT count OFFSET offset` — the operands swap |
 | `FOR UPDATE` / `LOCK IN SHARE MODE` | commits are optimistic; retry on `Error::Conflict` instead of locking rows |
@@ -869,10 +948,12 @@ Over 1M orders + 10K users (Apple Silicon, `cargo bench --bench sql`):
 
 An index remains the fastest plan for a frequent join. Without one, execution
 is memory-bounded but pays partitioning and temporary-I/O cost. These are
-query-only Criterion intervals. In the 2026-08-08 10M-row scale harness,
-transactional EliteSQL took 22.620 s with the former 128 MiB default versus
-SQLite's 13.663 s; the former 256 MiB ingest profile took 18.798 s, and sorted
-bulk EliteSQL took 9.968 s versus 13.822 s. Point reads and the measured
-unindexed equality scan favored EliteSQL. Run-promotion drain, memory evidence,
-raw runs and concurrent-writer tails are documented in
+query-only Criterion intervals. In the 2026-08-09 10M-row repeat after
+relational compatibility, transactional EliteSQL took 24.049 s with the former
+128 MiB profile versus SQLite's 15.670 s (1.535x SQLite time). Concurrent
+throughput changed by at most 2% from the preceding EliteSQL baseline and
+remained 1.86x–2.40x SQLite across one, two, four and eight writers. The
+fixtures use explicit text ids and no foreign keys, so these are regression
+measurements of the shared write path, not isolated identity/FK costs.
+Historical bulk, memory, raw repetitions and latency tails are documented in
 [benchmark.md](benchmark.md).

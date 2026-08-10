@@ -17,6 +17,6 @@ mod parser;
 
 pub(crate) use exec::{
     execute, execute_cursor, execute_cursor_named, execute_cursor_positional, execute_named,
-    execute_positional,
+    execute_positional, execute_txn, execute_txn_named, execute_txn_positional,
 };
 pub use exec::{QueryCursor, QueryOutput};

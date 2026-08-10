@@ -5,3 +5,4 @@ elitesql.egg-info/PKG-INFO
 elitesql.egg-info/SOURCES.txt
 elitesql.egg-info/dependency_links.txt
 elitesql.egg-info/top_level.txt
+tests/test_params.py

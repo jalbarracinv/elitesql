@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -32,6 +33,10 @@ pub(crate) struct Manifest {
     pub segments: Vec<SegmentMeta>,
     /// Active WAL file id. WAL files with a different id are obsolete.
     pub wal_id: u32,
+    /// Highest durable integer identity allocated per table. A default keeps
+    /// manifests written before identity support readable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub identity_high_water: BTreeMap<String, i64>,
 }
 
 impl Manifest {
@@ -41,6 +46,7 @@ impl Manifest {
             committed_version: 0,
             segments: Vec::new(),
             wal_id: 1,
+            identity_high_water: BTreeMap::new(),
         }
     }
 

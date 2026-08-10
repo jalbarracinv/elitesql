@@ -392,9 +392,12 @@ impl Parser {
     /// trailing clauses. Shared by CREATE TABLE and ALTER TABLE ADD COLUMN.
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
         let name = self.ident("column name")?;
-        let (ty, dim) = self.parse_type()?;
+        let (ty, dim, max_length, enum_values) = self.parse_type()?;
         let mut not_null = false;
         let mut default = None;
+        let mut identity = false;
+        let mut foreign_key = None;
+        let mut primary_key = false;
         loop {
             if self.eat_kw("NOT") {
                 self.expect_kw("NULL")?;
@@ -404,36 +407,140 @@ impl Parser {
                     return Err(self.err_at("duplicate DEFAULT clause"));
                 }
                 default = Some(self.parse_literal()?);
-            } else if self.is_kw("PRIMARY") {
-                return Err(self.err_at(
-                    "PRIMARY KEY is not supported; the primary key is the implicit 'id' (text ULID)",
-                ));
-            } else if self.is_kw("REFERENCES") {
-                return Err(self.err_at("foreign keys are not supported in V1"));
+            } else if self.eat_kw("AUTO_INCREMENT") {
+                if identity {
+                    return Err(self.err_at("duplicate identity clause"));
+                }
+                identity = true;
+                not_null = true;
+            } else if self.eat_kw("GENERATED") {
+                if identity {
+                    return Err(self.err_at("duplicate identity clause"));
+                }
+                self.expect_kw("BY")?;
+                self.expect_kw("DEFAULT")?;
+                self.expect_kw("AS")?;
+                self.expect_kw("IDENTITY")?;
+                identity = true;
+                not_null = true;
+            } else if self.eat_kw("PRIMARY") {
+                self.expect_kw("KEY")?;
+                if primary_key {
+                    return Err(self.err_at("duplicate PRIMARY KEY clause"));
+                }
+                primary_key = true;
+                not_null = true;
+            } else if self.eat_kw("REFERENCES") {
+                if foreign_key.is_some() {
+                    return Err(self.err_at("duplicate REFERENCES clause"));
+                }
+                let referenced_table = self.ident("referenced table")?;
+                self.expect(&Tok::LParen, "'(' after referenced table")?;
+                let referenced_column = self.ident("referenced column")?;
+                self.expect(&Tok::RParen, "')' after referenced column")?;
+                let mut on_delete = crate::schema::ReferentialAction::Restrict;
+                if self.eat_kw("ON") {
+                    self.expect_kw("DELETE")?;
+                    if self.eat_kw("CASCADE") {
+                        on_delete = crate::schema::ReferentialAction::Cascade;
+                    } else if self.eat_kw("RESTRICT") {
+                        on_delete = crate::schema::ReferentialAction::Restrict;
+                    } else {
+                        return Err(self.err_at("expected CASCADE or RESTRICT after ON DELETE"));
+                    }
+                }
+                foreign_key = Some(crate::schema::ForeignKeyDef {
+                    column: name.clone(),
+                    referenced_table,
+                    referenced_column,
+                    on_delete,
+                });
             } else if self.is_kw("UNIQUE") {
                 return Err(self.err_at("inline UNIQUE is not supported; use CREATE UNIQUE INDEX"));
-            } else if self.is_kw("CHECK") || self.is_kw("GENERATED") || self.is_kw("COLLATE") {
+            } else if self.is_kw("CHECK") || self.is_kw("COLLATE") {
                 return Err(self.err_at("column constraints are not supported in V1"));
             } else {
                 break;
             }
+        }
+        if identity && ty != ColumnType::Int64 {
+            return Err(self.err_at("AUTO_INCREMENT/IDENTITY requires an int column"));
+        }
+        if identity && default.is_some() {
+            return Err(self.err_at("an identity column cannot also have DEFAULT"));
+        }
+        if primary_key && !identity && !(name == crate::schema::ID_COLUMN && ty == ColumnType::Text)
+        {
+            return Err(self.err_at(
+                "an inline PRIMARY KEY is only supported on an AUTO_INCREMENT/IDENTITY column; EliteSQL retains its implicit text id as the physical key",
+            ));
+        }
+        if name == crate::schema::ID_COLUMN
+            && ty == ColumnType::Text
+            && primary_key
+            && (default.is_some() || foreign_key.is_some())
+        {
+            return Err(self.err_at(
+                "the redundant id text PRIMARY KEY declaration cannot have DEFAULT or REFERENCES",
+            ));
         }
         Ok(ColumnDef {
             name,
             ty,
             not_null,
             dim,
+            max_length,
+            enum_values,
             default,
+            identity,
+            primary_key,
+            foreign_key,
         })
     }
 
-    fn parse_type(&mut self) -> Result<(ColumnType, Option<usize>)> {
+    fn parse_type(
+        &mut self,
+    ) -> Result<(
+        ColumnType,
+        Option<usize>,
+        Option<usize>,
+        Option<Vec<String>>,
+    )> {
         let word = self.ident("column type")?;
         let ty = match word.to_ascii_lowercase().as_str() {
             "bool" => ColumnType::Bool,
             "int" | "integer" | "bigint" | "int64" => ColumnType::Int64,
             "float64" => ColumnType::Float64,
             "text" => ColumnType::Text,
+            "longtext" => ColumnType::Text,
+            "varchar" => {
+                let max_length = if self.eat(&Tok::LParen) {
+                    let length = self.parse_uint("varchar length")? as usize;
+                    self.expect(&Tok::RParen, "')'")?;
+                    if length == 0 {
+                        return Err(Error::Sql("varchar length must be >= 1".into()));
+                    }
+                    Some(length)
+                } else {
+                    None
+                };
+                return Ok((ColumnType::Text, None, max_length, None));
+            }
+            "enum" => {
+                self.expect(&Tok::LParen, "'(' after enum")?;
+                let mut values = Vec::new();
+                loop {
+                    match self.parse_literal()? {
+                        Literal::Str(value) => values.push(value),
+                        _ => return Err(self.err_at("enum values must be string literals")),
+                    }
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen, "')' after enum values")?;
+                return Ok((ColumnType::Text, None, None, Some(values)));
+            }
             "blob" => ColumnType::Blob,
             "timestamp" => ColumnType::Timestamp,
             "json" => ColumnType::Json,
@@ -446,7 +553,7 @@ impl Parser {
                 if dim == 0 {
                     return Err(Error::Sql("vector dimension must be >= 1".into()));
                 }
-                return Ok((ColumnType::Vector, Some(dim)));
+                return Ok((ColumnType::Vector, Some(dim), None, None));
             }
             "smallint" | "int32" => {
                 return Err(Error::Sql(format!(
@@ -456,7 +563,7 @@ impl Parser {
             "real" | "double" | "float" => {
                 return Err(Error::Sql(format!("unknown type '{word}': use float64")))
             }
-            "varchar" | "char" | "string" | "nvarchar" => {
+            "char" | "string" | "nvarchar" => {
                 return Err(Error::Sql(format!("unknown type '{word}': use text")))
             }
             "datetime" => {
@@ -471,7 +578,7 @@ impl Parser {
                 )))
             }
         };
-        Ok((ty, None))
+        Ok((ty, None, None, None))
     }
 
     fn parse_create_index(&mut self, unique: bool) -> Result<Statement> {
@@ -501,6 +608,7 @@ impl Parser {
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
+        let mut ignore_unique = self.eat_kw("IGNORE");
         self.expect_kw("INTO")?;
         let table = self.ident("table name")?;
         let mut columns = Vec::new();
@@ -542,10 +650,34 @@ impl Parser {
                 break;
             }
         }
-        if self.is_kw("RETURNING") {
-            return Err(self.err_at(
-                "RETURNING is not supported in V1; INSERT already reports the generated ids",
-            ));
+        if self.eat_kw("ON") {
+            if !self.eat_kw("CONFLICT") {
+                if self.is_kw("DUPLICATE") {
+                    return Err(self.err_at(
+                        "ON DUPLICATE KEY UPDATE is not supported; use ON CONFLICT DO NOTHING or an explicit transaction",
+                    ));
+                }
+                return Err(self.err_at("expected CONFLICT after ON"));
+            }
+            self.expect_kw("DO")?;
+            self.expect_kw("NOTHING")?;
+            ignore_unique = true;
+        }
+        let mut returning = Vec::new();
+        if self.eat_kw("RETURNING") {
+            loop {
+                if self.eat(&Tok::Star) {
+                    if !returning.is_empty() {
+                        return Err(self.err_at("RETURNING * cannot be combined with columns"));
+                    }
+                    returning.push("*".into());
+                    break;
+                }
+                returning.push(self.ident("RETURNING column")?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
         }
         if self.is_kw("ON") {
             return Err(self.err_at(
@@ -556,6 +688,8 @@ impl Parser {
             table,
             columns,
             rows,
+            returning,
+            ignore_unique,
         })
     }
 
@@ -566,14 +700,40 @@ impl Parser {
         loop {
             let col = self.ident("column name")?;
             self.expect(&Tok::Eq, "'='")?;
-            let lit = self.parse_literal().map_err(|e| match e {
-                Error::Sql(m) => Error::Sql(format!(
-                    "{m}; SET only accepts literal values in V1 (no expressions)"
-                )),
-                other => other,
-            })?;
+            let value = if matches!(
+                self.peek(),
+                Some(Lexed { tok: Tok::Ident(word), .. })
+                    if !word.eq_ignore_ascii_case("TRUE")
+                        && !word.eq_ignore_ascii_case("FALSE")
+                        && !word.eq_ignore_ascii_case("NULL")
+                        && !word.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+                        && !word.eq_ignore_ascii_case("NOW")
+            ) {
+                let source = self.ident("source column")?;
+                let op = if self.eat(&Tok::Plus) {
+                    ArithmeticOp::Add
+                } else if self.eat(&Tok::Minus) {
+                    ArithmeticOp::Subtract
+                } else if self.eat(&Tok::Star) {
+                    ArithmeticOp::Multiply
+                } else if self.eat(&Tok::Slash) {
+                    ArithmeticOp::Divide
+                } else {
+                    return Err(self.err_at(
+                        "SET only accepts literal values or <column> +, -, * or / <literal>",
+                    ));
+                };
+                let right = self.parse_literal()?;
+                SetValue::Arithmetic {
+                    column: source,
+                    op,
+                    right,
+                }
+            } else {
+                SetValue::Literal(self.parse_literal()?)
+            };
             self.check_no_arith()?;
-            sets.push((col, lit));
+            sets.push((col, value));
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -606,14 +766,19 @@ impl Parser {
                 projection.push(SelectItem::Star);
             } else if let Some(func) = self.peek_agg_call() {
                 self.pos += 1; // the function name
-                let (func, arg) = self.parse_agg_call(func)?;
+                let (func, arg, distinct) = self.parse_agg_call(func)?;
                 self.check_no_arith()?;
                 let alias = if self.eat_kw("AS") {
                     Some(self.ident("alias")?)
                 } else {
                     None
                 };
-                projection.push(SelectItem::Aggregate { func, arg, alias });
+                projection.push(SelectItem::Aggregate {
+                    func,
+                    arg,
+                    distinct,
+                    alias,
+                });
             } else {
                 let col = self.parse_column_ref()?;
                 if self.peek().map(|t| &t.tok) == Some(&Tok::LParen) {
@@ -788,21 +953,22 @@ impl Parser {
 
     /// Parses the parenthesized argument of an aggregate call; the function
     /// name has already been consumed.
-    fn parse_agg_call(&mut self, func: AggFunc) -> Result<(AggFunc, Option<ColumnRef>)> {
+    fn parse_agg_call(&mut self, func: AggFunc) -> Result<(AggFunc, Option<ColumnRef>, bool)> {
         self.expect(&Tok::LParen, "'('")?;
         if self.eat(&Tok::Star) {
             if func != AggFunc::Count {
                 return Err(self.err_at("only COUNT accepts *"));
             }
             self.expect(&Tok::RParen, "')'")?;
-            return Ok((func, None));
+            return Ok((func, None, false));
         }
-        if self.is_kw("DISTINCT") {
-            return Err(self.err_at("DISTINCT inside aggregates is not supported in V1"));
+        let distinct = self.eat_kw("DISTINCT");
+        if distinct && func != AggFunc::Count {
+            return Err(self.err_at("only COUNT(DISTINCT column) is supported"));
         }
         let col = self.parse_column_ref()?;
         self.expect(&Tok::RParen, "')'")?;
-        Ok((func, Some(col)))
+        Ok((func, Some(col), distinct))
     }
 
     fn parse_uint(&mut self, what: &str) -> Result<u64> {
@@ -1022,8 +1188,12 @@ impl Parser {
                 );
             }
             self.pos += 1;
-            let (func, arg) = self.parse_agg_call(func)?;
-            return Ok(Operand::Agg { func, arg });
+            let (func, arg, distinct) = self.parse_agg_call(func)?;
+            return Ok(Operand::Agg {
+                func,
+                arg,
+                distinct,
+            });
         }
         match self.peek().map(|t| t.tok.clone()) {
             Some(Tok::Ident(w)) => {
@@ -1147,6 +1317,12 @@ impl Parser {
                     Ok(Literal::Bool(false))
                 } else if w.eq_ignore_ascii_case("NULL") {
                     Ok(Literal::Null)
+                } else if w.eq_ignore_ascii_case("CURRENT_TIMESTAMP") {
+                    Ok(Literal::CurrentTimestamp)
+                } else if w.eq_ignore_ascii_case("NOW") {
+                    self.expect(&Tok::LParen, "'(' after NOW")?;
+                    self.expect(&Tok::RParen, "')' after NOW(")?;
+                    Ok(Literal::CurrentTimestamp)
                 } else {
                     self.pos -= 1;
                     Err(self.err_at("expected a literal value"))

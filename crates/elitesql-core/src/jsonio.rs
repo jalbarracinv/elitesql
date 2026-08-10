@@ -202,6 +202,18 @@ pub fn record_to_json(record: &Record) -> J {
     J::Object(map)
 }
 
+/// Decode a record-shaped JSON object using the same native/tagged value
+/// representation as SQL parameters and the C/sidecar protocols.
+pub fn json_to_record(value: &J) -> Result<Record> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::InvalidArgument("record must be a JSON object".into()))?;
+    object
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), json_to_value(value)?)))
+        .collect()
+}
+
 /// The result of `Db::query` as JSON — the shape used by the C ABI and the
 /// sidecar protocol.
 pub fn output_to_json(out: &QueryOutput) -> J {
@@ -214,6 +226,15 @@ pub fn output_to_json(out: &QueryOutput) -> J {
                 .collect::<Vec<_>>(),
         }),
         QueryOutput::Inserted { ids } => json!({"inserted": ids}),
+        QueryOutput::InsertedIdentity {
+            ids,
+            column,
+            values,
+        } => json!({
+            "inserted": ids,
+            "identity": {"column": column, "values": values},
+            "lastrowid": values.first(),
+        }),
         QueryOutput::Affected(n) => json!({"affected": n}),
         QueryOutput::None => json!({"ok": true}),
     }
@@ -238,6 +259,34 @@ pub fn query_with_params_json(db: &crate::Db, sql: &str, params: &J) -> Result<Q
                 .map(|(name, value)| Ok((name.clone(), json_to_value(value)?)))
                 .collect::<Result<Record>>()?;
             db.query_named_params(sql, &values)
+        }
+        _ => Err(Error::InvalidArgument(
+            "SQL parameters must be a JSON array, object, or null".into(),
+        )),
+    }
+}
+
+/// Transactional counterpart of [`query_with_params_json`].
+pub fn query_txn_with_params_json(
+    txn: &mut crate::Txn,
+    sql: &str,
+    params: &J,
+) -> Result<QueryOutput> {
+    match params {
+        J::Null => txn.query(sql),
+        J::Array(values) => {
+            let values = values
+                .iter()
+                .map(json_to_value)
+                .collect::<Result<Vec<_>>>()?;
+            txn.query_params(sql, &values)
+        }
+        J::Object(values) => {
+            let values = values
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), json_to_value(value)?)))
+                .collect::<Result<Record>>()?;
+            txn.query_named(sql, &values)
         }
         _ => Err(Error::InvalidArgument(
             "SQL parameters must be a JSON array, object, or null".into(),

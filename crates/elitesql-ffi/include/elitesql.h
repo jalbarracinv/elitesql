@@ -16,12 +16,14 @@
 #define ELITESQL_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct EliteSql EliteSql;
+typedef struct EliteSqlTxn EliteSqlTxn;
 
 /* Static version string; do not free. */
 const char *elitesql_version(void);
@@ -54,6 +56,25 @@ uint32_t elitesql_query(EliteSql *db, const char *sql, char **result_json);
  * Values use the same native/tagged representation documented above. */
 uint32_t elitesql_query_params(EliteSql *db, const char *sql,
                               const char *params_json, char **result_json);
+
+/* Multi-operation optimistic transaction. Records/patches use JSON objects
+ * with the same tagged values as query parameters. insert returns
+ * {"id":...,"record":{...}}, including generated identity values. A commit
+ * may return conflict_retry (9); retry the complete unit of work. */
+uint32_t elitesql_txn_begin(EliteSql *db, EliteSqlTxn **out);
+uint32_t elitesql_txn_query_params(EliteSqlTxn *txn, const char *sql,
+                                  const char *params_json, char **result_json);
+uint32_t elitesql_txn_insert(EliteSqlTxn *txn, const char *table,
+                            const char *record_json, char **result_json);
+uint32_t elitesql_txn_get(EliteSqlTxn *txn, const char *table, const char *id,
+                         char **result_json);
+uint32_t elitesql_txn_update(EliteSqlTxn *txn, const char *table, const char *id,
+                            const char *patch_json);
+uint32_t elitesql_txn_delete(EliteSqlTxn *txn, const char *table, const char *id,
+                            bool *deleted);
+uint32_t elitesql_txn_commit(EliteSqlTxn *txn, uint64_t *committed_version);
+uint32_t elitesql_txn_rollback(EliteSqlTxn *txn);
+uint32_t elitesql_txn_close(EliteSqlTxn *txn);
 
 /* ANN search. params_json: {"table","column","vector":[...],"top_k",
  * "ef_search"?, "filter"?:{col:value}}. result_json:

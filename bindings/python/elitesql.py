@@ -29,7 +29,11 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-__all__ = ["EliteSQL", "SidecarClient", "Snapshot", "EliteSQLError", "check", "repair"]
+__all__ = [
+    "EliteSQL", "SidecarClient", "Snapshot", "Transaction", "SidecarTransaction", "Cursor",
+    "EliteSQLError",
+    "check", "repair",
+]
 
 
 class EliteSQLError(Exception):
@@ -102,6 +106,34 @@ def _configure(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
         ctypes.POINTER(ctypes.c_void_p),
     ]
+    lib.elitesql_txn_begin.restype = ctypes.c_uint32
+    lib.elitesql_txn_begin.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    lib.elitesql_txn_query_params.restype = ctypes.c_uint32
+    lib.elitesql_txn_query_params.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.elitesql_txn_insert.restype = ctypes.c_uint32
+    lib.elitesql_txn_insert.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.elitesql_txn_get.restype = ctypes.c_uint32
+    lib.elitesql_txn_get.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.elitesql_txn_update.restype = ctypes.c_uint32
+    lib.elitesql_txn_update.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+    ]
+    lib.elitesql_txn_delete.restype = ctypes.c_uint32
+    lib.elitesql_txn_delete.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_bool),
+    ]
+    lib.elitesql_txn_commit.restype = ctypes.c_uint32
+    lib.elitesql_txn_commit.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
+    lib.elitesql_txn_rollback.restype = ctypes.c_uint32
+    lib.elitesql_txn_rollback.argtypes = [ctypes.c_void_p]
+    lib.elitesql_txn_close.restype = ctypes.c_uint32
+    lib.elitesql_txn_close.argtypes = [ctypes.c_void_p]
     lib.elitesql_search_vector.restype = ctypes.c_uint32
     lib.elitesql_search_vector.argtypes = [
         ctypes.c_void_p,
@@ -341,6 +373,9 @@ class EliteSQL:
         _raise_if(self._lib, status)
         return _decode_result(json.loads(_take_string(self._lib, out)))
 
+    def cursor(self) -> "Cursor":
+        return Cursor(self)
+
     def search_vector(self, table: str, column: str, vector: list[float], top_k: int = 10,
                       ef_search: Optional[int] = None, filter: Optional[dict] = None) -> list[dict]:
         params: dict[str, Any] = {
@@ -426,6 +461,39 @@ class EliteSQL:
         _raise_if(self._lib, self._lib.elitesql_snapshot_open(self._h(), ctypes.byref(handle)))
         return Snapshot(self, handle)
 
+    def transaction(self) -> "Transaction":
+        """Begin an atomic multi-operation transaction.
+
+        A commit can raise ``EliteSQLError`` with code ``CONFLICT_RETRY``;
+        callers may then rerun the complete unit of work if its external side
+        effects are safe to repeat.
+        """
+        handle = ctypes.c_void_p()
+        _raise_if(self._lib, self._lib.elitesql_txn_begin(self._h(), ctypes.byref(handle)))
+        return Transaction(self, handle)
+
+    def run_transaction(self, operation, retries: int = 3):
+        """Run a caller-declared re-executable unit and retry conflicts.
+
+        Do not use this helper when ``operation`` performs external side
+        effects such as sending mail or calling a signing service.
+        """
+        if retries < 1:
+            raise ValueError("retries must be at least 1")
+        for attempt in range(retries):
+            tx = self.transaction()
+            try:
+                result = operation(tx)
+                tx.commit()
+                return result
+            except EliteSQLError as error:
+                tx.rollback()
+                if error.code != 9 or attempt + 1 == retries:
+                    raise
+            except Exception:
+                tx.rollback()
+                raise
+
     def checkpoint(self) -> None:
         _raise_if(self._lib, self._lib.elitesql_checkpoint(self._h()))
 
@@ -481,6 +549,110 @@ class Snapshot:
         self.close()
 
     def __del__(self):  # best effort
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class Transaction:
+    """Structured transaction over the native ``Txn`` engine API."""
+
+    def __init__(self, db: "EliteSQL", handle: ctypes.c_void_p):
+        self._db = db
+        self._handle: Optional[ctypes.c_void_p] = handle
+        self.committed_version: Optional[int] = None
+
+    def _h(self) -> ctypes.c_void_p:
+        if self._handle is None:
+            raise EliteSQLError(8, "transaction is closed")
+        return self._handle
+
+    @staticmethod
+    def _record(value: dict[str, Any]) -> bytes:
+        if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+            raise TypeError("transaction record must be a mapping with string keys")
+        encoded = {key: _encode_param(item) for key, item in value.items()}
+        return json.dumps(encoded, separators=(",", ":")).encode()
+
+    def insert(self, table: str, record: dict[str, Any]) -> dict[str, Any]:
+        out = ctypes.c_void_p()
+        status = self._db._lib.elitesql_txn_insert(
+            self._h(), table.encode(), self._record(record), ctypes.byref(out)
+        )
+        _raise_if(self._db._lib, status)
+        result = json.loads(_take_string(self._db._lib, out))
+        result["record"] = _decode_record(result["record"])
+        return result
+
+    def query(self, sql: str, params: Any = None) -> Any:
+        encoded = None if params is None else _encode_params(params)
+        out = ctypes.c_void_p()
+        status = self._db._lib.elitesql_txn_query_params(
+            self._h(), sql.encode(), json.dumps(encoded).encode(), ctypes.byref(out)
+        )
+        _raise_if(self._db._lib, status)
+        return _decode_result(json.loads(_take_string(self._db._lib, out)))
+
+    def cursor(self) -> "Cursor":
+        return Cursor(self)
+
+    def execute(self, sql: str, params: Any = None) -> "Cursor":
+        return self.cursor().execute(sql, params)
+
+    def get(self, table: str, id: str) -> Optional[dict[str, Any]]:
+        out = ctypes.c_void_p()
+        status = self._db._lib.elitesql_txn_get(
+            self._h(), table.encode(), id.encode(), ctypes.byref(out)
+        )
+        _raise_if(self._db._lib, status)
+        record = json.loads(_take_string(self._db._lib, out))["record"]
+        return _decode_record(record) if record is not None else None
+
+    def update(self, table: str, id: str, patch: dict[str, Any]) -> None:
+        status = self._db._lib.elitesql_txn_update(
+            self._h(), table.encode(), id.encode(), self._record(patch)
+        )
+        _raise_if(self._db._lib, status)
+
+    def delete(self, table: str, id: str) -> bool:
+        deleted = ctypes.c_bool()
+        status = self._db._lib.elitesql_txn_delete(
+            self._h(), table.encode(), id.encode(), ctypes.byref(deleted)
+        )
+        _raise_if(self._db._lib, status)
+        return bool(deleted.value)
+
+    def commit(self) -> int:
+        version = ctypes.c_uint64()
+        status = self._db._lib.elitesql_txn_commit(self._h(), ctypes.byref(version))
+        try:
+            _raise_if(self._db._lib, status)
+        finally:
+            self.close()
+        self.committed_version = int(version.value)
+        return self.committed_version
+
+    def rollback(self) -> None:
+        if self._handle is not None:
+            _raise_if(self._db._lib, self._db._lib.elitesql_txn_rollback(self._handle))
+            self.close()
+
+    def close(self) -> None:
+        if self._handle is not None:
+            handle, self._handle = self._handle, None
+            _raise_if(self._db._lib, self._db._lib.elitesql_txn_close(handle))
+
+    def __enter__(self) -> "Transaction":
+        return self
+
+    def __exit__(self, exc_type, _exc, _tb) -> None:
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+
+    def __del__(self):
         try:
             self.close()
         except Exception:
@@ -602,6 +774,41 @@ class SidecarClient:
             request["params"] = _encode_params(params)
         return _decode_result(self._call(request))
 
+    def cursor(self) -> "Cursor":
+        return Cursor(self)
+
+    def transaction(self) -> "SidecarTransaction":
+        """Begin a transaction pinned to this sidecar connection.
+
+        The client lock is held until commit/rollback so no other thread can
+        accidentally interleave an autocommit request on the same connection.
+        """
+        self._lock.acquire()
+        try:
+            self._call({"op": "begin"}, _locked=False)
+            return SidecarTransaction(self)
+        except Exception:
+            self._lock.release()
+            raise
+
+    def run_transaction(self, operation, retries: int = 3):
+        """Retry a callback only when it explicitly opts into replay."""
+        if retries < 1:
+            raise ValueError("retries must be at least 1")
+        for attempt in range(retries):
+            tx = self.transaction()
+            try:
+                result = operation(tx)
+                tx.commit()
+                return result
+            except EliteSQLError as error:
+                tx.rollback()
+                if error.code != 9 or attempt + 1 == retries:
+                    raise
+            except Exception:
+                tx.rollback()
+                raise
+
     def search_vector(self, table: str, column: str, vector: list[float], top_k: int = 10,
                       ef_search: Optional[int] = None, filter: Optional[dict] = None) -> list[dict]:
         request: dict[str, Any] = {
@@ -672,3 +879,168 @@ class SidecarClient:
 
     def compact(self) -> None:
         self._call({"op": "compact"})
+
+
+class SidecarTransaction:
+    """Structured transaction bound to one sidecar connection."""
+
+    def __init__(self, client: SidecarClient):
+        self._client = client
+        self._active = True
+        self.committed_version: Optional[int] = None
+
+    def _call(self, request: dict[str, Any]) -> Any:
+        if not self._active:
+            raise EliteSQLError(8, "transaction is closed")
+        return self._client._call(request, _locked=False)
+
+    @staticmethod
+    def _record(value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+            raise TypeError("transaction record must be a mapping with string keys")
+        return {key: _encode_param(item) for key, item in value.items()}
+
+    def insert(self, table: str, record: dict[str, Any]) -> dict[str, Any]:
+        result = self._call({
+            "op": "txn_insert", "table": table, "record": self._record(record),
+        })
+        result["record"] = _decode_record(result["record"])
+        return result
+
+    def query(self, sql: str, params: Any = None) -> Any:
+        request: dict[str, Any] = {"op": "query_in_txn", "sql": sql}
+        if params is not None:
+            request["params"] = _encode_params(params)
+        return _decode_result(self._call(request))
+
+    def cursor(self) -> "Cursor":
+        return Cursor(self)
+
+    def execute(self, sql: str, params: Any = None) -> "Cursor":
+        return self.cursor().execute(sql, params)
+
+    def get(self, table: str, id: str) -> Optional[dict[str, Any]]:
+        record = self._call({"op": "txn_get", "table": table, "id": id})["record"]
+        return _decode_record(record) if record is not None else None
+
+    def update(self, table: str, id: str, patch: dict[str, Any]) -> None:
+        self._call({
+            "op": "txn_update", "table": table, "id": id,
+            "patch": self._record(patch),
+        })
+
+    def delete(self, table: str, id: str) -> bool:
+        return bool(self._call({"op": "txn_delete", "table": table, "id": id}))
+
+    def _finish(self) -> None:
+        if self._active:
+            self._active = False
+            self._client._lock.release()
+
+    def commit(self) -> int:
+        try:
+            self.committed_version = int(self._call({"op": "commit"}))
+            return self.committed_version
+        finally:
+            self._finish()
+
+    def rollback(self) -> None:
+        try:
+            if self._active:
+                self._call({"op": "rollback"})
+        finally:
+            self._finish()
+
+    def __enter__(self) -> "SidecarTransaction":
+        return self
+
+    def __exit__(self, exc_type, _exc, _tb) -> None:
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+
+    def __del__(self):
+        if getattr(self, "_active", False):
+            try:
+                self.rollback()
+            except Exception:
+                # The connection may already be gone; always release the lock.
+                self._finish()
+
+
+class Cursor:
+    """Small Python DB-API-style cursor over ``EliteSQL.query``.
+
+    Results are buffered because the underlying convenience query API returns
+    a complete result. Use the native streaming cursor APIs for unbounded
+    result sets.
+    """
+
+    def __init__(self, connection: EliteSQL | SidecarClient | Transaction | SidecarTransaction):
+        self.connection = connection
+        self.description: Optional[list[tuple[Any, ...]]] = None
+        self.rowcount = -1
+        self.lastrowid: Any = None
+        self._rows: list[list[Any]] = []
+        self._position = 0
+        self._closed = False
+
+    def execute(self, sql: str, params: Any = None) -> "Cursor":
+        if self._closed:
+            raise EliteSQLError(8, "cursor is closed")
+        result = self.connection.query(sql, params)
+        self._rows = list(result.get("rows", [])) if isinstance(result, dict) else []
+        self._position = 0
+        self.lastrowid = result.get("lastrowid") if isinstance(result, dict) else None
+        if isinstance(result, dict) and "columns" in result:
+            self.description = [
+                (name, None, None, None, None, None, None) for name in result["columns"]
+            ]
+            self.rowcount = len(self._rows)
+        else:
+            self.description = None
+            if isinstance(result, dict) and "affected" in result:
+                self.rowcount = int(result["affected"])
+            elif isinstance(result, dict) and "inserted" in result:
+                self.rowcount = len(result["inserted"])
+            else:
+                self.rowcount = -1
+        return self
+
+    def executemany(self, sql: str, sequence: Iterable[Any]) -> "Cursor":
+        total = 0
+        lastrowid = None
+        for params in sequence:
+            self.execute(sql, params)
+            if self.rowcount > 0:
+                total += self.rowcount
+            lastrowid = self.lastrowid
+        self.rowcount = total
+        self.lastrowid = lastrowid
+        return self
+
+    def fetchone(self) -> Optional[list[Any]]:
+        if self._position >= len(self._rows):
+            return None
+        row = self._rows[self._position]
+        self._position += 1
+        return row
+
+    def fetchmany(self, size: int = 1) -> list[list[Any]]:
+        start = self._position
+        self._position = min(len(self._rows), self._position + max(0, size))
+        return self._rows[start:self._position]
+
+    def fetchall(self) -> list[list[Any]]:
+        return self.fetchmany(len(self._rows) - self._position)
+
+    def close(self) -> None:
+        self._closed = True
+        self._rows = []
+
+    def __enter__(self) -> "Cursor":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()

@@ -76,6 +76,57 @@ class EmbeddedParameterTests(unittest.TestCase):
                 with self.assertRaises(EliteSQLError):
                     db.query("SELECT * FROM docs", ["unused"])
 
+    def test_structured_transaction_is_atomic_and_returns_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with EliteSQL(Path(directory) / "txn.esql", lib_path=str(LIB_PATH)) as db:
+                db.query(
+                    "CREATE TABLE docs (doc_id int AUTO_INCREMENT, title text NOT NULL, done bool NOT NULL)"
+                )
+                with db.transaction() as tx:
+                    inserted = tx.execute(
+                        "INSERT INTO docs (title, done) VALUES (%s, %s) RETURNING id, doc_id",
+                        ["contract", False],
+                    ).fetchone()
+                    self.assertEqual(inserted[1], 1)
+                    changed = tx.execute(
+                        "UPDATE docs SET done = %s WHERE id = %s", [True, inserted[0]]
+                    )
+                    self.assertEqual(changed.rowcount, 1)
+                    self.assertTrue(tx.get("docs", inserted[0])["done"])
+                self.assertEqual(
+                    db.query("SELECT doc_id, done FROM docs")["rows"], [[1, True]]
+                )
+
+                with self.assertRaises(RuntimeError):
+                    with db.transaction() as tx:
+                        tx.insert("docs", {"title": "rolled back", "done": False})
+                        raise RuntimeError("abort")
+                self.assertEqual(db.query("SELECT count(*) AS n FROM docs")["rows"], [[1]])
+
+    def test_dbapi_cursor_exposes_integer_lastrowid_and_fetch_methods(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with EliteSQL(Path(directory) / "cursor.esql", lib_path=str(LIB_PATH)) as db:
+                db.query("CREATE TABLE docs (doc_id int AUTO_INCREMENT, title varchar(20) NOT NULL)")
+                cursor = db.cursor()
+                returned = cursor.execute(
+                    "INSERT INTO docs (title) VALUES (%s)", ["contract"]
+                )
+                self.assertIs(returned, cursor)
+                self.assertEqual(cursor.lastrowid, 1)
+                self.assertEqual(cursor.rowcount, 1)
+
+                cursor.executemany(
+                    "INSERT INTO docs (title) VALUES (%s)",
+                    [["second"], ["third"]],
+                )
+                self.assertEqual(cursor.rowcount, 2)
+                self.assertEqual(cursor.lastrowid, 3)
+                cursor.execute("SELECT doc_id, title FROM docs ORDER BY doc_id")
+                self.assertEqual(cursor.fetchone(), [1, "contract"])
+                self.assertEqual(cursor.fetchmany(1), [[2, "second"]])
+                self.assertEqual(cursor.fetchall(), [[3, "third"]])
+                self.assertIsNone(cursor.fetchone())
+
 
 if __name__ == "__main__":
     unittest.main()

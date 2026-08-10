@@ -1,20 +1,21 @@
 # EliteSQL current benchmarks
 
-This document publishes the measurements collected on 2026-08-08 after the
-bounded-memory, paged/mmap index, typed SQL parameter, and primary immutable-run
-changes. Earlier results are retained only as a labeled before/after baseline;
-they describe a materially different checkpoint algorithm.
+This document publishes the latest measurements collected on 2026-08-09 after
+adding the relational-compatibility layer: integer identities, one-column
+foreign keys, SQL inside explicit transactions, MySQL-compatible text types,
+`INSERT IGNORE`, `INSERT ... RETURNING`, arithmetic updates and current-time
+expressions. The 2026-08-08 results are retained as a labeled baseline.
 
 The results are candid. The primary directory publishes immutable deltas and
 promotes groups of sixteen same-level runs in the background; equality and
 BM25 retain fanout eight. Non-overlapping V2 primary runs are promoted by
 copying already checksummed pages without decoding and rebuilding every entry.
-The current implementation also has a direct sorted bulk loader, streaming
+The implementation also has a direct sorted bulk loader, streaming
 unindexed equality scans, compact mmap page directories, transaction-local
-table interning and allocation-light checkpoint snapshots. On the reference
-10M workload EliteSQL stayed within 2x SQLite with the then-current lightweight
-default and within 1.5x with the former opt-in ingest profile. It beat SQLite
-for sorted bulk load, point lookup and the measured unindexed equality scan.
+table interning and allocation-light checkpoint snapshots. On the repeated 10M
+transactional workload EliteSQL took 1.535x SQLite's total load time. In the
+concurrent-writer workload it delivered 1.86x–2.40x SQLite's throughput and
+stayed within 2% of its pre-compatibility throughput at every writer count.
 
 Post-reference architectural change (2026-08-08): primary-only automatic
 checkpoints now freeze one bounded memtable generation and flush it on a
@@ -35,7 +36,7 @@ implementation was close to flush-throughput-bound at this scale.
 - macOS 26.5.2 (25F84), arm64
 - Rust/Cargo 1.93.1, release benchmark profile
 - SQLite 3.45.0 through `rusqlite`'s bundled build
-- EliteSQL 0.0.1 worktree on top of commit `001e791`
+- EliteSQL 0.0.1 relational-compatibility worktree on top of commit `e5d6638`
 
 The worktree contains the changes being measured; the commit hash alone is not
 sufficient to reproduce these numbers until those changes are committed.
@@ -83,7 +84,34 @@ run promotions (`maintenance drain`) are reported separately; `total load`
 includes all three. Point reads follow 1,000 warmups. The full scan is the
 average of three unindexed equality lookups that each return one row.
 
-### 10M rows: optimized former-default transactional path
+### 10M rows: compatibility repeat and former-default baseline
+
+The compatibility worktree was remeasured on 2026-08-09 with the exact former
+128 MiB profile rather than relying on changed defaults:
+
+| Engine | Ingest wall | Final checkpoint | Drain | Total load | Rows/s | Point read | Full scan | Disk |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| EliteSQL | 22.888 s | 0.110 s | 1.051 s | 24.049 s | 415,816 | 67.092 µs | 1.189 s | 2248.86 MiB |
+| SQLite | 11.613 s | 4.057 s | 0 s | 15.670 s | 638,171 | 84.450 µs | 1.298 s | 1520.11 MiB |
+
+EliteSQL took 1.535x SQLite's end-to-end load time. Compared with the
+2026-08-08 EliteSQL baseline immediately below, ingest and total load increased
+6.3%, and throughput decreased 5.9%. SQLite's total time in the same repeat
+increased 14.7%, so the relative EliteSQL/SQLite load-time ratio improved from
+1.656x to 1.535x. The one-run point-read result was much slower for both
+engines than the preceding run and is not enough evidence for a point-lookup
+regression; the scan still favored EliteSQL by 1.09x.
+
+This fixture uses explicit text primary keys and declares neither an identity
+nor a foreign key. It measures the common transaction/SQL staging path after
+the compatibility changes, but it does **not** isolate the cost of allocating
+an identity or validating/cascading a foreign key. The direct sorted bulk path
+likewise remains intended for explicit sorted `id text` imports before derived
+indexes exist.
+
+The new structured result is
+[`benchmark-results/scale-relational-compat-2026-08-09.csv`](benchmark-results/scale-relational-compat-2026-08-09.csv).
+The following table is the comparable 2026-08-08 baseline.
 
 Configuration: 10K rows/transaction, 10K point reads, three full scans and the
 former 128 MiB EliteSQL envelope.
@@ -147,7 +175,7 @@ logical governor. Checkpoint snapshots intern table names and store IDs in one
 contiguous buffer, avoiding the allocator retention that previously pushed
 physical footprint above 350 MiB.
 
-The latest structured results are in
+The optimized 2026-08-08 baseline is in
 [`benchmark-results/scale-optimized-2026-08-08.csv`](benchmark-results/scale-optimized-2026-08-08.csv).
 The preceding 25.984 s checkpoint/LSM baseline remains in
 [`benchmark-results/scale-current-2026-08-08.csv`](benchmark-results/scale-current-2026-08-08.csv),
@@ -209,33 +237,42 @@ that no consolidation occurred before timing ended; SQLite likewise disables
 automatic WAL checkpoints. This isolates commit concurrency rather than
 silently charging maintenance to only one engine.
 
-| Writers | EliteSQL rows/s | SQLite rows/s | EliteSQL / SQLite |
-|---:|---:|---:|---:|
-| 1 | 491,420 | 230,633 | 2.131× |
-| 2 | 404,311 | 221,590 | 1.825× |
-| 4 | 384,854 | 193,139 | 1.993× |
-| 8 | 376,398 | 153,122 | 2.458× |
+| Writers | EliteSQL rows/s | SQLite rows/s | EliteSQL / SQLite | Change vs prior EliteSQL |
+|---:|---:|---:|---:|---:|
+| 1 | 501,179 | 222,970 | 2.248× | +1.99% |
+| 2 | 405,854 | 217,778 | 1.864× | +0.38% |
+| 4 | 378,800 | 177,277 | 2.137× | -1.57% |
+| 8 | 369,113 | 153,889 | 2.399× | -1.94% |
 
 | Writers | Engine | p50 | p95 | p99 | Maximum |
 |---:|---|---:|---:|---:|---:|
-| 1 | EliteSQL | 19.2 µs | 24.3 µs | 30.1 µs | 0.56 ms |
-| 1 | SQLite | 30.4 µs | 76.0 µs | 98.0 µs | 1.53 ms |
-| 2 | EliteSQL | 48.3 µs | 54.3 µs | 81.3 µs | 0.52 ms |
-| 2 | SQLite | 31.0 µs | 75.8 µs | 99.4 µs | 469.08 ms |
-| 4 | EliteSQL | 102.7 µs | 111.9 µs | 144.0 µs | 0.49 ms |
-| 4 | SQLite | 43.7 µs | 77.6 µs | 96.3 µs | 782.27 ms |
-| 8 | EliteSQL | 210.0 µs | 223.7 µs | 260.9 µs | 0.91 ms |
-| 8 | SQLite | 49.5 µs | 77.3 µs | 97.7 µs | 1193.64 ms |
+| 1 | EliteSQL | 18.9 µs | 24.2 µs | 28.3 µs | 0.515 ms |
+| 1 | SQLite | 31.6 µs | 80.0 µs | 97.7 µs | 0.671 ms |
+| 2 | EliteSQL | 48.8 µs | 53.0 µs | 63.3 µs | 0.510 ms |
+| 2 | SQLite | 31.8 µs | 79.1 µs | 100.7 µs | 469.146 ms |
+| 4 | EliteSQL | 103.7 µs | 111.9 µs | 131.1 µs | 1.983 ms |
+| 4 | SQLite | 51.5 µs | 80.5 µs | 101.0 µs | 889.757 ms |
+| 8 | EliteSQL | 210.5 µs | 223.4 µs | 318.5 µs | 4.382 ms |
+| 8 | SQLite | 52.1 µs | 81.8 µs | 105.6 µs | 1202.220 ms |
 
-EliteSQL wins median throughput at every writer count by 1.82x–2.46x. It also
-keeps the median worst transaction below 1 ms, while SQLite's serialized lock
-wait reaches 469–1194 ms with 2–8 writers. EliteSQL's p99 is better at one and
-two writers but remains 1.50x and 2.67x higher at four and eight writers; that
-normal-tail latency is the main remaining concurrency target.
+EliteSQL wins median throughput at every writer count by 1.86x–2.40x. Relative
+to the pre-compatibility run, EliteSQL throughput moved by no more than 2% at
+any writer count. Its p99 improved at one, two and four writers, but increased
+22.1% at eight writers. Two of the new runs also exposed isolated maximum
+latency spikes at four and eight writers (median maxima 1.983 and 4.382 ms), so
+the compatibility change is throughput-neutral in this test but the high-end
+commit tail still needs attention. SQLite's serialized lock waits reached
+469–1202 ms with 2–8 writers.
+
+As in the scale harness, rows use explicit disjoint text IDs and no foreign
+keys. This is a regression check for shared transaction machinery, not a
+microbenchmark of identity allocation or cascade validation.
 
 Raw repetitions are in
+[`benchmark-results/concurrent-writers-relational-compat-2026-08-09.csv`](benchmark-results/concurrent-writers-relational-compat-2026-08-09.csv).
+The pre-compatibility baseline remains in
 [`benchmark-results/concurrent-writers-2026-08-08.csv`](benchmark-results/concurrent-writers-2026-08-08.csv).
-The charts were regenerated from that CSV:
+The charts were regenerated from the 2026-08-09 CSV:
 
 ![Concurrent write throughput](benchmark-results/concurrent-throughput.svg)
 
@@ -394,7 +431,9 @@ Every follow-up must preserve the bounded-memory and crash-recovery contracts.
 # Transactional scale and isolated-engine memory
 cargo bench -p elitesql-core --bench scale_vs_sqlite -- \
   --rows 10m --durability fast --batch-size 10k \
-  --point-reads 10k --full-scans 3
+  --point-reads 10k --full-scans 3 \
+  --total-memory-mib 128 --index-delta-mib 24 \
+  --maintenance-mib 32 --memtable-mib 16
 
 # Direct sorted bulk load
 cargo bench -p elitesql-core --bench scale_vs_sqlite -- \
@@ -411,9 +450,9 @@ cargo bench -p elitesql-core --bench sql
 # Concurrent writers and charts
 cargo bench -p elitesql-core --bench concurrent_writers -- \
   --rows 200k --batch-size 10 --repetitions 3 --durability fast \
-  --csv benchmark-results/concurrent-writers-2026-08-08.csv
+  --csv benchmark-results/concurrent-writers-relational-compat-2026-08-09.csv
 python3 scripts/plot-concurrent-benchmark.py \
-  benchmark-results/concurrent-writers-2026-08-08.csv \
+  benchmark-results/concurrent-writers-relational-compat-2026-08-09.csv \
   --output-dir benchmark-results
 
 # Synthetic ANN
