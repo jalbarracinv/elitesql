@@ -1,31 +1,22 @@
 //! Autocommit writes must not surface `Conflict` to the caller.
 //!
-//! These tests are `#[ignore]`d because they FAIL against the current engine.
-//! They document a gap between the manual and the behaviour, not a regression.
-//!
 //! The manual states that autocommit `UPDATE`/`DELETE` handle optimistic
 //! conflict retries on their own, and that callers only need to retry inside
-//! explicit transactions. Measured, that promise does not hold: with
-//! `WRITE_RETRIES = 3` back-to-back attempts and no wait between them,
-//! contending writers collide again in lockstep and 4 of 24 concurrent updates
-//! to a single row surface `Conflict`.
+//! explicit transactions. These tests hold the engine to that promise under
+//! the worst case for optimistic concurrency: many writers, one row.
 //!
-//! The obvious fix — backoff with jitter and a deadline instead of a fixed
-//! attempt count — makes these pass, but it also makes
-//! `sql_update_arithmetic::concurrent_decrements_do_not_lose_updates_or_go_negative`
-//! fail about once in twelve runs. That test only breaks if a decrement is
-//! applied twice, which means a `commit()` reported `Conflict` after the write
-//! had already landed. A longer retry window does not create that; it exposes
-//! it. Widening retries before commit is idempotent under conflict would trade
-//! a visible error for silent lost or duplicated updates.
-//!
-//! So the retry budget stays as it is until commit is proven idempotent. Run
-//! these with `cargo test -- --ignored` when working on that.
+//! Two engine changes make them pass. First, `exec_update`/`exec_delete` take
+//! their transaction snapshot BEFORE reading the row set; reading first left
+//! a window where a concurrent commit landed inside the snapshot, invisible
+//! to the write-write check, and was silently overwritten (measured: 135 of
+//! 3200 retried increments lost). Second, the retry loop backs off with
+//! jitter under a time budget (`WRITE_RETRY_BUDGET`) instead of a fixed
+//! attempt count, so colliding writers stop retrying in lockstep.
 
 use std::sync::Arc;
 use std::thread;
 
-use elitesql_core::{Db, QueryOutput, Value};
+use elitesql_core::{Db, DbOptions, Durability, Error, QueryOutput, Value};
 
 fn abrir(dir: &tempfile::TempDir) -> Arc<Db> {
     let db = Db::open_or_create(dir.path().join("concurrencia.esql")).expect("open");
@@ -43,7 +34,6 @@ fn contar(db: &Db, sql: &str) -> i64 {
 }
 
 #[test]
-#[ignore = "documents an unfixed contract gap; see module docs"]
 fn concurrent_autocommit_updates_on_one_row_never_conflict() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = abrir(&dir);
@@ -83,7 +73,6 @@ fn concurrent_autocommit_updates_on_one_row_never_conflict() {
 }
 
 #[test]
-#[ignore = "documents an unfixed contract gap; see module docs"]
 fn concurrent_autocommit_arithmetic_updates_all_land() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = abrir(&dir);
@@ -99,12 +88,16 @@ fn concurrent_autocommit_arithmetic_updates_all_land() {
     let hilos: Vec<_> = (0..HILOS)
         .map(|_| {
             let db = Arc::clone(&db);
-            thread::spawn(move || db.query("UPDATE contador SET valor = valor + 1 WHERE nombre = 'a'"))
+            thread::spawn(move || {
+                db.query("UPDATE contador SET valor = valor + 1 WHERE nombre = 'a'")
+            })
         })
         .collect();
 
     for h in hilos {
-        h.join().expect("thread").expect("autocommit update must not conflict");
+        h.join()
+            .expect("thread")
+            .expect("autocommit update must not conflict");
     }
 
     assert_eq!(
@@ -115,7 +108,53 @@ fn concurrent_autocommit_arithmetic_updates_all_land() {
 }
 
 #[test]
-#[ignore = "documents an unfixed contract gap; see module docs"]
+fn hammered_increments_never_lose_updates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Fast durability removes the per-commit fsync, so the commit rate — and
+    // with it the pressure on the snapshot-before-read ordering — goes way up.
+    // This is the load that exposed the lost-update window described in the
+    // module docs.
+    let opts = DbOptions {
+        durability: Durability::Fast,
+        ..DbOptions::default()
+    };
+    let db = Arc::new(Db::create_with(dir.path().join("martillo.esql"), opts).expect("create"));
+    db.query("CREATE TABLE contador (valor int NOT NULL)")
+        .expect("create");
+    db.query("INSERT INTO contador (id, valor) VALUES ('c', 0)")
+        .expect("insert");
+
+    const HILOS: usize = 16;
+    const VUELTAS: usize = 200;
+    let hilos: Vec<_> = (0..HILOS)
+        .map(|_| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                for _ in 0..VUELTAS {
+                    // Caller-side retry on Conflict, exactly as the manual
+                    // instructs: with it, an increment may be delayed but must
+                    // never be lost.
+                    loop {
+                        match db.query("UPDATE contador SET valor = valor + 1 WHERE id = 'c'") {
+                            Ok(_) => break,
+                            Err(Error::Conflict(_)) => continue,
+                            Err(error) => panic!("unexpected error: {error}"),
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for hilo in hilos {
+        hilo.join().expect("thread");
+    }
+
+    let esperado = (HILOS * VUELTAS) as i64;
+    let valor = contar(&db, "SELECT valor FROM contador WHERE id = 'c'");
+    assert_eq!(valor, esperado, "lost {} increments", esperado - valor);
+}
+
+#[test]
 fn concurrent_autocommit_deletes_never_conflict() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = abrir(&dir);
@@ -147,6 +186,9 @@ fn concurrent_autocommit_deletes_never_conflict() {
         .map(|e| e.to_string())
         .collect();
 
-    assert!(fallos.is_empty(), "autocommit DELETE conflicted: {fallos:?}");
+    assert!(
+        fallos.is_empty(),
+        "autocommit DELETE conflicted: {fallos:?}"
+    );
     assert_eq!(contar(&db, "SELECT count(*) AS n FROM cola"), 0);
 }

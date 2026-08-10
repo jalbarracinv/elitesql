@@ -13,8 +13,10 @@
 //!
 //! Consistency: SELECT reads the latest committed state (read-committed);
 //! snapshot-consistent reads are available through the Rust API (`scan_at`).
-//! UPDATE/DELETE run their write set through a transaction and retry on
-//! optimistic conflict.
+//! UPDATE/DELETE run their write set through a transaction whose snapshot is
+//! taken BEFORE the row set is read — see the ordering comment in
+//! `exec_update` — and retry on optimistic conflict with jittered backoff
+//! until `WRITE_RETRY_BUDGET` runs out.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -23,7 +25,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::collate::Collation;
 use crate::db::{Db, Record, Snapshot, Txn};
@@ -153,7 +155,24 @@ impl Iterator for QueryCursor<'_> {
     }
 }
 
-const WRITE_RETRIES: usize = 3;
+/// How long an autocommit UPDATE/DELETE keeps retrying its optimistic commit
+/// before surfacing `Conflict`. The manual promises callers that autocommit
+/// writes absorb conflicts themselves; a fixed attempt count broke that
+/// promise under contention because colliding writers retried in lockstep.
+const WRITE_RETRY_BUDGET: Duration = Duration::from_secs(3);
+
+/// Sleep before the next optimistic retry: exponential from 50µs capped at
+/// 6.4ms, with clock-derived jitter so writers that collided once don't
+/// collide again in lockstep.
+fn backoff_before_retry(attempt: u32) {
+    let cap_us = 50u64 << attempt.min(7);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.subsec_nanos() as u64)
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_micros(1 + nanos % cap_us));
+}
+
 /// Executor-only carrier for the opaque physical ULID. It is never parsed as
 /// SQL, projected, or persisted; mutation plans need it when a declared `id`
 /// shadows the old public physical-id alias.
@@ -4343,10 +4362,17 @@ fn exec_update(
     }];
     let conjuncts = resolve_where(&tables, where_clause)?;
 
-    let mut last_err = None;
-    for _ in 0..WRITE_RETRIES {
-        let matching = fetch_table(db, &tables[0], 0, &conjuncts)?;
+    let deadline = Instant::now() + WRITE_RETRY_BUDGET;
+    let mut attempt = 0u32;
+    loop {
+        // The snapshot must predate the read: a commit landing between a read
+        // and `begin()` sits inside the snapshot, so the write-write check at
+        // commit cannot see it and the patch built from the stale row would
+        // silently overwrite it. Reading after `begin()` can only surface rows
+        // NEWER than the snapshot, which the version check turns into a
+        // Conflict and a retry — never into a lost update.
         let mut txn = db.begin();
+        let matching = fetch_table(db, &tables[0], 0, &conjuncts)?;
         let mut count = 0u64;
         for rec in &matching {
             let id = physical_row_id(rec)?;
@@ -4373,11 +4399,16 @@ fn exec_update(
         }
         match txn.commit() {
             Ok(_) => return Ok(QueryOutput::Affected(count)),
-            Err(Error::Conflict(m)) => last_err = Some(Error::Conflict(m)),
+            Err(Error::Conflict(m)) => {
+                if Instant::now() >= deadline {
+                    return Err(Error::Conflict(m));
+                }
+                backoff_before_retry(attempt);
+                attempt += 1;
+            }
             Err(e) => return Err(e),
         }
     }
-    Err(last_err.expect("retries ran"))
 }
 
 fn arithmetic_value(left: &Value, right: &Value, op: ArithmeticOp, column: &str) -> Result<Value> {
@@ -4654,10 +4685,14 @@ fn exec_delete(db: &Db, table: &str, where_clause: Option<&Expr>) -> Result<Quer
     }];
     let conjuncts = resolve_where(&tables, where_clause)?;
 
-    let mut last_err = None;
-    for _ in 0..WRITE_RETRIES {
-        let matching = fetch_table(db, &tables[0], 0, &conjuncts)?;
+    let deadline = Instant::now() + WRITE_RETRY_BUDGET;
+    let mut attempt = 0u32;
+    loop {
+        // Same ordering invariant as exec_update: the snapshot must predate
+        // the read, or a row edited out of the WHERE clause between the read
+        // and `begin()` is deleted anyway with no conflict raised.
         let mut txn = db.begin();
+        let matching = fetch_table(db, &tables[0], 0, &conjuncts)?;
         let mut count = 0u64;
         for rec in &matching {
             let id = physical_row_id(rec)?;
@@ -4667,11 +4702,16 @@ fn exec_delete(db: &Db, table: &str, where_clause: Option<&Expr>) -> Result<Quer
         }
         match txn.commit() {
             Ok(_) => return Ok(QueryOutput::Affected(count)),
-            Err(Error::Conflict(m)) => last_err = Some(Error::Conflict(m)),
+            Err(Error::Conflict(m)) => {
+                if Instant::now() >= deadline {
+                    return Err(Error::Conflict(m));
+                }
+                backoff_before_retry(attempt);
+                attempt += 1;
+            }
             Err(e) => return Err(e),
         }
     }
-    Err(last_err.expect("retries ran"))
 }
 
 fn resolve_where(tables: &[TableCtx], where_clause: Option<&Expr>) -> Result<Vec<RExpr>> {
