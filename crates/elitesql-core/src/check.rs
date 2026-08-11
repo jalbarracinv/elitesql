@@ -40,9 +40,7 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
         return Ok(report);
     }
 
-    if let Err(e) = Catalog::load(&dir.join(CATALOG_FILE)) {
-        report.errors.push(format!("catalog: {e}"));
-    }
+    let catalog_mirror_error = Catalog::load(&dir.join(CATALOG_FILE)).err();
 
     match DdlIntent::load(dir) {
         Ok(Some(intent)) => report.warnings.push(format!(
@@ -83,6 +81,15 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
     let Some(manifest) = manifest else {
         return Ok(report);
     };
+    if manifest.catalog.is_none() {
+        if let Some(error) = catalog_mirror_error {
+            report.errors.push(format!("catalog: {error}"));
+        }
+    } else if let Some(error) = catalog_mirror_error {
+        report.warnings.push(format!(
+            "catalog.json mirror is unreadable ({error}); embedded manifest catalog remains authoritative"
+        ));
+    }
 
     // Segments: every listed segment must exist and validate fully.
     let mut listed = HashSet::new();
@@ -184,13 +191,16 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
             }
             let mut last = manifest.committed_version;
             for rec in &scan.records {
-                if rec.version <= manifest.committed_version {
-                    continue;
-                }
-                if rec.version <= last && last != manifest.committed_version {
+                let Some(expected) = last.checked_add(1) else {
+                    report
+                        .errors
+                        .push(format!("wal {}: commit version exhausted", manifest.wal_id));
+                    break;
+                };
+                if rec.version != expected {
                     report.errors.push(format!(
-                        "wal {}: non-monotonic commit versions",
-                        manifest.wal_id
+                        "wal {}: commit version gap (expected {expected}, found {})",
+                        manifest.wal_id, rec.version
                     ));
                     break;
                 }
@@ -209,12 +219,10 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
                 }
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            report.warnings.push(format!(
-                "wal {} missing (recreated on next open)",
-                manifest.wal_id
-            ));
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.errors.push(format!(
+            "wal {} missing; uncheckpointed commits may be lost",
+            manifest.wal_id
+        )),
         Err(e) => report.errors.push(format!("wal {}: {e}", manifest.wal_id)),
     }
     if let Ok(dirents) = fs::read_dir(dir.join(WAL_DIR)) {

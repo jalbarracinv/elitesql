@@ -73,7 +73,7 @@ fn equality_deltas_promote_without_resurrecting_old_pairs() {
         checkpoint_bytes.push(total - previous_bytes);
         previous_bytes = total;
     }
-    db.wait_for_secondary_compaction();
+    db.wait_for_secondary_compaction().unwrap();
 
     assert_eq!(indexed_ids(&db, "hot"), canonical_ids(&db, "hot"));
     assert_eq!(indexed_ids(&db, "cold"), canonical_ids(&db, "cold"));
@@ -128,7 +128,7 @@ fn missing_secondary_level_is_rebuilt_from_canonical_data() {
             txn.commit().unwrap();
             db.checkpoint().unwrap();
         }
-        db.wait_for_secondary_compaction();
+        db.wait_for_secondary_compaction().unwrap();
     }
 
     let run = fs::read_dir(path.join("indexes"))

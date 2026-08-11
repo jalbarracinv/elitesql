@@ -331,7 +331,7 @@ fn async_mode_indexes_in_background() {
             .unwrap();
     }
     // Commits return before indexing; wait for the background thread.
-    db.wait_vector_indexing();
+    db.wait_vector_indexing().unwrap();
     assert_eq!(db.vector_indexing_backlog(), 0);
     let hits = db
         .search_vector(

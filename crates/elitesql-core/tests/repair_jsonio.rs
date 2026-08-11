@@ -188,6 +188,28 @@ fn salvage_refuses_existing_destination() {
 }
 
 #[test]
+fn salvage_never_deletes_an_unrelated_fixed_partial_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.esql");
+    {
+        let db = Db::create(&src).unwrap();
+        db.query("CREATE TABLE t (a int64)").unwrap();
+        db.query("INSERT INTO t (a) VALUES (1)").unwrap();
+    }
+    let dst = dir.path().join("dst.esql");
+    let unrelated = dir.path().join("dst.esql.partial");
+    std::fs::create_dir(&unrelated).unwrap();
+    std::fs::write(unrelated.join("keep"), b"not salvage-owned").unwrap();
+
+    salvage(&src, &dst).unwrap();
+    assert_eq!(
+        std::fs::read(unrelated.join("keep")).unwrap(),
+        b"not salvage-owned"
+    );
+    assert_eq!(Db::open(dst).unwrap().scan("t").unwrap().len(), 1);
+}
+
+#[test]
 fn import_export_type_mapping() {
     // json_to_value_for_type accepts natural encodings per column type.
     use elitesql_core::ColumnType as T;

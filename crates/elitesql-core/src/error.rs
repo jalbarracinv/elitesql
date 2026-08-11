@@ -49,6 +49,11 @@ pub enum Error {
     /// Concurrent operations wait for permits; intrinsically oversized work
     /// must use batching/streaming or a larger configured pool.
     MemoryLimit(String),
+    /// A WAL record or canonical namespace replacement completed, but its
+    /// durability sync failed. The new state is adopted logically, while a
+    /// power loss may still remove it; callers must inspect after reopening
+    /// rather than retrying the unit of work blindly.
+    CommitUnknown(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +78,7 @@ impl Error {
             Error::ColumnNotFound { .. } => 14,
             Error::IndexNotFound { .. } => 15,
             Error::MemoryLimit(_) => 16,
+            Error::CommitUnknown(_) => 17,
         }
     }
 }
@@ -108,6 +114,7 @@ impl fmt::Display for Error {
                 write!(f, "index not found on {table}.{column}")
             }
             Error::MemoryLimit(msg) => write!(f, "memory limit exceeded: {msg}"),
+            Error::CommitUnknown(msg) => write!(f, "commit outcome unknown: {msg}"),
         }
     }
 }

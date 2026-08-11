@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Barrier};
 
 use elitesql_core::{Column, ColumnType, Db, Error, Record, TableSchema, Value};
 use tempfile::TempDir;
@@ -152,6 +153,81 @@ fn delete_respects_snapshots() {
     let old = db.get_at(&before, "docs", &id).unwrap().unwrap();
     assert_eq!(old["title"], Value::Text("ephemeral".into()));
     assert_eq!(db.scan_at(&before, "docs").unwrap().len(), 1);
+}
+
+#[test]
+fn snapshot_from_another_database_is_rejected() {
+    let (_first_dir, first) = new_db();
+    let (_second_dir, second) = new_db();
+    let snapshot = first.snapshot();
+
+    assert!(matches!(
+        second.get_at(&snapshot, "docs", "missing"),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        second.scan_at(&snapshot, "docs"),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        second.scan_batch_at(&snapshot, "docs", None, 10),
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[test]
+fn concurrent_open_or_create_has_one_non_destructive_creator() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = Arc::new(dir.path().join("create-race.esql"));
+    let ready = Arc::new(Barrier::new(12));
+    let hold = Arc::new(Barrier::new(12));
+    let workers: Vec<_> = (0..12)
+        .map(|_| {
+            let path = path.clone();
+            let ready = ready.clone();
+            let hold = hold.clone();
+            std::thread::spawn(move || {
+                ready.wait();
+                let result = Db::open_or_create(path.as_ref());
+                hold.wait();
+                result
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    for error in results.into_iter().filter_map(Result::err) {
+        assert!(
+            matches!(error, Error::DatabaseLocked(_)),
+            "losing creators must observe the winner, not corrupt it: {error}"
+        );
+    }
+
+    let reopened = Db::open(path.as_ref()).unwrap();
+    assert!(reopened.tables().is_empty());
+}
+
+#[test]
+fn create_refuses_a_nonempty_unowned_directory_without_deleting_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("occupied.esql");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("catalog.json"), b"user catalog").unwrap();
+    std::fs::create_dir(path.join("segments")).unwrap();
+    std::fs::write(path.join("segments/important.seg"), b"user data").unwrap();
+
+    assert!(matches!(Db::create(&path), Err(Error::InvalidArgument(_))));
+    assert_eq!(
+        std::fs::read(path.join("catalog.json")).unwrap(),
+        b"user catalog"
+    );
+    assert_eq!(
+        std::fs::read(path.join("segments/important.seg")).unwrap(),
+        b"user data"
+    );
 }
 
 #[test]

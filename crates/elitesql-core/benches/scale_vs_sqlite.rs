@@ -378,7 +378,7 @@ fn run_elitesql(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Er
     db.checkpoint()?;
     let final_checkpoint_wall = checkpoint_started.elapsed();
     let drain_started = Instant::now();
-    db.wait_for_primary_compaction();
+    db.wait_for_primary_compaction().unwrap();
     let maintenance_drain_wall = drain_started.elapsed();
     let total_load = load_started.elapsed();
     let maintenance_after = db.maintenance_stats();

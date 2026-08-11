@@ -7,9 +7,9 @@ little-endian. Current `format_version`: 2.
 app.esql/
   ELITESQL        # marker: "elitesql format_version=2\n"
   LOCK            # flock: exclusive (writer) or shared (read-only)
-  catalog.json    # tables, columns, indexes (atomic JSON via tmp+rename)
-  manifest        # atomic pointer to the visible state
-  manifest.prev   # previous manifest (recovery fallback)
+  catalog.json    # compatibility/tooling mirror of the catalog
+  manifest        # atomic data + schema generation
+  manifest.prev   # redundant recovery copy after successful publication
   wal/NNNNNN.wal  # durable commits since the last checkpoint
   segments/NNNNNN.seg   # immutable data (created at checkpoint/compaction)
   vectors/XXXXXXXX.vidx # persisted ANN graphs (derived, disposable)
@@ -19,10 +19,14 @@ app.esql/
 ## manifest
 
 `ESQLMANI` (8 bytes) + u32 crc32 of the body + u32 length + JSON body:
-`{format_version, committed_version, segments: [{id, len}], wal_id}`.
+`{format_version, committed_version, segments: [{id, len}], wal_id,
+identity_high_water, catalog}`. Embedding the catalog makes every canonical
+generation self-contained: schema cannot advance independently of its data.
 Publication: write `manifest.tmp` (fsync), rotate `manifest` →
 `manifest.prev`, rename `manifest.tmp` → `manifest`, fsync the directory.
-A crash between the renames leaves a valid `manifest.prev`.
+A crash between the renames leaves a valid old `manifest.prev`. Once the new
+primary is durable, the fallback is atomically refreshed to the same generation
+and synced before success is reported.
 
 ## Segments (`segments/`)
 
@@ -54,7 +58,9 @@ u32  crc32 of the whole record
 
 Idempotent replay: records at or below the manifest's watermark are skipped;
 a torn tail is truncated. At checkpoint the WAL rotates (id+1) and the old
-file is deleted once the manifest is published.
+file is deleted only after the primary and redundant manifest copies are
+durable. A missing active WAL or a commit-version gap is corruption, never an
+empty WAL to recreate or silently skip.
 
 ## Record payload
 

@@ -1,7 +1,9 @@
 import datetime as dt
+import ctypes
 import platform
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -42,6 +44,43 @@ class ParameterEncodingTests(unittest.TestCase):
     def test_parameter_container_must_be_sequence_or_mapping(self):
         with self.assertRaises(TypeError):
             _encode_params("not-a-parameter-sequence")
+
+    def test_close_waits_for_active_native_handle_leases(self):
+        closed = threading.Event()
+
+        class FakeLib:
+            @staticmethod
+            def elitesql_close(_handle):
+                closed.set()
+                return 0
+
+        db = EliteSQL.__new__(EliteSQL)
+        db._lib = FakeLib()
+        db._handle = ctypes.c_void_p(1)
+        db._lifecycle = threading.Condition()
+        db._active_calls = 0
+        db._closing = False
+        entered = threading.Event()
+        release = threading.Event()
+
+        def use_handle():
+            with db._lease():
+                entered.set()
+                release.wait(2)
+
+        user = threading.Thread(target=use_handle)
+        user.start()
+        self.assertTrue(entered.wait(2))
+        closer = threading.Thread(target=db.close)
+        closer.start()
+        with db._lifecycle:
+            self.assertTrue(db._lifecycle.wait_for(lambda: db._closing, timeout=2))
+        self.assertFalse(closed.is_set())
+        release.set()
+        user.join(2)
+        closer.join(2)
+        self.assertTrue(closed.is_set())
+        self.assertIsNone(db._handle)
 
 
 @unittest.skipUnless(LIB_PATH.is_file(), f"build {LIB_PATH} first")

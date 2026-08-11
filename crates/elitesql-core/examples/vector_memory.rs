@@ -176,7 +176,8 @@ fn run(args: Args) -> Result<(), String> {
         inserted = end;
         eprintln!("loaded {inserted}/{}", args.rows);
     }
-    db.wait_vector_indexing();
+    db.wait_vector_indexing()
+        .map_err(|error| error.to_string())?;
     let build_seconds = started.elapsed().as_secs_f64();
     let memory = db.global_memory_stats();
     let maintenance = db.maintenance_stats();

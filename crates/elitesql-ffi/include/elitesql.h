@@ -6,11 +6,14 @@
  *      6 duplicate_id, 7 schema_violation, 8 invalid_argument,
  *      9 conflict_retry, 10 database_locked, 11 unique_violation, 12 sql,
  *      13 read_only, 14 column_not_found, 15 index_not_found, 16 memory_limit,
+ *      17 commit_unknown (do not retry blindly; inspect after reopening),
  *      100 internal_panic.
  *  - Output strings are heap-allocated UTF-8 JSON; free with
  *    elitesql_free_string(). elitesql_last_error() is thread-local and NOT freed.
- *  - The handle is thread-safe: readers never block writers; writers only
- *    meet at commit.
+ *  - Database operations on one handle are thread-safe: readers never block
+ *    writers; writers only meet at commit. Transaction operations are
+ *    serialized by the library. Closing any handle must not overlap another
+ *    call that uses that same handle.
  */
 #ifndef ELITESQL_H
 #define ELITESQL_H

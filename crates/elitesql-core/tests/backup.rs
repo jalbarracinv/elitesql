@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use elitesql_core::{
     check, restore, Column, ColumnType, Db, DbOptions, Record, TableSchema, Value,
@@ -84,12 +84,18 @@ fn full_scan(db: &Db) -> BTreeMap<(String, String), Record> {
 fn backup_roundtrip_preserves_data_and_indexes() {
     let (dir, db) = populated_db();
     let dst = dir.path().join("backup.esql");
+    let unrelated_partial = dir.path().join("backup.esql.partial");
+    std::fs::create_dir(&unrelated_partial).unwrap();
+    std::fs::write(unrelated_partial.join("keep"), b"not owned by backup").unwrap();
 
     let report = db.backup(&dst).unwrap();
     assert_eq!(report.tables, 2);
     assert_eq!(report.records, 5);
     assert!(check(&dst).unwrap().is_ok(), "backup validates offline");
-    assert!(!dir.path().join("backup.esql.partial").exists());
+    assert_eq!(
+        std::fs::read(unrelated_partial.join("keep")).unwrap(),
+        b"not owned by backup"
+    );
 
     let copy = Db::open(&dst).unwrap();
     assert_eq!(full_scan(&db), full_scan(&copy), "same ids, same records");
@@ -183,18 +189,51 @@ fn backup_refuses_existing_destination() {
 }
 
 #[test]
+fn concurrent_backups_cannot_share_or_delete_the_same_partial_directory() {
+    let (dir, db) = populated_db();
+    let db = Arc::new(db);
+    let dst = dir.path().join("contended-backup.esql");
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let dst = dst.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            db.backup(dst)
+        }));
+    }
+    barrier.wait();
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert!(check(&dst).unwrap().is_ok());
+    assert_eq!(Db::open(&dst).unwrap().scan("notes").unwrap().len(), 3);
+}
+
+#[test]
 fn restore_roundtrip() {
     let (dir, db) = populated_db();
     let backup = dir.path().join("backup.esql");
     db.backup(&backup).unwrap();
 
     let restored_path = dir.path().join("restored.esql");
+    let unrelated_partial = dir.path().join("restored.esql.partial");
+    std::fs::create_dir(&unrelated_partial).unwrap();
+    std::fs::write(unrelated_partial.join("keep"), b"not owned by restore").unwrap();
     let report = restore(&backup, &restored_path).unwrap();
     assert_eq!(report.tables, 2);
     assert_eq!(report.records, 5);
 
     let restored = Db::open(&restored_path).unwrap();
     assert_eq!(full_scan(&db), full_scan(&restored));
+    assert_eq!(
+        std::fs::read(unrelated_partial.join("keep")).unwrap(),
+        b"not owned by restore"
+    );
     let hits = restored
         .search_text("notes", "body", "rust", 10, None)
         .unwrap();

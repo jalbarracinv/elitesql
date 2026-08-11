@@ -140,7 +140,7 @@ fn vector_index_options_async_and_drop() {
     db.query("INSERT INTO chunks (body, embedding) VALUES ('c', '[0.1, 0.2, 0.3, 0.4]')")
         .unwrap();
     // Async: the commit may return before the vector is searchable.
-    db.wait_vector_indexing();
+    db.wait_vector_indexing().unwrap();
     let query = [0.1f32, 0.2, 0.3, 0.4];
     assert_eq!(
         db.search_vector(

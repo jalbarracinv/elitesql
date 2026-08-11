@@ -26,6 +26,7 @@ import math
 import os
 import socket
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -44,6 +45,7 @@ class EliteSQLError(Exception):
         self.code = code
 
     CONFLICT_RETRY = 9  # retry the transaction/operation
+    COMMIT_UNKNOWN = 17  # do not retry blindly; inspect after reopening
 
 
 # --- library loading -------------------------------------------------------
@@ -329,12 +331,20 @@ class EliteSQL:
         )
         _raise_if(self._lib, status)
         self._handle: Optional[ctypes.c_void_p] = handle
+        self._lifecycle = threading.Condition()
+        self._active_calls = 0
+        self._closing = False
 
     # -- lifecycle
     def close(self) -> None:
-        if self._handle is not None:
-            _raise_if(self._lib, self._lib.elitesql_close(self._handle))
-            self._handle = None
+        with self._lifecycle:
+            if self._handle is None:
+                return
+            self._closing = True
+            while self._active_calls:
+                self._lifecycle.wait()
+            handle, self._handle = self._handle, None
+        _raise_if(self._lib, self._lib.elitesql_close(handle))
 
     def __enter__(self) -> "EliteSQL":
         return self
@@ -348,10 +358,21 @@ class EliteSQL:
         except Exception:
             pass
 
-    def _h(self) -> ctypes.c_void_p:
-        if self._handle is None:
-            raise EliteSQLError(8, "database is closed")
-        return self._handle
+    @contextmanager
+    def _lease(self):
+        """Keep the native handle alive for one concurrent FFI call."""
+        with self._lifecycle:
+            if self._handle is None or self._closing:
+                raise EliteSQLError(8, "database is closed")
+            self._active_calls += 1
+            handle = self._handle
+        try:
+            yield handle
+        finally:
+            with self._lifecycle:
+                self._active_calls -= 1
+                if self._active_calls == 0:
+                    self._lifecycle.notify_all()
 
     # -- operations
     def query(self, sql: str, params: Any = None) -> Any:
@@ -363,13 +384,14 @@ class EliteSQL:
         for ``%(name)s`` placeholders. Values are bound, never interpolated.
         """
         out = ctypes.c_void_p()
-        if params is None:
-            status = self._lib.elitesql_query(self._h(), sql.encode(), ctypes.byref(out))
-        else:
-            encoded = json.dumps(_encode_params(params), separators=(",", ":")).encode()
-            status = self._lib.elitesql_query_params(
-                self._h(), sql.encode(), encoded, ctypes.byref(out)
-            )
+        with self._lease() as handle:
+            if params is None:
+                status = self._lib.elitesql_query(handle, sql.encode(), ctypes.byref(out))
+            else:
+                encoded = json.dumps(_encode_params(params), separators=(",", ":")).encode()
+                status = self._lib.elitesql_query_params(
+                    handle, sql.encode(), encoded, ctypes.byref(out)
+                )
         _raise_if(self._lib, status)
         return _decode_result(json.loads(_take_string(self._lib, out)))
 
@@ -386,9 +408,10 @@ class EliteSQL:
         if filter is not None:
             params["filter"] = filter
         out = ctypes.c_void_p()
-        status = self._lib.elitesql_search_vector(
-            self._h(), json.dumps(params).encode(), ctypes.byref(out)
-        )
+        with self._lease() as handle:
+            status = self._lib.elitesql_search_vector(
+                handle, json.dumps(params).encode(), ctypes.byref(out)
+            )
         _raise_if(self._lib, status)
         hits = json.loads(_take_string(self._lib, out))["hits"]
         for h in hits:
@@ -406,12 +429,15 @@ class EliteSQL:
             params["ef_construction"] = ef_construction
         if quantized:
             params["quantized"] = True
-        status = self._lib.elitesql_create_vector_index(self._h(), json.dumps(params).encode())
+        with self._lease() as handle:
+            status = self._lib.elitesql_create_vector_index(handle, json.dumps(params).encode())
         _raise_if(self._lib, status)
 
     def create_text_index(self, table: str, column: str) -> None:
         params = json.dumps({"table": table, "column": column}).encode()
-        _raise_if(self._lib, self._lib.elitesql_create_text_index(self._h(), params))
+        with self._lease() as handle:
+            status = self._lib.elitesql_create_text_index(handle, params)
+        _raise_if(self._lib, status)
 
     def search_text(self, table: str, column: str, query: str, top_k: int = 10,
                     filter: Optional[dict] = None) -> list[dict]:
@@ -421,8 +447,10 @@ class EliteSQL:
         if filter is not None:
             params["filter"] = filter
         out = ctypes.c_void_p()
-        status = self._lib.elitesql_search_text(self._h(), json.dumps(params).encode(),
-                                              ctypes.byref(out))
+        with self._lease() as handle:
+            status = self._lib.elitesql_search_text(
+                handle, json.dumps(params).encode(), ctypes.byref(out)
+            )
         _raise_if(self._lib, status)
         hits = json.loads(_take_string(self._lib, out))["hits"]
         for h in hits:
@@ -447,8 +475,10 @@ class EliteSQL:
         if filter is not None:
             params["filter"] = filter
         out = ctypes.c_void_p()
-        status = self._lib.elitesql_search_hybrid(self._h(), json.dumps(params).encode(),
-                                                ctypes.byref(out))
+        with self._lease() as handle:
+            status = self._lib.elitesql_search_hybrid(
+                handle, json.dumps(params).encode(), ctypes.byref(out)
+            )
         _raise_if(self._lib, status)
         hits = json.loads(_take_string(self._lib, out))["hits"]
         for h in hits:
@@ -458,7 +488,9 @@ class EliteSQL:
     def snapshot(self) -> "Snapshot":
         """A stable read position; use as a context manager."""
         handle = ctypes.c_void_p()
-        _raise_if(self._lib, self._lib.elitesql_snapshot_open(self._h(), ctypes.byref(handle)))
+        with self._lease() as db_handle:
+            status = self._lib.elitesql_snapshot_open(db_handle, ctypes.byref(handle))
+        _raise_if(self._lib, status)
         return Snapshot(self, handle)
 
     def transaction(self) -> "Transaction":
@@ -469,7 +501,9 @@ class EliteSQL:
         effects are safe to repeat.
         """
         handle = ctypes.c_void_p()
-        _raise_if(self._lib, self._lib.elitesql_txn_begin(self._h(), ctypes.byref(handle)))
+        with self._lease() as db_handle:
+            status = self._lib.elitesql_txn_begin(db_handle, ctypes.byref(handle))
+        _raise_if(self._lib, status)
         return Transaction(self, handle)
 
     def run_transaction(self, operation, retries: int = 3):
@@ -495,10 +529,14 @@ class EliteSQL:
                 raise
 
     def checkpoint(self) -> None:
-        _raise_if(self._lib, self._lib.elitesql_checkpoint(self._h()))
+        with self._lease() as handle:
+            status = self._lib.elitesql_checkpoint(handle)
+        _raise_if(self._lib, status)
 
     def compact(self) -> None:
-        _raise_if(self._lib, self._lib.elitesql_compact(self._h()))
+        with self._lease() as handle:
+            status = self._lib.elitesql_compact(handle)
+        _raise_if(self._lib, status)
 
     @property
     def version(self) -> str:
@@ -513,6 +551,7 @@ class Snapshot:
     def __init__(self, db: "EliteSQL", handle: ctypes.c_void_p):
         self._db = db
         self._handle: Optional[ctypes.c_void_p] = handle
+        self._lock = threading.RLock()
 
     def _h(self) -> ctypes.c_void_p:
         if self._handle is None:
@@ -520,27 +559,30 @@ class Snapshot:
         return self._handle
 
     def get(self, table: str, id: str) -> Optional[dict]:
-        out = ctypes.c_void_p()
-        status = self._db._lib.elitesql_snapshot_get(
-            self._db._h(), self._h(), table.encode(), id.encode(), ctypes.byref(out)
-        )
+        with self._lock, self._db._lease() as db_handle:
+            out = ctypes.c_void_p()
+            status = self._db._lib.elitesql_snapshot_get(
+                db_handle, self._h(), table.encode(), id.encode(), ctypes.byref(out)
+            )
         _raise_if(self._db._lib, status)
         record = json.loads(_take_string(self._db._lib, out))["record"]
         return _decode_record(record) if record is not None else None
 
     def scan(self, table: str) -> list[dict]:
-        out = ctypes.c_void_p()
-        status = self._db._lib.elitesql_snapshot_scan(
-            self._db._h(), self._h(), table.encode(), ctypes.byref(out)
-        )
+        with self._lock, self._db._lease() as db_handle:
+            out = ctypes.c_void_p()
+            status = self._db._lib.elitesql_snapshot_scan(
+                db_handle, self._h(), table.encode(), ctypes.byref(out)
+            )
         _raise_if(self._db._lib, status)
         rows = json.loads(_take_string(self._db._lib, out))["rows"]
         return [_decode_record(r) for r in rows]
 
     def close(self) -> None:
-        if self._handle is not None:
-            self._db._lib.elitesql_snapshot_close(self._handle)
-            self._handle = None
+        with self._lock:
+            if self._handle is not None:
+                handle, self._handle = self._handle, None
+                _raise_if(self._db._lib, self._db._lib.elitesql_snapshot_close(handle))
 
     def __enter__(self) -> "Snapshot":
         return self
@@ -561,6 +603,7 @@ class Transaction:
     def __init__(self, db: "EliteSQL", handle: ctypes.c_void_p):
         self._db = db
         self._handle: Optional[ctypes.c_void_p] = handle
+        self._lock = threading.RLock()
         self.committed_version: Optional[int] = None
 
     def _h(self) -> ctypes.c_void_p:
@@ -576,21 +619,23 @@ class Transaction:
         return json.dumps(encoded, separators=(",", ":")).encode()
 
     def insert(self, table: str, record: dict[str, Any]) -> dict[str, Any]:
-        out = ctypes.c_void_p()
-        status = self._db._lib.elitesql_txn_insert(
-            self._h(), table.encode(), self._record(record), ctypes.byref(out)
-        )
+        with self._lock:
+            out = ctypes.c_void_p()
+            status = self._db._lib.elitesql_txn_insert(
+                self._h(), table.encode(), self._record(record), ctypes.byref(out)
+            )
         _raise_if(self._db._lib, status)
         result = json.loads(_take_string(self._db._lib, out))
         result["record"] = _decode_record(result["record"])
         return result
 
     def query(self, sql: str, params: Any = None) -> Any:
-        encoded = None if params is None else _encode_params(params)
-        out = ctypes.c_void_p()
-        status = self._db._lib.elitesql_txn_query_params(
-            self._h(), sql.encode(), json.dumps(encoded).encode(), ctypes.byref(out)
-        )
+        with self._lock:
+            encoded = None if params is None else _encode_params(params)
+            out = ctypes.c_void_p()
+            status = self._db._lib.elitesql_txn_query_params(
+                self._h(), sql.encode(), json.dumps(encoded).encode(), ctypes.byref(out)
+            )
         _raise_if(self._db._lib, status)
         return _decode_result(json.loads(_take_string(self._db._lib, out)))
 
@@ -601,47 +646,53 @@ class Transaction:
         return self.cursor().execute(sql, params)
 
     def get(self, table: str, id: str) -> Optional[dict[str, Any]]:
-        out = ctypes.c_void_p()
-        status = self._db._lib.elitesql_txn_get(
-            self._h(), table.encode(), id.encode(), ctypes.byref(out)
-        )
+        with self._lock:
+            out = ctypes.c_void_p()
+            status = self._db._lib.elitesql_txn_get(
+                self._h(), table.encode(), id.encode(), ctypes.byref(out)
+            )
         _raise_if(self._db._lib, status)
         record = json.loads(_take_string(self._db._lib, out))["record"]
         return _decode_record(record) if record is not None else None
 
     def update(self, table: str, id: str, patch: dict[str, Any]) -> None:
-        status = self._db._lib.elitesql_txn_update(
-            self._h(), table.encode(), id.encode(), self._record(patch)
-        )
+        with self._lock:
+            status = self._db._lib.elitesql_txn_update(
+                self._h(), table.encode(), id.encode(), self._record(patch)
+            )
         _raise_if(self._db._lib, status)
 
     def delete(self, table: str, id: str) -> bool:
-        deleted = ctypes.c_bool()
-        status = self._db._lib.elitesql_txn_delete(
-            self._h(), table.encode(), id.encode(), ctypes.byref(deleted)
-        )
+        with self._lock:
+            deleted = ctypes.c_bool()
+            status = self._db._lib.elitesql_txn_delete(
+                self._h(), table.encode(), id.encode(), ctypes.byref(deleted)
+            )
         _raise_if(self._db._lib, status)
         return bool(deleted.value)
 
     def commit(self) -> int:
-        version = ctypes.c_uint64()
-        status = self._db._lib.elitesql_txn_commit(self._h(), ctypes.byref(version))
-        try:
-            _raise_if(self._db._lib, status)
-        finally:
-            self.close()
-        self.committed_version = int(version.value)
-        return self.committed_version
+        with self._lock:
+            version = ctypes.c_uint64()
+            status = self._db._lib.elitesql_txn_commit(self._h(), ctypes.byref(version))
+            try:
+                _raise_if(self._db._lib, status)
+            finally:
+                self.close()
+            self.committed_version = int(version.value)
+            return self.committed_version
 
     def rollback(self) -> None:
-        if self._handle is not None:
-            _raise_if(self._db._lib, self._db._lib.elitesql_txn_rollback(self._handle))
-            self.close()
+        with self._lock:
+            if self._handle is not None:
+                _raise_if(self._db._lib, self._db._lib.elitesql_txn_rollback(self._handle))
+                self.close()
 
     def close(self) -> None:
-        if self._handle is not None:
-            handle, self._handle = self._handle, None
-            _raise_if(self._db._lib, self._db._lib.elitesql_txn_close(handle))
+        with self._lock:
+            if self._handle is not None:
+                handle, self._handle = self._handle, None
+                _raise_if(self._db._lib, self._db._lib.elitesql_txn_close(handle))
 
     def __enter__(self) -> "Transaction":
         return self
@@ -688,9 +739,9 @@ class SidecarClient:
         SidecarClient(host="db", port=7070, token=tok)  # TCP, needs the token
 
     A Unix socket is authenticated by filesystem permissions. TCP is not, so a
-    token is required and is sent as the first request on every connection,
-    including after a reconnect. The protocol is not encrypted: reach another
-    host through an SSH tunnel, a VPN or a private network.
+    token is required and is sent as the first request on every new connection.
+    The protocol is not encrypted: reach another host through an SSH tunnel, a
+    VPN or a private network.
 
     Each client owns one connection; it is thread-safe (a lock serializes
     request/response pairs). Create one per worker process.
@@ -753,8 +804,8 @@ class SidecarClient:
                 self._file.flush()
                 line = self._file.readline()
         else:
-            # The auth handshake runs inside _connect(), which already owns the
-            # connection; taking the lock again would deadlock a reconnect.
+            # The initial auth handshake runs before this client is shared;
+            # taking the regular request lock here is unnecessary.
             self._file.write(payload)
             self._file.flush()
             line = self._file.readline()

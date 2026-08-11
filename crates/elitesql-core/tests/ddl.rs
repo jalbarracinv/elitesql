@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Barrier};
 
 use elitesql_core::{
     check, Column, ColumnType, Db, Error, QueryOutput, Record, TableSchema, Value,
@@ -53,6 +54,39 @@ fn headers(out: QueryOutput) -> Vec<String> {
 fn assert_clean(path: &Path) {
     let report = check(path).unwrap();
     assert!(report.is_ok(), "check failed: {:?}", report.errors);
+}
+
+#[test]
+fn concurrent_catalog_changes_are_serialized_from_validation_to_publish() {
+    let (dir, db) = new_db();
+    db.create_table(users()).unwrap();
+    let db = Arc::new(db);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            db.add_column("users", Column::new("nickname", ColumnType::Text))
+        }));
+    }
+    barrier.wait();
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        db.table_schema("users")
+            .unwrap()
+            .columns
+            .iter()
+            .filter(|column| column.name == "nickname")
+            .count(),
+        1
+    );
+    assert_clean(&path_of(&dir));
 }
 
 // --- DROP TABLE ---------------------------------------------------------------
@@ -260,7 +294,7 @@ fn drop_vector_and_text_indexes() {
             ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
         ],
     );
-    db.wait_vector_indexing();
+    db.wait_vector_indexing().unwrap();
     assert_eq!(
         db.search_text("docs", "body", "fox", 5, None)
             .unwrap()
@@ -575,7 +609,7 @@ fn drop_column_keeps_other_columns_including_blobs_and_vectors() {
             ("embedding", Value::Vector(vec![0.0, 1.0, 0.0])),
         ],
     );
-    db.wait_vector_indexing();
+    db.wait_vector_indexing().unwrap();
 
     db.drop_column("docs", "scratch").unwrap();
     let read = db.get("docs", &id).unwrap().unwrap();
@@ -769,7 +803,7 @@ fn renames_keep_vector_and_text_search_working() {
             ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
         ],
     );
-    db.wait_vector_indexing();
+    db.wait_vector_indexing().unwrap();
 
     db.rename_column("docs", "body", "text_body").unwrap();
     db.rename_table("docs", "documents").unwrap();
@@ -1001,6 +1035,37 @@ fn interrupted_add_column_backfill_is_completed_on_open() {
     assert_clean(&path);
 }
 
+#[test]
+fn an_existing_ddl_intent_is_never_overwritten_by_a_new_schema_change() {
+    let (dir, db) = new_db();
+    let path = path_of(&dir);
+    db.create_table(users()).unwrap();
+    let original = r#"{"op":"RenameTable","table":"users","to":"people"}"#;
+    write_intent(&path, original);
+
+    assert!(matches!(
+        db.rename_column("users", "name", "full_name"),
+        Err(Error::CommitUnknown(_))
+    ));
+    assert_eq!(fs::read_to_string(path.join("ddl.json")).unwrap(), original);
+    let mut refused = Record::new();
+    refused.insert("name".into(), Value::Text("blocked".into()));
+    assert!(matches!(
+        db.insert("users", refused),
+        Err(Error::CommitUnknown(_))
+    ));
+    drop(db);
+
+    let reopened = Db::open(&path).unwrap();
+    assert_eq!(reopened.tables(), vec!["people".to_string()]);
+    assert!(reopened
+        .table_schema("people")
+        .unwrap()
+        .column("name")
+        .is_some());
+    assert!(!path.join("ddl.json").exists());
+}
+
 fn write_intent(db_path: &Path, json: &str) {
     fs::write(db_path.join("ddl.json"), json).unwrap();
 }
@@ -1071,6 +1136,12 @@ fn backup_and_salvage_carry_the_altered_schema() {
     drop(copy);
 
     let salvaged = dir.path().join("salvaged.esql");
+    assert!(matches!(
+        elitesql_core::salvage(&path, &salvaged),
+        Err(Error::DatabaseLocked(_))
+    ));
+    assert!(!salvaged.exists());
+    drop(db);
     let report = elitesql_core::salvage(&path, &salvaged).unwrap();
     assert_eq!(report.tables, vec!["people".to_string()]);
     let out = Db::open(&salvaged).unwrap();

@@ -591,9 +591,9 @@ explicit graceful-shutdown/testing synchronization.
 app.esql/
   ELITESQL        # marker + format_version
   LOCK            # process exclusion (flock)
-  catalog.json    # tables, columns, indexes
-  manifest        # atomic pointer to the visible state
-  manifest.prev   # recovery fallback
+  catalog.json    # compatibility/tooling catalog mirror
+  manifest        # atomic data + schema generation
+  manifest.prev   # redundant recovery fallback
   wal/            # durable commits (per-record CRC)
   segments/       # immutable data (per-entry CRC)
   indexes/        # paged primary/equality/BM25 files

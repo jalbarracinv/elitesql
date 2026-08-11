@@ -4,7 +4,8 @@
 //! fail-safe storage core from the spec:
 //!
 //! - Durable WAL with per-record CRC32 and idempotent replay.
-//! - Atomic manifest + `manifest.prev` recovery chain (temp file + rename).
+//! - Atomic, self-contained data/schema manifest plus redundant
+//!   `manifest.prev` recovery copy (temp file + rename).
 //! - MVCC: transactions read from a stable snapshot; writers stage in
 //!   parallel and only meet at commit (optimistic validation, `Conflict`
 //!   means retry).

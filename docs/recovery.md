@@ -9,15 +9,17 @@ And the golden rule: `Data files are canonical. Indexes are disposable.`
 EliteSQL assumes the process can die on any instruction. A commit writes:
 (1) large blob chunks (fsync), (2) the checksummed WAL record (fsync per the
 durability mode), (3) the in-memory apply. The manifest is only ever replaced
-through a temp file + atomic rename, keeping the previous one as
-`manifest.prev`.
+through a temp file + atomic rename. `manifest.prev` remains a usable old
+generation during replacement and is refreshed to a redundant copy of the
+new data-and-schema generation before success is reported.
 
 Opening after a crash:
 
 1. `manifest` is read; if its checksum fails, `manifest.prev` is used (and
    the primary is re-established without ever clobbering the good copy).
 2. The listed segments are loaded (per-entry CRC).
-3. The WAL is replayed from the manifest's watermark — idempotent replay; a
+3. The required active WAL is replayed from the manifest's watermark with
+   contiguous commit versions — idempotent replay; a
    torn tail (a half-written commit) is truncated: that commit never existed.
    All or nothing.
 4. Indexes (secondary, text, ANN) are rebuilt from canonical data; the ANN
@@ -41,9 +43,10 @@ committed when it started, preserves ids, schemas and index definitions, and
 is born compacted. From the CLI it needs the lock (no other process may hold
 the database open); embedded apps can call `db.backup(dst)` directly and
 back up WHILE other threads keep committing — writers are never blocked.
-The copy is written to `<dst>.partial` and renamed at the end (an interrupted
-backup never leaves a partial directory under the final name), then verified
-with `check` before reporting success.
+The copy is written to a unique `<dst>.<ulid>.partial` sibling and renamed at
+the end (an interrupted backup never leaves a partial directory under the
+final name or reuses another process's temporary path), then verified with
+`check` before reporting success.
 
 `restore` refuses to touch an existing destination, runs `check` on the
 backup first (a damaged backup is reported, never restored), copies the
@@ -80,7 +83,9 @@ elitesql export damaged.esql table --read-only > rescue.jsonl
 Builds a NEW database at `dst` with everything recoverable from `src`: it
 walks segments and WAL directly (valid prefix of each file), takes the latest
 version of every record, honors tombstones and re-inserts using the catalog's
-schema. Requires a readable `catalog.json`.
+schema. It prefers the catalog embedded in a valid manifest and falls back to
+legacy `catalog.json` only for older databases. The source is held under a
+shared process lock, so salvage refuses to race a live writer.
 
 It is never silent — the report counts recovered records, legitimate
 deletions, skipped entries, and one note per damage found. Whatever sat after

@@ -3,16 +3,23 @@
 //! and reported. The golden rule applies: data files are canonical, so
 //! salvage reads segments and WAL directly and rebuilds the rest.
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::db::{decode_record, Db, CATALOG_FILE, SEGMENTS_DIR};
+use crate::backup::{lock_destination, parent_of, partial_path};
+use crate::db::{acquire_lock, decode_record, Db, CATALOG_FILE, SEGMENTS_DIR};
 use crate::error::{Error, Result};
+use crate::manifest::fsync_dir;
+use crate::manifest::Manifest;
 use crate::schema::Catalog;
 use crate::segment::scan_segment;
 use crate::value::Value;
 use crate::wal::{scan_wal, WAL_DIR};
+
+type RecordKey = (String, String);
+type LatestRecord = (u64, Option<Vec<u8>>);
 
 #[derive(Debug, Default)]
 pub struct SalvageReport {
@@ -34,29 +41,48 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
     let dst = dst.as_ref();
     let mut report = SalvageReport::default();
 
-    let catalog = Catalog::load(&src.join(CATALOG_FILE)).map_err(|e| {
+    // Prevent a concurrent writer/compactor from replacing the files while
+    // salvage enumerates them. Read-only handles may coexist safely.
+    let _source_lock = acquire_lock(src, true)?;
+    let _destination_lock = lock_destination(dst)?;
+    if dst.exists() {
+        return Err(Error::InvalidArgument(format!(
+            "salvage destination already exists: {}",
+            dst.display()
+        )));
+    }
+    let partial = partial_path(dst)?;
+
+    let catalog = Manifest::load(src)
+        .ok()
+        .and_then(|(manifest, _)| manifest.catalog)
+        .map(Ok)
+        .unwrap_or_else(|| Catalog::load(&src.join(CATALOG_FILE)))
+        .map_err(|e| {
         Error::Corrupt(format!(
             "salvage requires a readable catalog.json ({e}); without the schema records cannot be re-typed"
         ))
     })?;
 
-    // Latest version per (table, id): version -> payload (None = tombstone).
+    // Latest version per (table, id): version + payload (None = tombstone).
     // Entries the catalog does not own are skipped, exactly as `open` skips
     // them: a table that was dropped, or a record written by an earlier table
     // of a name that has since been re-created. Segments keep those bytes until
     // a compaction, and salvage must not resurrect them.
-    type Versions = BTreeMap<u64, Option<Vec<u8>>>;
-    let mut latest: BTreeMap<(String, String), Versions> = BTreeMap::new();
+    let mut latest: BTreeMap<RecordKey, LatestRecord> = BTreeMap::new();
     let mut ignored: BTreeMap<String, u64> = BTreeMap::new();
     let mut push = |table: String, id: String, version: u64, payload: Option<Vec<u8>>| match catalog
         .table(&table)
     {
-        Some(schema) if version > schema.epoch => {
-            latest
-                .entry((table, id))
-                .or_default()
-                .insert(version, payload);
-        }
+        Some(schema) if version > schema.epoch => match latest.entry((table, id)) {
+            Entry::Vacant(entry) => {
+                entry.insert((version, payload));
+            }
+            Entry::Occupied(mut entry) if version > entry.get().0 => {
+                entry.insert((version, payload));
+            }
+            Entry::Occupied(_) => {}
+        },
         _ => *ignored.entry(table).or_default() += 1,
     };
 
@@ -129,60 +155,66 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
         ));
     }
 
-    // Rebuild into a fresh database with the same schema (indexes included).
-    if dst.exists() {
-        return Err(Error::InvalidArgument(format!(
-            "salvage destination already exists: {}",
+    // Rebuild under a private sibling and publish only after verification.
+    let rebuilt = (|| -> Result<()> {
+        let out = Db::create(&partial)?;
+        for table in &catalog.tables {
+            out.create_table(table.clone())?;
+            report.tables.push(table.name.clone());
+        }
+
+        let mut txn = out.begin();
+        let mut in_batch = 0usize;
+        for ((table, id), (_, payload)) in latest {
+            let Some(payload) = payload else {
+                report.deleted_records += 1;
+                continue;
+            };
+            let mut record = match decode_record(&payload, Some(&src.join(crate::db::BLOBS_DIR))) {
+                Ok(r) => r,
+                Err(e) => {
+                    report.skipped += 1;
+                    report
+                        .notes
+                        .push(format!("{table}/{id}: undecodable payload ({e})"));
+                    continue;
+                }
+            };
+            record.insert("id".into(), Value::Text(id.clone()));
+            match txn.insert(&table, record) {
+                Ok(_) => {
+                    report.recovered_records += 1;
+                    in_batch += 1;
+                }
+                Err(e) => {
+                    report.skipped += 1;
+                    report
+                        .notes
+                        .push(format!("{table}/{id}: not re-inserted ({e})"));
+                }
+            }
+            if in_batch >= 1000 {
+                txn.commit()?;
+                txn = out.begin();
+                in_batch = 0;
+            }
+        }
+        txn.commit()?;
+        out.checkpoint()?;
+        drop(out);
+        Ok(())
+    })();
+    if let Err(error) = rebuilt {
+        let _ = fs::remove_dir_all(&partial);
+        return Err(error);
+    }
+    fs::rename(&partial, dst)?;
+    if let Err(error) = fsync_dir(parent_of(dst)) {
+        return Err(Error::CommitUnknown(format!(
+            "salvage was renamed to {}, but syncing its parent failed: {error}",
             dst.display()
         )));
     }
-    let out = Db::create(dst)?;
-    for table in &catalog.tables {
-        out.create_table(table.clone())?;
-        report.tables.push(table.name.clone());
-    }
-
-    let mut txn = out.begin();
-    let mut in_batch = 0usize;
-    for ((table, id), versions) in latest {
-        let Some((_, payload)) = versions.iter().next_back() else {
-            continue;
-        };
-        let Some(payload) = payload else {
-            report.deleted_records += 1;
-            continue;
-        };
-        let mut record = match decode_record(payload, Some(&src.join(crate::db::BLOBS_DIR))) {
-            Ok(r) => r,
-            Err(e) => {
-                report.skipped += 1;
-                report
-                    .notes
-                    .push(format!("{table}/{id}: undecodable payload ({e})"));
-                continue;
-            }
-        };
-        record.insert("id".into(), Value::Text(id.clone()));
-        match txn.insert(&table, record) {
-            Ok(_) => {
-                report.recovered_records += 1;
-                in_batch += 1;
-            }
-            Err(e) => {
-                report.skipped += 1;
-                report
-                    .notes
-                    .push(format!("{table}/{id}: not re-inserted ({e})"));
-            }
-        }
-        if in_batch >= 1000 {
-            txn.commit()?;
-            txn = out.begin();
-            in_batch = 0;
-        }
-    }
-    txn.commit()?;
-    out.checkpoint()?;
     Ok(report)
 }
 

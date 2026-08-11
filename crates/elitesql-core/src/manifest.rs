@@ -4,13 +4,20 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::error::{Error, Result};
-use crate::schema::FORMAT_VERSION;
+use crate::schema::{Catalog, FORMAT_VERSION};
 
 pub(crate) const MANIFEST_FILE: &str = "manifest";
 pub(crate) const MANIFEST_PREV_FILE: &str = "manifest.prev";
 const MANIFEST_TMP_FILE: &str = "manifest.tmp";
+const MANIFEST_PREV_TMP_FILE: &str = "manifest.prev.tmp";
 const MAGIC: &[u8; 8] = b"ESQLMANI";
+
+#[cfg(test)]
+static FAIL_NEXT_PREVIOUS_DIR_SYNC: AtomicBool = AtomicBool::new(false);
 
 // On-disk layout: 8-byte magic, u32 crc32 of the JSON body, u32 body length,
 // JSON body. The manifest is the atomic pointer to the visible state; it is
@@ -37,6 +44,18 @@ pub(crate) struct Manifest {
     /// manifests written before identity support readable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub identity_high_water: BTreeMap<String, i64>,
+    /// Schema generation that describes these segments. Older manifests did
+    /// not embed it and are upgraded on the first writable open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<Catalog>,
+}
+
+pub(crate) enum PublishOutcome {
+    Complete,
+    /// The namespace replacement completed, but directory durability could
+    /// not be established. Callers must adopt the published generation and
+    /// fence further writes until the database is reopened.
+    SyncFailed(std::io::Error),
 }
 
 impl Manifest {
@@ -47,6 +66,7 @@ impl Manifest {
             segments: Vec::new(),
             wal_id: 1,
             identity_high_water: BTreeMap::new(),
+            catalog: Some(Catalog::new()),
         }
     }
 
@@ -80,6 +100,9 @@ impl Manifest {
                 manifest.format_version
             )));
         }
+        if let Some(catalog) = &manifest.catalog {
+            catalog.validate()?;
+        }
         Ok(manifest)
     }
 
@@ -101,22 +124,35 @@ impl Manifest {
     /// manifest to `manifest.prev`, rename temp into place, fsync the dir.
     /// A crash between the two renames leaves a valid `manifest.prev`,
     /// which `load` falls back to.
-    pub fn publish(&self, dir: &Path) -> Result<()> {
+    pub fn publish(&self, dir: &Path) -> Result<PublishOutcome> {
         let tmp = dir.join(MANIFEST_TMP_FILE);
         let current = dir.join(MANIFEST_FILE);
         write_synced(&tmp, &self.encode())?;
         if current.exists() {
             fs::rename(&current, dir.join(MANIFEST_PREV_FILE))?;
         }
-        fs::rename(&tmp, &current)?;
-        fsync_dir(dir)
+        if let Err(error) = fs::rename(&tmp, &current) {
+            // The new generation was not published. Restore the old primary
+            // when possible so readers do not have to depend on fallback
+            // healing after an ordinary pre-publication error.
+            let previous = dir.join(MANIFEST_PREV_FILE);
+            if previous.exists() {
+                let _ = fs::rename(&previous, &current);
+                let _ = fsync_dir(dir);
+            }
+            return Err(error.into());
+        }
+        if let Err(error) = fsync_dir(dir) {
+            return Ok(PublishOutcome::SyncFailed(as_io(error)));
+        }
+        self.refresh_previous(dir)
     }
 
     /// Repair after opening through `manifest.prev`: the primary manifest is
     /// corrupt, so it must NOT be rotated into `manifest.prev` (that would
     /// destroy the only good copy). Delete it first, then write a fresh
     /// primary; `manifest.prev` stays untouched as the fallback throughout.
-    pub fn heal(&self, dir: &Path) -> Result<()> {
+    pub fn heal(&self, dir: &Path) -> Result<PublishOutcome> {
         let tmp = dir.join(MANIFEST_TMP_FILE);
         let current = dir.join(MANIFEST_FILE);
         match fs::remove_file(&current) {
@@ -126,7 +162,48 @@ impl Manifest {
         }
         write_synced(&tmp, &self.encode())?;
         fs::rename(&tmp, &current)?;
-        fsync_dir(dir)
+        if let Err(error) = fsync_dir(dir) {
+            return Ok(PublishOutcome::SyncFailed(as_io(error)));
+        }
+        self.refresh_previous(dir)
+    }
+
+    pub fn previous(dir: &Path) -> Option<Manifest> {
+        read_and_decode(&dir.join(MANIFEST_PREV_FILE)).ok()
+    }
+
+    /// Once the primary generation is durable, make the fallback an identical
+    /// redundant copy. Until this finishes, the old fallback remains valid.
+    pub fn refresh_previous(&self, dir: &Path) -> Result<PublishOutcome> {
+        let tmp = dir.join(MANIFEST_PREV_TMP_FILE);
+        if let Err(error) = write_synced(&tmp, &self.encode()) {
+            return Ok(PublishOutcome::SyncFailed(as_io(error)));
+        }
+        if let Err(error) = fs::rename(&tmp, dir.join(MANIFEST_PREV_FILE)) {
+            return Ok(PublishOutcome::SyncFailed(error));
+        }
+        #[cfg(test)]
+        if FAIL_NEXT_PREVIOUS_DIR_SYNC.swap(false, Ordering::AcqRel) {
+            return Ok(PublishOutcome::SyncFailed(std::io::Error::other(
+                "injected manifest fallback directory sync failure",
+            )));
+        }
+        Ok(match fsync_dir(dir) {
+            Ok(()) => PublishOutcome::Complete,
+            Err(error) => PublishOutcome::SyncFailed(as_io(error)),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_previous_dir_sync_for_test() {
+    FAIL_NEXT_PREVIOUS_DIR_SYNC.store(true, Ordering::Release);
+}
+
+fn as_io(error: Error) -> std::io::Error {
+    match error {
+        Error::Io(error) => error,
+        error => std::io::Error::other(error.to_string()),
     }
 }
 

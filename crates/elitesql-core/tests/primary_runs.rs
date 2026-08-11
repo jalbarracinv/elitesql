@@ -1,4 +1,5 @@
 use std::fs;
+use std::time::{Duration, Instant};
 
 use elitesql_core::{Column, ColumnType, Db, DbOptions, Record, TableSchema, Value};
 
@@ -38,7 +39,7 @@ fn checkpoints_publish_constant_size_deltas_and_levels_bound_run_count() {
         checkpoint_run_bytes.push(total - previous);
         previous = total;
     }
-    db.wait_for_primary_compaction();
+    db.wait_for_primary_compaction().unwrap();
 
     let smallest = *checkpoint_run_bytes.iter().min().unwrap();
     let largest = *checkpoint_run_bytes.iter().max().unwrap();
@@ -59,6 +60,43 @@ fn checkpoints_publish_constant_size_deltas_and_levels_bound_run_count() {
     assert_eq!(
         reopened.get("items", "id-039-0099").unwrap().unwrap()["value"],
         Value::Int64(3_999)
+    );
+}
+
+#[test]
+fn background_checkpoints_and_primary_promotions_preserve_every_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("background-primary-overlap.esql");
+    let options = DbOptions {
+        memtable_max_bytes: 1,
+        ..DbOptions::default()
+    };
+    let db = Db::create_with(&path, options.clone()).unwrap();
+    db.create_table(TableSchema::new(
+        "items",
+        vec![Column::new("value", ColumnType::Int64)],
+    ))
+    .unwrap();
+
+    for batch in 0..20 {
+        insert_batch(&db, batch, 250);
+        let expected = (batch + 1) as u64;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while db.maintenance_stats().checkpoints < expected {
+            assert!(Instant::now() < deadline, "background checkpoint stalled");
+            std::thread::yield_now();
+        }
+    }
+    db.wait_for_primary_compaction().unwrap();
+    assert!(db.maintenance_stats().primary_run_compactions > 0);
+    assert_eq!(db.scan("items").unwrap().len(), 5_000);
+    drop(db);
+
+    let reopened = Db::open_with(&path, options).unwrap();
+    assert_eq!(reopened.scan("items").unwrap().len(), 5_000);
+    assert_eq!(
+        reopened.get("items", "id-019-0249").unwrap().unwrap()["value"],
+        Value::Int64(4_999)
     );
 }
 
@@ -84,7 +122,7 @@ fn missing_run_is_discarded_and_rebuilt_from_canonical_segments() {
             insert_batch(&db, batch, 20);
             db.checkpoint().unwrap();
         }
-        db.wait_for_primary_compaction();
+        db.wait_for_primary_compaction().unwrap();
     }
 
     let run = fs::read_dir(path.join("indexes"))

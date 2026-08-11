@@ -23,6 +23,7 @@
 
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -32,9 +33,10 @@ use elitesql_core::{jsonio, Db, Error, Txn};
 use serde_json::{json, Value as J};
 
 /// Protocol-level error code for authentication, outside the engine's range
-/// (`Error::code()` currently returns 1..=16) so clients can tell them apart.
+/// (`Error::code()` currently returns 1..=17) so clients can tell them apart.
 const AUTH_ERROR_CODE: u32 = 20;
 const SIDECAR_TXN_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 
 pub struct ServeOptions {
     /// Unix socket path to bind, when serving locally.
@@ -70,7 +72,7 @@ enum Auth {
 /// cannot discover the token one byte at a time.
 fn token_matches(expected: &str, supplied: &str) -> bool {
     let (a, b) = (expected.as_bytes(), supplied.as_bytes());
-    let mut diff = (a.len() ^ b.len()) as u8;
+    let mut diff = u8::from(a.len() != b.len());
     for i in 0..a.len().max(b.len()) {
         diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
     }
@@ -82,6 +84,7 @@ fn token_matches(expected: &str, supplied: &str) -> bool {
 trait Stream: Read + Write + Send + Sized + 'static {
     fn duplicate(&self) -> std::io::Result<Self>;
     fn peer(&self) -> String;
+    fn set_timeouts(&self, timeout: Option<Duration>) -> std::io::Result<()>;
 }
 
 impl Stream for UnixStream {
@@ -90,6 +93,10 @@ impl Stream for UnixStream {
     }
     fn peer(&self) -> String {
         "unix".into()
+    }
+    fn set_timeouts(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)?;
+        self.set_write_timeout(timeout)
     }
 }
 
@@ -101,6 +108,10 @@ impl Stream for TcpStream {
         self.peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "tcp".into())
+    }
+    fn set_timeouts(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)?;
+        self.set_write_timeout(timeout)
     }
 }
 
@@ -121,8 +132,17 @@ fn serve_unix(
     options: &ServeOptions,
     live: Arc<AtomicUsize>,
 ) -> Result<(), String> {
-    // A stale socket file from a previous run would block the bind.
-    if std::fs::metadata(socket_path).is_ok() {
+    // Remove only a provably stale Unix socket. Never unlink a regular file or
+    // steal the pathname of a listener that is still accepting connections.
+    if let Ok(metadata) = std::fs::symlink_metadata(socket_path) {
+        if !metadata.file_type().is_socket() {
+            return Err(format!(
+                "refusing to remove non-socket path at {socket_path}"
+            ));
+        }
+        if UnixStream::connect(socket_path).is_ok() {
+            return Err(format!("socket {socket_path} is already in use"));
+        }
         std::fs::remove_file(socket_path)
             .map_err(|e| format!("cannot remove stale socket: {e}"))?;
     }
@@ -217,15 +237,55 @@ fn accept_loop<S: Stream>(
 }
 
 fn handle_connection<S: Stream>(db: Arc<Db>, stream: S, auth: Auth) {
-    let reader = BufReader::new(match stream.duplicate() {
+    handle_connection_with_timeout(db, stream, auth, SIDECAR_TXN_TIMEOUT)
+}
+
+fn handle_connection_with_timeout<S: Stream>(
+    db: Arc<Db>,
+    stream: S,
+    auth: Auth,
+    idle_timeout: Duration,
+) {
+    if stream.set_timeouts(None).is_err() {
+        return;
+    }
+    let mut reader = BufReader::new(match stream.duplicate() {
         Ok(s) => s,
         Err(_) => return,
     });
     let mut writer = BufWriter::new(stream);
     let mut authenticated = matches!(auth, Auth::Trusted);
     let mut txn = None;
-    for line in reader.lines() {
-        let Ok(line) = line else { return };
+    loop {
+        if reader
+            .get_ref()
+            .set_timeouts(txn.as_ref().map(|_| idle_timeout))
+            .is_err()
+        {
+            return;
+        }
+        let mut line = String::new();
+        let read = match reader
+            .by_ref()
+            .take(MAX_REQUEST_BYTES + 1)
+            .read_line(&mut line)
+        {
+            Ok(read) => read,
+            Err(_) => return, // timeout/disconnect rolls back `txn` by drop
+        };
+        if read == 0 {
+            return;
+        }
+        if read as u64 > MAX_REQUEST_BYTES || !line.ends_with('\n') {
+            let response = json!({
+                "ok": false,
+                "code": 8,
+                "error": format!("request exceeds the {MAX_REQUEST_BYTES}-byte line limit"),
+            });
+            let _ = writeln!(writer, "{response}");
+            let _ = writer.flush();
+            return;
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -596,6 +656,74 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_idle_timeout_rolls_back_active_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::create(dir.path().join("idle-timeout.esql")).unwrap());
+        db.query("CREATE TABLE docs (title text NOT NULL)").unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let served = db.clone();
+        let worker = std::thread::spawn(move || {
+            handle_connection_with_timeout(served, server, Auth::Trusted, Duration::from_millis(50))
+        });
+        let mut responses = BufReader::new(client.try_clone().unwrap());
+
+        assert_eq!(
+            socket_call(&mut client, &mut responses, json!({"op": "begin"}))["ok"],
+            true
+        );
+        assert_eq!(
+            socket_call(
+                &mut client,
+                &mut responses,
+                json!({
+                    "op": "query_in_txn",
+                    "sql": "INSERT INTO docs (title) VALUES ('must timeout')"
+                })
+            )["ok"],
+            true
+        );
+        worker.join().unwrap();
+        assert!(db.scan("docs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn idle_connection_without_a_transaction_remains_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::create(dir.path().join("idle-client.esql")).unwrap());
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            handle_connection_with_timeout(db, server, Auth::Trusted, Duration::from_millis(30))
+        });
+        let mut responses = BufReader::new(client.try_clone().unwrap());
+
+        std::thread::sleep(Duration::from_millis(90));
+        let response = socket_call(&mut client, &mut responses, json!({"op": "ping"}));
+        assert_eq!(response["result"], "pong");
+        drop(responses);
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn sidecar_rejects_an_oversized_request_without_parsing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::create(dir.path().join("oversized.esql")).unwrap());
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || handle_connection(db, server, Auth::Trusted));
+        client
+            .write_all(&vec![b' '; MAX_REQUEST_BYTES as usize + 1])
+            .unwrap();
+        client.flush().unwrap();
+
+        let mut response = String::new();
+        BufReader::new(client).read_line(&mut response).unwrap();
+        let response: J = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["code"], 8);
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn four_sidecar_workers_keep_credit_and_document_commits_atomic() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
@@ -771,6 +899,30 @@ mod tests {
         assert!(!token_matches("s3cr3t", ""));
         assert!(!token_matches("", "x"));
         assert!(token_matches("", ""));
+        let two_hundred_fifty_six_nuls = String::from_utf8(vec![0; 256]).unwrap();
+        assert!(!token_matches("", &two_hundred_fifty_six_nuls));
+    }
+
+    #[test]
+    fn unix_listener_refuses_to_delete_a_regular_file_at_the_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::create(dir.path().join("socket-file.esql")).unwrap());
+        let socket_path = dir.path().join("app.sock");
+        std::fs::write(&socket_path, b"must survive").unwrap();
+        let options = ServeOptions {
+            socket_path: Some(socket_path.to_string_lossy().into_owned()),
+            ..ServeOptions::default()
+        };
+
+        let error = serve_unix(
+            db,
+            options.socket_path.as_deref().unwrap(),
+            &options,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap_err();
+        assert!(error.contains("non-socket"), "{error}");
+        assert_eq!(std::fs::read(socket_path).unwrap(), b"must survive");
     }
 
     #[test]

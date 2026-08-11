@@ -109,6 +109,7 @@ pub(crate) struct WalScan {
 pub(crate) fn scan_wal(data: &[u8]) -> WalScan {
     let mut records = Vec::new();
     let mut pos = 0usize;
+    let mut previous_version: Option<u64> = None;
     loop {
         let start = pos;
         if pos >= data.len() {
@@ -119,7 +120,17 @@ pub(crate) fn scan_wal(data: &[u8]) -> WalScan {
             };
         }
         match parse_record(data, &mut pos, start) {
-            Ok(r) => records.push(r),
+            Ok(r) if previous_version.is_none_or(|previous| r.version > previous) => {
+                previous_version = Some(r.version);
+                records.push(r)
+            }
+            Ok(_) => {
+                return WalScan {
+                    records,
+                    valid_len: start as u64,
+                    clean: false,
+                }
+            }
             Err(_) => {
                 return WalScan {
                     records,
@@ -211,6 +222,14 @@ pub(crate) struct WalWriter {
     file: File,
     pub len: u64,
     last_sync: Instant,
+    poisoned: Option<String>,
+    #[cfg(test)]
+    fail_next_sync: bool,
+}
+
+pub(crate) enum WalAppendOutcome {
+    Complete,
+    SyncFailed(std::io::Error),
 }
 
 impl WalWriter {
@@ -224,7 +243,27 @@ impl WalWriter {
             file,
             len,
             last_sync: Instant::now(),
+            poisoned: None,
+            #[cfg(test)]
+            fail_next_sync: false,
         })
+    }
+
+    fn rollback_partial_append(&mut self, start: u64, write_error: std::io::Error) -> Error {
+        if let Err(rollback_error) = self.file.set_len(start) {
+            self.poisoned = Some(format!(
+                "write failed ({write_error}); truncating to {start} also failed ({rollback_error})"
+            ));
+            return Error::Io(std::io::Error::other(
+                self.poisoned.as_ref().expect("poison just stored").clone(),
+            ));
+        }
+        Error::Io(write_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_sync_for_test(&mut self) {
+        self.fail_next_sync = true;
     }
 
     pub fn append_commit(
@@ -232,21 +271,101 @@ impl WalWriter {
         bytes: &[u8],
         durability: Durability,
         balanced_interval_ms: u64,
-    ) -> Result<()> {
-        self.file.write_all(bytes)?;
-        self.len += bytes.len() as u64;
-        match durability {
+    ) -> Result<WalAppendOutcome> {
+        if let Some(message) = &self.poisoned {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "WAL writer is unusable after an earlier append failure: {message}"
+            ))));
+        }
+        let start = self.len;
+        if let Err(write_error) = self.file.write_all(bytes) {
+            // `write_all` may have emitted a prefix. Never append another
+            // record behind that torn tail. If rollback itself fails, poison
+            // the writer so this handle cannot acknowledge later commits.
+            return Err(self.rollback_partial_append(start, write_error));
+        }
+        self.len = self.len.saturating_add(bytes.len() as u64);
+        let mut sync_attempted = false;
+        let sync_result = match durability {
             Durability::Safe => {
-                self.file.sync_data()?;
+                sync_attempted = true;
+                self.file.sync_data()
             }
             Durability::Balanced => {
                 if self.last_sync.elapsed().as_millis() as u64 >= balanced_interval_ms {
-                    self.file.sync_data()?;
-                    self.last_sync = Instant::now();
+                    sync_attempted = true;
+                    self.file.sync_data()
+                } else {
+                    Ok(())
                 }
             }
-            Durability::Fast => {}
+            Durability::Fast => Ok(()),
+        };
+        #[cfg(test)]
+        let sync_result = if sync_attempted && std::mem::take(&mut self.fail_next_sync) {
+            Err(std::io::Error::other("injected WAL sync failure"))
+        } else {
+            sync_result
+        };
+        match sync_result {
+            Ok(()) => {
+                if sync_attempted {
+                    self.last_sync = Instant::now();
+                }
+                Ok(WalAppendOutcome::Complete)
+            }
+            // The full framed record is already part of this process's WAL.
+            // Rolling it back would make its outcome even less knowable and
+            // permit version reuse. Publish it logically and tell the caller
+            // that crash durability is unknown.
+            Err(error) => Ok(WalAppendOutcome::SyncFailed(error)),
         }
-        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_stops_before_duplicate_or_regressing_versions() {
+        let first = encode_commit(7, &[("t", "a", Some(b"one"))], &[]);
+        let duplicate = encode_commit(7, &[("t", "b", Some(b"two"))], &[]);
+        let later = encode_commit(8, &[("t", "c", Some(b"three"))], &[]);
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(&duplicate);
+        bytes.extend_from_slice(&later);
+
+        let scan = scan_wal(&bytes);
+        assert!(!scan.clean);
+        assert_eq!(scan.valid_len, first.len() as u64);
+        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records[0].version, 7);
+    }
+
+    #[test]
+    fn partial_append_is_rolled_back_before_another_record_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(WAL_DIR)).unwrap();
+        let mut writer = WalWriter::open(dir.path(), 1).unwrap();
+        let torn = encode_commit(1, &[("t", "a", Some(b"one"))], &[]);
+        writer.file.write_all(&torn[..torn.len() / 2]).unwrap();
+        let _ = writer.rollback_partial_append(0, std::io::Error::other("injected partial write"));
+        assert_eq!(std::fs::metadata(wal_path(dir.path(), 1)).unwrap().len(), 0);
+
+        let complete = encode_commit(1, &[("t", "b", Some(b"two"))], &[]);
+        assert!(matches!(
+            writer
+                .append_commit(&complete, Durability::Fast, 0)
+                .unwrap(),
+            WalAppendOutcome::Complete
+        ));
+        drop(writer);
+        let bytes = std::fs::read(wal_path(dir.path(), 1)).unwrap();
+        let scan = scan_wal(&bytes);
+        assert!(scan.clean);
+        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records[0].version, 1);
+        assert_eq!(scan.records[0].changes[0].id, "b");
     }
 }

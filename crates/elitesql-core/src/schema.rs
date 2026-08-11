@@ -394,10 +394,9 @@ impl TableSchema {
     }
 }
 
-/// The table catalog, persisted as `catalog.json` in the database directory.
-/// Written atomically and durably: temp file, fsync, rename, fsync of the
-/// directory — the same discipline as the manifest, because DDL correctness
-/// depends on a committed catalog surviving a crash.
+/// The table catalog embedded in each canonical manifest generation.
+/// `catalog.json` remains an atomically written compatibility/tooling mirror;
+/// current engines recover schema and data together from the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Catalog {
     pub format_version: u32,
@@ -424,13 +423,32 @@ impl Catalog {
         let bytes = fs::read(path)?;
         let catalog: Catalog = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Corrupt(format!("invalid catalog: {e}")))?;
-        if catalog.format_version != FORMAT_VERSION {
+        catalog.validate()?;
+        Ok(catalog)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.format_version != FORMAT_VERSION {
             return Err(Error::Corrupt(format!(
                 "unsupported format_version {} (expected {FORMAT_VERSION})",
-                catalog.format_version
+                self.format_version
             )));
         }
-        Ok(catalog)
+        for (index, table) in self.tables.iter().enumerate() {
+            table.validate().map_err(|error| {
+                Error::Corrupt(format!("invalid catalog table '{}': {error}", table.name))
+            })?;
+            if self.tables[..index]
+                .iter()
+                .any(|previous| previous.name == table.name)
+            {
+                return Err(Error::Corrupt(format!(
+                    "catalog contains duplicate table '{}'",
+                    table.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {

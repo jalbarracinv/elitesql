@@ -71,7 +71,7 @@ fn obsolete_operation_threshold_compacts_and_reports_reclamation() {
         assert!(db.delete("docs", &format!("row-{i:02}")).unwrap());
     }
     db.checkpoint().unwrap();
-    db.wait_for_automatic_compaction();
+    db.wait_for_automatic_compaction().unwrap();
 
     let stats = db.maintenance_stats();
     assert_eq!(stats.automatic_compactions, 1, "{stats:?}");
@@ -105,13 +105,13 @@ fn insert_only_workload_waits_for_the_segment_limit() {
         db.insert("docs", record(&format!("row-{i}"), 0)).unwrap();
         db.checkpoint().unwrap();
     }
-    db.wait_for_automatic_compaction();
+    db.wait_for_automatic_compaction().unwrap();
     assert_eq!(db.maintenance_stats().automatic_compactions, 0);
     assert_eq!(db.maintenance_stats().segments, 3);
 
     db.insert("docs", record("row-3", 0)).unwrap();
     db.checkpoint().unwrap();
-    db.wait_for_automatic_compaction();
+    db.wait_for_automatic_compaction().unwrap();
     let stats = db.maintenance_stats();
     assert_eq!(stats.automatic_compactions, 1, "{stats:?}");
     assert_eq!(stats.segments, 1);
@@ -135,7 +135,7 @@ fn disabled_policy_accumulates_debt_until_manual_compaction() {
     db.checkpoint().unwrap();
     db.update("docs", "row", update(1)).unwrap();
     db.checkpoint().unwrap();
-    db.wait_for_automatic_compaction();
+    db.wait_for_automatic_compaction().unwrap();
 
     let before = db.maintenance_stats();
     assert_eq!(before.automatic_compactions, 0);
@@ -159,7 +159,7 @@ fn live_snapshot_versions_survive_automatic_compaction() {
     let snapshot = db.snapshot();
     db.update("docs", "row", update(3)).unwrap();
     db.checkpoint().unwrap();
-    db.wait_for_automatic_compaction();
+    db.wait_for_automatic_compaction().unwrap();
 
     assert_eq!(db.maintenance_stats().automatic_compactions, 1);
     assert_eq!(
@@ -173,7 +173,7 @@ fn live_snapshot_versions_survive_automatic_compaction() {
 
     drop(snapshot);
     db.checkpoint().unwrap();
-    db.wait_for_automatic_compaction();
+    db.wait_for_automatic_compaction().unwrap();
     assert_eq!(db.maintenance_stats().automatic_compactions, 2);
     assert_eq!(
         db.get("docs", "row").unwrap().unwrap()["generation"],
@@ -198,7 +198,7 @@ fn debt_is_reconstructed_on_open() {
     drop(db);
 
     let db = Db::open_with(&path, db_options(auto_options(1))).unwrap();
-    db.wait_for_automatic_compaction();
+    db.wait_for_automatic_compaction().unwrap();
     let stats = db.maintenance_stats();
     assert_eq!(stats.automatic_compactions, 1, "{stats:?}");
     assert_eq!(stats.compaction_debt_operations, 0, "{stats:?}");
@@ -249,7 +249,7 @@ fn concurrent_writers_remain_consistent_while_auto_compacting() {
     for handle in handles {
         handle.join().unwrap();
     }
-    db.wait_for_automatic_compaction();
+    db.wait_for_automatic_compaction().unwrap();
     assert!(db.maintenance_stats().automatic_compactions > 0);
     for worker in 0..4 {
         assert_eq!(

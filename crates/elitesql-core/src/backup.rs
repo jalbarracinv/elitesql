@@ -2,15 +2,18 @@
 //! copy of the database into a brand-new directory — safe to call while
 //! other threads keep committing. `restore` validates a backup with `check`
 //! and materializes it as a fresh database, rebuilding derived indexes.
-//! Both write into a `<dst>.partial` sibling and rename it into place at the
-//! end, so an interrupted run never leaves a half-written directory under
-//! the final name.
+//! Both write into a unique `<dst>.<ulid>.partial` sibling and rename it into
+//! place at the end, so an interrupted run never leaves a half-written
+//! directory under the final name or deletes an unrelated temporary path.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use ulid::Ulid;
 
 use crate::check::check;
-use crate::db::{Db, DbOptions, BLOBS_DIR, CATALOG_FILE, LOCK_FILE, MARKER_FILE, SEGMENTS_DIR};
+use crate::db::{
+    acquire_lock, Db, DbOptions, BLOBS_DIR, CATALOG_FILE, LOCK_FILE, MARKER_FILE, SEGMENTS_DIR,
+};
 use crate::ddl::DDL_FILE;
 use crate::error::{Error, Result};
 use crate::manifest::fsync_dir;
@@ -43,6 +46,7 @@ impl Db {
     /// Tables created after the call began may appear empty in the copy.
     pub fn backup(&self, dst: impl AsRef<Path>) -> Result<BackupReport> {
         let dst = dst.as_ref();
+        let _destination = lock_destination(dst)?;
         if dst.exists() {
             return Err(Error::InvalidArgument(format!(
                 "backup destination already exists: {}",
@@ -50,10 +54,12 @@ impl Db {
             )));
         }
         let partial = partial_path(dst)?;
-        if partial.exists() {
-            fs::remove_dir_all(&partial)?; // leftover from an interrupted run
-        }
 
+        // Snapshot versions alone do not freeze the catalog: DDL is
+        // deliberately visible to all readers. Keep the DDL gate for the
+        // logical copy so schemas and rows describe one coherent point while
+        // ordinary DML continues through MVCC.
+        let _ddl = self.acquire_ddl_guard();
         let snap = self.snapshot();
         let result = (|| {
             // Fast durability defers fsync to the final checkpoint, which
@@ -72,19 +78,25 @@ impl Db {
                 };
                 out.create_table(schema)?;
                 report.tables += 1;
-                let rows = self.scan_at(&snap, &table)?;
-                for chunk in rows.chunks(BACKUP_BATCH) {
+                let mut cursor: Option<String> = None;
+                loop {
+                    let rows =
+                        self.scan_batch_at(&snap, &table, cursor.as_deref(), BACKUP_BATCH)?;
+                    if rows.is_empty() {
+                        break;
+                    }
                     let mut txn = out.begin();
-                    for (_, record) in chunk {
+                    for (_, record) in &rows {
                         // The scanned record carries its `id`, so the copy
                         // keeps the original ids.
                         txn.insert(&table, record.clone())?;
                     }
                     txn.commit()?;
-                    report.records += chunk.len() as u64;
+                    report.records += rows.len() as u64;
+                    cursor = rows.last().map(|(id, _)| id.clone());
                 }
             }
-            out.wait_vector_indexing();
+            out.wait_vector_indexing()?;
             out.checkpoint()?;
             Ok(report)
         })();
@@ -92,7 +104,12 @@ impl Db {
         match result {
             Ok(report) => {
                 fs::rename(&partial, dst)?;
-                fsync_dir(parent_of(dst))?;
+                if let Err(error) = fsync_dir(parent_of(dst)) {
+                    return Err(Error::CommitUnknown(format!(
+                        "backup was renamed to {}, but syncing its parent failed: {error}",
+                        dst.display()
+                    )));
+                }
                 Ok(report)
             }
             Err(e) => {
@@ -111,12 +128,17 @@ impl Db {
 pub fn restore(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<RestoreReport> {
     let src = src.as_ref();
     let dst = dst.as_ref();
+    let _destination = lock_destination(dst)?;
     if dst.exists() {
         return Err(Error::InvalidArgument(format!(
             "restore destination already exists: {}",
             dst.display()
         )));
     }
+    // `check` followed by file-by-file copy is only meaningful over an
+    // immutable source generation. A writer takes the exclusive form of this
+    // same process lock, so hold a shared lock through verification and copy.
+    let _source_lock = acquire_lock(src, true)?;
     let check_report = check(src)?;
     if !check_report.is_ok() {
         return Err(Error::Corrupt(format!(
@@ -127,9 +149,6 @@ pub fn restore(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<RestoreRe
     }
 
     let partial = partial_path(dst)?;
-    if partial.exists() {
-        fs::remove_dir_all(&partial)?; // leftover from an interrupted run
-    }
     let copied = (|| {
         fs::create_dir_all(&partial)?;
         copy_file(src, &partial, MARKER_FILE)?;
@@ -147,37 +166,59 @@ pub fn restore(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<RestoreRe
         copy_dir(src, &partial, WAL_DIR)?;
         copy_dir(src, &partial, SEGMENTS_DIR)?;
         copy_dir(src, &partial, BLOBS_DIR)?;
+        fsync_dir(&partial)?;
         Ok(())
     })();
     if let Err(e) = copied {
         let _ = fs::remove_dir_all(&partial);
         return Err(e);
     }
-    fs::rename(&partial, dst)?;
-    fsync_dir(parent_of(dst))?;
-
-    let db = Db::open(dst)?;
-    let mut report = RestoreReport {
-        warnings: check_report.warnings,
-        ..RestoreReport::default()
+    // Verify and rebuild disposable indexes while the directory still has its
+    // private temporary name. No validation error can leave a final destination.
+    let verified = (|| {
+        let db = Db::open(&partial)?;
+        let mut report = RestoreReport {
+            warnings: check_report.warnings,
+            ..RestoreReport::default()
+        };
+        for table in db.tables() {
+            report.tables += 1;
+            report.records += db.scan(&table)?.len() as u64;
+        }
+        drop(db);
+        Ok(report)
+    })();
+    let report = match verified {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&partial);
+            return Err(error);
+        }
     };
-    for table in db.tables() {
-        report.tables += 1;
-        report.records += db.scan(&table)?.len() as u64;
+    fs::rename(&partial, dst)?;
+    if let Err(error) = fsync_dir(parent_of(dst)) {
+        return Err(Error::CommitUnknown(format!(
+            "restore was renamed to {}, but syncing its parent failed: {error}",
+            dst.display()
+        )));
     }
     Ok(report)
 }
 
-/// `<dst>.partial` next to the destination, so the final rename stays within
-/// one filesystem.
-fn partial_path(dst: &Path) -> Result<PathBuf> {
+/// A private sibling next to the destination, so the final rename stays within
+/// one filesystem without deleting a pre-existing, unrelated `.partial` path.
+pub(crate) fn partial_path(dst: &Path) -> Result<PathBuf> {
     let name = dst.file_name().ok_or_else(|| {
         Error::InvalidArgument(format!("invalid destination path: {}", dst.display()))
     })?;
-    Ok(dst.with_file_name(format!("{}.partial", name.to_string_lossy())))
+    Ok(dst.with_file_name(format!(
+        "{}.{}.partial",
+        name.to_string_lossy(),
+        Ulid::new()
+    )))
 }
 
-fn parent_of(path: &Path) -> &Path {
+pub(crate) fn parent_of(path: &Path) -> &Path {
     match path.parent() {
         Some(p) if p.as_os_str().is_empty() => Path::new("."),
         Some(p) => p,
@@ -185,8 +226,34 @@ fn parent_of(path: &Path) -> &Path {
     }
 }
 
+/// Serialize all producers targeting the same final directory. The sibling
+/// lock file intentionally persists after close; advisory state lives in the
+/// inode lock, and retaining the inode avoids an unlink/open race between
+/// consecutive producers.
+pub(crate) fn lock_destination(dst: &Path) -> Result<File> {
+    let name = dst.file_name().ok_or_else(|| {
+        Error::InvalidArgument(format!("invalid destination path: {}", dst.display()))
+    })?;
+    let lock = dst.with_file_name(format!(
+        "{}.elitesql-destination-lock",
+        name.to_string_lossy()
+    ));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(Error::DatabaseLocked(dst.display().to_string())),
+        Err(TryLockError::Error(error)) => Err(Error::Io(error)),
+    }
+}
+
 fn copy_file(src: &Path, dst: &Path, name: &str) -> Result<()> {
-    fs::copy(src.join(name), dst.join(name))?;
+    let target = dst.join(name);
+    fs::copy(src.join(name), &target)?;
+    File::open(target)?.sync_all()?;
     Ok(())
 }
 
@@ -209,7 +276,10 @@ fn copy_dir(src: &Path, dst: &Path, name: &str) -> Result<()> {
         if as_str == LOCK_FILE || as_str.ends_with(".tmp") {
             continue;
         }
-        fs::copy(entry.path(), to.join(&file_name))?;
+        let target = to.join(&file_name);
+        fs::copy(entry.path(), &target)?;
+        File::open(target)?.sync_all()?;
     }
+    fsync_dir(&to)?;
     Ok(())
 }

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock};
@@ -12,6 +13,7 @@ use ulid::Ulid;
 
 use crate::ddl::{DdlIntent, Rewrite};
 use crate::error::{Error, Result};
+use crate::manifest::PublishOutcome;
 use crate::manifest::{fsync_dir, Manifest, SegmentMeta};
 use crate::memory::{GlobalMemoryStats, MemoryGovernor, MemoryLimits, MemoryPermit, MemoryPool};
 use crate::paged::{
@@ -35,7 +37,9 @@ use crate::value::{
 use crate::vector::{
     IndexingMode, VecIdx, VectorHit, VectorIndexDef, VectorIndexOptions, VectorSearchOptions,
 };
-use crate::wal::{encode_commit, scan_wal, wal_path, Durability, WalWriter, WAL_DIR};
+use crate::wal::{
+    encode_commit, scan_wal, wal_path, Durability, WalAppendOutcome, WalWriter, WAL_DIR,
+};
 
 pub(crate) const MARKER_FILE: &str = "ELITESQL";
 pub(crate) const CATALOG_FILE: &str = "catalog.json";
@@ -44,6 +48,8 @@ pub(crate) const BLOBS_DIR: &str = "blobs";
 const VECTORS_DIR: &str = "vectors";
 const INDEXES_DIR: &str = "indexes";
 pub(crate) const LOCK_FILE: &str = "LOCK";
+const CREATION_FILE: &str = ".ELITESQL.creating";
+const CREATION_MAGIC: &[u8] = b"elitesql creation journal v1\n";
 
 // Primary runs are compact and range-pruned. A wider tier reduces rewrite
 // amplification for append-heavy ingest while keeping the number of searched
@@ -52,6 +58,7 @@ const PRIMARY_LEVEL_FANOUT: usize = 16;
 const PRIMARY_BASE_LEVEL: u8 = u8::MAX;
 const DERIVED_LEVEL_FANOUT: usize = 8;
 const DERIVED_BASE_LEVEL: u8 = u8::MAX;
+const MAX_MAINTENANCE_WAIT_RETRIES: u64 = 8;
 
 /// Optimistic-conflict retries per backfill batch during `ADD COLUMN`.
 const BACKFILL_RETRIES: usize = 3;
@@ -1719,7 +1726,6 @@ struct FrozenCheckpointJob {
     next_segment_id: u32,
     catalog: Catalog,
     identity_high_water: BTreeMap<String, i64>,
-    old_primary_runs: Vec<PrimaryRunMeta>,
     first_primary_run: bool,
     wal_id: u32,
     wal_cutoff: u64,
@@ -1765,6 +1771,14 @@ struct Shared {
     /// Serializes commits, checkpoints and compaction. Writers stage in
     /// parallel without this lock and only meet here, at commit.
     commit: Mutex<CommitState>,
+    /// A canonical rename completed but its directory sync did not. Reads may
+    /// continue over the adopted generation, but no later write may extend an
+    /// outcome whose crash durability is unknown.
+    canonical_error: Mutex<Option<String>>,
+    /// Serializes catalog changes from validation through durable intent,
+    /// application and intent cleanup. The commit mutex alone is insufficient
+    /// for multi-phase DDL because backfills deliberately release it.
+    ddl: Mutex<()>,
     commit_count: AtomicU64,
     commit_nanos: AtomicU64,
     commit_lock_wait_nanos: AtomicU64,
@@ -1777,11 +1791,18 @@ struct Shared {
     /// It is initialized from the largest persisted ULID when the database opens.
     last_generated_id: Mutex<Ulid>,
     /// Queue into the background vector-indexing thread (Async mode).
-    vector_tx: Mutex<Option<mpsc::Sender<VecJob>>>,
+    vector_tx: Mutex<Option<mpsc::SyncSender<VecJob>>>,
     /// Vectors enqueued but not yet searchable.
     vector_backlog: AtomicU64,
+    vector_worker_alive: AtomicBool,
+    vector_worker_error: Mutex<Option<String>>,
     /// Queue into the single background compaction worker.
     maintenance_tx: Mutex<Option<mpsc::Sender<MaintenanceJob>>>,
+    maintenance_worker_alive: AtomicBool,
+    maintenance_worker_error: Mutex<Option<String>>,
+    /// Failed primary/derived run promotions. Waiters permit bounded retries:
+    /// publication races may be transient, persistent I/O errors must not spin.
+    index_maintenance_failures: AtomicU64,
     /// Dedicated writer for one frozen primary memtable. It is separate from
     /// the compaction queue because the queued job owns the maintenance pool
     /// while its resident generation remains visible to readers.
@@ -1953,13 +1974,18 @@ struct PreparedChange {
     payload: Option<Arc<Vec<u8>>>,
 }
 
+struct ApplyRecordState<'a> {
+    put: Option<(&'a Arc<Vec<u8>>, &'a Record)>,
+    prior: Option<Record>,
+}
+
 /// An embedded EliteSQL database backed by a self-contained directory.
 ///
 /// Storage: commits are appended to a durable WAL (fsync per the
 /// durability mode) and applied to an in-memory MVCC index; checkpoints
 /// drain committed data into immutable segments and publish an atomic
-/// manifest (with `manifest.prev` as the recovery fallback). On open, the
-/// manifest chain is loaded, segments are scanned, and the WAL is replayed
+/// self-contained data/schema manifest (with a redundant `manifest.prev`
+/// recovery copy). On open, the manifest chain is loaded, segments are scanned, and the WAL is replayed
 /// idempotently; a torn WAL tail is truncated. Vector (ANN) indexes are
 /// derived structures rebuilt from canonical data on open and compaction.
 pub struct Db {
@@ -1996,98 +2022,195 @@ impl Drop for Db {
     }
 }
 
+fn record_maintenance_error(shared: &Shared, message: impl Into<String>) {
+    *shared
+        .maintenance_worker_error
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(message.into());
+}
+
+fn maintenance_wait_error(shared: &Shared, operation: &str) -> Error {
+    let message = shared
+        .maintenance_worker_error
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+        .unwrap_or_else(|| format!("{operation} did not complete after bounded retries"));
+    Error::Io(std::io::Error::other(message))
+}
+
 /// Attach the background vector-indexing thread and produce the handle.
 fn finish_db(shared: Arc<Shared>) -> Db {
     let initial_delta_bytes = shared.state.read().unwrap().index_delta_memory_bytes();
     shared
         .memory_governor
         .set_index_delta_bytes(initial_delta_bytes);
-    let (tx, rx) = mpsc::channel::<VecJob>();
+    // Bound queued vector payloads and apply backpressure to commits when the
+    // indexer falls behind. Pending jobs are already charged to the index
+    // delta pool; this count bound prevents the channel metadata/payloads from
+    // growing independently until OOM.
+    let vector_queue_capacity =
+        (shared.opts.memory.index_delta_pool_bytes / (64 * 1024)).clamp(16, 4096);
+    let (tx, rx) = mpsc::sync_channel::<VecJob>(vector_queue_capacity);
     *shared.vector_tx.lock().unwrap() = Some(tx);
     let sh = shared.clone();
     let handle = std::thread::spawn(move || {
-        while let Ok(job) = rx.recv() {
-            {
-                let mut st = sh.state.write().unwrap();
-                if let Some(vidx) = st.vector.get_mut(&(job.table, job.column)) {
-                    vidx.insert(&job.id, &job.vector);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            while let Ok(job) = rx.recv() {
+                {
+                    let mut st = sh.state.write().unwrap();
+                    if let Some(vidx) = st.vector.get_mut(&(job.table, job.column)) {
+                        vidx.insert(&job.id, &job.vector);
+                    }
                 }
+                sh.vector_backlog.fetch_sub(1, AtomicOrdering::SeqCst);
             }
-            sh.vector_backlog.fetch_sub(1, AtomicOrdering::SeqCst);
+        }));
+        if outcome.is_err() {
+            *sh.vector_worker_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) =
+                Some("vector indexing worker panicked".into());
         }
+        sh.vector_worker_alive.store(false, AtomicOrdering::Release);
     });
 
     let (maintenance_tx, maintenance_rx) = mpsc::channel::<MaintenanceJob>();
     *shared.maintenance_tx.lock().unwrap() = Some(maintenance_tx);
     let maintenance_shared = shared.clone();
     let maintenance_handle = std::thread::spawn(move || {
-        while let Ok(job) = maintenance_rx.recv() {
-            match job {
-                MaintenanceJob::Compact => {
-                    let should_run = auto_compaction_needed(&maintenance_shared);
-                    if should_run {
-                        let before = segment_bytes(&maintenance_shared);
-                        let started = Instant::now();
-                        let result =
-                            Db::rewrite_segments_shared(&maintenance_shared, &Rewrite::None);
-                        let nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                        if result.is_ok() {
-                            let after = segment_bytes(&maintenance_shared);
-                            maintenance_shared
-                                .automatic_compaction_count
-                                .fetch_add(1, AtomicOrdering::Relaxed);
-                            maintenance_shared
-                                .automatic_compaction_nanos
-                                .fetch_add(nanos, AtomicOrdering::Relaxed);
-                            maintenance_shared
-                                .automatic_compaction_bytes_reclaimed
-                                .fetch_add(before.saturating_sub(after), AtomicOrdering::Relaxed);
-                        } else {
-                            maintenance_shared
-                                .automatic_compaction_failures
-                                .fetch_add(1, AtomicOrdering::Relaxed);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            while let Ok(job) = maintenance_rx.recv() {
+                match job {
+                    MaintenanceJob::Compact => {
+                        let should_run = auto_compaction_needed(&maintenance_shared);
+                        if should_run {
+                            let before = segment_bytes(&maintenance_shared);
+                            let started = Instant::now();
+                            let result =
+                                Db::rewrite_segments_shared(&maintenance_shared, &Rewrite::None);
+                            let nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                            if result.is_ok() {
+                                let after = segment_bytes(&maintenance_shared);
+                                maintenance_shared
+                                    .automatic_compaction_count
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                                maintenance_shared
+                                    .automatic_compaction_nanos
+                                    .fetch_add(nanos, AtomicOrdering::Relaxed);
+                                maintenance_shared
+                                    .automatic_compaction_bytes_reclaimed
+                                    .fetch_add(
+                                        before.saturating_sub(after),
+                                        AtomicOrdering::Relaxed,
+                                    );
+                            } else {
+                                record_maintenance_error(
+                                    &maintenance_shared,
+                                    "automatic segment compaction failed",
+                                );
+                                maintenance_shared
+                                    .automatic_compaction_failures
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                            }
+                        }
+                        let mut auto = maintenance_shared.auto_compaction_state.lock().unwrap();
+                        auto.scheduled = false;
+                        if should_run {
+                            auto.last_attempt = Some(Instant::now());
                         }
                     }
-                    let mut auto = maintenance_shared.auto_compaction_state.lock().unwrap();
-                    auto.scheduled = false;
-                    if should_run {
-                        auto.last_attempt = Some(Instant::now());
-                    }
-                }
-                MaintenanceJob::CompactPrimaryRuns => {
-                    while primary_compaction_needed(&maintenance_shared) {
-                        if compact_one_primary_level(&maintenance_shared).is_err() {
-                            break;
+                    MaintenanceJob::CompactPrimaryRuns => {
+                        let mut failed = false;
+                        while primary_compaction_needed(&maintenance_shared) {
+                            if compact_one_primary_level(&maintenance_shared).is_err() {
+                                record_maintenance_error(
+                                    &maintenance_shared,
+                                    "primary run compaction failed",
+                                );
+                                failed = true;
+                                maintenance_shared
+                                    .index_maintenance_failures
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                                break;
+                            }
+                        }
+                        maintenance_shared
+                            .primary_compaction_scheduled
+                            .store(false, AtomicOrdering::Release);
+                        if !failed {
+                            maybe_schedule_primary_compaction(&maintenance_shared);
                         }
                     }
-                    maintenance_shared
-                        .primary_compaction_scheduled
-                        .store(false, AtomicOrdering::Release);
-                    maybe_schedule_primary_compaction(&maintenance_shared);
-                }
-                MaintenanceJob::CompactSecondaryRuns => {
-                    while secondary_compaction_needed(&maintenance_shared) {
-                        if compact_one_secondary_level(&maintenance_shared).is_err() {
-                            break;
+                    MaintenanceJob::CompactSecondaryRuns => {
+                        let mut failed = false;
+                        while secondary_compaction_needed(&maintenance_shared) {
+                            if compact_one_secondary_level(&maintenance_shared).is_err() {
+                                record_maintenance_error(
+                                    &maintenance_shared,
+                                    "secondary run compaction failed",
+                                );
+                                failed = true;
+                                maintenance_shared
+                                    .index_maintenance_failures
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                                break;
+                            }
+                        }
+                        maintenance_shared
+                            .secondary_compaction_scheduled
+                            .store(false, AtomicOrdering::Release);
+                        if !failed {
+                            maybe_schedule_secondary_compaction(&maintenance_shared);
                         }
                     }
-                    maintenance_shared
-                        .secondary_compaction_scheduled
-                        .store(false, AtomicOrdering::Release);
-                    maybe_schedule_secondary_compaction(&maintenance_shared);
-                }
-                MaintenanceJob::CompactTextRuns => {
-                    while text_compaction_needed(&maintenance_shared) {
-                        if compact_one_text_level(&maintenance_shared).is_err() {
-                            break;
+                    MaintenanceJob::CompactTextRuns => {
+                        let mut failed = false;
+                        while text_compaction_needed(&maintenance_shared) {
+                            if compact_one_text_level(&maintenance_shared).is_err() {
+                                record_maintenance_error(
+                                    &maintenance_shared,
+                                    "text run compaction failed",
+                                );
+                                failed = true;
+                                maintenance_shared
+                                    .index_maintenance_failures
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                                break;
+                            }
+                        }
+                        maintenance_shared
+                            .text_compaction_scheduled
+                            .store(false, AtomicOrdering::Release);
+                        if !failed {
+                            maybe_schedule_text_compaction(&maintenance_shared);
                         }
                     }
-                    maintenance_shared
-                        .text_compaction_scheduled
-                        .store(false, AtomicOrdering::Release);
-                    maybe_schedule_text_compaction(&maintenance_shared);
                 }
             }
+        }));
+        maintenance_shared
+            .maintenance_worker_alive
+            .store(false, AtomicOrdering::Release);
+        if outcome.is_err() {
+            record_maintenance_error(&maintenance_shared, "maintenance worker panicked");
+            maintenance_shared
+                .index_maintenance_failures
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            maintenance_shared
+                .primary_compaction_scheduled
+                .store(false, AtomicOrdering::Release);
+            maintenance_shared
+                .secondary_compaction_scheduled
+                .store(false, AtomicOrdering::Release);
+            maintenance_shared
+                .text_compaction_scheduled
+                .store(false, AtomicOrdering::Release);
+            maintenance_shared
+                .auto_compaction_state
+                .lock()
+                .unwrap()
+                .scheduled = false;
         }
     });
 
@@ -2095,12 +2218,27 @@ fn finish_db(shared: Arc<Shared>) -> Db {
     *shared.checkpoint_tx.lock().unwrap() = Some(checkpoint_tx);
     let checkpoint_shared = shared.clone();
     let checkpoint_handle = std::thread::spawn(move || {
-        while let Ok(job) = checkpoint_rx.recv() {
-            let result = flush_frozen_checkpoint(&checkpoint_shared, job);
-            let mut status = checkpoint_shared.background_checkpoint.lock().unwrap();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            while let Ok(job) = checkpoint_rx.recv() {
+                let result = flush_frozen_checkpoint(&checkpoint_shared, job);
+                let mut status = checkpoint_shared.background_checkpoint.lock().unwrap();
+                status.running = false;
+                status.last_error = result.err().map(|error| error.to_string());
+                checkpoint_shared.background_checkpoint_done.notify_all();
+            }
+        }));
+        if outcome.is_err() {
+            let mut status = checkpoint_shared
+                .background_checkpoint
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             status.running = false;
-            status.last_error = result.err().map(|error| error.to_string());
+            status.last_error = Some("background checkpoint worker panicked".into());
             checkpoint_shared.background_checkpoint_done.notify_all();
+            drop(status);
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                thaw_frozen_checkpoint(&checkpoint_shared)
+            }));
         }
     });
 
@@ -2113,6 +2251,10 @@ fn finish_db(shared: Arc<Shared>) -> Db {
 }
 
 impl Db {
+    pub(crate) fn acquire_ddl_guard(&self) -> MutexGuard<'_, ()> {
+        self.shared.ddl.lock().unwrap()
+    }
+
     pub fn create(path: impl AsRef<Path>) -> Result<Db> {
         Db::create_with(path, DbOptions::default())
     }
@@ -2126,10 +2268,18 @@ impl Db {
     }
 
     pub fn open_or_create_with(path: impl AsRef<Path>, opts: DbOptions) -> Result<Db> {
-        if path.as_ref().join(MARKER_FILE).exists() {
+        let path = path.as_ref();
+        if path.join(MARKER_FILE).exists() {
             Db::open_with(path, opts)
         } else {
-            Db::create_with(path, opts)
+            match Db::create_with(path, opts.clone()) {
+                Ok(db) => Ok(db),
+                // Another creator may have won between the initial probe and
+                // our exclusive lock. `create_with` rechecks under that lock
+                // and refuses to overwrite; reopen through the normal path.
+                Err(_) if path.join(MARKER_FILE).exists() => Db::open_with(path, opts),
+                Err(error) => Err(error),
+            }
         }
     }
 
@@ -2156,27 +2306,54 @@ impl Db {
             ));
         }
         let dir = path.as_ref().to_path_buf();
-        if dir.join(MARKER_FILE).exists() {
-            return Err(Error::InvalidArgument(format!(
-                "database already exists at {}",
-                dir.display()
-            )));
-        }
+        let _creation_lock = lock_creation_destination(&dir)?;
+        prepare_creation_directory(&dir)?;
         fs::create_dir_all(dir.join(SEGMENTS_DIR))?;
         fs::create_dir_all(dir.join(WAL_DIR))?;
         fs::create_dir_all(dir.join(VECTORS_DIR))?;
         fs::create_dir_all(dir.join(INDEXES_DIR))?;
         fs::create_dir_all(dir.join(BLOBS_DIR))?;
         let lock_file = acquire_lock(&dir, false)?;
+        // The pre-lock check is only an early error. A concurrent creator can
+        // publish the marker before this process acquires LOCK, so the
+        // authoritative existence check must happen while exclusion is held.
+        if dir.join(MARKER_FILE).exists() {
+            return Err(Error::InvalidArgument(format!(
+                "database already exists at {}",
+                dir.display()
+            )));
+        }
 
-        let mut marker = File::create(dir.join(MARKER_FILE))?;
-        marker.write_all(format!("elitesql format_version={FORMAT_VERSION}\n").as_bytes())?;
-        marker.sync_all()?;
         Catalog::new().save(&dir.join(CATALOG_FILE))?;
         let manifest = Manifest::initial();
-        manifest.publish(&dir)?;
+        if let PublishOutcome::SyncFailed(error) = manifest.publish(&dir)? {
+            return Err(Error::CommitUnknown(format!(
+                "database manifest was created, but syncing its directory failed: {error}"
+            )));
+        }
         File::create(wal_path(&dir, manifest.wal_id))?.sync_all()?;
         fsync_dir(&dir.join(WAL_DIR))?;
+        // The marker is the creation commit record: publish it only after all
+        // mandatory files are durable. A crash before this point leaves an
+        // unmarked directory that a later creator may safely initialize; a
+        // visible marker always names a complete database.
+        let marker_path = dir.join(MARKER_FILE);
+        let marker_tmp = dir.join(format!(".{MARKER_FILE}.tmp"));
+        let mut marker = File::create(&marker_tmp)?;
+        marker.write_all(format!("elitesql format_version={FORMAT_VERSION}\n").as_bytes())?;
+        marker.sync_all()?;
+        fs::rename(&marker_tmp, &marker_path)?;
+        if let Err(error) = fsync_dir(&dir) {
+            return Err(Error::CommitUnknown(format!(
+                "database marker was renamed into place, but syncing its directory failed: {error}"
+            )));
+        }
+        match fs::remove_file(dir.join(CREATION_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        fsync_dir(&dir)?;
 
         let wal = Some(WalWriter::open(&dir, manifest.wal_id)?);
         let blobs_dir = dir.join(BLOBS_DIR);
@@ -2204,6 +2381,8 @@ impl Db {
                 wal,
                 memtable_bytes: 0,
             }),
+            canonical_error: Mutex::new(None),
+            ddl: Mutex::new(()),
             commit_count: AtomicU64::new(0),
             commit_nanos: AtomicU64::new(0),
             commit_lock_wait_nanos: AtomicU64::new(0),
@@ -2214,7 +2393,12 @@ impl Db {
             last_generated_id: Mutex::new(Ulid::nil()),
             vector_tx: Mutex::new(None),
             vector_backlog: AtomicU64::new(0),
+            vector_worker_alive: AtomicBool::new(true),
+            vector_worker_error: Mutex::new(None),
             maintenance_tx: Mutex::new(None),
+            maintenance_worker_alive: AtomicBool::new(true),
+            maintenance_worker_error: Mutex::new(None),
+            index_maintenance_failures: AtomicU64::new(0),
             checkpoint_tx: Mutex::new(None),
             background_checkpoint: Mutex::new(BackgroundCheckpointState::default()),
             background_checkpoint_done: Condvar::new(),
@@ -2269,18 +2453,50 @@ impl Db {
                 dir.display()
             )));
         }
+        if !ro {
+            let _ = fs::remove_file(dir.join(CREATION_FILE));
+        }
         let lock_file = acquire_lock(&dir, ro)?;
-        let catalog = Catalog::load(&dir.join(CATALOG_FILE))?;
-        let (manifest, used_prev) = Manifest::load(&dir)?;
+        let (mut manifest, used_prev) = Manifest::load(&dir)?;
+        let catalog = match manifest.catalog.clone() {
+            Some(catalog) => catalog,
+            None => Catalog::load(&dir.join(CATALOG_FILE))?,
+        };
         if used_prev && !ro {
             // The primary manifest was unreadable; re-establish it from the
             // fallback without ever rotating the corrupt file over the good one.
-            manifest.heal(&dir)?;
+            if let PublishOutcome::SyncFailed(error) = manifest.heal(&dir)? {
+                return Err(Error::CommitUnknown(format!(
+                    "fallback manifest was restored, but syncing its directory failed: {error}"
+                )));
+            }
+        }
+        if manifest.catalog.is_none() && !ro {
+            // Upgrade legacy manifests before serving writes. From this point
+            // onward both primary and fallback generations carry the schema
+            // that describes their segment set.
+            manifest.catalog = Some(catalog.clone());
+            if let PublishOutcome::SyncFailed(error) = manifest.publish(&dir)? {
+                return Err(Error::CommitUnknown(format!(
+                    "legacy manifest was upgraded, but syncing its directory failed: {error}"
+                )));
+            }
+        }
+        if !ro
+            && Manifest::previous(&dir)
+                .is_none_or(|previous| previous.encode() != manifest.encode())
+        {
+            if let PublishOutcome::SyncFailed(error) = manifest.refresh_previous(&dir)? {
+                return Err(Error::CommitUnknown(format!(
+                    "manifest fallback refresh was incomplete: {error}"
+                )));
+            }
         }
         if !ro {
             fs::create_dir_all(dir.join(VECTORS_DIR))?;
             fs::create_dir_all(dir.join(INDEXES_DIR))?;
             fs::create_dir_all(dir.join(BLOBS_DIR))?;
+            cleanup_blob_staging(&dir);
             cleanup_orphans(&dir, &manifest)?;
             cleanup_orphan_vidx(&dir, &catalog);
             cleanup_orphan_sidx(&dir, &catalog);
@@ -2513,9 +2729,11 @@ impl Db {
             .collect();
         let mut memtable_bytes = 0u64;
         let wal_file = wal_path(&dir, manifest.wal_id);
-        if !wal_file.exists() && !ro {
-            File::create(&wal_file)?.sync_all()?;
-            fsync_dir(&dir.join(WAL_DIR))?;
+        if !wal_file.exists() {
+            return Err(Error::Corrupt(format!(
+                "active WAL {} is missing; it may have contained commits above manifest version {}",
+                manifest.wal_id, manifest.committed_version
+            )));
         }
         let data = match fs::read(&wal_file) {
             Ok(d) => d,
@@ -2529,8 +2747,14 @@ impl Db {
             f.sync_all()?;
         }
         for rec in scan.records {
-            if rec.version <= committed_version {
-                continue;
+            let expected = committed_version.checked_add(1).ok_or_else(|| {
+                Error::Corrupt("commit version exhausted while replaying WAL".into())
+            })?;
+            if rec.version != expected {
+                return Err(Error::Corrupt(format!(
+                    "WAL commit version gap: expected {expected}, found {}",
+                    rec.version
+                )));
             }
             for (table, value) in rec.identity_high_water {
                 identity_high_water
@@ -2685,6 +2909,8 @@ impl Db {
                 wal,
                 memtable_bytes,
             }),
+            canonical_error: Mutex::new(None),
+            ddl: Mutex::new(()),
             commit_count: AtomicU64::new(0),
             commit_nanos: AtomicU64::new(0),
             commit_lock_wait_nanos: AtomicU64::new(0),
@@ -2695,7 +2921,12 @@ impl Db {
             last_generated_id: Mutex::new(last_generated_id),
             vector_tx: Mutex::new(None),
             vector_backlog: AtomicU64::new(0),
+            vector_worker_alive: AtomicBool::new(true),
+            vector_worker_error: Mutex::new(None),
             maintenance_tx: Mutex::new(None),
+            maintenance_worker_alive: AtomicBool::new(true),
+            maintenance_worker_error: Mutex::new(None),
+            index_maintenance_failures: AtomicU64::new(0),
             checkpoint_tx: Mutex::new(None),
             background_checkpoint: Mutex::new(BackgroundCheckpointState::default()),
             background_checkpoint_done: Condvar::new(),
@@ -2749,6 +2980,7 @@ impl Db {
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
+        let _ddl = self.shared.ddl.lock().unwrap();
         schema.validate()?;
         if let Some(identity_name) = schema
             .columns
@@ -2783,7 +3015,7 @@ impl Db {
                 });
             }
         }
-        let _cs = lock_commit_for_maintenance(&self.shared)?;
+        let mut cs = lock_commit_for_maintenance(&self.shared)?;
         let mut st = self.shared.state.write().unwrap();
         // This incarnation of the table only owns data committed from now on.
         // Anything older under the same name belongs to a table that was
@@ -2835,12 +3067,13 @@ impl Db {
                     foreign_key.referenced_column
                 )));
             }
-            if !(foreign_key.referenced_column == ID_COLUMN && target.has_implicit_id())
-                && !target
-                    .indexes
-                    .iter()
-                    .any(|index| index.column == foreign_key.referenced_column && index.unique)
-            {
+            let implicit_primary =
+                foreign_key.referenced_column == ID_COLUMN && target.has_implicit_id();
+            let unique_index = target
+                .indexes
+                .iter()
+                .any(|index| index.column == foreign_key.referenced_column && index.unique);
+            if !implicit_primary && !unique_index {
                 return Err(Error::SchemaViolation(format!(
                     "foreign key target {}.{} must have a unique index",
                     foreign_key.referenced_table, foreign_key.referenced_column
@@ -2854,10 +3087,6 @@ impl Db {
                     def.column
                 )));
             }
-            st.secondary.insert(
-                (schema.name.clone(), def.column.clone()),
-                SecIdx::resident(HashMap::new()),
-            );
         }
         for def in &schema.vector_indexes {
             match schema.column(&def.column) {
@@ -2869,10 +3098,6 @@ impl Db {
                     )))
                 }
             }
-            st.vector.insert(
-                (schema.name.clone(), def.column.clone()),
-                VecIdx::new(def.clone()),
-            );
         }
         for def in &schema.text_indexes {
             match schema.column(&def.column) {
@@ -2884,11 +3109,28 @@ impl Db {
                     )))
                 }
             }
+        }
+        let mut next_catalog = st.catalog.clone();
+        next_catalog.tables.push(schema.clone());
+        let publication_error =
+            publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next_catalog)?;
+        for def in &schema.indexes {
+            st.secondary.insert(
+                (schema.name.clone(), def.column.clone()),
+                SecIdx::resident(HashMap::new()),
+            );
+        }
+        for def in &schema.vector_indexes {
+            st.vector.insert(
+                (schema.name.clone(), def.column.clone()),
+                VecIdx::new(def.clone()),
+            );
+        }
+        for def in &schema.text_indexes {
             st.text
                 .insert((schema.name.clone(), def.column.clone()), TextIdx::new());
         }
-        st.catalog.tables.push(schema);
-        st.catalog.save(&self.shared.dir.join(CATALOG_FILE))
+        publication_error.map_or(Ok(()), Err)
     }
 
     /// Create a secondary (optionally unique) equality index over a column,
@@ -2897,7 +3139,8 @@ impl Db {
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
-        let _cs = lock_commit_for_maintenance(&self.shared)?;
+        let _ddl = self.shared.ddl.lock().unwrap();
+        let mut cs = lock_commit_for_maintenance(&self.shared)?;
         let _memory = Self::acquire_maintenance_memory(&self.shared);
         let mut st = self.shared.state.write().unwrap();
         {
@@ -2974,44 +3217,57 @@ impl Db {
                 column: column.into(),
                 unique,
             });
-        if let Err(error) = next_catalog.save(&self.shared.dir.join(CATALOG_FILE)) {
-            let _ = fs::remove_file(&tmp);
+        let publication_error =
+            match publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next_catalog) {
+                Ok(error) => error,
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(error);
+                }
+            };
+        let post_publish = (|| -> Result<()> {
+            fs::rename(&tmp, &path)?;
+            fsync_dir(&self.shared.dir.join(INDEXES_DIR))?;
+            let meta = DerivedRunMeta {
+                file: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("secondary path has utf8 filename")
+                    .to_owned(),
+                level: DERIVED_BASE_LEVEL,
+                bytes: fs::metadata(&path)?.len(),
+                generation: st.committed_version,
+            };
+            DerivedRunManifest::new(
+                DerivedRunKind::Secondary,
+                table,
+                column,
+                st.committed_version,
+                vec![meta.clone()],
+                [0, 0],
+            )
+            .publish(&sidx_manifest_path(&self.shared.dir, table, column))?;
+            let version = st.committed_version;
+            st.secondary.insert(
+                (table.into(), column.into()),
+                SecIdx::paged_runs(
+                    version,
+                    vec![SecRun {
+                        meta,
+                        index: Arc::new(PagedIndex::open(&path)?),
+                    }],
+                )?,
+            );
+            Ok(())
+        })();
+        if let Err(error) = post_publish {
+            fence_writes(
+                &self.shared,
+                format!("catalog published for {table}.{column}, but secondary index setup failed: {error}"),
+            );
             return Err(error);
         }
-        st.catalog = next_catalog;
-        fs::rename(&tmp, &path)?;
-        fsync_dir(&self.shared.dir.join(INDEXES_DIR))?;
-        let meta = DerivedRunMeta {
-            file: path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("secondary path has utf8 filename")
-                .to_owned(),
-            level: DERIVED_BASE_LEVEL,
-            bytes: fs::metadata(&path)?.len(),
-            generation: st.committed_version,
-        };
-        DerivedRunManifest::new(
-            DerivedRunKind::Secondary,
-            table,
-            column,
-            st.committed_version,
-            vec![meta.clone()],
-            [0, 0],
-        )
-        .publish(&sidx_manifest_path(&self.shared.dir, table, column))?;
-        let version = st.committed_version;
-        st.secondary.insert(
-            (table.into(), column.into()),
-            SecIdx::paged_runs(
-                version,
-                vec![SecRun {
-                    meta,
-                    index: Arc::new(PagedIndex::open(&path)?),
-                }],
-            )?,
-        );
-        Ok(())
+        publication_error.map_or(Ok(()), Err)
     }
 
     /// Create an ANN (HNSW) index over a vector column, built from the
@@ -3026,7 +3282,8 @@ impl Db {
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
-        let _cs = lock_commit_for_maintenance(&self.shared)?;
+        let _ddl = self.shared.ddl.lock().unwrap();
+        let mut cs = lock_commit_for_maintenance(&self.shared)?;
         let _memory = Self::acquire_maintenance_memory(&self.shared);
         let mut st = self.shared.state.write().unwrap();
         {
@@ -3078,14 +3335,14 @@ impl Db {
             }
             Ok(true)
         })?;
-        let schema = st
-            .catalog
-            .tables
-            .iter_mut()
-            .find(|t| t.name == table)
-            .expect("checked above");
-        schema.vector_indexes.push(def);
-        st.catalog.save(&self.shared.dir.join(CATALOG_FILE))?;
+        let mut next_catalog = st.catalog.clone();
+        next_catalog
+            .table_mut(table)
+            .expect("checked above")
+            .vector_indexes
+            .push(def);
+        let publication_error =
+            publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next_catalog)?;
         let def = st
             .catalog
             .table(table)
@@ -3101,17 +3358,28 @@ impl Db {
             // Keep a brand-new empty graph mutable so subsequent inserts are
             // included in its first durable base at close/consolidation.
             st.vector.insert((table.into(), column.into()), vidx);
-            return Ok(());
+            return publication_error.map_or(Ok(()), Err);
         }
-        let path = vidx_path(&self.shared.dir, table, column);
-        let tmp = path.with_extension("vidx.tmp");
-        vidx.dump_file(&tmp, table, column, &def, st.committed_version)?;
-        fs::rename(&tmp, &path)?;
-        let file = File::open(&path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file) }?;
-        let (mapped, _) = VecIdx::load_mmap(mmap, table, column, &def)?;
-        st.vector.insert((table.into(), column.into()), mapped);
-        Ok(())
+        let post_publish = (|| -> Result<()> {
+            let path = vidx_path(&self.shared.dir, table, column);
+            let tmp = path.with_extension("vidx.tmp");
+            vidx.dump_file(&tmp, table, column, &def, st.committed_version)?;
+            fs::rename(&tmp, &path)?;
+            fsync_dir(&self.shared.dir.join(VECTORS_DIR))?;
+            let file = File::open(&path)?;
+            let mmap = unsafe { MmapOptions::new().map(&file) }?;
+            let (mapped, _) = VecIdx::load_mmap(mmap, table, column, &def)?;
+            st.vector.insert((table.into(), column.into()), mapped);
+            Ok(())
+        })();
+        if let Err(error) = post_publish {
+            fence_writes(
+                &self.shared,
+                format!("catalog published for {table}.{column}, but vector index setup failed: {error}"),
+            );
+            return Err(error);
+        }
+        publication_error.map_or(Ok(()), Err)
     }
 
     /// Create a basic full-text index (inverted index + BM25) over a text
@@ -3120,7 +3388,8 @@ impl Db {
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
-        let _cs = lock_commit_for_maintenance(&self.shared)?;
+        let _ddl = self.shared.ddl.lock().unwrap();
+        let mut cs = lock_commit_for_maintenance(&self.shared)?;
         let _memory = Self::acquire_maintenance_memory(&self.shared);
         let mut st = self.shared.state.write().unwrap();
         {
@@ -3177,35 +3446,50 @@ impl Db {
             .push(TextIndexDef {
                 column: column.into(),
             });
-        if let Err(error) = next_catalog.save(&self.shared.dir.join(CATALOG_FILE)) {
-            let _ = fs::remove_file(&tmp);
+        let publication_error =
+            match publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next_catalog) {
+                Ok(error) => error,
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(error);
+                }
+            };
+        let post_publish = (|| -> Result<()> {
+            fs::rename(&tmp, &path)?;
+            fsync_dir(&self.shared.dir.join(INDEXES_DIR))?;
+            let meta = DerivedRunMeta {
+                file: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("text path has utf8 filename")
+                    .to_owned(),
+                level: DERIVED_BASE_LEVEL,
+                bytes: fs::metadata(&path)?.len(),
+                generation: version,
+            };
+            let text = TextIdx::paged_runs(
+                version,
+                vec![TextRun {
+                    meta,
+                    index: Arc::new(PagedIndex::open(&path)?),
+                }],
+                doc_count,
+                total_len,
+            )?;
+            publish_text_manifest(&self.shared.dir, table, column, version, &text)?;
+            st.text.insert((table.into(), column.into()), text);
+            Ok(())
+        })();
+        if let Err(error) = post_publish {
+            fence_writes(
+                &self.shared,
+                format!(
+                    "catalog published for {table}.{column}, but text index setup failed: {error}"
+                ),
+            );
             return Err(error);
         }
-        st.catalog = next_catalog;
-        fs::rename(&tmp, &path)?;
-        fsync_dir(&self.shared.dir.join(INDEXES_DIR))?;
-        let meta = DerivedRunMeta {
-            file: path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("text path has utf8 filename")
-                .to_owned(),
-            level: DERIVED_BASE_LEVEL,
-            bytes: fs::metadata(&path)?.len(),
-            generation: version,
-        };
-        let text = TextIdx::paged_runs(
-            version,
-            vec![TextRun {
-                meta,
-                index: Arc::new(PagedIndex::open(&path)?),
-            }],
-            doc_count,
-            total_len,
-        )?;
-        publish_text_manifest(&self.shared.dir, table, column, version, &text)?;
-        st.text.insert((table.into(), column.into()), text);
-        Ok(())
+        publication_error.map_or(Ok(()), Err)
     }
 
     // --- DDL: DROP and ALTER -------------------------------------------------
@@ -3233,7 +3517,8 @@ impl Db {
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
-        let _cs = lock_commit_for_maintenance(&self.shared)?;
+        let _ddl = self.shared.ddl.lock().unwrap();
+        let mut cs = lock_commit_for_maintenance(&self.shared)?;
         let mut st = self.shared.state.write().unwrap();
         let schema = st
             .catalog
@@ -3268,8 +3553,8 @@ impl Db {
         })?;
         let mut next = st.catalog.clone();
         next.tables.retain(|t| t.name != table);
-        next.save(&self.shared.dir.join(CATALOG_FILE))?;
-        st.catalog = next;
+        let publication_error =
+            publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next)?;
         st.identity_high_water.remove(table);
         // Immutable primary pages may keep unreachable keys until compaction;
         // dropping only the bounded mutable delta avoids materializing the
@@ -3284,7 +3569,7 @@ impl Db {
         self.shared
             .memory_governor
             .set_index_delta_bytes(retained_delta_bytes);
-        drop(_cs);
+        drop(cs);
         for column in &vector_columns {
             let _ = fs::remove_file(vidx_path(&self.shared.dir, table, column));
         }
@@ -3301,7 +3586,7 @@ impl Db {
         }
         refresh_compaction_debt(&self.shared);
         maybe_schedule_auto_compaction(&self.shared);
-        Ok(())
+        publication_error.map_or(Ok(()), Err)
     }
 
     /// Drop the secondary (equality) index on a column. The column and its
@@ -3325,7 +3610,8 @@ impl Db {
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
-        let _cs = lock_commit_for_maintenance(&self.shared)?;
+        let _ddl = self.shared.ddl.lock().unwrap();
+        let mut cs = lock_commit_for_maintenance(&self.shared)?;
         let mut st = self.shared.state.write().unwrap();
         let schema = st
             .catalog
@@ -3369,8 +3655,8 @@ impl Db {
             IndexKind::Vector => schema.vector_indexes.retain(|d| d.column != column),
             IndexKind::Text => schema.text_indexes.retain(|d| d.column != column),
         }
-        next.save(&self.shared.dir.join(CATALOG_FILE))?;
-        st.catalog = next;
+        let publication_error =
+            publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next)?;
         let key = (table.to_owned(), column.to_owned());
         match kind {
             IndexKind::Secondary => {
@@ -3400,7 +3686,7 @@ impl Db {
                 cleanup_orphan_tidx(&self.shared.dir, &cleanup_catalog);
             }
         }
-        Ok(())
+        publication_error.map_or(Ok(()), Err)
     }
 
     /// Add a column.
@@ -3415,6 +3701,7 @@ impl Db {
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
+        let _ddl = self.shared.ddl.lock().unwrap();
         column.validate()?;
         {
             let st = self.shared.state.read().unwrap();
@@ -3430,6 +3717,10 @@ impl Db {
             }
         }
         if column.default.is_none() {
+            // Keep writers excluded from the emptiness check through catalog
+            // publication; otherwise an insert using the old schema could
+            // land between them and violate a new NOT NULL column.
+            let mut cs = lock_commit_for_maintenance(&self.shared)?;
             if !column.nullable && !self.table_is_empty(table) {
                 return Err(Error::SchemaViolation(format!(
                     "column {table}.{} is NOT NULL: give it a DEFAULT so the records already \
@@ -3438,16 +3729,21 @@ impl Db {
                 )));
             }
             // One durable catalog write, atomic on its own: no intent needed.
-            let _cs = lock_commit_for_maintenance(&self.shared)?;
             let mut st = self.shared.state.write().unwrap();
             let mut next = st.catalog.clone();
             let schema = next
                 .table_mut(table)
                 .ok_or_else(|| Error::TableNotFound(table.into()))?;
+            if schema.column(&column.name).is_some() {
+                return Err(Error::InvalidArgument(format!(
+                    "column {table}.{} already exists",
+                    column.name
+                )));
+            }
             schema.columns.push(column);
-            next.save(&self.shared.dir.join(CATALOG_FILE))?;
-            st.catalog = next;
-            return Ok(());
+            let publication_error =
+                publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next)?;
+            return publication_error.map_or(Ok(()), Err);
         }
         let not_null = !column.nullable;
         let intent = DdlIntent::AddColumn {
@@ -3455,9 +3751,7 @@ impl Db {
             column,
             not_null,
         };
-        intent.write(&self.shared.dir)?;
-        self.apply_ddl(&intent)?;
-        DdlIntent::clear(&self.shared.dir)
+        self.run_ddl_intent(&intent)
     }
 
     /// Drop a column, its data and any index over it. The table's records are
@@ -3466,6 +3760,7 @@ impl Db {
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
+        let _ddl = self.shared.ddl.lock().unwrap();
         {
             let st = self.shared.state.read().unwrap();
             let schema = st
@@ -3503,9 +3798,7 @@ impl Db {
             table: table.to_owned(),
             column: column.to_owned(),
         };
-        intent.write(&self.shared.dir)?;
-        self.apply_ddl(&intent)?;
-        DdlIntent::clear(&self.shared.dir)
+        self.run_ddl_intent(&intent)
     }
 
     /// Rename a table. Records are keyed by table name on disk, so this
@@ -3514,6 +3807,7 @@ impl Db {
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
+        let _ddl = self.shared.ddl.lock().unwrap();
         {
             let st = self.shared.state.read().unwrap();
             if st.catalog.table(table).is_none() {
@@ -3546,9 +3840,7 @@ impl Db {
             table: table.to_owned(),
             to: new_name.to_owned(),
         };
-        intent.write(&self.shared.dir)?;
-        self.apply_ddl(&intent)?;
-        DdlIntent::clear(&self.shared.dir)
+        self.run_ddl_intent(&intent)
     }
 
     /// Rename a column, carrying any index over it. Column names live in every
@@ -3557,6 +3849,7 @@ impl Db {
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
+        let _ddl = self.shared.ddl.lock().unwrap();
         {
             let st = self.shared.state.read().unwrap();
             let schema = st
@@ -3608,9 +3901,7 @@ impl Db {
             column: column.to_owned(),
             to: new_name.to_owned(),
         };
-        intent.write(&self.shared.dir)?;
-        self.apply_ddl(&intent)?;
-        DdlIntent::clear(&self.shared.dir)
+        self.run_ddl_intent(&intent)
     }
 
     /// Run one DDL operation to completion. Every step is idempotent, so this
@@ -3638,11 +3929,53 @@ impl Db {
         }
     }
 
+    fn run_ddl_intent(&self, intent: &DdlIntent) -> Result<()> {
+        ensure_canonical_writable(&self.shared)?;
+        if let Some(pending) = DdlIntent::load(&self.shared.dir)? {
+            fence_writes(
+                &self.shared,
+                format!(
+                    "pending DDL must be recovered before another schema change: {}",
+                    pending.describe()
+                ),
+            );
+            return Err(Error::CommitUnknown(
+                "a previous DDL intent is still pending; reopen the database to recover it".into(),
+            ));
+        }
+        if let Err(error) = intent.write(&self.shared.dir) {
+            if self.shared.dir.join(crate::ddl::DDL_FILE).exists() {
+                fence_writes(
+                    &self.shared,
+                    format!(
+                        "DDL intent may have been published despite a sync failure; reopen to recover: {error}"
+                    ),
+                );
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.apply_ddl(intent) {
+            fence_writes(
+                &self.shared,
+                format!("DDL application failed with a durable pending intent: {error}"),
+            );
+            return Err(error);
+        }
+        if let Err(error) = DdlIntent::clear(&self.shared.dir) {
+            fence_writes(
+                &self.shared,
+                format!("DDL completed but intent cleanup was uncertain: {error}"),
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Three durable steps, each one leaving a consistent database behind:
     /// publish the column as nullable, backfill it, then enforce `NOT NULL`.
     fn apply_add_column(&self, table: &str, column: &Column, not_null: bool) -> Result<()> {
         {
-            let _cs = lock_commit_for_maintenance(&self.shared)?;
+            let mut cs = lock_commit_for_maintenance(&self.shared)?;
             let mut st = self.shared.state.write().unwrap();
             let mut next = st.catalog.clone();
             let schema = next
@@ -3654,12 +3987,15 @@ impl Db {
                 Some(existing) => *existing = staged,
                 None => schema.columns.push(staged),
             }
-            next.save(&self.shared.dir.join(CATALOG_FILE))?;
-            st.catalog = next;
+            if let Some(error) =
+                publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next)?
+            {
+                return Err(error);
+            }
         }
         self.backfill_column(table, &column.name, &column.default_value()?)?;
         if not_null {
-            let _cs = lock_commit_for_maintenance(&self.shared)?;
+            let mut cs = lock_commit_for_maintenance(&self.shared)?;
             let mut st = self.shared.state.write().unwrap();
             let mut next = st.catalog.clone();
             let schema = next
@@ -3668,8 +4004,11 @@ impl Db {
             if let Some(existing) = schema.columns.iter_mut().find(|c| c.name == column.name) {
                 existing.nullable = false;
             }
-            next.save(&self.shared.dir.join(CATALOG_FILE))?;
-            st.catalog = next;
+            if let Some(error) =
+                publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next)?
+            {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -4063,10 +4402,25 @@ impl Db {
     }
 
     /// Block until every async-committed vector is searchable.
-    pub fn wait_vector_indexing(&self) {
+    pub fn wait_vector_indexing(&self) -> Result<()> {
         while self.vector_indexing_backlog() > 0 {
+            if !self
+                .shared
+                .vector_worker_alive
+                .load(AtomicOrdering::Acquire)
+            {
+                let message = self
+                    .shared
+                    .vector_worker_error
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone()
+                    .unwrap_or_else(|| "vector indexing worker stopped with pending work".into());
+                return Err(Error::Io(std::io::Error::other(message)));
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        Ok(())
     }
 
     pub fn tables(&self) -> Vec<String> {
@@ -4336,9 +4690,7 @@ impl Db {
                 .into_inner()
                 .map_err(|error| Error::Io(error.into_error()))?;
             segment_file.sync_all()?;
-            if blob_sink.wrote {
-                fsync_dir(&self.shared.dir.join(BLOBS_DIR))?;
-            }
+            blob_sink.publish()?;
 
             let mut new_segments = old_segments.clone();
             new_segments.push(SegmentMeta {
@@ -4412,20 +4764,25 @@ impl Db {
             let st = self.shared.state.read().unwrap();
             identity_manifest(&st)
         };
-        if let Err(error) = (Manifest {
+        let manifest_outcome = match (Manifest {
             format_version: FORMAT_VERSION,
             committed_version: version,
             segments: new_segments.clone(),
             wal_id: cs.wal().id,
             identity_high_water,
+            catalog: Some(self.shared.state.read().unwrap().catalog.clone()),
         })
         .publish(&self.shared.dir)
         {
-            let _ = PrimaryRunManifest::new(old_generation, old_run_metas).publish(&indexes_dir);
-            let _ = fs::remove_file(&segment_path);
-            let _ = fs::remove_file(&run_path);
-            return Err(error);
-        }
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ =
+                    PrimaryRunManifest::new(old_generation, old_run_metas).publish(&indexes_dir);
+                let _ = fs::remove_file(&segment_path);
+                let _ = fs::remove_file(&run_path);
+                return Err(error);
+            }
+        };
 
         let final_ulid = Ulid::from_string(&final_id).ok();
         {
@@ -4445,12 +4802,27 @@ impl Db {
             let mut previous = self.shared.last_generated_id.lock().unwrap();
             *previous = (*previous).max(final_ulid);
         }
+        let publication_error =
+            publication_sync_error(&self.shared, "bulk insert manifest", manifest_outcome);
         self.shared
             .primary_checkpoint_bytes_written
             .fetch_add(run_bytes, AtomicOrdering::Relaxed);
         cleanup_primary_run_orphans(&self.shared.dir);
         maybe_schedule_primary_compaction(&self.shared);
-        Ok(rows)
+        if publication_error.is_none() {
+            cleanup_orphans(
+                &self.shared.dir,
+                &Manifest {
+                    format_version: FORMAT_VERSION,
+                    committed_version: version,
+                    segments: self.shared.state.read().unwrap().segments.clone(),
+                    wal_id: cs.wal().id,
+                    identity_high_water: identity_manifest(&self.shared.state.read().unwrap()),
+                    catalog: Some(self.shared.state.read().unwrap().catalog.clone()),
+                },
+            )?;
+        }
+        publication_error.map_or(Ok(rows), Err)
     }
 
     pub fn update(&self, table: &str, id: &str, patch: Record) -> Result<()> {
@@ -4508,6 +4880,7 @@ impl Db {
         table: &str,
         id: &str,
     ) -> Result<Option<Record>> {
+        self.validate_snapshot_owner(snapshot)?;
         shared_get_at(&self.shared, table, id, snapshot.version)
     }
 
@@ -4537,6 +4910,7 @@ impl Db {
     /// All records of a table as of a snapshot, ordered by id.
     pub fn scan_at(&self, snapshot: &Snapshot, table: &str) -> Result<Vec<(String, Record)>> {
         let _memory = self.acquire_query_memory();
+        self.validate_snapshot_owner(snapshot)?;
         shared_scan_at(&self.shared, table, snapshot.version)
     }
 
@@ -4560,7 +4934,18 @@ impl Db {
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Record)>> {
+        self.validate_snapshot_owner(snapshot)?;
         shared_scan_batch_at(&self.shared, table, snapshot.version, after_id, limit)
+    }
+
+    fn validate_snapshot_owner(&self, snapshot: &Snapshot) -> Result<()> {
+        if Arc::ptr_eq(&self.shared, &snapshot.shared) {
+            Ok(())
+        } else {
+            Err(Error::InvalidArgument(
+                "snapshot belongs to a different database handle".into(),
+            ))
+        }
     }
 
     /// Equality lookup over the latest committed state. Uses the secondary
@@ -4847,16 +5232,33 @@ impl Db {
 
     /// Wait until the current primary-index level promotion has published.
     /// Checkpoints remain independently durable while this maintenance runs.
-    pub fn wait_for_primary_compaction(&self) {
-        let _ = wait_for_background_checkpoint(&self.shared);
+    pub fn wait_for_primary_compaction(&self) -> Result<()> {
+        wait_for_background_checkpoint(&self.shared)?;
+        let initial_failures = self
+            .shared
+            .index_maintenance_failures
+            .load(AtomicOrdering::Relaxed);
         loop {
+            if !self
+                .shared
+                .maintenance_worker_alive
+                .load(AtomicOrdering::Acquire)
+                || self
+                    .shared
+                    .index_maintenance_failures
+                    .load(AtomicOrdering::Relaxed)
+                    .saturating_sub(initial_failures)
+                    >= MAX_MAINTENANCE_WAIT_RETRIES
+            {
+                return Err(maintenance_wait_error(&self.shared, "primary compaction"));
+            }
             maybe_schedule_primary_compaction(&self.shared);
             let scheduled = self
                 .shared
                 .primary_compaction_scheduled
                 .load(AtomicOrdering::Acquire);
             if !scheduled && !primary_compaction_needed(&self.shared) {
-                return;
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -4864,29 +5266,63 @@ impl Db {
 
     /// Wait until every currently eligible secondary-index level promotion
     /// has published. Checkpoints remain independently durable.
-    pub fn wait_for_secondary_compaction(&self) {
+    pub fn wait_for_secondary_compaction(&self) -> Result<()> {
+        let initial_failures = self
+            .shared
+            .index_maintenance_failures
+            .load(AtomicOrdering::Relaxed);
         loop {
+            if !self
+                .shared
+                .maintenance_worker_alive
+                .load(AtomicOrdering::Acquire)
+                || self
+                    .shared
+                    .index_maintenance_failures
+                    .load(AtomicOrdering::Relaxed)
+                    .saturating_sub(initial_failures)
+                    >= MAX_MAINTENANCE_WAIT_RETRIES
+            {
+                return Err(maintenance_wait_error(&self.shared, "secondary compaction"));
+            }
             maybe_schedule_secondary_compaction(&self.shared);
             let scheduled = self
                 .shared
                 .secondary_compaction_scheduled
                 .load(AtomicOrdering::Acquire);
             if !scheduled && !secondary_compaction_needed(&self.shared) {
-                return;
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(1));
         }
     }
 
-    pub fn wait_for_text_compaction(&self) {
+    pub fn wait_for_text_compaction(&self) -> Result<()> {
+        let initial_failures = self
+            .shared
+            .index_maintenance_failures
+            .load(AtomicOrdering::Relaxed);
         loop {
+            if !self
+                .shared
+                .maintenance_worker_alive
+                .load(AtomicOrdering::Acquire)
+                || self
+                    .shared
+                    .index_maintenance_failures
+                    .load(AtomicOrdering::Relaxed)
+                    .saturating_sub(initial_failures)
+                    >= MAX_MAINTENANCE_WAIT_RETRIES
+            {
+                return Err(maintenance_wait_error(&self.shared, "text compaction"));
+            }
             maybe_schedule_text_compaction(&self.shared);
             let scheduled = self
                 .shared
                 .text_compaction_scheduled
                 .load(AtomicOrdering::Acquire);
             if !scheduled && !text_compaction_needed(&self.shared) {
-                return;
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -4947,10 +5383,18 @@ impl Db {
 
     /// Wait until a queued/running automatic compaction finishes. Primarily
     /// useful for graceful shutdown, tests, and maintenance observability.
-    pub fn wait_for_automatic_compaction(&self) {
+    pub fn wait_for_automatic_compaction(&self) -> Result<()> {
         while self.shared.auto_compaction_state.lock().unwrap().scheduled {
+            if !self
+                .shared
+                .maintenance_worker_alive
+                .load(AtomicOrdering::Acquire)
+            {
+                return Err(maintenance_wait_error(&self.shared, "automatic compaction"));
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
+        Ok(())
     }
 
     /// Rewrite segments keeping only versions visible to the latest state or
@@ -4990,7 +5434,7 @@ impl Db {
             w
         };
 
-        let (committed_version, seg_id, old_ids, mut source_tables) = {
+        let (committed_version, seg_id, mut source_tables) = {
             let st = shared.state.read().unwrap();
             let mut tables: BTreeSet<String> = st
                 .catalog
@@ -5003,15 +5447,7 @@ impl Db {
                 // target name while the catalog still uses the source name.
                 tables.insert(to.to_owned());
             }
-            (
-                st.committed_version,
-                st.next_segment_id,
-                st.segments
-                    .iter()
-                    .map(|segment| segment.id)
-                    .collect::<Vec<_>>(),
-                tables,
-            )
+            (st.committed_version, st.next_segment_id, tables)
         };
         let work_budget = (shared.opts.memory.maintenance_pool_bytes / 3).max(1);
         let seg_path = shared
@@ -5168,27 +5604,28 @@ impl Db {
         blob_refs_writer.finish()?;
         let blob_refs_index = PagedIndex::open(&blob_refs_path)?;
 
-        // The manifest is the atomic pointer to the data, so it goes first.
-        Manifest {
+        // Keep the human/tooling catalog mirror ahead of canonical publication.
+        // Current engines pair schema and data through the embedded catalog in
+        // the manifest, so a crash here still opens the old complete generation.
+        if rw.is_ddl() {
+            new_catalog.save(&shared.dir.join(CATALOG_FILE))?;
+        }
+
+        // The manifest atomically publishes both transformed data and schema.
+        let manifest_outcome = Manifest {
             format_version: FORMAT_VERSION,
             committed_version,
             segments: new_segments.clone(),
             wal_id: cs.wal().id,
             identity_high_water: identity_high_water.clone(),
+            catalog: Some(new_catalog.clone()),
         }
         .publish(&shared.dir)?;
 
-        // Then the catalog that describes it. A crash in between leaves the
-        // `ddl.json` record on disk and the next open replays this operation
-        // from the top; every step is idempotent, so the replay is safe.
-        if rw.is_ddl() {
-            new_catalog.save(&shared.dir.join(CATALOG_FILE))?;
-        }
-
-        // The primary directory is disposable but its run-set publication is
-        // tied to the exact canonical segment/catalog generation above.
-        publish_primary_run_manifest(&shared.dir, generation, &new_primary)?;
-
+        let primary_publish_error =
+            publish_primary_run_manifest(&shared.dir, generation, &new_primary).err();
+        // Canonical publication has completed. Adopt it in memory before
+        // propagating any disposable-index error.
         {
             let mut st = shared.state.write().unwrap();
             st.catalog = new_catalog;
@@ -5209,7 +5646,30 @@ impl Db {
             st.vector.clear();
             st.text.clear();
         }
-        rebuild_derived_indexes_after_rewrite(shared, rw.is_ddl())?;
+        let publication_error =
+            publication_sync_error(shared, "compaction manifest", manifest_outcome);
+        if let Some(error) = primary_publish_error {
+            if publication_error.is_none() {
+                fence_writes(
+                    shared,
+                    format!(
+                        "canonical rewrite published but primary index publication failed: {error}"
+                    ),
+                );
+            }
+            return Err(publication_error.unwrap_or(error));
+        }
+        if let Err(error) = rebuild_derived_indexes_after_rewrite(shared, rw.is_ddl()) {
+            if publication_error.is_none() {
+                fence_writes(
+                    shared,
+                    format!(
+                        "canonical rewrite published but derived index rebuild failed: {error}"
+                    ),
+                );
+            }
+            return Err(publication_error.unwrap_or(error));
+        }
         cleanup_primary_run_orphans(&shared.dir);
         let retained = shared.state.read().unwrap().index_delta_memory_bytes();
         shared.memory_governor.set_index_delta_bytes(retained);
@@ -5217,38 +5677,39 @@ impl Db {
         cleanup_orphan_sidx(&shared.dir, &catalog);
         cleanup_orphan_tidx(&shared.dir, &catalog);
         cleanup_orphan_vidx(&shared.dir, &catalog);
-        for id in old_ids {
-            let _ = fs::remove_file(shared.dir.join(SEGMENTS_DIR).join(segment_file_name(id)));
+        if publication_error.is_none() {
+            cleanup_orphans(
+                &shared.dir,
+                &Manifest {
+                    format_version: FORMAT_VERSION,
+                    committed_version,
+                    segments: shared.state.read().unwrap().segments.clone(),
+                    wal_id: cs.wal().id,
+                    identity_high_water: identity_manifest(&shared.state.read().unwrap()),
+                    catalog: Some(shared.state.read().unwrap().catalog.clone()),
+                },
+            )?;
         }
 
         // Blob references were externally sorted while the segment streamed;
         // no HashSet proportional to the number of chunks is retained.
         let blobs_dir = shared.dir.join(BLOBS_DIR);
-        if let Ok(entries) = fs::read_dir(&blobs_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let keep = path
-                    .file_stem()
-                    .map(|stem| {
-                        let mut found = false;
-                        blob_refs_index
-                            .visit_key(stem.to_string_lossy().as_bytes(), |_| {
-                                found = true;
-                                Ok(false)
-                            })
-                            .map(|()| found)
-                            .unwrap_or(false)
+        if publication_error.is_none() {
+            gc_blob_files(&blobs_dir, |stem| {
+                let mut found = false;
+                blob_refs_index
+                    .visit_key(stem.as_bytes(), |_| {
+                        found = true;
+                        Ok(false)
                     })
-                    .unwrap_or(false);
-                if !keep {
-                    let _ = fs::remove_file(&path);
-                }
-            }
+                    .map(|()| found)
+                    .unwrap_or(false)
+            });
         }
         drop(blob_refs_index);
         let _ = fs::remove_file(&blob_refs_path);
         reset_compaction_debt(shared);
-        Ok(())
+        publication_error.map_or(Ok(()), Err)
     }
 }
 
@@ -5879,7 +6340,7 @@ fn maybe_schedule_auto_compaction(shared: &Shared) {
     }
 }
 
-fn acquire_lock(dir: &Path, shared: bool) -> Result<File> {
+pub(crate) fn acquire_lock(dir: &Path, shared: bool) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -5897,8 +6358,68 @@ fn acquire_lock(dir: &Path, shared: bool) -> Result<File> {
     }
 }
 
+fn lock_creation_destination(dir: &Path) -> Result<File> {
+    let parent = dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = dir.file_name().ok_or_else(|| {
+        Error::InvalidArgument(format!("invalid database path: {}", dir.display()))
+    })?;
+    let path = parent.join(format!(".{}.elitesql-create-lock", name.to_string_lossy()));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn prepare_creation_directory(dir: &Path) -> Result<()> {
+    if dir.join(MARKER_FILE).exists() {
+        return Err(Error::InvalidArgument(format!(
+            "database already exists at {}",
+            dir.display()
+        )));
+    }
+    if dir.exists() {
+        if !dir.is_dir() {
+            return Err(Error::InvalidArgument(format!(
+                "database path is not a directory: {}",
+                dir.display()
+            )));
+        }
+        let mut entries = fs::read_dir(dir)?;
+        if entries.next().transpose()?.is_some() {
+            let owned_partial =
+                fs::read(dir.join(CREATION_FILE)).is_ok_and(|bytes| bytes == CREATION_MAGIC);
+            if !owned_partial {
+                return Err(Error::InvalidArgument(format!(
+                    "refusing to initialize non-empty directory without an EliteSQL creation journal: {}",
+                    dir.display()
+                )));
+            }
+            fs::remove_dir_all(dir)?;
+            fs::create_dir(dir)?;
+        }
+    } else {
+        fs::create_dir(dir)?;
+    }
+    let journal_path = dir.join(CREATION_FILE);
+    let mut journal = File::create(journal_path)?;
+    journal.write_all(CREATION_MAGIC)?;
+    journal.sync_all()?;
+    fsync_dir(dir)
+}
+
 fn cleanup_orphans(dir: &Path, manifest: &Manifest) -> Result<()> {
-    let listed: HashSet<u32> = manifest.segments.iter().map(|s| s.id).collect();
+    let previous = Manifest::previous(dir);
+    let mut listed: HashSet<u32> = manifest.segments.iter().map(|s| s.id).collect();
+    if let Some(previous) = &previous {
+        listed.extend(previous.segments.iter().map(|segment| segment.id));
+    }
     for dirent in fs::read_dir(dir.join(SEGMENTS_DIR))? {
         let dirent = dirent?;
         let name = dirent.file_name();
@@ -5917,13 +6438,55 @@ fn cleanup_orphans(dir: &Path, manifest: &Manifest) -> Result<()> {
         let name = name.to_string_lossy();
         if let Some(stem) = name.strip_suffix(".wal") {
             if let Ok(id) = stem.parse::<u32>() {
-                if id != manifest.wal_id {
+                if id != manifest.wal_id
+                    && previous
+                        .as_ref()
+                        .is_none_or(|previous| id != previous.wal_id)
+                {
                     let _ = fs::remove_file(dirent.path());
                 }
             }
         }
     }
     Ok(())
+}
+
+fn cleanup_blob_staging(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir.join(BLOBS_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".blob.tmp"))
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn gc_blob_files(blobs_dir: &Path, mut referenced: impl FnMut(&str) -> bool) {
+    let Ok(entries) = fs::read_dir(blobs_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // In-flight commits prepare `<name>.blob.tmp` without the commit
+        // mutex. Only final chunks participate in GC; stale temporaries are
+        // removed on the next writable open.
+        if path.extension().is_none_or(|extension| extension != "blob") {
+            continue;
+        }
+        let keep = path
+            .file_stem()
+            .map(|stem| referenced(&stem.to_string_lossy()))
+            .unwrap_or(false);
+        if !keep {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// Apply a DDL rewrite to one record payload. Values are copied byte for byte,
@@ -6105,6 +6668,7 @@ fn commit_staged(
     if shared.opts.read_only {
         return Err(Error::ReadOnly);
     }
+    ensure_canonical_writable(shared)?;
     if staged_tables
         .iter()
         .all(|(_, staged_table)| staged_table.operations.is_empty())
@@ -6156,9 +6720,6 @@ fn commit_staged(
         });
     }
     staged.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-    if blob_sink.wrote {
-        fsync_dir(&shared.dir.join(BLOBS_DIR))?;
-    }
     let outside_prepare_time = prepare_started.elapsed();
 
     let mut lock_wait = Duration::ZERO;
@@ -6172,7 +6733,8 @@ fn commit_staged(
         // commit outcome ambiguous to the caller.
         take_background_checkpoint_error(shared)?;
         let locked_prepare_started = Instant::now();
-        let mut previous_entries: Vec<Vec<Option<VersionEntry>>> = Vec::with_capacity(staged.len());
+        let mut previous_entries: Vec<Vec<(Option<VersionEntry>, Option<Record>)>> =
+            Vec::with_capacity(staged.len());
         let (commit_version, incoming_index_bytes, identity_high_water) = {
             let st = shared.state.read().unwrap();
             for table in &staged {
@@ -6199,7 +6761,21 @@ fn commit_staged(
                             )));
                         }
                     }
-                    table_previous.push(previous);
+                    // Complete every fallible read before the WAL durability
+                    // point. Applying the already-committed change below must
+                    // only mutate memory and cannot return a late error after
+                    // partially publishing a transaction.
+                    let prior_record = match &previous {
+                        Some(entry)
+                            if !entry.is_tombstone()
+                                && (!table.schema.indexes.is_empty()
+                                    || !table.schema.text_indexes.is_empty()) =>
+                        {
+                            Some(read_record_kind(&st.blobs, &st.readers, &entry.kind)?)
+                        }
+                        _ => None,
+                    };
+                    table_previous.push((previous, prior_record));
                 }
                 previous_entries.push(table_previous);
             }
@@ -6256,6 +6832,12 @@ fn commit_staged(
             identity_high_water,
         );
     };
+    // Blob payloads are prepared outside the commit mutex so large values do
+    // not serialize writers. Promote their temporary files only now: a
+    // concurrent compaction holds this same mutex while running blob GC, so
+    // it can never delete a newly published chunk before the WAL references
+    // it. The directory sync happens before the WAL durability point.
+    blob_sink.publish()?;
     let prepare_time = outside_prepare_time.saturating_add(locked_prepare_time);
     // Durability point: the WAL record is the commit.
     let wal_started = Instant::now();
@@ -6276,7 +6858,7 @@ fn commit_staged(
         .map(|(table, value)| (table.as_str(), *value))
         .collect();
     let bytes = encode_commit(commit_version, &wal_changes, &identity_wal);
-    cs.wal().append_commit(
+    let wal_outcome = cs.wal().append_commit(
         &bytes,
         shared.opts.durability,
         shared.opts.balanced_sync_interval_ms,
@@ -6297,7 +6879,8 @@ fn commit_staged(
                 .last()
                 .map(|change| change.id.clone())
                 .expect("prepared tables are non-empty");
-            for (change, previous) in table.changes.into_iter().zip(table_previous) {
+            for (change, (previous, prior_record)) in table.changes.into_iter().zip(table_previous)
+            {
                 if let Some(previous) = &previous {
                     // An update, delete, or reinsert supersedes one previously
                     // visible record version. Count rows, not SQL statements.
@@ -6329,9 +6912,12 @@ fn commit_staged(
                     &table.schema,
                     &table.name,
                     change.id,
-                    put,
+                    ApplyRecordState {
+                        put,
+                        prior: prior_record,
+                    },
                     &mut jobs,
-                )?;
+                );
                 added += change
                     .payload
                     .as_deref()
@@ -6358,7 +6944,15 @@ fn commit_staged(
                 .fetch_add(jobs.len() as u64, AtomicOrdering::SeqCst);
             for job in jobs {
                 if tx.send(job).is_err() {
-                    shared.vector_backlog.fetch_sub(1, AtomicOrdering::SeqCst);
+                    *shared
+                        .vector_worker_error
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = Some(
+                        "vector indexing worker stopped before accepting committed work".into(),
+                    );
+                    // Keep the backlog charged: the vector is committed but
+                    // not searchable. A waiter must report the dead worker,
+                    // not claim that indexing completed successfully.
                 }
             }
         }
@@ -6367,17 +6961,28 @@ fn commit_staged(
     shared
         .memory_governor
         .add_index_delta_bytes(incoming_index_bytes);
-    if cs.memtable_bytes >= shared.opts.memtable_max_bytes {
-        let frozen_running = shared.state.read().unwrap().index.frozen.is_some();
-        if !frozen_running {
-            let memory = Db::acquire_maintenance_memory(shared);
-            if !schedule_frozen_checkpoint(shared, &mut cs, memory)? {
-                let _memory = Db::acquire_maintenance_memory(shared);
-                checkpoint_measured(shared, &mut cs)?;
-                refresh_compaction_debt_if_needed(shared);
-                maybe_schedule_auto_compaction(shared);
+    let maintenance_result = (|| -> Result<()> {
+        if cs.memtable_bytes >= shared.opts.memtable_max_bytes {
+            let frozen_running = shared.state.read().unwrap().index.frozen.is_some();
+            if !frozen_running {
+                let memory = Db::acquire_maintenance_memory(shared);
+                if !schedule_frozen_checkpoint(shared, &mut cs, memory)? {
+                    let _memory = Db::acquire_maintenance_memory(shared);
+                    checkpoint_measured(shared, &mut cs)?;
+                    refresh_compaction_debt_if_needed(shared);
+                    maybe_schedule_auto_compaction(shared);
+                }
             }
         }
+        Ok(())
+    })();
+    if let Err(error) = maintenance_result {
+        // The transaction is already in the WAL and visible. Never turn a
+        // post-commit checkpoint failure into an apparent transaction
+        // failure that callers might retry. Defer it to the next write before
+        // that write reaches its own durability point.
+        let mut status = shared.background_checkpoint.lock().unwrap();
+        status.last_error = Some(format!("post-commit maintenance failed: {error}"));
     }
     let elapsed_nanos = |duration: Duration| duration.as_nanos().min(u64::MAX as u128) as u64;
     shared.commit_count.fetch_add(1, AtomicOrdering::Relaxed);
@@ -6397,7 +7002,12 @@ fn commit_staged(
     shared
         .commit_apply_nanos
         .fetch_add(elapsed_nanos(apply_time), AtomicOrdering::Relaxed);
-    Ok(commit_version)
+    match wal_outcome {
+        WalAppendOutcome::Complete => Ok(commit_version),
+        WalAppendOutcome::SyncFailed(error) => Err(Error::CommitUnknown(format!(
+            "version {commit_version} was published, but syncing its WAL record failed: {error}"
+        ))),
+    }
 }
 
 fn estimate_staged_index_bytes(st: &State, staged: &[PreparedTable]) -> Result<usize> {
@@ -6743,9 +7353,10 @@ fn apply_one_owned(
     schema: &TableSchema,
     table: &str,
     id: String,
-    put: Option<(&Arc<Vec<u8>>, &Record)>,
+    records: ApplyRecordState<'_>,
     jobs: &mut Vec<VecJob>,
-) -> Result<()> {
+) {
+    let ApplyRecordState { put, prior } = records;
     let id_ref = id.as_str();
     let has_derived_indexes = !schema.indexes.is_empty()
         || !schema.text_indexes.is_empty()
@@ -6756,17 +7367,11 @@ fn apply_one_owned(
             None => VKind::MemTombstone,
         };
         st.index.push(table, id, VersionEntry { version, kind });
-        return Ok(());
+        return;
     }
     let defs = &schema.indexes;
     let tdefs = &schema.text_indexes;
     if !defs.is_empty() || !tdefs.is_empty() {
-        let prior: Option<Record> = match st.latest_owned(table, id_ref)? {
-            Some(last) if !last.is_tombstone() => {
-                Some(read_record_kind(&st.blobs, &st.readers, &last.kind)?)
-            }
-            _ => None,
-        };
         if let Some(prior) = prior {
             for def in defs {
                 if let Some(v) = prior.get(&def.column) {
@@ -6846,7 +7451,6 @@ fn apply_one_owned(
         }
     }
     st.index.push(table, id, VersionEntry { version, kind });
-    Ok(())
 }
 
 /// Drain committed in-memory data into a new segment, publish a new manifest
@@ -6895,6 +7499,7 @@ fn take_background_checkpoint_error(shared: &Shared) -> Result<()> {
 }
 
 fn lock_commit_for_maintenance<'a>(shared: &'a Arc<Shared>) -> Result<MutexGuard<'a, CommitState>> {
+    ensure_canonical_writable(shared)?;
     loop {
         wait_for_background_checkpoint(shared)?;
         let guard = shared.commit.lock().unwrap();
@@ -6903,6 +7508,60 @@ fn lock_commit_for_maintenance<'a>(shared: &'a Arc<Shared>) -> Result<MutexGuard
         }
         drop(guard);
     }
+}
+
+fn ensure_canonical_writable(shared: &Shared) -> Result<()> {
+    if let Some(message) = shared.canonical_error.lock().unwrap().as_ref() {
+        return Err(Error::CommitUnknown(format!(
+            "database writes are fenced until reopen after an uncertain canonical publication: {message}"
+        )));
+    }
+    Ok(())
+}
+
+fn publication_sync_error(
+    shared: &Shared,
+    operation: &str,
+    outcome: PublishOutcome,
+) -> Option<Error> {
+    let PublishOutcome::SyncFailed(error) = outcome else {
+        return None;
+    };
+    let message =
+        format!("{operation} was renamed into place, but syncing its directory failed: {error}");
+    *shared.canonical_error.lock().unwrap() = Some(message.clone());
+    Some(Error::CommitUnknown(message))
+}
+
+/// Publish a catalog-only generation while the caller holds commit + state.
+/// `catalog.json` is a compatibility mirror; the manifest-embedded catalog is
+/// the canonical schema paired with its exact segment/WAL generation.
+fn publish_catalog_generation_locked(
+    shared: &Arc<Shared>,
+    _cs: &mut CommitState,
+    state: &mut State,
+    next: Catalog,
+) -> Result<Option<Error>> {
+    // Writing the mirror first is safe: if canonical publication does not
+    // happen, current engines ignore the ahead mirror in favor of the embedded
+    // catalog in the old manifest.
+    next.save(&shared.dir.join(CATALOG_FILE))?;
+    let (current, _) = Manifest::load(&shared.dir)?;
+    let outcome = Manifest {
+        format_version: FORMAT_VERSION,
+        committed_version: current.committed_version,
+        segments: current.segments,
+        wal_id: current.wal_id,
+        identity_high_water: current.identity_high_water,
+        catalog: Some(next.clone()),
+    }
+    .publish(&shared.dir)?;
+    state.catalog = next;
+    Ok(publication_sync_error(shared, "catalog manifest", outcome))
+}
+
+fn fence_writes(shared: &Shared, message: impl Into<String>) {
+    *shared.canonical_error.lock().unwrap() = Some(message.into());
 }
 
 fn background_checkpoint_supported(shared: &Shared) -> bool {
@@ -6943,7 +7602,6 @@ fn schedule_frozen_checkpoint(
             next_segment_id: state.next_segment_id,
             catalog: state.catalog.clone(),
             identity_high_water: identity_manifest(&state),
-            old_primary_runs: state.index.run_metas(),
             first_primary_run: state.index.runs.is_empty(),
             wal_id: cs.wal().id,
             wal_cutoff: cs.wal().len,
@@ -7194,16 +7852,19 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
             "background checkpoint observed an unexpected WAL generation".into(),
         ));
     }
-    let still_frozen = shared
-        .state
-        .read()
-        .unwrap()
-        .index
-        .frozen
-        .as_ref()
-        .is_some_and(|frozen| {
-            frozen.version == job.version && Arc::ptr_eq(&frozen.delta, &job.frozen)
-        });
+    let (still_frozen, mut new_primary_runs) = {
+        let state = shared.state.read().unwrap();
+        (
+            state.index.frozen.as_ref().is_some_and(|frozen| {
+                frozen.version == job.version && Arc::ptr_eq(&frozen.delta, &job.frozen)
+            }),
+            // Primary run compaction is allowed while the frozen segment is
+            // being written. It publishes under this same commit mutex, so
+            // the current run set—not the one captured at freeze time—is the
+            // authoritative base for the new L0 manifest.
+            state.index.run_metas(),
+        )
+    };
     if !still_frozen {
         return Err(Error::Corrupt(
             "background checkpoint lost its frozen generation".into(),
@@ -7231,15 +7892,15 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
     fsync_dir(&shared.dir.join(WAL_DIR))?;
     let next_wal = WalWriter::open(&shared.dir, new_wal_id)?;
 
-    let mut new_primary_runs = job.old_primary_runs.clone();
     new_primary_runs.push(primary_meta.clone());
     PrimaryRunManifest::new(generation, new_primary_runs).publish(&indexes_dir)?;
-    Manifest {
+    let manifest_outcome = Manifest {
         format_version: FORMAT_VERSION,
         committed_version: job.version,
         segments: new_segments.clone(),
         wal_id: new_wal_id,
         identity_high_water: job.identity_high_water.clone(),
+        catalog: Some(job.catalog.clone()),
     }
     .publish(&shared.dir)?;
 
@@ -7268,7 +7929,21 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
     drop(state);
     drop(cs);
 
-    let _ = fs::remove_file(wal_path(&shared.dir, job.wal_id));
+    let publication_error =
+        publication_sync_error(shared, "background checkpoint manifest", manifest_outcome);
+    if publication_error.is_none() {
+        cleanup_orphans(
+            &shared.dir,
+            &Manifest {
+                format_version: FORMAT_VERSION,
+                committed_version: job.version,
+                segments: shared.state.read().unwrap().segments.clone(),
+                wal_id: new_wal_id,
+                identity_high_water: job.identity_high_water.clone(),
+                catalog: Some(job.catalog.clone()),
+            },
+        )?;
+    }
     shared
         .primary_checkpoint_bytes_written
         .fetch_add(primary_bytes, AtomicOrdering::Relaxed);
@@ -7280,7 +7955,7 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
     maybe_schedule_primary_compaction(shared);
     refresh_compaction_debt_if_needed(shared);
     maybe_schedule_auto_compaction(shared);
-    Ok(())
+    publication_error.map_or(Ok(()), Err)
 }
 
 fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
@@ -7516,35 +8191,46 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
     } else {
         None
     };
+    let mut prepared_segment_reader = match &written {
+        Some((seg_id, _)) => Some(File::open(
+            shared
+                .dir
+                .join(SEGMENTS_DIR)
+                .join(segment_file_name(*seg_id)),
+        )?),
+        None => None,
+    };
 
     // Create the new WAL before the manifest that references it, so the
     // manifest never points at a missing file.
     let new_wal_id = cs.wal().id + 1;
     File::create(wal_path(&shared.dir, new_wal_id))?.sync_all()?;
     fsync_dir(&shared.dir.join(WAL_DIR))?;
-    Manifest {
+    let next_wal = WalWriter::open(&shared.dir, new_wal_id)?;
+    let manifest_outcome = Manifest {
         format_version: FORMAT_VERSION,
         committed_version,
         segments: new_segments.clone(),
         wal_id: new_wal_id,
         identity_high_water,
+        catalog: Some(catalog.clone()),
     }
     .publish(&shared.dir)?;
-    let _ = fs::remove_file(wal_path(&shared.dir, cs.wal().id));
 
     // Canonical publication has succeeded. Switch to the new WAL before any
     // disposable index work so a failed run-manifest publication cannot leave
     // future commits appending to an unlinked old WAL inode.
-    cs.wal = Some(WalWriter::open(&shared.dir, new_wal_id)?);
+    cs.wal = Some(next_wal);
 
     {
         let mut st = shared.state.write().unwrap();
         if let Some((seg_id, _)) = &written {
-            let seg_path = shared
-                .dir
-                .join(SEGMENTS_DIR)
-                .join(segment_file_name(*seg_id));
-            st.readers.insert(*seg_id, File::open(&seg_path)?);
+            st.readers.insert(
+                *seg_id,
+                prepared_segment_reader
+                    .take()
+                    .expect("reader prepared before canonical publication"),
+            );
             st.next_segment_id = seg_id + 1;
             if new_segment_superseded {
                 st.superseded_segments.insert(*seg_id);
@@ -7557,7 +8243,9 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
     if let Some((meta, _)) = &prepared_primary {
         new_primary_runs.push(meta.clone());
     }
-    PrimaryRunManifest::new(generation, new_primary_runs).publish(&shared.dir.join(INDEXES_DIR))?;
+    let primary_publish_error = PrimaryRunManifest::new(generation, new_primary_runs)
+        .publish(&shared.dir.join(INDEXES_DIR))
+        .err();
 
     {
         let mut st = shared.state.write().unwrap();
@@ -7571,11 +8259,34 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
         }
     }
     cs.memtable_bytes = 0;
+    let publication_error = publication_sync_error(shared, "checkpoint manifest", manifest_outcome);
+    if let Some(error) = primary_publish_error {
+        if publication_error.is_none() {
+            fence_writes(
+                shared,
+                format!("checkpoint published but primary index publication failed: {error}"),
+            );
+        }
+        return Err(publication_error.unwrap_or(error));
+    }
     cleanup_primary_run_orphans(&shared.dir);
     maybe_schedule_primary_compaction(shared);
     let retained = shared.state.read().unwrap().index_delta_memory_bytes();
     shared.memory_governor.set_index_delta_bytes(retained);
-    Ok(())
+    if publication_error.is_none() {
+        cleanup_orphans(
+            &shared.dir,
+            &Manifest {
+                format_version: FORMAT_VERSION,
+                committed_version,
+                segments: shared.state.read().unwrap().segments.clone(),
+                wal_id: new_wal_id,
+                identity_high_water: identity_manifest(&shared.state.read().unwrap()),
+                catalog: Some(shared.state.read().unwrap().catalog.clone()),
+            },
+        )?;
+    }
+    publication_error.map_or(Ok(()), Err)
 }
 
 /// Publish every mutable index delta as an immutable mmap run. The caller
@@ -7587,6 +8298,15 @@ fn consolidate_index_deltas_locked(shared: &Arc<Shared>, cs: &mut CommitState) -
     // before reconciling against actual structures, otherwise resetting the
     // counter here could forget already-admitted but not-yet-applied vectors.
     while shared.vector_backlog.load(AtomicOrdering::SeqCst) > 0 {
+        if !shared.vector_worker_alive.load(AtomicOrdering::Acquire) {
+            let message = shared
+                .vector_worker_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+                .unwrap_or_else(|| "vector worker stopped with pending work".into());
+            return Err(Error::Io(std::io::Error::other(message)));
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
     checkpoint_measured(shared, cs)?;
@@ -9049,7 +9769,7 @@ fn normalize_record(schema: &TableSchema, mut record: Record) -> Result<Record> 
 pub(crate) struct BlobSink {
     dir: PathBuf,
     threshold: usize,
-    pub wrote: bool,
+    staged: Vec<(PathBuf, PathBuf)>,
 }
 
 impl BlobSink {
@@ -9057,7 +9777,7 @@ impl BlobSink {
         BlobSink {
             dir: db_dir.join(BLOBS_DIR),
             threshold,
-            wrote: false,
+            staged: Vec::new(),
         }
     }
 
@@ -9069,12 +9789,35 @@ impl BlobSink {
         }
         let name = Ulid::new().to_string();
         let (bytes, crc) = write_blob_file_bytes(content);
-        let path = self.dir.join(format!("{name}.blob"));
-        let mut f = File::create(&path)?;
+        let final_path = self.dir.join(format!("{name}.blob"));
+        let temporary_path = self.dir.join(format!("{name}.blob.tmp"));
+        let mut f = File::create(&temporary_path)?;
         f.write_all(&bytes)?;
         f.sync_all()?;
-        self.wrote = true;
+        self.staged.push((temporary_path, final_path));
         Ok(Some((name, crc)))
+    }
+
+    /// Atomically expose every prepared chunk. Callers serialize this with
+    /// blob GC through the database commit mutex.
+    fn publish(&mut self) -> Result<()> {
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+        for (temporary, final_path) in &self.staged {
+            fs::rename(temporary, final_path)?;
+        }
+        fsync_dir(&self.dir)?;
+        self.staged.clear();
+        Ok(())
+    }
+}
+
+impl Drop for BlobSink {
+    fn drop(&mut self) {
+        for (temporary, _) in &self.staged {
+            let _ = fs::remove_file(temporary);
+        }
     }
 }
 
@@ -9190,5 +9933,136 @@ mod primary_index_tests {
             .unwrap();
         let missing: Vec<_> = raw_ids.difference(&visited).cloned().collect();
         assert_eq!(visited.len(), 200, "missing {missing:?}");
+    }
+
+    #[test]
+    fn blob_gc_ignores_commit_staging_files_until_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(BLOBS_DIR)).unwrap();
+        let mut sink = BlobSink::new(dir.path(), 1);
+        let content = b"large durable payload";
+        let (name, _) = sink
+            .maybe_externalize(content)
+            .unwrap()
+            .expect("threshold externalizes");
+        let temporary = dir.path().join(BLOBS_DIR).join(format!("{name}.blob.tmp"));
+        let final_path = dir.path().join(BLOBS_DIR).join(format!("{name}.blob"));
+        assert!(temporary.exists());
+
+        gc_blob_files(&dir.path().join(BLOBS_DIR), |_| false);
+        assert!(temporary.exists(), "GC must not remove an in-flight commit");
+        sink.publish().unwrap();
+        assert!(!temporary.exists());
+        assert!(final_path.exists());
+    }
+
+    #[test]
+    fn sync_failure_is_reported_as_unknown_after_logical_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync-unknown.esql");
+        let db = Db::create(&path).unwrap();
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::new("value", ColumnType::Int64)],
+        ))
+        .unwrap();
+        db.shared
+            .commit
+            .lock()
+            .unwrap()
+            .wal()
+            .fail_next_sync_for_test();
+
+        let mut first = Record::new();
+        first.insert("id".into(), Value::Text("a".into()));
+        first.insert("value".into(), Value::Int64(1));
+        assert!(matches!(
+            db.insert("docs", first),
+            Err(Error::CommitUnknown(_))
+        ));
+        assert_eq!(db.snapshot().version(), 1);
+        assert_eq!(
+            db.get("docs", "a").unwrap().unwrap()["value"],
+            Value::Int64(1)
+        );
+
+        let mut second = Record::new();
+        second.insert("id".into(), Value::Text("b".into()));
+        second.insert("value".into(), Value::Int64(2));
+        db.insert("docs", second).unwrap();
+        assert_eq!(db.snapshot().version(), 2);
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(reopened.scan("docs").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ambiguous_manifest_refresh_adopts_generation_and_fences_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest-unknown.esql");
+        let db = Db::create(&path).unwrap();
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::new("value", ColumnType::Int64)],
+        ))
+        .unwrap();
+        let mut record = Record::new();
+        record.insert("id".into(), Value::Text("a".into()));
+        record.insert("value".into(), Value::Int64(1));
+        db.insert("docs", record).unwrap();
+
+        crate::manifest::fail_next_previous_dir_sync_for_test();
+        assert!(matches!(db.checkpoint(), Err(Error::CommitUnknown(_))));
+        assert!(
+            wal_path(&path, 1).exists(),
+            "an ambiguous fallback refresh must not delete the old WAL"
+        );
+        assert!(wal_path(&path, 2).exists());
+        assert_eq!(
+            db.get("docs", "a").unwrap().unwrap()["value"],
+            Value::Int64(1)
+        );
+
+        let mut refused = Record::new();
+        refused.insert("value".into(), Value::Int64(2));
+        assert!(matches!(
+            db.insert("docs", refused),
+            Err(Error::CommitUnknown(_))
+        ));
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(
+            reopened.get("docs", "a").unwrap().unwrap()["value"],
+            Value::Int64(1)
+        );
+        let mut accepted = Record::new();
+        accepted.insert("value".into(), Value::Int64(3));
+        reopened.insert("docs", accepted).unwrap();
+    }
+
+    #[test]
+    fn dead_vector_worker_with_backlog_is_reported_instead_of_waiting_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("worker-failure.esql")).unwrap();
+        db.shared.vector_backlog.store(1, AtomicOrdering::Release);
+        db.shared
+            .vector_worker_alive
+            .store(false, AtomicOrdering::Release);
+        *db.shared.vector_worker_error.lock().unwrap() = Some("injected worker failure".into());
+
+        let error = db.wait_vector_indexing().unwrap_err();
+        assert!(
+            error.to_string().contains("injected worker failure"),
+            "{error}"
+        );
+
+        // Restore the synthetic state before dropping the otherwise healthy
+        // database and its real worker thread.
+        db.shared.vector_backlog.store(0, AtomicOrdering::Release);
+        db.shared
+            .vector_worker_alive
+            .store(true, AtomicOrdering::Release);
     }
 }

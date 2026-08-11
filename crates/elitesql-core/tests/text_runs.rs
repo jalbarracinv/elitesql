@@ -77,7 +77,7 @@ fn bm25_deltas_promote_without_resurrecting_postings() {
         checkpoint_bytes.push(total - previous_bytes);
         previous_bytes = total;
     }
-    db.wait_for_text_compaction();
+    db.wait_for_text_compaction().unwrap();
 
     for term in ["alpha", "beta", "gamma", "common"] {
         assert_eq!(search_ids(&db, term), canonical_ids(&db, term), "{term}");
@@ -146,7 +146,7 @@ fn missing_text_level_is_rebuilt_from_canonical_data() {
             txn.commit().unwrap();
             db.checkpoint().unwrap();
         }
-        db.wait_for_text_compaction();
+        db.wait_for_text_compaction().unwrap();
     }
 
     let run = fs::read_dir(path.join("indexes"))

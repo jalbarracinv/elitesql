@@ -113,6 +113,7 @@ class EliteSQLError extends Error {
   }
 }
 EliteSQLError.CONFLICT_RETRY = 9;
+EliteSQLError.COMMIT_UNKNOWN = 17;
 
 class SidecarClient {
   constructor(socket) {

@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 use elitesql_core::{
-    check, Column, ColumnType, Db, DbOptions, Durability, Record, TableSchema, Value,
+    check, Column, ColumnType, Db, DbOptions, Durability, Error, Record, TableSchema, Value,
 };
 
 fn schema() -> TableSchema {
@@ -33,6 +33,22 @@ fn wal_file(db_path: &Path) -> std::path::PathBuf {
         .collect();
     files.sort();
     files.pop().expect("wal file present")
+}
+
+fn first_wal_record_len(bytes: &[u8]) -> usize {
+    let mut pos = 8;
+    let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    for _ in 0..count {
+        pos += 1;
+        let table_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2 + table_len;
+        let id_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2 + id_len;
+        let payload_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4 + payload_len;
+    }
+    pos + 4
 }
 
 #[test]
@@ -155,7 +171,7 @@ fn corrupt_manifest_falls_back_to_prev() {
             r.insert("id".into(), Value::Text(format!("b-{i}")));
             db.insert("docs", r).unwrap();
         }
-        db.checkpoint().unwrap(); // manifest M2: A+B in segments, prev = M1
+        db.checkpoint().unwrap(); // manifest M2: A+B; fallback is refreshed to M2
     }
     // Corrupt the primary manifest body.
     let manifest_path = path.join("manifest");
@@ -164,8 +180,8 @@ fn corrupt_manifest_falls_back_to_prev() {
     bytes[mid] ^= 0xFF;
     std::fs::write(&manifest_path, &bytes).unwrap();
 
-    // Opens via manifest.prev: metadata rolls back to M1 (set A only —
-    // set B's WAL was rotated away by the second checkpoint).
+    // Opens via a redundant manifest.prev of M2. A successfully acknowledged
+    // checkpoint must never disappear merely because the primary copy breaks.
     let db = Db::open(&path).unwrap();
     for i in 0..5 {
         assert!(
@@ -173,14 +189,138 @@ fn corrupt_manifest_falls_back_to_prev() {
             "set A survives"
         );
     }
-    assert_eq!(db.scan("docs").unwrap().len(), 5);
+    for i in 0..5 {
+        assert!(
+            db.get("docs", &format!("b-{i}")).unwrap().is_some(),
+            "set B survives"
+        );
+    }
+    assert_eq!(db.scan("docs").unwrap().len(), 10);
 
     // The healed manifest must be a normal, working database.
     let c = db.insert("docs", record("post heal", 9)).unwrap();
     drop(db);
     let db = Db::open(&path).unwrap();
     assert!(db.get("docs", &c).unwrap().is_some());
-    assert_eq!(db.scan("docs").unwrap().len(), 6);
+    assert_eq!(db.scan("docs").unwrap().len(), 11);
+}
+
+#[test]
+fn manifest_fallback_keeps_acknowledged_catalog_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog-fallback.esql");
+    {
+        let db = Db::create(&path).unwrap();
+        db.create_table(schema()).unwrap();
+        let mut first = record("one", 1);
+        first.insert("id".into(), Value::Text("one".into()));
+        db.insert("docs", first).unwrap();
+        db.add_column("docs", Column::new("tag", ColumnType::Text))
+            .unwrap();
+        db.create_index("docs", "title", true).unwrap();
+    }
+
+    let manifest_path = path.join("manifest");
+    let mut manifest = std::fs::read(&manifest_path).unwrap();
+    let mid = manifest.len() / 2;
+    manifest[mid] ^= 0xFF;
+    std::fs::write(&manifest_path, manifest).unwrap();
+    // The standalone catalog is only a compatibility mirror now.
+    std::fs::write(path.join("catalog.json"), b"not json").unwrap();
+
+    let db = Db::open(&path).unwrap();
+    assert!(db
+        .table_schema("docs")
+        .unwrap()
+        .columns
+        .iter()
+        .any(|column| column.name == "tag"));
+    let mut duplicate = record("one", 2);
+    duplicate.insert("id".into(), Value::Text("two".into()));
+    assert!(matches!(
+        db.insert("docs", duplicate),
+        Err(Error::UniqueViolation { .. })
+    ));
+}
+
+#[test]
+fn manifest_fallback_after_compaction_keeps_external_blobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blob-fallback.esql");
+    {
+        let db = Db::create_with(
+            &path,
+            DbOptions {
+                external_blob_threshold: 8,
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
+        db.create_table(TableSchema::new(
+            "files",
+            vec![Column::new("data", ColumnType::Blob)],
+        ))
+        .unwrap();
+        let mut original = Record::new();
+        original.insert("id".into(), Value::Text("file".into()));
+        original.insert("data".into(), Value::Blob(vec![1; 4096]));
+        db.insert("files", original).unwrap();
+        db.checkpoint().unwrap();
+        let mut patch = Record::new();
+        patch.insert("data".into(), Value::Blob(vec![2; 8192]));
+        db.update("files", "file", patch).unwrap();
+        db.compact().unwrap();
+    }
+
+    let manifest_path = path.join("manifest");
+    let mut manifest = std::fs::read(&manifest_path).unwrap();
+    let mid = manifest.len() / 2;
+    manifest[mid] ^= 0xFF;
+    std::fs::write(manifest_path, manifest).unwrap();
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(
+        db.get("files", "file").unwrap().unwrap()["data"],
+        Value::Blob(vec![2; 8192])
+    );
+}
+
+#[test]
+fn missing_active_wal_is_corruption_not_an_empty_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing-wal.esql");
+    {
+        let db = Db::create(&path).unwrap();
+        db.create_table(schema()).unwrap();
+        db.insert("docs", record("only in wal", 1)).unwrap();
+    }
+    std::fs::remove_file(wal_file(&path)).unwrap();
+
+    assert!(matches!(Db::open(&path), Err(Error::Corrupt(_))));
+    let report = check(&path).unwrap();
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|error| error.contains("wal")));
+}
+
+#[test]
+fn a_wal_version_gap_is_rejected_instead_of_losing_the_missing_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wal-gap.esql");
+    {
+        let db = Db::create(&path).unwrap();
+        db.create_table(schema()).unwrap();
+        db.insert("docs", record("first", 1)).unwrap();
+        db.insert("docs", record("second", 2)).unwrap();
+    }
+    let wal = wal_file(&path);
+    let bytes = std::fs::read(&wal).unwrap();
+    let first_len = first_wal_record_len(&bytes);
+    std::fs::write(&wal, &bytes[first_len..]).unwrap();
+
+    assert!(matches!(Db::open(&path), Err(Error::Corrupt(_))));
+    let report = check(&path).unwrap();
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|error| error.contains("gap")));
 }
 
 #[test]

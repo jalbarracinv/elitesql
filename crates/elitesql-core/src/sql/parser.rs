@@ -9,6 +9,12 @@ use super::ast::*;
 use super::lexer::{lex, Lexed, Tok};
 
 const MAX_EXPR_DEPTH: u32 = 64;
+type ParsedColumnType = (
+    ColumnType,
+    Option<usize>,
+    Option<usize>,
+    Option<Vec<String>>,
+);
 
 /// Reserved words that can never be a table alias.
 const RESERVED: &[&str] = &[
@@ -498,14 +504,7 @@ impl Parser {
         })
     }
 
-    fn parse_type(
-        &mut self,
-    ) -> Result<(
-        ColumnType,
-        Option<usize>,
-        Option<usize>,
-        Option<Vec<String>>,
-    )> {
+    fn parse_type(&mut self) -> Result<ParsedColumnType> {
         let word = self.ident("column type")?;
         let ty = match word.to_ascii_lowercase().as_str() {
             "bool" => ColumnType::Bool,

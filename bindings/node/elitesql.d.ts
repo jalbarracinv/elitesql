@@ -16,6 +16,7 @@ export interface Hit {
 export class EliteSQLError extends Error {
   code: number;
   static CONFLICT_RETRY: number;
+  static COMMIT_UNKNOWN: number;
 }
 
 export class SidecarClient {
