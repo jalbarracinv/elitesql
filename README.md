@@ -653,13 +653,39 @@ rows in 24.049 s versus SQLite's 15.670 s (1.535x SQLite time). Against the
 2026-08-08 EliteSQL baseline, throughput decreased 5.9%; SQLite also varied in
 this repeat, and the relative load-time ratio improved from 1.656x to 1.535x.
 
-The repeated concurrent-writer benchmark stayed within 2% of the preceding
-EliteSQL throughput at each of 1/2/4/8 writers and delivered 1.86x–2.40x
-SQLite's throughput. The p99 improved at one, two and four writers but was
-22.1% worse at eight, with isolated 4–8 ms maximum-latency spikes. These
-fixtures use explicit text IDs and no foreign keys: they verify the shared
-transaction path after the compatibility changes, but do not isolate identity
-allocation or cascade-validation cost.
+The 2026-08-23 coordinated-commit repeat improved the focused Fast workload
+from 382,868 to 401,175 rows/s at four writers and from 373,521 to 572,261 at
+sixteen. It preserves one versioned CRC recovery frame per transaction and is
+limited to disjoint inserts without identity, foreign-key or derived-index
+work. Safe now uses the same independent-frame coordinator and waits for one
+strict sync per eligible batch; other transactions retain the general
+group-sync path. A new
+persisted-reader/mixed harness measured median point-read throughput of
+362,557/666,045/841,250/815,137 reads/s at 1/4/8/16 readers with no query-pool
+waits. CPU-aware point-read admission now activates only while state writers
+are active. In the exact 16-reader/four-writer repeat it reduced median writer
+p99 from 11.147 ms to 0.595 ms (-94.7%) while mixed read/write throughput rose
+0.9%; the deliberate tradeoff was reader p99 moving from 0.062 to 0.222 ms.
+
+The expanded contention matrix also validates updates, deletes, identity,
+foreign keys and synchronous equality/BM25/HNSW maintenance. Warm-cache writer
+p99 medians were 0.458/1.362/1.170/1.271/0.768/1.665 ms respectively. Its cold
+mode reopens without warmup and performs explicit OS page-cache eviction on
+Linux/Android; macOS results report `evict=0/0` and must be treated as reopened,
+not truly OS-cold. See `benchmark.md` for methodology and raw CSVs; these are
+focused local measurements, not universal hardware claims.
+
+A subsequent full normal-power acceptance run repeated every core Cargo
+benchmark without replacing those historical results. At 10M rows the current
+transactional profile measured 8.643 s versus SQLite's 7.595 s, while direct
+sorted bulk measured 5.235 s versus 8.260 s. Fast/Balanced concurrent writes
+won aggregate throughput at every tested writer count. The original Safe table
+was not like-for-like on macOS: EliteSQL used `F_FULLFSYNC`, while SQLite FULL
+used ordinary `fsync`. With SQLite `fullfsync=ON`, the corrected one-writer
+result is tied at about 2.5K rows/s and EliteSQL reaches 36.7K rows/s at 16
+writers by averaging 15.7 commits per strict sync. ANN search became
+5.3-6.6x faster while recall and persisted reopen regressed, so that result is
+not quality-neutral. See the [full acceptance report](benchmark-results/full-acceptance-2026-08-23.md).
 
 Historical results remain useful: the former 256 MiB ingest profile completed
 in 18.798 s, and `Db::bulk_insert_sorted` completed in 9.968 s versus SQLite's
@@ -670,9 +696,9 @@ An isolated 10M transactional run stayed inside every logical pool
 65.56 MiB peak physical footprint. Max RSS was 879.47 MiB because it includes
 clean file-backed mmap pages touched during the historical run; those pages are
 reclaimable and intentionally not equivalent to mandatory heap. Remaining
-performance work centers on a dedicated identity/FK benchmark,
-primary-manifest publication latency, and p99/max commit latency with four to
-eight writers.
+performance work includes primary-manifest publication latency, true cold-cache
+runs on Linux, Safe/Balanced mixed matrices, more hardware, and possibly
+transaction-local identity ranges if their rollback semantics are specified.
 Re-run the scale matrix for the current 384/512 MiB profiles before comparing
 them directly with the former-profile results.
 
@@ -684,6 +710,12 @@ cargo bench -p elitesql-core --bench scale_vs_sqlite -- --rows 10m \
   --durability fast --batch-size 10k --point-reads 10k --full-scans 3 \
   --total-memory-mib 128 --index-delta-mib 24 \
   --maintenance-mib 32 --memtable-mib 16
+cargo bench -p elitesql-core --bench concurrent_rw -- \
+  --rows 100k --read-operations 200k --write-rows 20k \
+  --readers 1,4,8,16 --writers 0,1,4 --repetitions 3
+cargo bench -p elitesql-core --bench contention_matrix -- \
+  --workloads insert,update,delete,identity,foreign-key,derived \
+  --cache warm,cold --readers 16 --writers 4 --repetitions 3
 ```
 
 It gives both engines the same deterministic rows and 10K-row transaction batches. Durability is matched explicitly: EliteSQL `fast` ↔ SQLite WAL/`synchronous=OFF`, `balanced` ↔ `NORMAL`, and `safe` ↔ `FULL`. Use `--bulk-sorted` for the direct import path; `--durability balanced|safe`, `--batch-size`, `--point-reads`, `--full-scans`, `--engine both|elitesql|sqlite`, `--total-memory-mib`, `--index-delta-mib`, `--maintenance-mib`, and `--memtable-mib` change or isolate the workload; `--smoke` runs a quick 10K-row correctness check.

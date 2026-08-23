@@ -18,7 +18,7 @@ use std::error::Error;
 use std::fs;
 use std::hint::black_box;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use elitesql_core::{
@@ -85,6 +85,7 @@ struct Config {
     maintenance_mib: Option<usize>,
     memtable_mib: Option<usize>,
     bulk_sorted: bool,
+    csv: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +130,7 @@ impl Default for Config {
             maintenance_mib: None,
             memtable_mib: None,
             bulk_sorted: false,
+            csv: None,
         }
     }
 }
@@ -178,6 +180,16 @@ impl Config {
                         Some(parse_mib(&required_value(&mut args, "--memtable-mib")?)?);
                 }
                 "--bulk-sorted" => config.bulk_sorted = true,
+                "--csv" => {
+                    let path = PathBuf::from(required_value(&mut args, "--csv")?);
+                    config.csv = Some(if path.is_absolute() {
+                        path
+                    } else {
+                        Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("../..")
+                            .join(path)
+                    });
+                }
                 "--smoke" => {
                     config.rows = 10_000;
                     config.point_reads = 1_000;
@@ -242,6 +254,7 @@ fn usage() -> &'static str {
        --maintenance-mib N  EliteSQL maintenance pool\n\
        --memtable-mib N     EliteSQL automatic checkpoint threshold\n\
        --bulk-sorted        Use EliteSQL's direct sorted bulk-load path\n\
+       --csv PATH           Write structured single-run results\n\
        --smoke              Use 10k rows and 1k point reads\n\
        -h, --help           Show this help"
 }
@@ -767,6 +780,44 @@ fn print_single_result(config: &Config, result: &ResultRow) {
     );
 }
 
+fn csv(config: &Config, results: &[ResultRow]) -> String {
+    let mut output = String::from(
+        "engine,rows,batch_size,point_reads,full_scans,durability,bulk_sorted,total_memory_mib,index_delta_mib,maintenance_mib,memtable_mib,ingest_wall_seconds,final_checkpoint_seconds,maintenance_drain_seconds,checkpoint_work_seconds,checkpoint_count,promotion_work_seconds,promotion_count,total_load_seconds,rows_per_second,point_reads_seconds,point_read_us,full_scans_seconds,full_scan_seconds,disk_bytes\n",
+    );
+    let optional = |value: Option<usize>| value.map_or_else(String::new, |value| value.to_string());
+    for result in results {
+        output.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{:.9},{:.9},{:.9},{:.9},{},{:.9},{},{:.9},{:.3},{:.9},{:.3},{:.9},{:.9},{}\n",
+            result.engine,
+            config.rows,
+            config.batch_size,
+            config.point_reads,
+            config.full_scans,
+            config.durability.name(),
+            config.bulk_sorted,
+            optional(config.total_memory_mib),
+            optional(config.index_delta_mib),
+            optional(config.maintenance_mib),
+            optional(config.memtable_mib),
+            result.ingest_wall.as_secs_f64(),
+            result.final_checkpoint_wall.as_secs_f64(),
+            result.maintenance_drain_wall.as_secs_f64(),
+            result.checkpoint_work.as_secs_f64(),
+            result.checkpoint_count,
+            result.promotion_work.as_secs_f64(),
+            result.promotion_count,
+            result.total_load.as_secs_f64(),
+            config.rows as f64 / result.total_load.as_secs_f64(),
+            result.point_reads.as_secs_f64(),
+            result.point_reads.as_secs_f64() * 1_000_000.0 / config.point_reads as f64,
+            result.full_scans.as_secs_f64(),
+            result.full_scans.as_secs_f64() / config.full_scans as f64,
+            result.disk_bytes,
+        ));
+    }
+    output
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let config = match Config::parse() {
         Ok(Some(config)) => config,
@@ -810,20 +861,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let ids = point_read_ids(config.rows, config.point_reads);
-    match config.engine {
+    let results = match config.engine {
         EngineSelection::Both => {
             let elitesql = run_elitesql(&config, &ids)?;
             let sqlite = run_sqlite(&config, &ids)?;
             print_results(&config, &elitesql, &sqlite);
+            vec![elitesql, sqlite]
         }
         EngineSelection::EliteSql => {
             let result = run_elitesql(&config, &ids)?;
             print_single_result(&config, &result);
+            vec![result]
         }
         EngineSelection::Sqlite => {
             let result = run_sqlite(&config, &ids)?;
             print_single_result(&config, &result);
+            vec![result]
         }
+    };
+    if let Some(path) = &config.csv {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, csv(&config, &results))?;
+        println!("\nCSV: {}", path.display());
     }
     Ok(())
 }

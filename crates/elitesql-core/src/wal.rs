@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{IoSlice, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -329,6 +329,67 @@ impl WalWriter {
         Ok(self.len)
     }
 
+    /// Append several already-framed commits with vectored writes. All
+    /// records retain independent CRCs and recovery boundaries; the only
+    /// shared work is entering the kernel. A partial/error outcome rolls the
+    /// complete batch back to its original length just like a single append.
+    pub fn append_commits_unflushed(&mut self, records: &[&[u8]]) -> Result<u64> {
+        if let Some(message) = &self.poisoned {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "WAL writer is unusable after an earlier append failure: {message}"
+            ))));
+        }
+        let total = records.iter().try_fold(0usize, |total, record| {
+            total
+                .checked_add(record.len())
+                .ok_or_else(|| Error::InvalidArgument("WAL batch length overflow".into()))
+        })?;
+        if total == 0 {
+            return Ok(self.len);
+        }
+
+        let start = self.len;
+        let mut index = 0usize;
+        let mut offset = 0usize;
+        while index < records.len() {
+            let mut slices = Vec::with_capacity((records.len() - index).min(64));
+            slices.push(IoSlice::new(&records[index][offset..]));
+            for record in records.iter().skip(index + 1).take(63) {
+                slices.push(IoSlice::new(record));
+            }
+            let written = match self.file.write_vectored(&slices) {
+                Ok(0) => {
+                    return Err(self.rollback_partial_append(
+                        start,
+                        std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "failed to append coordinated WAL batch",
+                        ),
+                    ))
+                }
+                Ok(written) => written,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(self.rollback_partial_append(start, error)),
+            };
+            let mut remaining = written;
+            while index < records.len() {
+                let available = records[index].len() - offset;
+                if remaining < available {
+                    offset += remaining;
+                    break;
+                }
+                remaining -= available;
+                index += 1;
+                offset = 0;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        self.len = self.len.saturating_add(total as u64);
+        Ok(self.len)
+    }
+
     pub fn sync_due(&self, durability: Durability, balanced_interval_ms: u64) -> bool {
         match durability {
             Durability::Safe => true,
@@ -431,5 +492,26 @@ mod tests {
             scanned.records[0].changes[0].payload.as_deref(),
             Some(b"one".as_slice())
         );
+    }
+
+    #[test]
+    fn vectored_batch_retains_independent_recovery_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(WAL_DIR)).unwrap();
+        let mut writer = WalWriter::open(dir.path(), 1).unwrap();
+        let first = encode_commit(1, &[("t", "a", Some(b"one"))], &[]).unwrap();
+        let second = encode_commit(2, &[("t", "b", Some(b"two"))], &[]).unwrap();
+
+        writer.append_commits_unflushed(&[&first, &second]).unwrap();
+        drop(writer);
+
+        let bytes = std::fs::read(wal_path(dir.path(), 1)).unwrap();
+        let scan = scan_wal(&bytes);
+        assert!(scan.clean);
+        assert_eq!(scan.records.len(), 2);
+        assert_eq!(scan.records[0].version, 1);
+        assert_eq!(scan.records[0].changes[0].id, "a");
+        assert_eq!(scan.records[1].version, 2);
+        assert_eq!(scan.records[1].changes[0].id, "b");
     }
 }

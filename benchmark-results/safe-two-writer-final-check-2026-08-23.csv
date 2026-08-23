@@ -1,0 +1,3 @@
+engine,sync_primitive,writers,repetition,rows,batch_size,durability,elapsed_seconds,rows_per_second,p50_us,p95_us,p99_us,max_us,checkpoint_seconds,wal_syncs,wal_sync_us,commits_per_sync,max_group_commits,wal_synced_bytes,max_group_bytes,grouped_commits,coordinated_batches,coordinated_commits,coalesce_us_per_commit,leader_lock_wait_us_per_commit,lock_wait_us,lock_hold_us,locked_prepare_us,wal_append_us,apply_us
+EliteSQL,F_FULLFSYNC,2,1,10000,10,safe,1.967403958,5082.840,3997.458,4247.083,5028.041,5122.333,0.062059667,500,3498.068,2.000000,2,1443780,2892,1000,500,1000,131.027,0.000,262.037,1799.324,5.932,29.178,14.368
+SQLite-fsync,fsync,2,1,10000,10,safe,0.104758083,95458.028,88.416,114.125,183.458,62492.459,0.003233708,,,,,,,,,,,,,,,,

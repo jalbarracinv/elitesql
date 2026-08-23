@@ -197,6 +197,7 @@ version = "0.0.1"
 dependencies = [
  "crc32fast",
  "criterion",
+ "libc",
  "memmap2",
  "parking_lot",
  "rusqlite",

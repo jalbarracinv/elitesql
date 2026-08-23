@@ -15,8 +15,8 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use elitesql_core::{
-    AutoCompactionOptions, Column, ColumnType, Db, DbOptions, Durability, Record, TableSchema,
-    Value, VectorIndexOptions, VectorSearchOptions,
+    AutoCompactionOptions, Column, ColumnType, Db, DbOptions, Durability, MemoryOptions, Record,
+    TableSchema, Value, VectorIndexOptions, VectorSearchOptions,
 };
 use tempfile::TempDir;
 
@@ -25,6 +25,35 @@ const DIM: usize = 64;
 const K: usize = 10;
 const CLUSTERS: usize = 1024;
 const NOISE: f32 = 0.6;
+
+fn benchmark_options() -> DbOptions {
+    let monolithic = std::env::var_os("ELITESQL_VECTOR_MONOLITHIC").is_some();
+    let mut options = DbOptions {
+        durability: Durability::Fast,
+        auto_compaction: AutoCompactionOptions::disabled(),
+        ..DbOptions::default()
+    };
+    if monolithic {
+        // Diagnostic/reference profile: retain the complete HNSW generation
+        // so quality can be compared with the default checkpointed layout.
+        options.memtable_max_bytes = 512 * 1024 * 1024;
+        options.memory = MemoryOptions::ingest_performance();
+    }
+    options
+}
+
+fn vector_index_options() -> VectorIndexOptions {
+    let mut options = VectorIndexOptions::default();
+    if let Ok(value) = std::env::var("ELITESQL_VECTOR_M") {
+        options.m = value.parse().expect("ELITESQL_VECTOR_M must be an integer");
+    }
+    if let Ok(value) = std::env::var("ELITESQL_VECTOR_EF_CONSTRUCTION") {
+        options.ef_construction = value
+            .parse()
+            .expect("ELITESQL_VECTOR_EF_CONSTRUCTION must be an integer");
+    }
+    options
+}
 
 struct XorShift(u64);
 
@@ -73,12 +102,7 @@ impl Clustered {
 
 fn build() -> (TempDir, Db, Vec<Vec<f32>>) {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        durability: Durability::Fast,
-        auto_compaction: AutoCompactionOptions::disabled(),
-        ..DbOptions::default()
-    };
-    let db = Db::create_with(dir.path().join("vec.esql"), opts).unwrap();
+    let db = Db::create_with(dir.path().join("vec.esql"), benchmark_options()).unwrap();
     db.create_table(TableSchema::new(
         "docs",
         vec![
@@ -87,9 +111,15 @@ fn build() -> (TempDir, Db, Vec<Vec<f32>>) {
         ],
     ))
     .unwrap();
-    db.create_vector_index("docs", "embedding", VectorIndexOptions::default())
+    let vector_options = vector_index_options();
+    println!(
+        "ANN construction: m={}, ef_construction={}",
+        vector_options.m, vector_options.ef_construction
+    );
+    db.create_vector_index("docs", "embedding", vector_options)
         .unwrap();
 
+    let build_started = std::time::Instant::now();
     let mut gen = Clustered::new(0xABCDEF);
     let mut vectors = Vec::with_capacity(N);
     let mut txn = db.begin();
@@ -107,6 +137,14 @@ fn build() -> (TempDir, Db, Vec<Vec<f32>>) {
         }
     }
     txn.commit().unwrap();
+    println!("ANN indexed ingest: {:?}", build_started.elapsed());
+    let stats = db.maintenance_stats();
+    println!(
+        "ANN layout: monolithic={}, checkpoints={}, derived_publications={}",
+        std::env::var_os("ELITESQL_VECTOR_MONOLITHIC").is_some(),
+        stats.checkpoints,
+        stats.derived_publications
+    );
     (dir, db, vectors)
 }
 
@@ -139,15 +177,20 @@ fn bench_vector(c: &mut Criterion) {
     let (dir, db, vectors) = build();
 
     // Acceptance metric: recall@10 vs brute-force ground truth.
+    let mut recalls = Vec::new();
     for ef in [64, 128, 256, 512] {
         let recall = measure_recall(&db, &vectors, ef, 50);
         println!("recall@{K} (N={N}, dim={DIM}, ef_search={ef}): {recall:.4}");
-        if ef == 128 {
-            assert!(
-                recall >= 0.85,
-                "recall@10 with ef=128 must be >= 0.85, got {recall}"
-            );
-        }
+        recalls.push((ef, recall));
+    }
+    // These tolerate the small same-machine variation observed when the
+    // historical 0.932/0.994/1.000/1.000 run was reproduced, while rejecting
+    // the material 0.850/0.952 regression from changed generation boundaries.
+    for ((ef, recall), minimum) in recalls.into_iter().zip([0.920, 0.985, 0.995, 0.995]) {
+        assert!(
+            recall >= minimum,
+            "recall@10 with ef={ef} must be >= {minimum:.3}, got {recall:.4}"
+        );
     }
 
     let mut g = c.benchmark_group("vector_100k");
@@ -171,12 +214,7 @@ fn bench_vector(c: &mut Criterion) {
     // Open-time with the persisted graph (vs a full rebuild of 100K inserts).
     drop(db);
     let t0 = std::time::Instant::now();
-    let opts = DbOptions {
-        durability: Durability::Fast,
-        auto_compaction: AutoCompactionOptions::disabled(),
-        ..DbOptions::default()
-    };
-    let db = Db::open_with(dir.path().join("vec.esql"), opts).unwrap();
+    let db = Db::open_with(dir.path().join("vec.esql"), benchmark_options()).unwrap();
     println!(
         "open with persisted graph (N={N}, dim={DIM}): {:?}",
         t0.elapsed()

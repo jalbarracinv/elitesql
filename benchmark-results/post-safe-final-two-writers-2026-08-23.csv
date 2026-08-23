@@ -1,0 +1,7 @@
+engine,sync_primitive,writers,repetition,rows,batch_size,durability,elapsed_seconds,rows_per_second,p50_us,p95_us,p99_us,max_us,checkpoint_seconds,wal_syncs,wal_sync_us,commits_per_sync,max_group_commits,wal_synced_bytes,max_group_bytes,grouped_commits,coordinated_batches,coordinated_commits,coalesce_us_per_commit,leader_lock_wait_us_per_commit,lock_wait_us,lock_hold_us,locked_prepare_us,wal_append_us,apply_us
+EliteSQL,F_FULLFSYNC,2,1,20000,10,safe,4.027132083,4966.313,4006.000,4951.083,5434.000,7880.417,0.070179250,1002,3511.623,1.996008,2,2889780,2892,1996,998,1996,137.357,0.000,272.735,1818.201,8.880,35.138,20.865
+SQLite-fullfsync,F_FULLFSYNC,2,1,20000,10,safe,8.127773500,2460.698,4000.708,4555.125,5811.041,4090429.750,0.011620541,,,,,,,,,,,,,,,,
+SQLite-fullfsync,F_FULLFSYNC,2,2,20000,10,safe,8.119054875,2463.341,3999.500,4532.375,5272.250,4080537.375,0.009735500,,,,,,,,,,,,,,,,
+EliteSQL,F_FULLFSYNC,2,2,20000,10,safe,4.149913042,4819.378,4004.458,5174.083,8025.500,9853.583,0.068033292,1033,3529.720,1.936108,2,2889780,2892,1934,967,1934,132.614,0.002,261.096,1765.703,10.337,38.781,18.973
+EliteSQL,F_FULLFSYNC,2,3,20000,10,safe,4.007995542,4990.026,3998.083,4938.500,5671.000,9867.458,0.066647875,1001,3502.955,1.998002,2,2889780,2892,1998,999,1998,138.587,0.000,272.301,1812.190,8.441,34.674,18.296
+SQLite-fullfsync,F_FULLFSYNC,2,3,20000,10,safe,8.091287209,2471.795,3997.625,4395.750,5074.708,4090912.791,0.012986791,,,,,,,,,,,,,,,,

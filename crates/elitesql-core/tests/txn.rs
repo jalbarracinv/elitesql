@@ -519,6 +519,39 @@ fn unindexed_find_eq_streams_latest_versions_across_storage_layers() {
 }
 
 #[test]
+fn unindexed_find_eq_ignores_older_versions_in_the_same_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streaming-same-segment.esql");
+    let db = Db::create(&path).unwrap();
+    db.create_table(TableSchema::new(
+        "docs",
+        vec![Column::new("score", ColumnType::Int64)],
+    ))
+    .unwrap();
+
+    let mut record = Record::new();
+    record.insert("id".into(), Value::Text("changing".into()));
+    record.insert("score".into(), Value::Int64(1));
+    db.insert("docs", record).unwrap();
+    for score in [2, 3, 4] {
+        let mut patch = Record::new();
+        patch.insert("score".into(), Value::Int64(score));
+        db.update("docs", "changing", patch).unwrap();
+    }
+    db.checkpoint().unwrap();
+
+    for old in [1, 2, 3] {
+        assert!(db
+            .find_eq("docs", "score", &Value::Int64(old))
+            .unwrap()
+            .is_empty());
+    }
+    let current = db.find_eq("docs", "score", &Value::Int64(4)).unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].0, "changing");
+}
+
+#[test]
 fn secondary_index_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.esql");

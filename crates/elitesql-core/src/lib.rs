@@ -10,7 +10,8 @@
 //!   parallel and only meet at commit (optimistic validation, `Conflict`
 //!   means retry).
 //! - Secondary and unique indexes validated at commit.
-//! - Durability modes: `Safe` (fsync per commit), `Balanced`, `Fast`.
+//! - Durability modes: `Safe` (strict sync per acknowledged commit group),
+//!   `Balanced`, `Fast`.
 //! - Checkpoints drain the WAL into immutable segments; compaction rewrites
 //!   segments while preserving versions needed by live snapshots.
 //! - Process exclusion via lock file; `check()` for offline validation.

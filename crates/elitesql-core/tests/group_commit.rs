@@ -55,6 +55,13 @@ fn concurrent_safe_commits_share_syncs_and_survive_reopen() {
         stats.grouped_commits >= 2,
         "no commit observed a shared sync group: {stats:?}"
     );
+    assert!(
+        stats.coordinated_commits >= 2,
+        "Safe inserts did not share a coordinated WAL batch: {stats:?}"
+    );
+    assert!(stats.wal_sync_time > std::time::Duration::ZERO);
+    assert!(stats.wal_synced_bytes > 0);
+    assert!(stats.wal_sync_max_group_commits >= 2);
     assert_eq!(db.scan("docs").unwrap().len(), WRITERS);
     drop(db);
 

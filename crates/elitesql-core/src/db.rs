@@ -66,10 +66,9 @@ const PRIMARY_BASE_LEVEL: u8 = u8::MAX;
 const DERIVED_LEVEL_FANOUT: usize = 8;
 const DERIVED_BASE_LEVEL: u8 = u8::MAX;
 const MAX_MAINTENANCE_WAIT_RETRIES: u64 = 8;
-/// Maximum coalescing delay, paid only when another committer is already
-/// queued. This is long enough for queued writers to append and join while
-/// keeping the added tail latency sub-millisecond.
-const GROUP_COMMIT_MAX_DELAY: Duration = Duration::from_micros(200);
+/// Bound one coordinated publication so a sustained producer stream cannot
+/// monopolize the commit mutex indefinitely.
+const COMMIT_COORDINATOR_MAX_BATCH: usize = 64;
 
 /// Optimistic-conflict retries per backfill batch during `ADD COLUMN`.
 const BACKFILL_RETRIES: usize = 3;
@@ -95,6 +94,10 @@ pub struct DbOptions {
     pub memtable_max_bytes: u64,
     /// Max time between WAL fsyncs in `Balanced` mode.
     pub balanced_sync_interval_ms: u64,
+    /// Maximum time a contended `Safe` commit leader waits for peer commits
+    /// before issuing the strict WAL durability barrier. `0` disables the
+    /// intentional coalescing window without changing durability semantics.
+    pub safe_group_commit_delay_us: u64,
     /// Open read-only: shared lock, tolerant loading (valid prefixes of
     /// corrupt files are exposed instead of failing), zero writes to disk,
     /// every write operation returns `Error::ReadOnly`. This is the
@@ -317,6 +320,7 @@ impl Default for DbOptions {
             // restartable graph. A 64 MiB memtable avoids an earlier checkpoint.
             memtable_max_bytes: 64 * 1024 * 1024,
             balanced_sync_interval_ms: 25,
+            safe_group_commit_delay_us: 200,
             read_only: false,
             external_blob_threshold: 256 * 1024,
             auto_compaction: AutoCompactionOptions::default(),
@@ -374,8 +378,26 @@ pub struct MaintenanceStats {
     /// Physical WAL sync calls. In Safe/Balanced modes this may be lower than
     /// `commits` because concurrent commits share one group sync.
     pub wal_syncs: u64,
+    /// Total wall time spent inside physical WAL sync calls.
+    pub wal_sync_time: Duration,
+    /// WAL bytes covered by physical sync calls and the largest observed
+    /// commits/bytes group for one call.
+    pub wal_synced_bytes: u64,
+    pub wal_sync_max_group_commits: u64,
+    pub wal_sync_max_group_bytes: u64,
+    /// Intentional Safe coalescing delay and time subsequently spent waiting
+    /// to reacquire the commit mutex as group leader.
+    pub wal_group_coalesce_time: Duration,
+    pub wal_group_leader_lock_wait_time: Duration,
     /// Commits that joined a WAL sync group containing at least two commits.
     pub grouped_commits: u64,
+    /// Eligible insert batches published by the commit coordinator and
+    /// the number of individual transactions they contained.
+    pub coordinated_batches: u64,
+    pub coordinated_commits: u64,
+    /// Point reads that yielded because active state writers had already
+    /// filled the CPU-aware mixed-workload reader allowance.
+    pub point_read_throttles: u64,
     /// In-memory publication to primary and derived mutable indexes.
     pub commit_apply_time: Duration,
     pub checkpoints: u64,
@@ -640,10 +662,16 @@ impl PrimaryIdx {
         use std::ops::Bound::{Excluded, Unbounded};
 
         let prefix = primary_table_prefix(table);
+        let after_key = after_id.map(|after| primary_key(table, after));
         let mut cursors: Vec<_> = self
             .runs
             .iter()
-            .map(|run| PrimaryTableCursor::new(run.index.prefix_cursor(&prefix), table))
+            .map(|run| {
+                PrimaryTableCursor::new(
+                    run.index.prefix_cursor_after(&prefix, after_key.as_deref()),
+                    table,
+                )
+            })
             .collect();
         let mut heads: Vec<_> = cursors
             .iter_mut()
@@ -1526,19 +1554,13 @@ struct SecPairCursor<'a> {
 impl<'a> SecPairCursor<'a> {
     fn new(index: &'a PagedIndex, key: &[u8], after: Option<&str>) -> Result<Self> {
         let prefix = secondary_pair_prefix(key);
+        let after_key = after.map(|after| secondary_pair_key(key, after));
         let mut cursor = Self {
-            cursor: index.prefix_cursor(&prefix),
+            cursor: index.prefix_cursor_after(&prefix, after_key.as_deref()),
             prefix,
             head: None,
         };
         cursor.advance()?;
-        while cursor
-            .head
-            .as_ref()
-            .is_some_and(|head| after.is_some_and(|after| head.0.as_str() <= after))
-        {
-            cursor.advance()?;
-        }
         Ok(cursor)
     }
 
@@ -2004,6 +2026,133 @@ struct CommitState {
     wal_sync_group: Option<Arc<WalSyncGroup>>,
 }
 
+#[derive(Default)]
+struct CommitCoordinatorState {
+    active: bool,
+    queue: VecDeque<Arc<CoordinatedCommit>>,
+}
+
+struct CoordinatedCommit {
+    prepared: Mutex<Option<PreparedCommit>>,
+    result: Mutex<Option<Result<u64>>>,
+    changed: Condvar,
+    lead: AtomicBool,
+    queued_at: Instant,
+}
+
+impl CoordinatedCommit {
+    fn new(prepared: PreparedCommit) -> Self {
+        Self {
+            prepared: Mutex::new(Some(prepared)),
+            result: Mutex::new(None),
+            changed: Condvar::new(),
+            lead: AtomicBool::new(false),
+            queued_at: Instant::now(),
+        }
+    }
+
+    fn complete(&self, result: Result<u64>) {
+        *self.result.lock().unwrap() = Some(result);
+        self.changed.notify_one();
+    }
+
+    fn promote_to_leader(&self) {
+        // Hold the same mutex used by the waiter while publishing the baton.
+        // Otherwise a notify between the waiter's predicate check and its
+        // actual sleep could be lost and leave the coordinator stalled.
+        let _result = self.result.lock().unwrap();
+        self.lead.store(true, AtomicOrdering::Release);
+        self.changed.notify_one();
+    }
+
+    fn take_result(&self) -> Option<Result<u64>> {
+        self.result.lock().unwrap().take()
+    }
+
+    fn wait_for_result_or_lead(&self) -> Option<Result<u64>> {
+        let mut result = self.result.lock().unwrap();
+        while result.is_none() && !self.lead.swap(false, AtomicOrdering::AcqRel) {
+            result = self.changed.wait(result).unwrap();
+        }
+        result.take()
+    }
+}
+
+struct ActiveStateWriter<'a>(&'a Shared);
+
+impl<'a> ActiveStateWriter<'a> {
+    fn enter(shared: &'a Shared) -> Self {
+        shared
+            .active_state_writers
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        Self(shared)
+    }
+}
+
+impl Drop for ActiveStateWriter<'_> {
+    fn drop(&mut self) {
+        self.0
+            .active_state_writers
+            .fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
+struct PointReadAdmission<'a> {
+    shared: &'a Shared,
+    counted: bool,
+}
+
+impl<'a> PointReadAdmission<'a> {
+    fn enter(shared: &'a Shared) -> Self {
+        let mut throttled = false;
+        loop {
+            let writers = shared.active_state_writers.load(AtomicOrdering::Relaxed);
+            if writers == 0 {
+                return Self {
+                    shared,
+                    counted: false,
+                };
+            }
+            let parallelism = shared.point_read_parallelism.max(1);
+            let writer_slots = usize::try_from(writers)
+                .unwrap_or(usize::MAX)
+                .min(parallelism.saturating_sub(1));
+            let reader_limit = parallelism.saturating_sub(writer_slots).max(1);
+            let previous = shared
+                .admitted_point_reads
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            if shared.active_state_writers.load(AtomicOrdering::Relaxed) == 0
+                || previous < reader_limit as u64
+            {
+                return Self {
+                    shared,
+                    counted: true,
+                };
+            }
+            shared
+                .admitted_point_reads
+                .fetch_sub(1, AtomicOrdering::Relaxed);
+            if !throttled {
+                shared
+                    .point_read_throttle_count
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                throttled = true;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+impl Drop for PointReadAdmission<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            self.shared
+                .admitted_point_reads
+                .fetch_sub(1, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
 enum CommitMutex {
     /// Preserve the standard mutex's scheduling behavior for Safe group
     /// commit, where short bursts should append before one elected fsync.
@@ -2070,6 +2219,7 @@ struct WalSyncGroup {
     result: Mutex<Option<WalGroupResult>>,
     done: Condvar,
     commits: AtomicU64,
+    bytes: AtomicU64,
 }
 
 struct TimedCommitGuard<'a> {
@@ -2108,16 +2258,18 @@ impl Drop for TimedCommitGuard<'_> {
 }
 
 impl WalSyncGroup {
-    fn new() -> Self {
+    fn new(bytes: u64) -> Self {
         Self {
             result: Mutex::new(None),
             done: Condvar::new(),
             commits: AtomicU64::new(1),
+            bytes: AtomicU64::new(bytes),
         }
     }
 
-    fn join(&self) {
+    fn join(&self, bytes: u64) {
         self.commits.fetch_add(1, AtomicOrdering::Relaxed);
+        self.bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
     }
 
     fn complete(&self, result: WalGroupResult) {
@@ -2217,6 +2369,10 @@ struct Shared {
     /// Serializes commits, checkpoints and compaction. Writers stage in
     /// parallel without this lock and only meet here, at commit.
     commit: CommitMutex,
+    /// Prepared transactions queue here before one elected caller drains a
+    /// bounded batch. Complex transactions retain the general serialized
+    /// path; disjoint inserts share WAL and publication overhead.
+    commit_coordinator: Mutex<CommitCoordinatorState>,
     /// A canonical rename completed but its directory sync did not. Reads may
     /// continue over the adopted generation, but no later write may extend an
     /// outcome whose crash durability is unknown.
@@ -2243,7 +2399,24 @@ struct Shared {
     /// preserving single-writer latency.
     commit_waiters: AtomicU64,
     wal_sync_count: AtomicU64,
+    wal_sync_nanos: AtomicU64,
+    wal_synced_bytes: AtomicU64,
+    wal_sync_max_group_commits: AtomicU64,
+    wal_sync_max_group_bytes: AtomicU64,
+    wal_group_coalesce_nanos: AtomicU64,
+    wal_group_leader_lock_wait_nanos: AtomicU64,
     grouped_commit_count: AtomicU64,
+    coordinated_batch_count: AtomicU64,
+    coordinated_commit_count: AtomicU64,
+    /// CPU-aware admission used only while commits or identity reservations
+    /// are active. Read-only workloads retain an unthrottled point-read path.
+    point_read_parallelism: usize,
+    active_state_writers: AtomicU64,
+    /// Short-lived memory that a concurrent Safe burst was observed. Leaders
+    /// consume it only after direct concurrency is no longer visible.
+    safe_coalesce_budget: AtomicU64,
+    admitted_point_reads: AtomicU64,
+    point_read_throttle_count: AtomicU64,
     /// version -> live snapshot refcount; compaction preserves these.
     snapshots: Mutex<BTreeMap<u64, usize>>,
     /// Last generated or observed ULID, used to keep implicit ids increasing.
@@ -2462,6 +2635,17 @@ struct PreparedChange {
     id: String,
     operation: Option<Record>,
     payload: Option<Arc<Vec<u8>>>,
+}
+
+struct PreparedCommit {
+    snap_version: u64,
+    staged: Vec<PreparedTable>,
+    preencoded_wal: Option<Vec<u8>>,
+    optimistic_prior_records: Vec<Vec<Option<(u64, Record)>>>,
+    incoming_index_bytes: usize,
+    outside_prepare_time: Duration,
+    commit_started: Instant,
+    _pending_blobs: PendingBlobPublications,
 }
 
 struct ApplyRecordState<'a> {
@@ -2971,6 +3155,7 @@ impl Db {
                 },
                 opts.durability,
             ),
+            commit_coordinator: Mutex::new(CommitCoordinatorState::default()),
             canonical_error: Mutex::new(None),
             pending_blob_publications: Mutex::new(HashSet::new()),
             ddl: Mutex::new(()),
@@ -2985,7 +3170,21 @@ impl Db {
             commit_apply_nanos: AtomicU64::new(0),
             commit_waiters: AtomicU64::new(0),
             wal_sync_count: AtomicU64::new(0),
+            wal_sync_nanos: AtomicU64::new(0),
+            wal_synced_bytes: AtomicU64::new(0),
+            wal_sync_max_group_commits: AtomicU64::new(0),
+            wal_sync_max_group_bytes: AtomicU64::new(0),
+            wal_group_coalesce_nanos: AtomicU64::new(0),
+            wal_group_leader_lock_wait_nanos: AtomicU64::new(0),
             grouped_commit_count: AtomicU64::new(0),
+            coordinated_batch_count: AtomicU64::new(0),
+            coordinated_commit_count: AtomicU64::new(0),
+            point_read_parallelism: std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get),
+            active_state_writers: AtomicU64::new(0),
+            safe_coalesce_budget: AtomicU64::new(0),
+            admitted_point_reads: AtomicU64::new(0),
+            point_read_throttle_count: AtomicU64::new(0),
             snapshots: Mutex::new(BTreeMap::new()),
             last_generated_id: Mutex::new(Ulid::nil()),
             vector_tx: Mutex::new(None),
@@ -3561,6 +3760,7 @@ impl Db {
                 },
                 opts.durability,
             ),
+            commit_coordinator: Mutex::new(CommitCoordinatorState::default()),
             canonical_error: Mutex::new(None),
             pending_blob_publications: Mutex::new(HashSet::new()),
             ddl: Mutex::new(()),
@@ -3575,7 +3775,21 @@ impl Db {
             commit_apply_nanos: AtomicU64::new(0),
             commit_waiters: AtomicU64::new(0),
             wal_sync_count: AtomicU64::new(0),
+            wal_sync_nanos: AtomicU64::new(0),
+            wal_synced_bytes: AtomicU64::new(0),
+            wal_sync_max_group_commits: AtomicU64::new(0),
+            wal_sync_max_group_bytes: AtomicU64::new(0),
+            wal_group_coalesce_nanos: AtomicU64::new(0),
+            wal_group_leader_lock_wait_nanos: AtomicU64::new(0),
             grouped_commit_count: AtomicU64::new(0),
+            coordinated_batch_count: AtomicU64::new(0),
+            coordinated_commit_count: AtomicU64::new(0),
+            point_read_parallelism: std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get),
+            active_state_writers: AtomicU64::new(0),
+            safe_coalesce_budget: AtomicU64::new(0),
+            admitted_point_reads: AtomicU64::new(0),
+            point_read_throttle_count: AtomicU64::new(0),
             snapshots: Mutex::new(BTreeMap::new()),
             last_generated_id: Mutex::new(last_generated_id),
             vector_tx: Mutex::new(None),
@@ -5038,10 +5252,15 @@ impl Db {
                 "vector top_k={top_k} exceeds the per-query candidate capacity {candidate_cap}"
             )));
         }
-        let ef_base = opts
+        let requested_ef = opts
             .ef_search
-            .unwrap_or_else(|| top_k.saturating_mul(2).max(64))
-            .min(candidate_cap);
+            .unwrap_or_else(|| top_k.saturating_mul(2).max(64));
+        // Larger memory defaults reduced the number of independently searched
+        // HNSW generations and silently cut aggregate graph exploration at the
+        // same public ef_search. Calibrate the internal beam so the public
+        // quality curve remains at least as strong as the historical default,
+        // while keeping construction cost and persisted graph size unchanged.
+        let ef_base = requested_ef.saturating_mul(2).min(candidate_cap);
         if vidx.live_len() == 0 {
             return Ok(Vec::new());
         }
@@ -5557,7 +5776,11 @@ impl Db {
 
     /// Latest committed version of a record, or `None` if absent or deleted.
     pub fn get(&self, table: &str, id: &str) -> Result<Option<Record>> {
-        let _memory = self.acquire_query_memory();
+        // A point lookup has no query operator or candidate buffer: its only
+        // material allocation is the Record returned to the caller, which is
+        // explicitly outside the working-set budget. Reserving a full
+        // query_working_bytes slot here needlessly capped default concurrency
+        // at four readers.
         self.get_unbudgeted(table, id)
     }
 
@@ -5567,7 +5790,6 @@ impl Db {
 
     /// Read a record as of a snapshot.
     pub fn get_at(&self, snapshot: &Snapshot, table: &str, id: &str) -> Result<Option<Record>> {
-        let _memory = self.acquire_query_memory();
         self.get_at_unbudgeted(snapshot, table, id)
     }
 
@@ -5674,7 +5896,7 @@ impl Db {
         let version = st.committed_version;
         *snapshots.entry(version).or_insert(0) += 1;
         drop(snapshots);
-        let snapshot = Snapshot {
+        let _snapshot_guard = Snapshot {
             version,
             shared: self.shared.clone(),
         };
@@ -5726,9 +5948,12 @@ impl Db {
             return Ok(out);
         }
 
-        drop(st);
-        let mut out = shared_scan_at(&self.shared, table, snapshot.version)?;
-        out.retain(|(_, record)| record.get(column).unwrap_or(&Value::Null) == value);
+        // Walk immutable segments in physical order and decode only matching
+        // records. Holding the shared state view keeps its segment set and
+        // latest-version directory stable for the duration; the scan is
+        // read-only and therefore remains concurrent with other readers.
+        let mut out = Vec::new();
+        find_eq_streaming(&self.shared, &st, table, column, value, &mut out)?;
         out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
@@ -5903,9 +6128,43 @@ impl Db {
                     .load(AtomicOrdering::Relaxed),
             ),
             wal_syncs: self.shared.wal_sync_count.load(AtomicOrdering::Relaxed),
+            wal_sync_time: Duration::from_nanos(
+                self.shared.wal_sync_nanos.load(AtomicOrdering::Relaxed),
+            ),
+            wal_synced_bytes: self.shared.wal_synced_bytes.load(AtomicOrdering::Relaxed),
+            wal_sync_max_group_commits: self
+                .shared
+                .wal_sync_max_group_commits
+                .load(AtomicOrdering::Relaxed),
+            wal_sync_max_group_bytes: self
+                .shared
+                .wal_sync_max_group_bytes
+                .load(AtomicOrdering::Relaxed),
+            wal_group_coalesce_time: Duration::from_nanos(
+                self.shared
+                    .wal_group_coalesce_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
+            wal_group_leader_lock_wait_time: Duration::from_nanos(
+                self.shared
+                    .wal_group_leader_lock_wait_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
             grouped_commits: self
                 .shared
                 .grouped_commit_count
+                .load(AtomicOrdering::Relaxed),
+            coordinated_batches: self
+                .shared
+                .coordinated_batch_count
+                .load(AtomicOrdering::Relaxed),
+            coordinated_commits: self
+                .shared
+                .coordinated_commit_count
+                .load(AtomicOrdering::Relaxed),
+            point_read_throttles: self
+                .shared
+                .point_read_throttle_count
                 .load(AtomicOrdering::Relaxed),
             commit_apply_time: Duration::from_nanos(
                 self.shared.commit_apply_nanos.load(AtomicOrdering::Relaxed),
@@ -6939,6 +7198,10 @@ impl Txn {
 }
 
 fn reserve_identity(shared: &Shared, table: &str, explicit: Option<i64>) -> Result<i64> {
+    // Identity allocation mutates publication state before commit staging.
+    // Announce that brief writer section so a saturated point-read workload
+    // cannot repeatedly reacquire the state lock ahead of the allocator.
+    let _active_state_writer = ActiveStateWriter::enter(shared);
     let mut st = shared.state.write().unwrap();
     let high = st.identity_high_water.entry(table.to_owned()).or_insert(0);
     match explicit {
@@ -7434,6 +7697,7 @@ fn shared_get_at(
     id: &str,
     max_version: u64,
 ) -> Result<Option<Record>> {
+    let _admission = PointReadAdmission::enter(shared);
     let st = shared.state.read().unwrap();
     let schema = st
         .catalog
@@ -7441,11 +7705,11 @@ fn shared_get_at(
         .ok_or_else(|| Error::TableNotFound(table.into()))?;
     match st.visible_owned(table, id, max_version)? {
         Some(entry) if !entry.is_tombstone() => {
-            let mut rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
+            let mut record = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
             if schema.has_implicit_id() {
-                rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+                record.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
             }
-            Ok(Some(rec))
+            Ok(Some(record))
         }
         _ => Ok(None),
     }
@@ -7543,26 +7807,38 @@ fn finish_or_wait_wal_sync(
 
     // Only a contended writer opens the coalescing window. Uncontended Safe
     // commits retain their original one-sync latency.
-    if shared.commit_waiters.load(AtomicOrdering::Acquire) > 0 {
-        std::thread::sleep(GROUP_COMMIT_MAX_DELAY);
+    if shared.commit_waiters.load(AtomicOrdering::Acquire) > 0
+        && shared.opts.safe_group_commit_delay_us > 0
+    {
+        let coalesce_started = Instant::now();
+        std::thread::sleep(Duration::from_micros(
+            shared.opts.safe_group_commit_delay_us,
+        ));
+        shared.wal_group_coalesce_nanos.fetch_add(
+            elapsed_nanos(coalesce_started.elapsed()),
+            AtomicOrdering::Relaxed,
+        );
     }
 
+    let leader_lock_started = Instant::now();
     let mut cs = shared.commit.lock();
+    shared.wal_group_leader_lock_wait_nanos.fetch_add(
+        elapsed_nanos(leader_lock_started.elapsed()),
+        AtomicOrdering::Relaxed,
+    );
     debug_assert!(
         cs.wal_sync_group
             .as_ref()
             .is_some_and(|active| Arc::ptr_eq(active, &group)),
         "the elected WAL sync group stays active until its leader completes"
     );
+    let sync_started = Instant::now();
     let outcome = cs.wal().sync_data();
+    let sync_time = sync_started.elapsed();
     cs.wal_sync_group = None;
-    shared.wal_sync_count.fetch_add(1, AtomicOrdering::Relaxed);
     let commits = group.commits.load(AtomicOrdering::Acquire);
-    if commits > 1 {
-        shared
-            .grouped_commit_count
-            .fetch_add(commits, AtomicOrdering::Relaxed);
-    }
+    let bytes = group.bytes.load(AtomicOrdering::Acquire);
+    record_wal_sync(shared, sync_time, commits, bytes);
     drop(cs);
 
     let result = match outcome {
@@ -7571,6 +7847,31 @@ fn finish_or_wait_wal_sync(
     };
     group.complete(result.clone());
     result
+}
+
+fn elapsed_nanos(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn record_wal_sync(shared: &Shared, elapsed: Duration, commits: u64, bytes: u64) {
+    shared.wal_sync_count.fetch_add(1, AtomicOrdering::Relaxed);
+    shared
+        .wal_sync_nanos
+        .fetch_add(elapsed_nanos(elapsed), AtomicOrdering::Relaxed);
+    shared
+        .wal_synced_bytes
+        .fetch_add(bytes, AtomicOrdering::Relaxed);
+    shared
+        .wal_sync_max_group_commits
+        .fetch_max(commits, AtomicOrdering::Relaxed);
+    shared
+        .wal_sync_max_group_bytes
+        .fetch_max(bytes, AtomicOrdering::Relaxed);
+    if commits > 1 {
+        shared
+            .grouped_commit_count
+            .fetch_add(commits, AtomicOrdering::Relaxed);
+    }
 }
 
 fn lock_commit_for_transaction(shared: &Shared) -> TimedCommitGuard<'_> {
@@ -7601,6 +7902,36 @@ fn commit_staged(
     {
         return Ok(shared.state.read().unwrap().committed_version);
     }
+    let _active_state_writer = ActiveStateWriter::enter(shared);
+    let prepared = prepare_commit(shared, snap_version, staged_tables);
+    let prepared = prepared?;
+    if is_coordinated_insert_candidate(&prepared) {
+        coordinate_commit(shared, prepared)
+    } else {
+        finish_prepared_commit(shared, prepared)
+    }
+}
+
+fn is_coordinated_insert_candidate(prepared: &PreparedCommit) -> bool {
+    prepared.preencoded_wal.is_some()
+        && prepared.staged.iter().all(|table| {
+            table.schema.indexes.is_empty()
+                && table.schema.text_indexes.is_empty()
+                && table.schema.vector_indexes.is_empty()
+                && table.schema.foreign_keys.is_empty()
+                && !table.schema.columns.iter().any(|column| column.identity)
+                && table
+                    .changes
+                    .iter()
+                    .all(|change| change.operation.is_some())
+        })
+}
+
+fn prepare_commit(
+    shared: &Arc<Shared>,
+    snap_version: u64,
+    staged_tables: Vec<(String, StagedTable)>,
+) -> Result<PreparedCommit> {
     let commit_started = Instant::now();
     let prepare_started = Instant::now();
     let mut blob_sink = BlobSink::new(&shared.dir, shared.opts.external_blob_threshold);
@@ -7675,7 +8006,7 @@ fn commit_staged(
     // sync the blob directory before contending for the commit mutex; the
     // pending set makes concurrent compaction GC treat them as referenced
     // until either this commit applies or aborts.
-    let _pending_blobs = PendingBlobPublications::new(shared.clone(), &blob_sink);
+    let pending_blobs = PendingBlobPublications::new(shared.clone(), &blob_sink);
     blob_sink.publish()?;
     #[cfg(test)]
     {
@@ -7755,6 +8086,381 @@ fn commit_staged(
         )));
     }
     let outside_prepare_time = prepare_started.elapsed();
+
+    Ok(PreparedCommit {
+        snap_version,
+        staged,
+        preencoded_wal,
+        optimistic_prior_records,
+        incoming_index_bytes,
+        outside_prepare_time,
+        commit_started,
+        _pending_blobs: pending_blobs,
+    })
+}
+
+fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Result<u64> {
+    let request = Arc::new(CoordinatedCommit::new(prepared));
+    let mut leader = {
+        let mut coordinator = shared.commit_coordinator.lock().unwrap();
+        coordinator.queue.push_back(request.clone());
+        if coordinator.active {
+            false
+        } else {
+            coordinator.active = true;
+            true
+        }
+    };
+
+    loop {
+        if leader {
+            if should_coalesce_safe_batch(shared) {
+                let coalesce_started = Instant::now();
+                std::thread::sleep(Duration::from_micros(
+                    shared.opts.safe_group_commit_delay_us,
+                ));
+                shared.wal_group_coalesce_nanos.fetch_add(
+                    elapsed_nanos(coalesce_started.elapsed()),
+                    AtomicOrdering::Relaxed,
+                );
+            }
+            let batch = {
+                let mut coordinator = shared.commit_coordinator.lock().unwrap();
+                let take = coordinator.queue.len().min(COMMIT_COORDINATOR_MAX_BATCH);
+                coordinator.queue.drain(..take).collect::<Vec<_>>()
+            };
+            process_coordinated_batch(shared, batch);
+            let mut coordinator = shared.commit_coordinator.lock().unwrap();
+            if let Some(next) = coordinator.queue.front() {
+                next.promote_to_leader();
+            } else {
+                coordinator.active = false;
+            }
+        }
+        if let Some(result) = request.take_result() {
+            return result;
+        }
+        match request.wait_for_result_or_lead() {
+            Some(result) => return result,
+            None => leader = true,
+        }
+    }
+}
+
+fn should_coalesce_safe_batch(shared: &Shared) -> bool {
+    if shared.opts.durability != Durability::Safe || shared.opts.safe_group_commit_delay_us == 0 {
+        return false;
+    }
+    if shared.active_state_writers.load(AtomicOrdering::Acquire) > 1 {
+        // Preserve a short contention memory across the tiny gap between two
+        // writers finishing one batch and staging the next. Without it, a
+        // two-writer workload can alternate just cleanly enough for each new
+        // leader to misclassify the stream as single-writer.
+        shared
+            .safe_coalesce_budget
+            .store(8, AtomicOrdering::Release);
+        return true;
+    }
+    shared
+        .safe_coalesce_budget
+        .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |budget| {
+            budget.checked_sub(1)
+        })
+        .is_ok()
+}
+
+fn process_coordinated_batch(shared: &Arc<Shared>, batch: Vec<Arc<CoordinatedCommit>>) {
+    let mut prepared = batch
+        .iter()
+        .map(|request| {
+            request
+                .prepared
+                .lock()
+                .unwrap()
+                .take()
+                .expect("coordinated commit is processed once")
+        })
+        .collect::<Vec<_>>();
+    let queue_wait = batch
+        .iter()
+        .map(|request| request.queued_at.elapsed())
+        .fold(Duration::ZERO, Duration::saturating_add);
+    if let Some(results) = finish_coordinated_insert_batch(shared, &mut prepared, queue_wait) {
+        debug_assert_eq!(batch.len(), results.len());
+        for (request, result) in batch.into_iter().zip(results) {
+            request.complete(result);
+        }
+        return;
+    }
+    for (request, prepared) in batch.into_iter().zip(prepared) {
+        request.complete(finish_prepared_commit(shared, prepared));
+    }
+}
+
+/// Coordinated path for disjoint inserts into unconstrained tables.
+/// Validation still happens under the serialization mutex, every transaction
+/// receives its own version and WAL frame, and readers see the complete batch
+/// only after the vectored append and one state publication finish. `Safe`
+/// batches issue one strict durability barrier before any member returns.
+fn finish_coordinated_insert_batch(
+    shared: &Arc<Shared>,
+    prepared: &mut [PreparedCommit],
+    queue_wait: Duration,
+) -> Option<Vec<Result<u64>>> {
+    if prepared.len() < 2 {
+        return None;
+    }
+    debug_assert!(prepared.iter().all(is_coordinated_insert_candidate));
+    if shared
+        .background_checkpoint
+        .lock()
+        .unwrap()
+        .last_error
+        .is_some()
+    {
+        return None;
+    }
+    let incoming_bytes = prepared.iter().try_fold(0usize, |total, commit| {
+        total.checked_add(commit.incoming_index_bytes)
+    })?;
+    if shared.memory_governor.index_would_exceed(incoming_bytes) {
+        return None;
+    }
+
+    let lock_started = Instant::now();
+    shared.commit_waiters.fetch_add(1, AtomicOrdering::AcqRel);
+    let mut cs = lock_commit_for_transaction(shared);
+    shared.commit_waiters.fetch_sub(1, AtomicOrdering::AcqRel);
+    let lock_wait = lock_started.elapsed().saturating_add(queue_wait);
+    let locked_prepare_started = Instant::now();
+    let mut ids = HashSet::new();
+    let start_version = {
+        let state = shared.state.read().unwrap();
+        for commit in prepared.iter() {
+            for table in &commit.staged {
+                if state.catalog.table(&table.name) != Some(&table.schema) {
+                    return None;
+                }
+                for change in &table.changes {
+                    if !ids.insert((table.name.clone(), change.id.clone())) {
+                        return None;
+                    }
+                    let previous = if state.id_is_above_high_watermark(&table.name, &change.id) {
+                        None
+                    } else {
+                        match state.latest_owned(&table.name, &change.id) {
+                            Ok(previous) => previous,
+                            Err(_) => return None,
+                        }
+                    };
+                    // Updates/reinserts need prior-record and derived-index
+                    // handling from the general path.
+                    if previous.is_some() {
+                        return None;
+                    }
+                }
+            }
+        }
+        state.committed_version
+    };
+    let batch_len = u64::try_from(prepared.len()).expect("coordinator batch length fits u64");
+    let Some(end_version) = start_version.checked_add(batch_len) else {
+        return Some(
+            (0..prepared.len())
+                .map(|_| {
+                    Err(Error::InvalidArgument(
+                        "commit version space is exhausted".into(),
+                    ))
+                })
+                .collect(),
+        );
+    };
+    let versions = ((start_version + 1)..=end_version).collect::<Vec<_>>();
+    let locked_prepare_time = locked_prepare_started.elapsed();
+
+    let wal_started = Instant::now();
+    for (commit, version) in prepared.iter_mut().zip(&versions) {
+        set_encoded_commit_version(
+            commit
+                .preencoded_wal
+                .as_mut()
+                .expect("insert batch has preencoded WAL"),
+            *version,
+        );
+    }
+    let wal_append_started = Instant::now();
+    let records = prepared
+        .iter()
+        .map(|commit| {
+            commit
+                .preencoded_wal
+                .as_deref()
+                .expect("insert batch has preencoded WAL")
+        })
+        .collect::<Vec<_>>();
+    let synced_bytes = records.iter().fold(0u64, |total, record| {
+        total.saturating_add(record.len() as u64)
+    });
+    if let Err(error) = cs.wal().append_commits_unflushed(&records) {
+        drop(cs);
+        let message = error.to_string();
+        return Some(
+            versions
+                .into_iter()
+                .map(|_| {
+                    Err(Error::Io(std::io::Error::other(format!(
+                        "coordinated WAL append failed: {message}"
+                    ))))
+                })
+                .collect(),
+        );
+    }
+    let wal_append_time = wal_append_started.elapsed();
+    let sync_due = cs.wal().sync_due(
+        shared.opts.durability,
+        shared.opts.balanced_sync_interval_ms,
+    );
+    let sync_outcome = sync_due.then(|| {
+        let sync_started = Instant::now();
+        let outcome = cs.wal().sync_data();
+        record_wal_sync(shared, sync_started.elapsed(), batch_len, synced_bytes);
+        outcome
+    });
+
+    let apply_started = Instant::now();
+    let mut added = 0u64;
+    {
+        let mut state = shared.state.write().unwrap();
+        for (commit, version) in prepared.iter_mut().zip(&versions) {
+            for table in std::mem::take(&mut commit.staged) {
+                let high_id = table
+                    .changes
+                    .last()
+                    .map(|change| change.id.clone())
+                    .expect("prepared table is non-empty");
+                for change in table.changes {
+                    let put = change.operation.as_ref().zip(change.payload.as_ref());
+                    let put = put.map(|(record, payload)| (payload, record));
+                    let mut jobs = Vec::new();
+                    apply_one_owned(
+                        &mut state,
+                        *version,
+                        &table.schema,
+                        &table.name,
+                        change.id,
+                        ApplyRecordState { put, prior: None },
+                        &mut jobs,
+                    );
+                    debug_assert!(jobs.is_empty());
+                    added = added.saturating_add(
+                        change
+                            .payload
+                            .as_deref()
+                            .map_or(0, |payload| payload.len() as u64)
+                            + 32,
+                    );
+                }
+                state.record_high_id(&table.name, &high_id);
+            }
+            state.committed_version = *version;
+        }
+    }
+    let apply_time = apply_started.elapsed();
+    cs.memtable_bytes = cs.memtable_bytes.saturating_add(added);
+    shared.memory_governor.add_index_delta_bytes(incoming_bytes);
+    let maintenance_needed = cs.memtable_bytes >= shared.opts.memtable_max_bytes;
+    drop(cs);
+    let wal_time = wal_started.elapsed();
+
+    if maintenance_needed {
+        let result = (|| -> Result<()> {
+            let mut cs = lock_commit_after_group_sync(shared);
+            if cs.memtable_bytes >= shared.opts.memtable_max_bytes
+                && shared.state.read().unwrap().index.frozen.is_none()
+                && !shared.background_derived.lock().unwrap().running
+            {
+                let memory = Db::acquire_maintenance_memory(shared);
+                let _ = schedule_frozen_checkpoint(shared, &mut cs, memory)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let mut status = shared.background_checkpoint.lock().unwrap();
+            status.commit_unknown = matches!(&error, Error::CommitUnknown(_));
+            status.last_error = Some(format!("post-commit maintenance failed: {error}"));
+        }
+    }
+
+    let elapsed_nanos = |duration: Duration| duration.as_nanos().min(u64::MAX as u128) as u64;
+    let count = prepared.len() as u64;
+    shared
+        .commit_count
+        .fetch_add(count, AtomicOrdering::Relaxed);
+    let total_commit_nanos = prepared.iter().fold(0u64, |total, commit| {
+        total.saturating_add(elapsed_nanos(commit.commit_started.elapsed()))
+    });
+    shared
+        .commit_nanos
+        .fetch_add(total_commit_nanos, AtomicOrdering::Relaxed);
+    shared
+        .commit_lock_wait_nanos
+        .fetch_add(elapsed_nanos(lock_wait), AtomicOrdering::Relaxed);
+    let outside_prepare = prepared
+        .iter()
+        .map(|commit| commit.outside_prepare_time)
+        .fold(Duration::ZERO, Duration::saturating_add);
+    shared.commit_prepare_nanos.fetch_add(
+        elapsed_nanos(outside_prepare.saturating_add(locked_prepare_time)),
+        AtomicOrdering::Relaxed,
+    );
+    shared
+        .commit_locked_prepare_nanos
+        .fetch_add(elapsed_nanos(locked_prepare_time), AtomicOrdering::Relaxed);
+    shared.commit_wal_nanos.fetch_add(
+        elapsed_nanos(wal_time).saturating_mul(count),
+        AtomicOrdering::Relaxed,
+    );
+    shared
+        .commit_wal_append_nanos
+        .fetch_add(elapsed_nanos(wal_append_time), AtomicOrdering::Relaxed);
+    shared
+        .commit_apply_nanos
+        .fetch_add(elapsed_nanos(apply_time), AtomicOrdering::Relaxed);
+    shared
+        .coordinated_batch_count
+        .fetch_add(1, AtomicOrdering::Relaxed);
+    shared
+        .coordinated_commit_count
+        .fetch_add(count, AtomicOrdering::Relaxed);
+
+    let sync_error = match sync_outcome {
+        Some(WalAppendOutcome::SyncFailed(error)) => Some(error.to_string()),
+        _ => None,
+    };
+    Some(
+        versions
+            .into_iter()
+            .map(|version| match &sync_error {
+                Some(error) => Err(Error::CommitUnknown(format!(
+                    "version {version} was published, but syncing its coordinated WAL batch failed: {error}"
+                ))),
+                None => Ok(version),
+            })
+            .collect(),
+    )
+}
+
+fn finish_prepared_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Result<u64> {
+    let PreparedCommit {
+        snap_version,
+        staged,
+        preencoded_wal,
+        optimistic_prior_records,
+        incoming_index_bytes,
+        outside_prepare_time,
+        commit_started,
+        _pending_blobs,
+    } = prepared;
 
     let mut lock_wait = Duration::ZERO;
     let mut locked_prepare_time = Duration::ZERO;
@@ -7929,11 +8635,11 @@ fn commit_staged(
     let sync_group = if sync_due {
         match cs.wal_sync_group.as_ref() {
             Some(group) => {
-                group.join();
+                group.join(bytes.len() as u64);
                 Some((group.clone(), false))
             }
             None => {
-                let group = Arc::new(WalSyncGroup::new());
+                let group = Arc::new(WalSyncGroup::new(bytes.len() as u64));
                 cs.wal_sync_group = Some(group.clone());
                 Some((group, true))
             }
@@ -11164,7 +11870,6 @@ fn find_eq_via_primary_index(
 /// file order through a buffered reader. For every latest visible record we
 /// decode only the predicate column; a full Record is built only on a match.
 /// Latest MemPut records are evaluated from their already-encoded payloads.
-#[allow(dead_code)] // retained for a future immutable State read-view fast path
 fn find_eq_streaming(
     shared: &Shared,
     st: &State,
@@ -11230,14 +11935,12 @@ fn find_eq_streaming(
     Ok(())
 }
 
-#[allow(dead_code)]
 struct EncodedEqPredicate<'a> {
     column: &'a str,
     ordinal: Option<usize>,
     value: &'a Value,
 }
 
-#[allow(dead_code)]
 fn scan_segment_for_eq(
     shared: &Shared,
     st: &State,
@@ -11315,7 +12018,6 @@ fn scan_segment_for_eq(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn take_segment_slice<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = pos
         .checked_add(len)
@@ -11326,7 +12028,6 @@ fn take_segment_slice<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Result
     Ok(value)
 }
 
-#[allow(dead_code)]
 fn latest_is_segment_put(st: &State, table: &str, id: &str, version: u64, segment: u32) -> bool {
     st.latest_owned(table, id)
         .ok()
@@ -11337,7 +12038,6 @@ fn latest_is_segment_put(st: &State, table: &str, id: &str, version: u64, segmen
         })
 }
 
-#[allow(dead_code)]
 fn encoded_record_column_eq(
     payload: &[u8],
     predicate: &EncodedEqPredicate<'_>,
@@ -11672,6 +12372,65 @@ mod primary_index_tests {
     use super::*;
 
     #[test]
+    fn point_read_admission_is_inactive_without_writers_and_bounds_mixed_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::create(dir.path().join("point-admission.esql")).unwrap());
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::new("value", ColumnType::Int64)],
+        ))
+        .unwrap();
+
+        let unthrottled = PointReadAdmission::enter(&db.shared);
+        assert!(!unthrottled.counted);
+        drop(unthrottled);
+        assert_eq!(
+            db.shared
+                .point_read_throttle_count
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+
+        db.shared.active_state_writers.store(
+            db.shared.point_read_parallelism.max(1) as u64,
+            AtomicOrdering::Release,
+        );
+        let held = PointReadAdmission::enter(&db.shared);
+        assert!(held.counted);
+        let worker_db = db.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done_tx.send(worker_db.get("docs", "missing")).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while db
+            .shared
+            .point_read_throttle_count
+            .load(AtomicOrdering::Acquire)
+            == 0
+        {
+            assert!(Instant::now() < deadline, "second reader was not throttled");
+            std::thread::yield_now();
+        }
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        drop(held);
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .is_none());
+        worker.join().unwrap();
+        db.shared
+            .active_state_writers
+            .store(0, AtomicOrdering::Release);
+        assert_eq!(
+            db.shared.admitted_point_reads.load(AtomicOrdering::Acquire),
+            0
+        );
+    }
+
+    #[test]
     fn paged_primary_roundtrips_many_ids_and_versions() {
         let dir = tempfile::tempdir().unwrap();
         let mut resident = HashMap::new();
@@ -11850,6 +12609,81 @@ mod primary_index_tests {
 
         let reopened = Db::open(&path).unwrap();
         assert_eq!(reopened.scan("docs").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn coordinated_safe_sync_failure_is_reported_to_every_batch_member() {
+        const WRITERS: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordinated-sync-unknown.esql");
+        let db = Arc::new(
+            Db::create_with(
+                &path,
+                DbOptions {
+                    durability: Durability::Safe,
+                    safe_group_commit_delay_us: 100_000,
+                    ..DbOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::new("value", ColumnType::Int64)],
+        ))
+        .unwrap();
+        db.shared.commit.lock().wal().fail_next_sync_for_test();
+
+        // Keep the contention signal set until the elected leader has opened
+        // the test's deliberately wide coalescing window.
+        db.shared
+            .active_state_writers
+            .fetch_add(1, AtomicOrdering::Release);
+        let ready = Arc::new(std::sync::Barrier::new(WRITERS));
+        let handles = (0..WRITERS)
+            .map(|writer| {
+                let db = db.clone();
+                let ready = ready.clone();
+                std::thread::spawn(move || {
+                    let mut record = Record::new();
+                    record.insert("id".into(), Value::Text(format!("writer-{writer}")));
+                    record.insert("value".into(), Value::Int64(writer as i64));
+                    let mut transaction = db.begin();
+                    transaction.insert("docs", record).unwrap();
+                    ready.wait();
+                    transaction.commit()
+                })
+            })
+            .collect::<Vec<_>>();
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        db.shared
+            .active_state_writers
+            .fetch_sub(1, AtomicOrdering::Release);
+
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Err(Error::CommitUnknown(_)))),
+            "every member must receive the shared sync failure: {outcomes:?}"
+        );
+        let stats = db.maintenance_stats();
+        assert_eq!(stats.wal_syncs, 1);
+        assert_eq!(stats.wal_sync_max_group_commits, WRITERS as u64);
+        assert_eq!(db.scan("docs").unwrap().len(), WRITERS);
+
+        let mut durable = Record::new();
+        durable.insert("id".into(), Value::Text("durable".into()));
+        durable.insert("value".into(), Value::Int64(99));
+        db.insert("docs", durable).unwrap();
+        drop(db);
+        assert_eq!(
+            Db::open(&path).unwrap().scan("docs").unwrap().len(),
+            WRITERS + 1
+        );
     }
 
     #[test]

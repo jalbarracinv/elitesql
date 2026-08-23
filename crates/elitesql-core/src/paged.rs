@@ -48,6 +48,10 @@ pub(crate) struct PagedIndex {
 pub(crate) struct PagedPrefixCursor<'a> {
     index: &'a PagedIndex,
     prefix: Vec<u8>,
+    /// Exclusive full-key lower bound. Keeping it separate from `prefix`
+    /// lets paginated callers seek directly into every immutable run instead
+    /// of replaying all preceding pages on each batch.
+    after: Option<Vec<u8>>,
     page_index: usize,
     pos: usize,
     end: usize,
@@ -228,10 +232,12 @@ impl PagedIndex {
                 continue;
             }
             let keep_going = self.scan_page_until(page, |candidate, value| {
-                if candidate == key {
-                    visit(value)
-                } else {
-                    Ok(true)
+                match candidate.cmp(key) {
+                    Ordering::Less => Ok(true),
+                    Ordering::Equal => visit(value),
+                    // Entries inside a page are sorted. Once the requested
+                    // key has been passed, parsing the rest cannot find it.
+                    Ordering::Greater => Ok(false),
                 }
             })?;
             if !keep_going {
@@ -242,12 +248,29 @@ impl PagedIndex {
     }
 
     pub(crate) fn prefix_cursor(&self, prefix: &[u8]) -> PagedPrefixCursor<'_> {
-        let page_index = self
-            .pages
-            .partition_point(|page| self.page(*page).last_key < prefix);
+        self.prefix_cursor_after(prefix, None)
+    }
+
+    /// Cursor over `prefix`, positioned strictly after a complete encoded
+    /// key. This is the persisted-run equivalent of `BTreeMap::range` with an
+    /// excluded lower bound.
+    pub(crate) fn prefix_cursor_after(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+    ) -> PagedPrefixCursor<'_> {
+        let page_index = match after {
+            Some(after) => self
+                .pages
+                .partition_point(|page| self.page(*page).last_key <= after),
+            None => self
+                .pages
+                .partition_point(|page| self.page(*page).last_key < prefix),
+        };
         PagedPrefixCursor {
             index: self,
             prefix: prefix.to_vec(),
+            after: after.map(<[u8]>::to_vec),
             page_index,
             pos: 0,
             end: 0,
@@ -366,6 +389,9 @@ impl<'a> PagedPrefixCursor<'a> {
                 }
                 let key = take(&self.index.mmap, &mut self.pos, key_len)?;
                 let value = take(&self.index.mmap, &mut self.pos, value_len)?;
+                if self.after.as_deref().is_some_and(|after| key <= after) {
+                    continue;
+                }
                 if key.starts_with(&self.prefix) {
                     return Ok(Some((key, value)));
                 }
@@ -975,6 +1001,29 @@ mod tests {
         assert_eq!(values[99], 99u32.to_be_bytes());
         assert_eq!(collect_values(&index, b"later"), vec![b"value".to_vec()]);
         assert!(collect_values(&index, b"missing").is_empty());
+    }
+
+    #[test]
+    fn prefix_cursor_seeks_strictly_after_full_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seek.page");
+        let mut writer = PagedWriter::create(&path, 1, Some(256)).unwrap();
+        for value in 0u32..200 {
+            let key = format!("docs/{value:04}");
+            writer.add(key.as_bytes(), &value.to_be_bytes()).unwrap();
+        }
+        writer.add(b"other/0000", b"outside-prefix").unwrap();
+        writer.finish().unwrap();
+
+        let index = PagedIndex::open(&path).unwrap();
+        let mut cursor = index.prefix_cursor_after(b"docs/", Some(b"docs/0127"));
+        let mut found = Vec::new();
+        while let Some((key, _)) = cursor.next().unwrap() {
+            found.push(std::str::from_utf8(key).unwrap().to_owned());
+        }
+        assert_eq!(found.first().map(String::as_str), Some("docs/0128"));
+        assert_eq!(found.last().map(String::as_str), Some("docs/0199"));
+        assert_eq!(found.len(), 72);
     }
 
     #[test]

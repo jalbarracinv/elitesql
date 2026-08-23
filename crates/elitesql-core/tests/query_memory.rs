@@ -371,6 +371,12 @@ fn database_query_pool_applies_backpressure_across_threads() {
 
     let cursor = db.query_cursor("SELECT id, n FROM items").unwrap();
     assert_eq!(db.global_memory_stats().query_in_use_bytes, 1024);
+    assert_eq!(
+        db.get("items", "a").unwrap().unwrap()["n"],
+        Value::Int64(1),
+        "a point lookup returns only caller-owned result memory and must not wait for an operator slot"
+    );
+    assert_eq!(db.global_memory_stats().query_in_use_bytes, 1024);
 
     let worker_db = db.clone();
     let (tx, rx) = mpsc::channel();

@@ -105,7 +105,9 @@ impl Default for VectorIndexOptions {
 /// Options for [`crate::Db::search_vector`].
 #[derive(Debug, Clone, Default)]
 pub struct VectorSearchOptions {
-    /// Search beam width; higher = better recall, slower. Default max(64, 2*top_k).
+    /// Logical search effort; higher = better recall, slower. The engine
+    /// calibrates this across immutable graph generations. Default
+    /// max(64, 2*top_k).
     pub ef_search: Option<usize>,
     /// Equality filters on other columns of the record (metadata filter).
     pub filter: Option<crate::Record>,
