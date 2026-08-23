@@ -163,22 +163,46 @@ and
 
 The independent Criterion comparison in
 [`vs_sqlite.rs`](crates/elitesql-core/benches/vs_sqlite.rs) uses 1,000-row
-inserts and prepared primary-key reads. The central estimates from the current
-run were:
+transactions and prepared primary-key reads. The published transaction result
+is the sustained comparison: the fixed harness loaded 1M identical explicit-ID
+rows in 1,000-row transactions, included automatic primary-index flush work in
+ingest wall time, then measured the final checkpoint separately. These are
+medians of five fresh runs under Fast/OFF durability with the 384 MiB default.
+The A/B baseline is commit `5fb56aa`; the optimized rows identify the measured
+dirty worktree:
 
-| Operation | EliteSQL | SQLite | Result |
+| Sustained 1M-row workload | EliteSQL | SQLite | Result |
 |---|---:|---:|---:|
-| 1,000 inserts, one transaction | 4.060 ms | 0.673 ms | EliteSQL 6.03x SQLite time |
-| 1,000 inserts, autocommit | 13.397 ms | 9.372 ms | EliteSQL 1.43x SQLite time |
-| Primary-key read | 0.350 us | 1.394 us | EliteSQL 3.98x faster |
+| Ingest wall | 0.833 s | 0.638 s | EliteSQL 1.306x SQLite time |
+| Final checkpoint | 0.097 s | 0.125 s | EliteSQL 1.29x faster |
+| Total load | 0.930 s | 0.764 s | EliteSQL 1.218x SQLite time |
+| Throughput | 1,075,081 rows/s | 1,308,961 rows/s | EliteSQL 17.9% lower |
 
-The matched single-transaction microbenchmark is now outside the former 2x
-boundary and needs profiling; unlike the 10M scale test, it repeatedly includes
-setup-sensitive small transactions and should not be used alone to describe
-bulk throughput. Autocommit semantics and durability costs differ between
-engines, so that row is supporting evidence rather than the primary acceptance
-measurement. Raw central estimates and confidence intervals are retained in
-[`current-2026-08-23-criterion.csv`](benchmark-results/current-2026-08-23-criterion.csv).
+Profiling found that EliteSQL cloned the cached table schema for every staged
+row. Reusing the transaction's cached schema removes that allocation and copy
+without changing validation, the memory budget, WAL format, commit semantics or
+recovery. In matched five-run A/B measurements, EliteSQL median ingest improved
+from 0.943 to 0.833 s (-11.7%) and total load from 1.040 to 0.930 s (-10.6%);
+the total-time ratio moved from 1.36x to 1.22x SQLite. Staging improved by about
+25%, while commit time was effectively unchanged, confirming where the saving
+came from.
+
+The independent warmed Criterion diagnostic corroborates the sustained result:
+generated-ID EliteSQL averaged 0.911 ms per transaction, explicit-ID EliteSQL
+0.904 ms, and SQLite 0.722 ms (1.26x and 1.25x SQLite time respectively). Its
+EliteSQL confidence intervals are relatively broad, so the fixed five-run
+workload above is the primary result. Autocommit semantics and durability costs
+differ between engines and remain supporting evidence. Prepared primary-key
+reads averaged 0.360 us in EliteSQL versus 1.418 us in SQLite, making EliteSQL
+3.94x faster in that microbenchmark.
+
+Raw historical and optimized fixed-workload runs are retained together in
+[`current-2026-08-23-small-transactions-fixed.csv`](benchmark-results/current-2026-08-23-small-transactions-fixed.csv).
+The complete new Criterion central estimates and confidence intervals are in
+[`current-2026-08-23-small-transactions-criterion.csv`](benchmark-results/current-2026-08-23-small-transactions-criterion.csv);
+the earlier full-run values remain in
+[`current-2026-08-23-criterion.csv`](benchmark-results/current-2026-08-23-criterion.csv)
+for historical comparison.
 
 ## SQL query and bound-parameter overhead
 
@@ -676,9 +700,17 @@ cargo bench -p elitesql-core --bench scale_vs_sqlite -- \
   --rows 10m --durability fast --batch-size 10k \
   --point-reads 1k --full-scans 1 --engine elitesql
 
-# Criterion microbenchmark and SQL, including bound parameters
+# Sustained transaction Criterion microbenchmarks
 cargo bench -p elitesql-core --bench vs_sqlite -- \
-  --save-baseline current-2026-08-23
+  --save-baseline current-small-txn-2026-08-23
+
+# Fixed sustained workload; repeat five times with a fresh output filename
+cargo bench -p elitesql-core --bench scale_vs_sqlite -- \
+  --rows 1m --durability fast --batch-size 1k \
+  --point-reads 100 --full-scans 1 \
+  --csv benchmark-results/small-transactions-repetition-1.csv
+
+# SQL, including bound parameters
 cargo bench -p elitesql-core --bench sql -- \
   --save-baseline current-2026-08-23
 

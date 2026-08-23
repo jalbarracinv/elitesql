@@ -1,0 +1,10 @@
+benchmark,mode,mean_ns,ci_lower_ns,ci_upper_ns
+insert_1k_rows/elitesql,autocommit,12775457.611,12262757.043,13306730.186
+insert_1k_rows/sqlite_autocommit,autocommit,9186224.383,8991323.934,9475564.608
+insert_1k_rows/elitesql_single_txn,cold_first_transaction,3359716.661,3143441.023,3589101.058
+insert_1k_rows/sqlite_single_txn,cold_first_transaction,680179.728,668893.841,691811.401
+insert_1k_rows/elitesql_single_txn_steady,sustained_generated_ids,910725.625,815146.333,1000949.841
+insert_1k_rows/elitesql_single_txn_explicit_steady,sustained_explicit_ids,903581.224,789531.220,1019988.482
+insert_1k_rows/sqlite_single_txn_steady,sustained_explicit_ids,722176.843,719154.496,726886.058
+get_by_id/elitesql,prepared_primary_key_read,359.895,358.643,361.379
+get_by_id/sqlite,prepared_primary_key_read,1418.103,1408.690,1429.582

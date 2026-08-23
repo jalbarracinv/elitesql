@@ -1,16 +1,20 @@
-//! Phase 0 acceptance benchmarks: elitesql vs SQLite on sequential inserts and
-//! point reads by id.
+//! Acceptance benchmarks: EliteSQL vs SQLite on cold and sustained sequential
+//! inserts plus point reads by id.
 //!
 //! Fairness notes:
 //! - elitesql runs with `Durability::Fast` (no per-commit fsync) and SQLite
 //!   with WAL + synchronous=OFF: the same (non-durable) write path class.
 //! - `sqlite_autocommit` commits per insert, like elitesql's per-op commit.
-//!   `sqlite_single_txn` is SQLite's best case (one transaction), shown for
-//!   transparency.
+//! - `*_single_txn` creates a fresh database per iteration and therefore
+//!   measures the first transaction after create.
+//! - `*_single_txn_steady` warms one database per Criterion sample, then times
+//!   consecutive transactions so setup and first-use effects stay out of the
+//!   sustained result.
 //!
 //! Run with: cargo bench -p elitesql-core
 
 use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use elitesql_core::{
@@ -21,6 +25,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 const INSERT_N: usize = 1_000;
+const STEADY_WARM_TRANSACTIONS: usize = 8;
 const READ_ROWS: usize = 10_000;
 const BODY: &str = "The quick brown fox jumps over the lazy dog. Pack my box with \
 five dozen liquor jugs. Sphinx of black quartz, judge my vow. How vexingly quick \
@@ -54,6 +59,12 @@ fn elitesql_record(i: usize) -> Record {
     r
 }
 
+fn elitesql_record_with_id(i: usize) -> Record {
+    let mut record = elitesql_record(i);
+    record.insert("id".into(), Value::Text(format!("row-{i:08}")));
+    record
+}
+
 fn sqlite_new() -> (TempDir, Connection) {
     let dir = tempfile::tempdir().unwrap();
     let conn = Connection::open(dir.path().join("bench.sqlite3")).unwrap();
@@ -66,11 +77,11 @@ fn sqlite_new() -> (TempDir, Connection) {
     (dir, conn)
 }
 
-fn sqlite_insert_rows(conn: &Connection, n: usize) {
+fn sqlite_insert_rows_from(conn: &Connection, start: usize, n: usize) {
     let mut stmt = conn
         .prepare("INSERT INTO docs (id, title, body, score) VALUES (?1, ?2, ?3, ?4)")
         .unwrap();
-    for i in 0..n {
+    for i in start..start + n {
         stmt.execute(rusqlite::params![
             format!("row-{i:08}"),
             format!("document number {i}"),
@@ -79,6 +90,71 @@ fn sqlite_insert_rows(conn: &Connection, n: usize) {
         ])
         .unwrap();
     }
+}
+
+fn sqlite_insert_rows(conn: &Connection, n: usize) {
+    sqlite_insert_rows_from(conn, 0, n);
+}
+
+fn elitesql_transaction(db: &Db, start: usize, explicit_ids: bool) {
+    let mut txn = db.begin();
+    for i in start..start + INSERT_N {
+        let record = if explicit_ids {
+            elitesql_record_with_id(i)
+        } else {
+            elitesql_record(i)
+        };
+        txn.insert("docs", record).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+fn warm_elitesql(db: &Db, explicit_ids: bool) -> usize {
+    let mut next = 0usize;
+    for _ in 0..STEADY_WARM_TRANSACTIONS {
+        elitesql_transaction(db, next, explicit_ids);
+        next += INSERT_N;
+    }
+    next
+}
+
+fn warm_sqlite(conn: &Connection) -> usize {
+    let mut next = 0usize;
+    for _ in 0..STEADY_WARM_TRANSACTIONS {
+        conn.execute_batch("BEGIN").unwrap();
+        sqlite_insert_rows_from(conn, next, INSERT_N);
+        conn.execute_batch("COMMIT").unwrap();
+        next += INSERT_N;
+    }
+    next
+}
+
+fn bench_elitesql_steady(iterations: u64, explicit_ids: bool) -> Duration {
+    let (_dir, db) = elitesql_new();
+    let mut next = warm_elitesql(&db, explicit_ids);
+    let mut measured = Duration::ZERO;
+    for _ in 0..iterations {
+        let started = Instant::now();
+        elitesql_transaction(&db, next, explicit_ids);
+        measured += started.elapsed();
+        next += INSERT_N;
+    }
+    measured
+}
+
+fn bench_sqlite_steady(iterations: u64) -> Duration {
+    let (_dir, conn) = sqlite_new();
+    let mut next = warm_sqlite(&conn);
+    let mut measured = Duration::ZERO;
+    for _ in 0..iterations {
+        let started = Instant::now();
+        conn.execute_batch("BEGIN").unwrap();
+        sqlite_insert_rows_from(&conn, next, INSERT_N);
+        conn.execute_batch("COMMIT").unwrap();
+        measured += started.elapsed();
+        next += INSERT_N;
+    }
+    measured
 }
 
 fn bench_inserts(c: &mut Criterion) {
@@ -136,6 +212,18 @@ fn bench_inserts(c: &mut Criterion) {
             },
             BatchSize::PerIteration,
         )
+    });
+
+    g.bench_function("elitesql_single_txn_steady", |b| {
+        b.iter_custom(|iterations| bench_elitesql_steady(iterations, false))
+    });
+
+    g.bench_function("elitesql_single_txn_explicit_steady", |b| {
+        b.iter_custom(|iterations| bench_elitesql_steady(iterations, true))
+    });
+
+    g.bench_function("sqlite_single_txn_steady", |b| {
+        b.iter_custom(bench_sqlite_steady)
     });
 
     g.finish();

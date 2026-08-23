@@ -6937,7 +6937,13 @@ impl Txn {
 
     pub fn insert(&mut self, table: &str, record: Record) -> Result<String> {
         let mut record = record;
-        let schema = self.table_schema(table)?;
+        self.schema(table)?;
+        let table_index = self
+            .staged
+            .iter()
+            .position(|(name, _)| name == table)
+            .expect("schema was cached above");
+        let schema = &self.staged[table_index].1.schema;
         let id = match (schema.has_implicit_id(), record.get(ID_COLUMN)) {
             (false, _) | (true, None) => {
                 let mut previous = self.shared.last_generated_id.lock().unwrap();
@@ -6992,23 +6998,17 @@ impl Txn {
             let generated = reserve_identity(&self.shared, table, explicit)?;
             record.insert(identity_name, Value::Int64(generated));
         }
-        let normalized = normalize_record(&schema, record)?;
-        let exists = match self
-            .staged
-            .iter()
-            .find(|(name, _)| name == table)
-            .and_then(|(_, staged)| staged.operations.get(&id))
+        let normalized = normalize_record(schema, record)?;
+        let staged_table = &self.staged[table_index].1;
+        let exists = match staged_table
+            .operations
+            .get(&id)
             .map(|staged| &staged.operation)
         {
             Some(Some(_)) => true,
             Some(None) => false,
             None => {
-                let above_snapshot_high = self
-                    .staged
-                    .iter()
-                    .find(|(name, _)| name == table)
-                    .map(|(_, staged)| staged)
-                    .expect("schema cached above")
+                let above_snapshot_high = staged_table
                     .snapshot_high_id
                     .as_deref()
                     .is_none_or(|high| id.as_str() > high);
