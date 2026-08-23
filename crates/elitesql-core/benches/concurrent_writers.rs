@@ -158,6 +158,13 @@ struct RunResult {
     elapsed: Duration,
     checkpoint: Duration,
     latencies_ns: Vec<u64>,
+    wal_syncs: Option<u64>,
+    grouped_commits: Option<u64>,
+    lock_wait_us: Option<f64>,
+    lock_hold_us: Option<f64>,
+    locked_prepare_us: Option<f64>,
+    wal_append_us: Option<f64>,
+    apply_us: Option<f64>,
 }
 
 impl RunResult {
@@ -325,6 +332,8 @@ fn run_elitesql(config: &Config, writers: usize, repetition: usize) -> Result<Ru
         );
     }
     let elapsed = started.elapsed();
+    let maintenance = db.maintenance_stats();
+    let commits = maintenance.commits.max(1) as f64;
 
     let memory = db.global_memory_stats();
     if memory.index_consolidations != 0 {
@@ -354,6 +363,17 @@ fn run_elitesql(config: &Config, writers: usize, repetition: usize) -> Result<Ru
         elapsed,
         checkpoint,
         latencies_ns: latencies,
+        wal_syncs: Some(maintenance.wal_syncs),
+        grouped_commits: Some(maintenance.grouped_commits),
+        lock_wait_us: Some(maintenance.commit_lock_wait_time.as_secs_f64() * 1_000_000.0 / commits),
+        lock_hold_us: Some(maintenance.commit_lock_hold_time.as_secs_f64() * 1_000_000.0 / commits),
+        locked_prepare_us: Some(
+            maintenance.commit_locked_prepare_time.as_secs_f64() * 1_000_000.0 / commits,
+        ),
+        wal_append_us: Some(
+            maintenance.commit_wal_append_time.as_secs_f64() * 1_000_000.0 / commits,
+        ),
+        apply_us: Some(maintenance.commit_apply_time.as_secs_f64() * 1_000_000.0 / commits),
     })
 }
 
@@ -476,6 +496,13 @@ fn run_sqlite(config: &Config, writers: usize, repetition: usize) -> Result<RunR
         elapsed,
         checkpoint,
         latencies_ns: latencies,
+        wal_syncs: None,
+        grouped_commits: None,
+        lock_wait_us: None,
+        lock_hold_us: None,
+        locked_prepare_us: None,
+        wal_append_us: None,
+        apply_us: None,
     })
 }
 
@@ -484,8 +511,23 @@ fn duration_ns(duration: Duration) -> u64 {
 }
 
 fn print_result(result: &RunResult) {
+    let syncs = result.wal_syncs.map_or_else(String::new, |wal_syncs| {
+        format!(
+            "  wal_syncs={wal_syncs} grouped={}",
+            result.grouped_commits.unwrap_or(0)
+        )
+    });
+    let critical = result.lock_hold_us.map_or_else(String::new, |lock_hold| {
+        format!(
+            "  lock(wait/hold)={:.1}/{lock_hold:.1} us prepare={:.1} append={:.1} apply={:.1} us",
+            result.lock_wait_us.unwrap_or(0.0),
+            result.locked_prepare_us.unwrap_or(0.0),
+            result.wal_append_us.unwrap_or(0.0),
+            result.apply_us.unwrap_or(0.0),
+        )
+    });
     println!(
-        "  {:<8} writers={:<2} run={} {:>10.0} rows/s  p50={:>8.1} us  p95={:>8.1} us  p99={:>8.1} us  max={:>9.1} us  checkpoint={:.3} s",
+        "  {:<8} writers={:<2} run={} {:>10.0} rows/s  p50={:>8.1} us  p95={:>8.1} us  p99={:>8.1} us  max={:>9.1} us  checkpoint={:.3} s{}{}",
         result.engine,
         result.writers,
         result.repetition,
@@ -495,16 +537,18 @@ fn print_result(result: &RunResult) {
         result.percentile_us(99),
         result.max_us(),
         result.checkpoint.as_secs_f64(),
+        syncs,
+        critical,
     );
 }
 
 fn csv(results: &[RunResult], config: &Config) -> String {
     let mut out = String::from(
-        "engine,writers,repetition,rows,batch_size,durability,elapsed_seconds,rows_per_second,p50_us,p95_us,p99_us,max_us,checkpoint_seconds\n",
+        "engine,writers,repetition,rows,batch_size,durability,elapsed_seconds,rows_per_second,p50_us,p95_us,p99_us,max_us,checkpoint_seconds,wal_syncs,grouped_commits,lock_wait_us,lock_hold_us,locked_prepare_us,wal_append_us,apply_us\n",
     );
     for result in results {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{:.9},{:.3},{:.3},{:.3},{:.3},{:.3},{:.9}\n",
+            "{},{},{},{},{},{},{:.9},{:.3},{:.3},{:.3},{:.3},{:.3},{:.9},{},{},{},{},{},{},{}\n",
             result.engine,
             result.writers,
             result.repetition,
@@ -518,6 +562,27 @@ fn csv(results: &[RunResult], config: &Config) -> String {
             result.percentile_us(99),
             result.max_us(),
             result.checkpoint.as_secs_f64(),
+            result
+                .wal_syncs
+                .map_or_else(String::new, |value| value.to_string()),
+            result
+                .grouped_commits
+                .map_or_else(String::new, |value| value.to_string()),
+            result
+                .lock_wait_us
+                .map_or_else(String::new, |value| format!("{value:.3}")),
+            result
+                .lock_hold_us
+                .map_or_else(String::new, |value| format!("{value:.3}")),
+            result
+                .locked_prepare_us
+                .map_or_else(String::new, |value| format!("{value:.3}")),
+            result
+                .wal_append_us
+                .map_or_else(String::new, |value| format!("{value:.3}")),
+            result
+                .apply_us
+                .map_or_else(String::new, |value| format!("{value:.3}")),
         ));
     }
     out

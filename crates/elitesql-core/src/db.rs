@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::FileExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use memmap2::{Advice, MmapOptions};
+use parking_lot::{Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
 use ulid::Ulid;
 
 use crate::ddl::{DdlIntent, Rewrite};
@@ -21,15 +23,19 @@ use crate::paged::{
     PagedPrefixCursor, PagedWriter,
 };
 use crate::run_manifest::{
-    DerivedRunKind, DerivedRunManifest, DerivedRunMeta, PrimaryRunManifest, PrimaryRunMeta,
+    DerivedRunKind, DerivedRunManifest, DerivedRunMeta, PreparedDerivedRunManifest,
+    PrimaryRunManifest, PrimaryRunMeta,
 };
 use crate::schema::{
-    Catalog, Column, IndexDef, ReferentialAction, TableSchema, FORMAT_VERSION, ID_COLUMN,
+    validate_short_string, Catalog, Column, IndexDef, ReferentialAction, TableSchema,
+    FORMAT_VERSION, ID_COLUMN,
 };
 use crate::segment::{
     encode_entry_into, segment_file_name, validate_segment, visit_segment, KIND_PUT, KIND_TOMBSTONE,
 };
-use crate::text::{validate_run as validate_text_run, TextHit, TextIdx, TextIndexDef, TextRun};
+use crate::text::{
+    validate_run as validate_text_run, FrozenTextDelta, TextHit, TextIdx, TextIndexDef, TextRun,
+};
 use crate::value::{
     decode_value, encode_blob_ref, encode_value, encoded_value_eq, read_u16, read_u32, read_u64,
     read_u8, skip_value, write_blob_file_bytes, BlobRef, ColumnType, Value, TAG_NULL,
@@ -38,7 +44,8 @@ use crate::vector::{
     IndexingMode, VecIdx, VectorHit, VectorIndexDef, VectorIndexOptions, VectorSearchOptions,
 };
 use crate::wal::{
-    encode_commit, scan_wal, wal_path, Durability, WalAppendOutcome, WalWriter, WAL_DIR,
+    encode_commit, scan_wal, set_encoded_commit_version, wal_path, Durability, WalAppendOutcome,
+    WalWriter, WAL_DIR,
 };
 
 pub(crate) const MARKER_FILE: &str = "ELITESQL";
@@ -59,6 +66,10 @@ const PRIMARY_BASE_LEVEL: u8 = u8::MAX;
 const DERIVED_LEVEL_FANOUT: usize = 8;
 const DERIVED_BASE_LEVEL: u8 = u8::MAX;
 const MAX_MAINTENANCE_WAIT_RETRIES: u64 = 8;
+/// Maximum coalescing delay, paid only when another committer is already
+/// queued. This is long enough for queued writers to append and join while
+/// keeping the added tail latency sub-millisecond.
+const GROUP_COMMIT_MAX_DELAY: Duration = Duration::from_micros(200);
 
 /// Optimistic-conflict retries per backfill batch during `ADD COLUMN`.
 const BACKFILL_RETRIES: usize = 3;
@@ -350,10 +361,21 @@ pub struct MaintenanceStats {
     /// synchronous checkpoint triggered by memory thresholds.
     pub commit_time: Duration,
     pub commit_lock_wait_time: Duration,
+    /// Time spent owning the serialization mutex in the main commit phase.
+    pub commit_lock_hold_time: Duration,
     /// Conflict checks, record encoding, unique validation and memory sizing.
     pub commit_prepare_time: Duration,
+    /// Conflict/constraint validation performed while serialization is held.
+    pub commit_locked_prepare_time: Duration,
     /// WAL encoding and append time (including the configured durability sync).
     pub commit_wal_time: Duration,
+    /// Version patching and WAL append, excluding group-sync wait.
+    pub commit_wal_append_time: Duration,
+    /// Physical WAL sync calls. In Safe/Balanced modes this may be lower than
+    /// `commits` because concurrent commits share one group sync.
+    pub wal_syncs: u64,
+    /// Commits that joined a WAL sync group containing at least two commits.
+    pub grouped_commits: u64,
     /// In-memory publication to primary and derived mutable indexes.
     pub commit_apply_time: Duration,
     pub checkpoints: u64,
@@ -389,6 +411,10 @@ pub struct MaintenanceStats {
     pub text_run_compaction_bytes_read: u64,
     pub text_run_compaction_bytes_written: u64,
     pub text_checkpoint_bytes_written: u64,
+    /// Frozen secondary/text/vector generations successfully serialized and
+    /// published by the dedicated background worker.
+    pub derived_publications: u64,
+    pub derived_publication_time: Duration,
 }
 
 /// Where one committed record version lives.
@@ -970,15 +996,19 @@ fn compact_one_primary_level(shared: &Arc<Shared>) -> Result<()> {
     let next_level = level.saturating_add(1).min(PRIMARY_BASE_LEVEL - 1);
     let file = format!("primary-L{next_level}-{}.pidx.run", Ulid::new());
     let path = indexes_dir.join(&file);
-    let tmp = path.with_extension("run.tmp");
+    // Keep the merge under a name that runtime orphan cleanup deliberately
+    // ignores. It becomes a normal run only after acquiring the publication
+    // mutex, so a concurrent checkpoint cannot delete an in-flight output.
+    let pending = path.with_file_name(format!("{file}.primary-pending"));
+    let tmp = path.with_file_name(format!("{file}.primary-pending.tmp"));
     let inputs: Vec<&PagedIndex> = selected.iter().map(|(_, index)| index.as_ref()).collect();
     if let Err(error) = merge_paged_indexes(&tmp, &inputs, generation) {
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
-    fs::rename(&tmp, &path)?;
+    fs::rename(&tmp, &pending)?;
     fsync_dir(&indexes_dir)?;
-    let output_bytes = fs::metadata(&path)?.len();
+    let output_bytes = fs::metadata(&pending)?.len();
     let output_meta = PrimaryRunMeta {
         file,
         level: next_level,
@@ -991,38 +1021,63 @@ fn compact_one_primary_level(shared: &Arc<Shared>) -> Result<()> {
     let maintenance_memory = shared
         .memory_governor
         .acquire(MemoryPool::Maintenance, directory_estimate);
-    let output_index = Arc::new(PagedIndex::open(&path)?);
+    let output_index = Arc::new(PagedIndex::open(&pending)?);
 
     // Commit paths acquire the commit mutex before maintenance admission.
     // Release the working-set permit before publication to preserve that
     // global lock order; publication itself allocates no database-sized set.
     drop(maintenance_memory);
-    let _commit = shared.commit.lock().unwrap();
-    let mut state = shared.state.write().unwrap();
-    // A checkpoint may append another immutable L0 while this merge runs.
-    // Those selected inputs remain valid. A canonical segment rewrite, on
-    // the other hand, replaces them and makes this predicate fail.
-    let still_current = selected
-        .iter()
-        .all(|(meta, _)| state.index.runs.iter().any(|run| run.meta == *meta));
-    if !still_current {
-        drop(state);
-        let _ = fs::remove_file(&path);
-        return Ok(());
-    }
+    let _publication = shared.primary_manifest_publication.lock().unwrap();
+    fs::rename(&pending, &path)?;
+    fsync_dir(&indexes_dir)?;
     let selected_names: HashSet<_> = selected
         .iter()
         .map(|(meta, _)| meta.file.as_str())
         .collect();
-    let mut metas: Vec<_> = state
-        .index
-        .runs
-        .iter()
-        .filter(|run| !selected_names.contains(run.meta.file.as_str()))
-        .map(|run| run.meta.clone())
-        .collect();
-    metas.push(output_meta.clone());
-    PrimaryRunManifest::new(state.index.generation, metas).publish(&indexes_dir)?;
+    let (expected_generation, metas) = {
+        let _commit = shared.commit.lock();
+        let state = shared.state.read().unwrap();
+        // A checkpoint may append another immutable L0 while this merge runs.
+        // Those selected inputs remain valid. A canonical segment rewrite, on
+        // the other hand, replaces them and makes this predicate fail.
+        let still_current = selected
+            .iter()
+            .all(|(meta, _)| state.index.runs.iter().any(|run| run.meta == *meta));
+        if !still_current {
+            drop(state);
+            let _ = fs::remove_file(&path);
+            return Ok(());
+        }
+        let mut metas: Vec<_> = state
+            .index
+            .runs
+            .iter()
+            .filter(|run| !selected_names.contains(run.meta.file.as_str()))
+            .map(|run| run.meta.clone())
+            .collect();
+        metas.push(output_meta.clone());
+        (state.index.generation, metas)
+    };
+    PrimaryRunManifest::new(expected_generation, metas)
+        .prepare(&indexes_dir)?
+        .publish()?;
+
+    let _commit = shared.commit.lock();
+    let mut state = shared.state.write().unwrap();
+    let still_current = state.index.generation == expected_generation
+        && selected
+            .iter()
+            .all(|(meta, _)| state.index.runs.iter().any(|run| run.meta == *meta));
+    if !still_current {
+        // A canonical rewrite does not depend on this disposable manifest and
+        // may race the unlocked rename. Restore the run set matching its new
+        // generation before deleting our unused output.
+        PrimaryRunManifest::new(state.index.generation, state.index.run_metas())
+            .publish(&indexes_dir)?;
+        drop(state);
+        let _ = fs::remove_file(&path);
+        return Ok(());
+    }
     state
         .index
         .runs
@@ -1134,26 +1189,69 @@ fn compact_one_secondary_level(shared: &Arc<Shared>) -> Result<()> {
     };
     let output_index = Arc::new(PagedIndex::open(&path)?);
     validate_secondary_run(&output_index)?;
+    let _publication = shared.derived_manifest_publication.lock().unwrap();
 
-    let _commit = shared.commit.lock().unwrap();
+    let selected_names: HashSet<_> = selected
+        .iter()
+        .map(|(meta, _)| meta.file.as_str())
+        .collect();
+    let manifest = {
+        let _commit = shared.commit.lock();
+        let state = shared.state.read().unwrap();
+        let Some(index) = state.secondary.get(&key) else {
+            drop(state);
+            let _ = fs::remove_file(&path);
+            return Ok(());
+        };
+        let still_current = index.generation == generation
+            && selected
+                .iter()
+                .all(|(meta, _)| index.runs.iter().any(|run| run.meta == *meta));
+        if !still_current {
+            drop(state);
+            let _ = fs::remove_file(&path);
+            return Ok(());
+        }
+        let mut metas: Vec<_> = index
+            .runs
+            .iter()
+            .filter(|run| !selected_names.contains(run.meta.file.as_str()))
+            .map(|run| run.meta.clone())
+            .collect();
+        metas.push(output_meta.clone());
+        DerivedRunManifest::new(
+            DerivedRunKind::Secondary,
+            &key.0,
+            &key.1,
+            generation,
+            metas,
+            [0, 0],
+        )
+    };
+    let manifest_outcome = manifest
+        .prepare(&sidx_manifest_path(&shared.dir, &key.0, &key.1))?
+        .publish()?;
+    if let PublishOutcome::SyncFailed(error) = manifest_outcome {
+        return Err(error.into());
+    }
+
+    let _commit = shared.commit.lock();
     let mut state = shared.state.write().unwrap();
     let Some(index) = state.secondary.get_mut(&key) else {
         drop(state);
         let _ = fs::remove_file(&path);
         return Ok(());
     };
-    let still_current = selected
-        .iter()
-        .all(|(meta, _)| index.runs.iter().any(|run| run.meta == *meta));
+    let still_current = index.generation == generation
+        && selected
+            .iter()
+            .all(|(meta, _)| index.runs.iter().any(|run| run.meta == *meta));
     if !still_current {
+        publish_secondary_manifest(&shared.dir, &key.0, &key.1, index.generation, index)?;
         drop(state);
         let _ = fs::remove_file(&path);
         return Ok(());
     }
-    let selected_names: HashSet<_> = selected
-        .iter()
-        .map(|(meta, _)| meta.file.as_str())
-        .collect();
     index
         .runs
         .retain(|run| !selected_names.contains(run.meta.file.as_str()));
@@ -1161,7 +1259,6 @@ fn compact_one_secondary_level(shared: &Arc<Shared>) -> Result<()> {
         meta: output_meta,
         index: output_index,
     });
-    publish_secondary_manifest(&shared.dir, &key.0, &key.1, index.generation, index)?;
     let catalog = state.catalog.clone();
     drop(state);
 
@@ -1179,7 +1276,9 @@ fn compact_one_secondary_level(shared: &Arc<Shared>) -> Result<()> {
     shared
         .secondary_run_compaction_bytes_written
         .fetch_add(output_bytes, AtomicOrdering::Relaxed);
-    cleanup_orphan_sidx(&shared.dir, &catalog);
+    if !shared.background_derived.lock().unwrap().running {
+        cleanup_orphan_sidx(&shared.dir, &catalog);
+    }
     Ok(())
 }
 
@@ -1261,26 +1360,70 @@ fn compact_one_text_level(shared: &Arc<Shared>) -> Result<()> {
     };
     let output_index = Arc::new(PagedIndex::open(&path)?);
     validate_text_run(&output_index)?;
+    let _publication = shared.derived_manifest_publication.lock().unwrap();
 
-    let _commit = shared.commit.lock().unwrap();
+    let selected_names: HashSet<_> = selected
+        .iter()
+        .map(|(meta, _)| meta.file.as_str())
+        .collect();
+    let manifest = {
+        let _commit = shared.commit.lock();
+        let state = shared.state.read().unwrap();
+        let Some(index) = state.text.get(&key) else {
+            drop(state);
+            let _ = fs::remove_file(&path);
+            return Ok(());
+        };
+        let still_current = index.generation == generation
+            && selected
+                .iter()
+                .all(|(meta, _)| index.runs.iter().any(|run| run.meta == *meta));
+        if !still_current {
+            drop(state);
+            let _ = fs::remove_file(&path);
+            return Ok(());
+        }
+        let mut metas: Vec<_> = index
+            .runs
+            .iter()
+            .filter(|run| !selected_names.contains(run.meta.file.as_str()))
+            .map(|run| run.meta.clone())
+            .collect();
+        metas.push(output_meta.clone());
+        let (doc_count, total_len) = index.doc_stats();
+        DerivedRunManifest::new(
+            DerivedRunKind::Text,
+            &key.0,
+            &key.1,
+            generation,
+            metas,
+            [doc_count, total_len],
+        )
+    };
+    let manifest_outcome = manifest
+        .prepare(&tidx_manifest_path(&shared.dir, &key.0, &key.1))?
+        .publish()?;
+    if let PublishOutcome::SyncFailed(error) = manifest_outcome {
+        return Err(error.into());
+    }
+
+    let _commit = shared.commit.lock();
     let mut state = shared.state.write().unwrap();
     let Some(index) = state.text.get_mut(&key) else {
         drop(state);
         let _ = fs::remove_file(&path);
         return Ok(());
     };
-    let still_current = selected
-        .iter()
-        .all(|(meta, _)| index.runs.iter().any(|run| run.meta == *meta));
+    let still_current = index.generation == generation
+        && selected
+            .iter()
+            .all(|(meta, _)| index.runs.iter().any(|run| run.meta == *meta));
     if !still_current {
+        publish_text_manifest(&shared.dir, &key.0, &key.1, index.generation, index)?;
         drop(state);
         let _ = fs::remove_file(&path);
         return Ok(());
     }
-    let selected_names: HashSet<_> = selected
-        .iter()
-        .map(|(meta, _)| meta.file.as_str())
-        .collect();
     index
         .runs
         .retain(|run| !selected_names.contains(run.meta.file.as_str()));
@@ -1288,7 +1431,6 @@ fn compact_one_text_level(shared: &Arc<Shared>) -> Result<()> {
         meta: output_meta,
         index: output_index,
     });
-    publish_text_manifest(&shared.dir, &key.0, &key.1, index.generation, index)?;
     let catalog = state.catalog.clone();
     drop(state);
 
@@ -1306,7 +1448,9 @@ fn compact_one_text_level(shared: &Arc<Shared>) -> Result<()> {
     shared
         .text_run_compaction_bytes_written
         .fetch_add(output_bytes, AtomicOrdering::Relaxed);
-    cleanup_orphan_tidx(&shared.dir, &catalog);
+    if !shared.background_derived.lock().unwrap().running {
+        cleanup_orphan_tidx(&shared.dir, &catalog);
+    }
     Ok(())
 }
 
@@ -1361,6 +1505,16 @@ struct SecIdx {
     /// Final removals since publication. Tombstones are required even when
     /// the matching add lives in a non-base level.
     removed: HashMap<Vec<u8>, BTreeSet<String>>,
+    /// Immutable in-memory overlay being written by background maintenance.
+    /// New commits land in `delta`/`removed` and therefore never mutate the
+    /// generation owned by the worker.
+    frozen: Option<Arc<FrozenSecDelta>>,
+}
+
+struct FrozenSecDelta {
+    generation: u64,
+    delta: HashMap<Vec<u8>, BTreeSet<String>>,
+    removed: HashMap<Vec<u8>, BTreeSet<String>>,
 }
 
 struct SecPairCursor<'a> {
@@ -1411,6 +1565,7 @@ impl SecIdx {
             runs: Vec::new(),
             delta: map,
             removed: HashMap::new(),
+            frozen: None,
         }
     }
 
@@ -1423,6 +1578,7 @@ impl SecIdx {
             runs,
             delta: HashMap::new(),
             removed: HashMap::new(),
+            frozen: None,
         })
     }
 
@@ -1456,6 +1612,18 @@ impl SecIdx {
             Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
             None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
         });
+        let mut frozen_added = self.frozen.as_ref().and_then(|frozen| {
+            frozen.delta.get(key).map(|ids| match after {
+                Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
+                None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
+            })
+        });
+        let mut frozen_removed = self.frozen.as_ref().and_then(|frozen| {
+            frozen.removed.get(key).map(|ids| match after {
+                Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
+                None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
+            })
+        });
         let mut out = Vec::with_capacity(limit.min(1024));
         loop {
             let next_persisted = cursors
@@ -1468,8 +1636,16 @@ impl SecIdx {
             let next_removed = removed
                 .as_mut()
                 .and_then(|iter| iter.peek().map(|id| id.as_str()));
+            let next_frozen_added = frozen_added
+                .as_mut()
+                .and_then(|iter| iter.peek().map(|id| id.as_str()));
+            let next_frozen_removed = frozen_removed
+                .as_mut()
+                .and_then(|iter| iter.peek().map(|id| id.as_str()));
             let Some(id) = next_persisted
                 .into_iter()
+                .chain(next_frozen_added)
+                .chain(next_frozen_removed)
                 .chain(next_added)
                 .chain(next_removed)
                 .min()
@@ -1486,6 +1662,30 @@ impl SecIdx {
                         newest = Some((version, operation));
                     }
                     cursor.advance()?;
+                }
+            }
+            let frozen_generation = self.frozen.as_ref().map(|frozen| frozen.generation);
+            if frozen_added.as_mut().is_some_and(|iter| {
+                iter.peek()
+                    .is_some_and(|candidate| candidate.as_str() == id)
+            }) {
+                frozen_added.as_mut().expect("checked above").next();
+                let operation = (
+                    frozen_generation.expect("frozen iterator has generation"),
+                    SECONDARY_ADD,
+                );
+                if newest.is_none_or(|current| operation.0 > current.0) {
+                    newest = Some(operation);
+                }
+            }
+            if frozen_removed.as_mut().is_some_and(|iter| {
+                iter.peek()
+                    .is_some_and(|candidate| candidate.as_str() == id)
+            }) {
+                frozen_removed.as_mut().expect("checked above").next();
+                let generation = frozen_generation.expect("frozen iterator has generation");
+                if newest.is_none_or(|current| generation >= current.0) {
+                    newest = Some((generation, SECONDARY_DELETE));
                 }
             }
             if added.as_mut().is_some_and(|iter| {
@@ -1529,7 +1729,7 @@ impl SecIdx {
                 self.delta.remove(key);
             }
         }
-        if !self.runs.is_empty() {
+        if !self.runs.is_empty() || self.frozen.is_some() {
             self.removed
                 .entry(key.to_vec())
                 .or_default()
@@ -1546,6 +1746,44 @@ impl SecIdx {
                 .sum()
         }
         map_bytes(&self.delta) + map_bytes(&self.removed)
+    }
+
+    fn frozen_delta_memory_bytes(&self) -> usize {
+        fn map_bytes(map: &HashMap<Vec<u8>, BTreeSet<String>>) -> usize {
+            map.iter()
+                .map(|(key, ids)| {
+                    key.len() + 96 + ids.iter().map(|id| id.len() + 48).sum::<usize>()
+                })
+                .sum()
+        }
+        self.frozen.as_ref().map_or(0, |frozen| {
+            map_bytes(&frozen.delta).saturating_add(map_bytes(&frozen.removed))
+        })
+    }
+
+    fn freeze_delta(&mut self, generation: u64) -> Option<Arc<FrozenSecDelta>> {
+        if self.frozen.is_some() || (self.delta.is_empty() && self.removed.is_empty()) {
+            return None;
+        }
+        let frozen = Arc::new(FrozenSecDelta {
+            generation,
+            delta: std::mem::take(&mut self.delta),
+            removed: std::mem::take(&mut self.removed),
+        });
+        self.frozen = Some(frozen.clone());
+        Some(frozen)
+    }
+
+    fn frozen_matches(&self, frozen: &Arc<FrozenSecDelta>) -> bool {
+        self.frozen
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, frozen))
+    }
+
+    fn clear_frozen(&mut self, frozen: &Arc<FrozenSecDelta>) {
+        if self.frozen_matches(frozen) {
+            self.frozen = None;
+        }
     }
 }
 
@@ -1633,10 +1871,16 @@ struct State {
     text: HashMap<(String, String), TextIdx>,
     /// Directory for out-of-line blob chunks.
     blobs: PathBuf,
-    readers: HashMap<u32, File>,
+    readers: SegmentReaders,
     segments: Vec<SegmentMeta>,
     next_segment_id: u32,
 }
+
+/// Open immutable segment handles. Keeping them behind `Arc` lets read paths
+/// retain exactly the files they need after releasing the global state lock.
+/// Compaction may unlink an old segment meanwhile, but the open descriptor
+/// remains valid until the last in-flight reader drops its clone.
+type SegmentReaders = HashMap<u32, Arc<File>>;
 
 impl State {
     fn id_is_above_high_watermark(&self, table: &str, id: &str) -> bool {
@@ -1686,14 +1930,50 @@ impl State {
     fn index_delta_memory_bytes(&self) -> usize {
         self.index
             .delta_memory_bytes()
+            .saturating_add(self.derived_delta_memory_bytes())
+    }
+
+    fn derived_delta_memory_bytes(&self) -> usize {
+        self.secondary
+            .values()
+            .map(SecIdx::delta_memory_bytes)
+            .sum::<usize>()
+            .saturating_add(self.text.values().map(TextIdx::delta_memory_bytes).sum())
+            .saturating_add(self.vector.values().map(VecIdx::delta_memory_bytes).sum())
+    }
+
+    fn derived_delta_memory_bytes_including_frozen(&self) -> usize {
+        self.derived_delta_memory_bytes()
             .saturating_add(
                 self.secondary
                     .values()
-                    .map(SecIdx::delta_memory_bytes)
+                    .map(SecIdx::frozen_delta_memory_bytes)
                     .sum(),
             )
-            .saturating_add(self.text.values().map(TextIdx::delta_memory_bytes).sum())
-            .saturating_add(self.vector.values().map(VecIdx::delta_memory_bytes).sum())
+            .saturating_add(
+                self.text
+                    .values()
+                    .map(TextIdx::frozen_delta_memory_bytes)
+                    .sum(),
+            )
+            .saturating_add(
+                self.vector
+                    .values()
+                    .map(VecIdx::frozen_delta_memory_bytes)
+                    .sum(),
+            )
+    }
+
+    fn has_frozen_derived(&self) -> bool {
+        self.secondary.values().any(|index| index.frozen.is_some())
+            || self
+                .text
+                .values()
+                .any(|index| index.frozen_delta().is_some())
+            || self
+                .vector
+                .values()
+                .any(|index| index.frozen_delta().is_some())
     }
 }
 
@@ -1707,6 +1987,7 @@ fn identity_manifest(state: &State) -> BTreeMap<String, i64> {
 
 /// A vector waiting to be indexed in background (Async mode).
 struct VecJob {
+    version: u64,
     table: String,
     column: String,
     id: String,
@@ -1717,6 +1998,140 @@ struct CommitState {
     /// None only in read-only mode, where every write path is guarded.
     wal: Option<WalWriter>,
     memtable_bytes: u64,
+    /// The current group accepts commits during its short coalescing window.
+    /// Its own condition variable lets waiters sleep without retaining the
+    /// global commit mutex.
+    wal_sync_group: Option<Arc<WalSyncGroup>>,
+}
+
+enum CommitMutex {
+    /// Preserve the standard mutex's scheduling behavior for Safe group
+    /// commit, where short bursts should append before one elected fsync.
+    Safe(Mutex<CommitState>),
+    /// Adaptive spinning plus explicit fair handoff bounds the queue for
+    /// Fast/Balanced commits that do not require an fsync every time.
+    Concurrent(ParkingMutex<CommitState>),
+}
+
+enum CommitGuard<'a> {
+    Safe(MutexGuard<'a, CommitState>),
+    Concurrent(ParkingMutexGuard<'a, CommitState>),
+}
+
+impl CommitMutex {
+    fn new(state: CommitState, durability: Durability) -> Self {
+        if durability == Durability::Safe {
+            Self::Safe(Mutex::new(state))
+        } else {
+            Self::Concurrent(ParkingMutex::new(state))
+        }
+    }
+
+    fn lock(&self) -> CommitGuard<'_> {
+        match self {
+            Self::Safe(mutex) => CommitGuard::Safe(mutex.lock().unwrap()),
+            Self::Concurrent(mutex) => CommitGuard::Concurrent(mutex.lock()),
+        }
+    }
+}
+
+impl Deref for CommitGuard<'_> {
+    type Target = CommitState;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Safe(guard) => guard,
+            Self::Concurrent(guard) => guard,
+        }
+    }
+}
+
+impl DerefMut for CommitGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Safe(guard) => guard,
+            Self::Concurrent(guard) => guard,
+        }
+    }
+}
+
+impl CommitGuard<'_> {
+    fn unlock_fair(self) {
+        match self {
+            Self::Safe(guard) => drop(guard),
+            Self::Concurrent(guard) => ParkingMutexGuard::unlock_fair(guard),
+        }
+    }
+}
+
+type WalGroupResult = std::result::Result<(), String>;
+
+struct WalSyncGroup {
+    result: Mutex<Option<WalGroupResult>>,
+    done: Condvar,
+    commits: AtomicU64,
+}
+
+struct TimedCommitGuard<'a> {
+    guard: Option<CommitGuard<'a>>,
+    started: Instant,
+    total_nanos: &'a AtomicU64,
+    waiters: &'a AtomicU64,
+    fair_handoff: bool,
+}
+
+impl Deref for TimedCommitGuard<'_> {
+    type Target = CommitState;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_deref().expect("commit guard is held")
+    }
+}
+
+impl DerefMut for TimedCommitGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.as_deref_mut().expect("commit guard is held")
+    }
+}
+
+impl Drop for TimedCommitGuard<'_> {
+    fn drop(&mut self) {
+        self.total_nanos.fetch_add(
+            self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            AtomicOrdering::Relaxed,
+        );
+        let guard = self.guard.take().expect("commit guard is held");
+        if self.fair_handoff && self.waiters.load(AtomicOrdering::Acquire) > 0 {
+            guard.unlock_fair();
+        }
+    }
+}
+
+impl WalSyncGroup {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            done: Condvar::new(),
+            commits: AtomicU64::new(1),
+        }
+    }
+
+    fn join(&self) {
+        self.commits.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn complete(&self, result: WalGroupResult) {
+        *self.result.lock().unwrap() = Some(result);
+        self.done.notify_all();
+    }
+
+    fn wait(&self) -> WalGroupResult {
+        let mut result = self.result.lock().unwrap();
+        while result.is_none() {
+            result = self.done.wait(result).unwrap();
+        }
+        result.as_ref().expect("group completion stored").clone()
+    }
 }
 
 struct FrozenCheckpointJob {
@@ -1732,8 +2147,39 @@ struct FrozenCheckpointJob {
     memory: Option<MemoryPermit>,
 }
 
+struct FrozenSecondaryJob {
+    key: (String, String),
+    frozen: Arc<FrozenSecDelta>,
+}
+
+struct FrozenTextJob {
+    key: (String, String),
+    frozen: Arc<FrozenTextDelta>,
+}
+
+struct FrozenVectorJob {
+    table: String,
+    def: VectorIndexDef,
+    frozen: Arc<VecIdx>,
+    generation: u64,
+}
+
+struct DerivedCheckpointJob {
+    secondary: Vec<FrozenSecondaryJob>,
+    text: Vec<FrozenTextJob>,
+    vector: Vec<FrozenVectorJob>,
+    memory: Option<MemoryPermit>,
+}
+
 #[derive(Debug, Default)]
 struct BackgroundCheckpointState {
+    running: bool,
+    last_error: Option<String>,
+    commit_unknown: bool,
+}
+
+#[derive(Debug, Default)]
+struct BackgroundDerivedState {
     running: bool,
     last_error: Option<String>,
 }
@@ -1770,11 +2216,15 @@ struct Shared {
     state: RwLock<State>,
     /// Serializes commits, checkpoints and compaction. Writers stage in
     /// parallel without this lock and only meet here, at commit.
-    commit: Mutex<CommitState>,
+    commit: CommitMutex,
     /// A canonical rename completed but its directory sync did not. Reads may
     /// continue over the adopted generation, but no later write may extend an
     /// outcome whose crash durability is unknown.
     canonical_error: Mutex<Option<String>>,
+    /// Blob filenames made durable before their WAL record is appended.
+    /// Compaction GC preserves these while commit validation runs without the
+    /// global commit mutex.
+    pending_blob_publications: Mutex<HashSet<String>>,
     /// Serializes catalog changes from validation through durable intent,
     /// application and intent cleanup. The commit mutex alone is insufficient
     /// for multi-phase DDL because backfills deliberately release it.
@@ -1782,16 +2232,25 @@ struct Shared {
     commit_count: AtomicU64,
     commit_nanos: AtomicU64,
     commit_lock_wait_nanos: AtomicU64,
+    commit_lock_hold_nanos: AtomicU64,
     commit_prepare_nanos: AtomicU64,
+    commit_locked_prepare_nanos: AtomicU64,
     commit_wal_nanos: AtomicU64,
+    commit_wal_append_nanos: AtomicU64,
     commit_apply_nanos: AtomicU64,
+    /// Committers currently queued for the serialization mutex. A group
+    /// leader only opens a coalescing window when contention already exists,
+    /// preserving single-writer latency.
+    commit_waiters: AtomicU64,
+    wal_sync_count: AtomicU64,
+    grouped_commit_count: AtomicU64,
     /// version -> live snapshot refcount; compaction preserves these.
     snapshots: Mutex<BTreeMap<u64, usize>>,
     /// Last generated or observed ULID, used to keep implicit ids increasing.
     /// It is initialized from the largest persisted ULID when the database opens.
     last_generated_id: Mutex<Ulid>,
     /// Queue into the background vector-indexing thread (Async mode).
-    vector_tx: Mutex<Option<mpsc::SyncSender<VecJob>>>,
+    vector_tx: Mutex<Option<mpsc::Sender<VecJob>>>,
     /// Vectors enqueued but not yet searchable.
     vector_backlog: AtomicU64,
     vector_worker_alive: AtomicBool,
@@ -1807,9 +2266,40 @@ struct Shared {
     /// the compaction queue because the queued job owns the maintenance pool
     /// while its resident generation remains visible to readers.
     checkpoint_tx: Mutex<Option<mpsc::Sender<FrozenCheckpointJob>>>,
+    derived_tx: Mutex<Option<mpsc::Sender<DerivedCheckpointJob>>>,
     background_checkpoint: Mutex<BackgroundCheckpointState>,
     background_checkpoint_done: Condvar,
+    background_derived: Mutex<BackgroundDerivedState>,
+    background_derived_done: Condvar,
+    /// Orders equality/BM25 run-set replacements without making ordinary
+    /// commits wait for manifest writes or directory syncs.
+    derived_manifest_publication: Mutex<()>,
+    derived_publication_count: AtomicU64,
+    derived_publication_nanos: AtomicU64,
+    #[cfg(test)]
+    derived_test_pause_before_publish: AtomicBool,
+    #[cfg(test)]
+    derived_test_reached_publish: AtomicBool,
+    #[cfg(test)]
+    derived_test_fail_before_manifest_rename: AtomicBool,
+    #[cfg(test)]
+    derived_test_fail_after_manifest_rename: AtomicBool,
+    #[cfg(test)]
+    blob_test_pause_after_publish: AtomicBool,
+    #[cfg(test)]
+    blob_test_reached_publish: AtomicBool,
+    #[cfg(test)]
+    primary_test_pause_before_manifest: AtomicBool,
+    #[cfg(test)]
+    primary_test_reached_manifest: AtomicBool,
+    #[cfg(test)]
+    primary_test_fail_before_manifest_rename: AtomicBool,
+    #[cfg(test)]
+    primary_test_fail_after_manifest_rename: AtomicBool,
     primary_compaction_scheduled: AtomicBool,
+    /// Orders primary run-set replacements while their manifests are written
+    /// without holding the commit mutex.
+    primary_manifest_publication: Mutex<()>,
     primary_run_compaction_count: AtomicU64,
     primary_run_compaction_nanos: AtomicU64,
     primary_run_compaction_bytes_read: AtomicU64,
@@ -1993,6 +2483,7 @@ pub struct Db {
     vector_thread: Option<std::thread::JoinHandle<()>>,
     maintenance_thread: Option<std::thread::JoinHandle<()>>,
     checkpoint_thread: Option<std::thread::JoinHandle<()>>,
+    derived_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Db {
@@ -2001,6 +2492,10 @@ impl Drop for Db {
         // until its publication finishes, so drain it before other workers.
         *self.shared.checkpoint_tx.lock().unwrap() = None;
         if let Some(handle) = self.checkpoint_thread.take() {
+            let _ = handle.join();
+        }
+        *self.shared.derived_tx.lock().unwrap() = None;
+        if let Some(handle) = self.derived_thread.take() {
             let _ = handle.join();
         }
         // Finish an already queued/running compaction before releasing the
@@ -2017,7 +2512,7 @@ impl Drop for Db {
         }
         // A transaction may outlive its originating handle, so preserve the
         // normal commit -> state lock order while publishing final deltas.
-        let _commit = self.shared.commit.lock().unwrap();
+        let _commit = self.shared.commit.lock();
         let _ = consolidate_derived_indexes(&self.shared);
     }
 }
@@ -2041,17 +2536,18 @@ fn maintenance_wait_error(shared: &Shared, operation: &str) -> Error {
 
 /// Attach the background vector-indexing thread and produce the handle.
 fn finish_db(shared: Arc<Shared>) -> Db {
+    if !shared.opts.read_only {
+        cleanup_derived_pending_files(&shared.dir);
+    }
     let initial_delta_bytes = shared.state.read().unwrap().index_delta_memory_bytes();
     shared
         .memory_governor
         .set_index_delta_bytes(initial_delta_bytes);
-    // Bound queued vector payloads and apply backpressure to commits when the
-    // indexer falls behind. Pending jobs are already charged to the index
-    // delta pool; this count bound prevents the channel metadata/payloads from
-    // growing independently until OOM.
-    let vector_queue_capacity =
-        (shared.opts.memory.index_delta_pool_bytes / (64 * 1024)).clamp(16, 4096);
-    let (tx, rx) = mpsc::sync_channel::<VecJob>(vector_queue_capacity);
+    // Pending vector payloads are admitted through and charged to the bounded
+    // index-delta pool before commit. An unbounded channel is therefore safe:
+    // the memory governor supplies the bound, while `send` never parks the
+    // global commit mutex behind a slower indexing worker.
+    let (tx, rx) = mpsc::channel::<VecJob>();
     *shared.vector_tx.lock().unwrap() = Some(tx);
     let sh = shared.clone();
     let handle = std::thread::spawn(move || {
@@ -2059,8 +2555,18 @@ fn finish_db(shared: Arc<Shared>) -> Db {
             while let Ok(job) = rx.recv() {
                 {
                     let mut st = sh.state.write().unwrap();
-                    if let Some(vidx) = st.vector.get_mut(&(job.table, job.column)) {
-                        vidx.insert(&job.id, &job.vector);
+                    // A newer update/delete can commit before this background
+                    // job runs. Never let an old queued vector resurrect or
+                    // overwrite that newer canonical state.
+                    let still_current = st
+                        .latest_owned(&job.table, &job.id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|entry| entry.version == job.version && !entry.is_tombstone());
+                    if still_current {
+                        if let Some(vidx) = st.vector.get_mut(&(job.table, job.column)) {
+                            vidx.insert(&job.id, &job.vector);
+                        }
                     }
                 }
                 sh.vector_backlog.fetch_sub(1, AtomicOrdering::SeqCst);
@@ -2223,6 +2729,7 @@ fn finish_db(shared: Arc<Shared>) -> Db {
                 let result = flush_frozen_checkpoint(&checkpoint_shared, job);
                 let mut status = checkpoint_shared.background_checkpoint.lock().unwrap();
                 status.running = false;
+                status.commit_unknown = matches!(&result, Err(Error::CommitUnknown(_)));
                 status.last_error = result.err().map(|error| error.to_string());
                 checkpoint_shared.background_checkpoint_done.notify_all();
             }
@@ -2233,6 +2740,7 @@ fn finish_db(shared: Arc<Shared>) -> Db {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             status.running = false;
+            status.commit_unknown = false;
             status.last_error = Some("background checkpoint worker panicked".into());
             checkpoint_shared.background_checkpoint_done.notify_all();
             drop(status);
@@ -2242,11 +2750,89 @@ fn finish_db(shared: Arc<Shared>) -> Db {
         }
     });
 
+    let (derived_tx, derived_rx) = mpsc::channel::<DerivedCheckpointJob>();
+    *shared.derived_tx.lock().unwrap() = Some(derived_tx);
+    let derived_shared = shared.clone();
+    let derived_handle = std::thread::spawn(move || {
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            while let Ok(job) = derived_rx.recv() {
+                let started = Instant::now();
+                let result = flush_frozen_derived(&derived_shared, job);
+                if result.is_err() {
+                    // The failed job no longer owns its maintenance permit,
+                    // but its frozen generation remains queryable for retry.
+                    // Transfer that resident memory back to the delta pool.
+                    let _commit = derived_shared.commit.lock();
+                    let state = derived_shared.state.read().unwrap();
+                    let retained = state
+                        .index
+                        .delta_memory_bytes()
+                        .saturating_add(state.derived_delta_memory_bytes_including_frozen());
+                    drop(state);
+                    derived_shared
+                        .memory_governor
+                        .set_index_delta_bytes(retained);
+                }
+                if result.is_ok() {
+                    derived_shared
+                        .derived_publication_count
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    derived_shared.derived_publication_nanos.fetch_add(
+                        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                        AtomicOrdering::Relaxed,
+                    );
+                }
+                let mut status = derived_shared.background_derived.lock().unwrap();
+                status.running = false;
+                status.last_error = result.err().map(|error| error.to_string());
+                if status.last_error.is_some() {
+                    derived_shared
+                        .index_maintenance_failures
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                derived_shared.background_derived_done.notify_all();
+            }
+        }));
+        if outcome.is_err() {
+            let mut status = derived_shared
+                .background_derived
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            status.running = false;
+            status.last_error = Some("background derived-index worker panicked".into());
+            derived_shared.background_derived_done.notify_all();
+        }
+    });
+
     Db {
         shared,
         vector_thread: Some(handle),
         maintenance_thread: Some(maintenance_handle),
         checkpoint_thread: Some(checkpoint_handle),
+        derived_thread: Some(derived_handle),
+    }
+}
+
+fn cleanup_derived_pending_files(dir: &Path) {
+    for child in [INDEXES_DIR, VECTORS_DIR] {
+        let Ok(entries) = fs::read_dir(dir.join(child)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let pending = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.ends_with(".derived-pending")
+                        || name.ends_with(".derived-pending.tmp")
+                        || name.ends_with(".primary-pending")
+                        || name.ends_with(".primary-pending.tmp")
+                });
+            if pending {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -2359,7 +2945,7 @@ impl Db {
         let blobs_dir = dir.join(BLOBS_DIR);
         let db = finish_db(Arc::new(Shared {
             dir,
-            opts,
+            opts: opts.clone(),
             memory_governor,
             _lock_file: lock_file,
             state: RwLock::new(State {
@@ -2377,18 +2963,29 @@ impl Db {
                 segments: Vec::new(),
                 next_segment_id: 1,
             }),
-            commit: Mutex::new(CommitState {
-                wal,
-                memtable_bytes: 0,
-            }),
+            commit: CommitMutex::new(
+                CommitState {
+                    wal,
+                    memtable_bytes: 0,
+                    wal_sync_group: None,
+                },
+                opts.durability,
+            ),
             canonical_error: Mutex::new(None),
+            pending_blob_publications: Mutex::new(HashSet::new()),
             ddl: Mutex::new(()),
             commit_count: AtomicU64::new(0),
             commit_nanos: AtomicU64::new(0),
             commit_lock_wait_nanos: AtomicU64::new(0),
+            commit_lock_hold_nanos: AtomicU64::new(0),
             commit_prepare_nanos: AtomicU64::new(0),
+            commit_locked_prepare_nanos: AtomicU64::new(0),
             commit_wal_nanos: AtomicU64::new(0),
+            commit_wal_append_nanos: AtomicU64::new(0),
             commit_apply_nanos: AtomicU64::new(0),
+            commit_waiters: AtomicU64::new(0),
+            wal_sync_count: AtomicU64::new(0),
+            grouped_commit_count: AtomicU64::new(0),
             snapshots: Mutex::new(BTreeMap::new()),
             last_generated_id: Mutex::new(Ulid::nil()),
             vector_tx: Mutex::new(None),
@@ -2400,9 +2997,36 @@ impl Db {
             maintenance_worker_error: Mutex::new(None),
             index_maintenance_failures: AtomicU64::new(0),
             checkpoint_tx: Mutex::new(None),
+            derived_tx: Mutex::new(None),
             background_checkpoint: Mutex::new(BackgroundCheckpointState::default()),
             background_checkpoint_done: Condvar::new(),
+            background_derived: Mutex::new(BackgroundDerivedState::default()),
+            background_derived_done: Condvar::new(),
+            derived_manifest_publication: Mutex::new(()),
+            derived_publication_count: AtomicU64::new(0),
+            derived_publication_nanos: AtomicU64::new(0),
+            #[cfg(test)]
+            derived_test_pause_before_publish: AtomicBool::new(false),
+            #[cfg(test)]
+            derived_test_reached_publish: AtomicBool::new(false),
+            #[cfg(test)]
+            derived_test_fail_before_manifest_rename: AtomicBool::new(false),
+            #[cfg(test)]
+            derived_test_fail_after_manifest_rename: AtomicBool::new(false),
+            #[cfg(test)]
+            blob_test_pause_after_publish: AtomicBool::new(false),
+            #[cfg(test)]
+            blob_test_reached_publish: AtomicBool::new(false),
+            #[cfg(test)]
+            primary_test_pause_before_manifest: AtomicBool::new(false),
+            #[cfg(test)]
+            primary_test_reached_manifest: AtomicBool::new(false),
+            #[cfg(test)]
+            primary_test_fail_before_manifest_rename: AtomicBool::new(false),
+            #[cfg(test)]
+            primary_test_fail_after_manifest_rename: AtomicBool::new(false),
             primary_compaction_scheduled: AtomicBool::new(false),
+            primary_manifest_publication: Mutex::new(()),
             primary_run_compaction_count: AtomicU64::new(0),
             primary_run_compaction_nanos: AtomicU64::new(0),
             primary_run_compaction_bytes_read: AtomicU64::new(0),
@@ -2497,6 +3121,7 @@ impl Db {
             fs::create_dir_all(dir.join(INDEXES_DIR))?;
             fs::create_dir_all(dir.join(BLOBS_DIR))?;
             cleanup_blob_staging(&dir);
+            cleanup_wal_bridge_staging(&dir);
             cleanup_orphans(&dir, &manifest)?;
             cleanup_orphan_vidx(&dir, &catalog);
             cleanup_orphan_sidx(&dir, &catalog);
@@ -2631,7 +3256,7 @@ impl Db {
             if !outcome.clean || outcome.valid_len != meta.len {
                 preloaded_primary_valid = false;
             }
-            readers.insert(meta.id, file);
+            readers.insert(meta.id, Arc::new(file));
         }
         if ro && preloaded_primary.is_some() && !preloaded_primary_valid {
             // The persisted directory may reference bytes beyond a damaged
@@ -2719,8 +3344,11 @@ impl Db {
             cleanup_primary_run_orphans(&dir);
         }
 
-        // Replay the WAL idempotently: only commits above the manifest
-        // watermark apply; a torn tail is truncated (never in read-only).
+        // Replay the WAL chain idempotently. Checkpoint publication may rotate
+        // writers before its manifest becomes visible, so consecutive WALs
+        // after the manifest's anchor are part of the same recoverable log.
+        // Bridge WALs may duplicate records already present in the anchor;
+        // versions at/below the recovered watermark are skipped.
         let mut committed_version = manifest.committed_version;
         let mut identity_high_water: HashMap<String, i64> = manifest
             .identity_high_water
@@ -2728,58 +3356,78 @@ impl Db {
             .map(|(table, value)| (table.clone(), *value))
             .collect();
         let mut memtable_bytes = 0u64;
-        let wal_file = wal_path(&dir, manifest.wal_id);
-        if !wal_file.exists() {
+        let anchor_wal = wal_path(&dir, manifest.wal_id);
+        if !anchor_wal.exists() {
             return Err(Error::Corrupt(format!(
                 "active WAL {} is missing; it may have contained commits above manifest version {}",
                 manifest.wal_id, manifest.committed_version
             )));
         }
-        let data = match fs::read(&wal_file) {
-            Ok(d) => d,
-            Err(_) if ro => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        let scan = scan_wal(&data);
-        if !scan.clean && !ro {
-            let f = OpenOptions::new().write(true).open(&wal_file)?;
-            f.set_len(scan.valid_len)?;
-            f.sync_all()?;
-        }
-        for rec in scan.records {
-            let expected = committed_version.checked_add(1).ok_or_else(|| {
-                Error::Corrupt("commit version exhausted while replaying WAL".into())
-            })?;
-            if rec.version != expected {
-                return Err(Error::Corrupt(format!(
-                    "WAL commit version gap: expected {expected}, found {}",
-                    rec.version
-                )));
+        let mut active_wal_id = manifest.wal_id;
+        let mut replay_wal_id = manifest.wal_id;
+        loop {
+            let wal_file = wal_path(&dir, replay_wal_id);
+            if !wal_file.exists() {
+                break;
             }
-            for (table, value) in rec.identity_high_water {
-                identity_high_water
-                    .entry(table)
-                    .and_modify(|high| *high = (*high).max(value))
-                    .or_insert(value);
+            let data = match fs::read(&wal_file) {
+                Ok(data) => data,
+                Err(_) if ro => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+            let scan = scan_wal(&data);
+            let clean = scan.clean;
+            if !clean && !ro {
+                let file = OpenOptions::new().write(true).open(&wal_file)?;
+                file.set_len(scan.valid_len)?;
+                file.sync_all()?;
             }
-            for ch in rec.changes {
-                let kind = match ch.payload {
-                    Some(p) => {
-                        memtable_bytes += p.len() as u64;
-                        VKind::MemPut(Arc::new(p))
-                    }
-                    None => VKind::MemTombstone,
-                };
-                primary.push(
-                    &ch.table,
-                    ch.id,
-                    VersionEntry {
-                        version: rec.version,
-                        kind,
-                    },
-                );
+            for rec in scan.records {
+                if rec.version <= committed_version {
+                    continue;
+                }
+                let expected = committed_version.checked_add(1).ok_or_else(|| {
+                    Error::Corrupt("commit version exhausted while replaying WAL".into())
+                })?;
+                if rec.version != expected {
+                    return Err(Error::Corrupt(format!(
+                        "WAL commit version gap: expected {expected}, found {}",
+                        rec.version
+                    )));
+                }
+                for (table, value) in rec.identity_high_water {
+                    identity_high_water
+                        .entry(table)
+                        .and_modify(|high| *high = (*high).max(value))
+                        .or_insert(value);
+                }
+                for ch in rec.changes {
+                    let kind = match ch.payload {
+                        Some(payload) => {
+                            memtable_bytes += payload.len() as u64;
+                            VKind::MemPut(Arc::new(payload))
+                        }
+                        None => VKind::MemTombstone,
+                    };
+                    primary.push(
+                        &ch.table,
+                        ch.id,
+                        VersionEntry {
+                            version: rec.version,
+                            kind,
+                        },
+                    );
+                }
+                committed_version = rec.version;
             }
-            committed_version = rec.version;
+            active_wal_id = replay_wal_id;
+            if !clean {
+                break;
+            }
+            let Some(next) = replay_wal_id.checked_add(1) else {
+                break;
+            };
+            replay_wal_id = next;
         }
 
         // A DDL operation interrupted by a crash is finished below, once the
@@ -2857,7 +3505,7 @@ impl Db {
         let wal = if ro {
             None
         } else {
-            Some(WalWriter::open(&dir, manifest.wal_id)?)
+            Some(WalWriter::open(&dir, active_wal_id)?)
         };
         let blobs_dir = dir.join(BLOBS_DIR);
         let mut last_generated_id = Ulid::nil();
@@ -2887,7 +3535,7 @@ impl Db {
         }
         let db = finish_db(Arc::new(Shared {
             dir,
-            opts,
+            opts: opts.clone(),
             memory_governor,
             _lock_file: lock_file,
             state: RwLock::new(State {
@@ -2905,18 +3553,29 @@ impl Db {
                 segments: manifest.segments,
                 next_segment_id,
             }),
-            commit: Mutex::new(CommitState {
-                wal,
-                memtable_bytes,
-            }),
+            commit: CommitMutex::new(
+                CommitState {
+                    wal,
+                    memtable_bytes,
+                    wal_sync_group: None,
+                },
+                opts.durability,
+            ),
             canonical_error: Mutex::new(None),
+            pending_blob_publications: Mutex::new(HashSet::new()),
             ddl: Mutex::new(()),
             commit_count: AtomicU64::new(0),
             commit_nanos: AtomicU64::new(0),
             commit_lock_wait_nanos: AtomicU64::new(0),
+            commit_lock_hold_nanos: AtomicU64::new(0),
             commit_prepare_nanos: AtomicU64::new(0),
+            commit_locked_prepare_nanos: AtomicU64::new(0),
             commit_wal_nanos: AtomicU64::new(0),
+            commit_wal_append_nanos: AtomicU64::new(0),
             commit_apply_nanos: AtomicU64::new(0),
+            commit_waiters: AtomicU64::new(0),
+            wal_sync_count: AtomicU64::new(0),
+            grouped_commit_count: AtomicU64::new(0),
             snapshots: Mutex::new(BTreeMap::new()),
             last_generated_id: Mutex::new(last_generated_id),
             vector_tx: Mutex::new(None),
@@ -2928,9 +3587,36 @@ impl Db {
             maintenance_worker_error: Mutex::new(None),
             index_maintenance_failures: AtomicU64::new(0),
             checkpoint_tx: Mutex::new(None),
+            derived_tx: Mutex::new(None),
             background_checkpoint: Mutex::new(BackgroundCheckpointState::default()),
             background_checkpoint_done: Condvar::new(),
+            background_derived: Mutex::new(BackgroundDerivedState::default()),
+            background_derived_done: Condvar::new(),
+            derived_manifest_publication: Mutex::new(()),
+            derived_publication_count: AtomicU64::new(0),
+            derived_publication_nanos: AtomicU64::new(0),
+            #[cfg(test)]
+            derived_test_pause_before_publish: AtomicBool::new(false),
+            #[cfg(test)]
+            derived_test_reached_publish: AtomicBool::new(false),
+            #[cfg(test)]
+            derived_test_fail_before_manifest_rename: AtomicBool::new(false),
+            #[cfg(test)]
+            derived_test_fail_after_manifest_rename: AtomicBool::new(false),
+            #[cfg(test)]
+            blob_test_pause_after_publish: AtomicBool::new(false),
+            #[cfg(test)]
+            blob_test_reached_publish: AtomicBool::new(false),
+            #[cfg(test)]
+            primary_test_pause_before_manifest: AtomicBool::new(false),
+            #[cfg(test)]
+            primary_test_reached_manifest: AtomicBool::new(false),
+            #[cfg(test)]
+            primary_test_fail_before_manifest_rename: AtomicBool::new(false),
+            #[cfg(test)]
+            primary_test_fail_after_manifest_rename: AtomicBool::new(false),
             primary_compaction_scheduled: AtomicBool::new(false),
+            primary_manifest_publication: Mutex::new(()),
             primary_run_compaction_count: AtomicU64::new(0),
             primary_run_compaction_nanos: AtomicU64::new(0),
             primary_run_compaction_bytes_read: AtomicU64::new(0),
@@ -3818,6 +4504,7 @@ impl Db {
                     "table name must not be empty".into(),
                 ));
             }
+            validate_short_string("table name", new_name)?;
             if new_name == table {
                 return Ok(());
             }
@@ -3870,6 +4557,7 @@ impl Db {
                     "column name must not be empty".into(),
                 ));
             }
+            validate_short_string("column name", new_name)?;
             if new_name == ID_COLUMN {
                 return Err(Error::InvalidArgument(format!(
                     "column name '{ID_COLUMN}' is reserved for the implicit primary key"
@@ -4291,6 +4979,11 @@ impl Db {
         top_k: usize,
         opts: &VectorSearchOptions,
     ) -> Result<Vec<VectorHit>> {
+        if query.iter().any(|component| !component.is_finite()) {
+            return Err(Error::InvalidArgument(
+                "vector query components must be finite float32 values".into(),
+            ));
+        }
         if top_k == 0 {
             return Ok(Vec::new());
         }
@@ -4403,24 +5096,7 @@ impl Db {
 
     /// Block until every async-committed vector is searchable.
     pub fn wait_vector_indexing(&self) -> Result<()> {
-        while self.vector_indexing_backlog() > 0 {
-            if !self
-                .shared
-                .vector_worker_alive
-                .load(AtomicOrdering::Acquire)
-            {
-                let message = self
-                    .shared
-                    .vector_worker_error
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .clone()
-                    .unwrap_or_else(|| "vector indexing worker stopped with pending work".into());
-                return Err(Error::Io(std::io::Error::other(message)));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        Ok(())
+        wait_vector_indexing_shared(&self.shared)
     }
 
     pub fn tables(&self) -> Vec<String> {
@@ -4462,6 +5138,26 @@ impl Db {
     ) -> Result<crate::sql::QueryOutput> {
         let _memory = self.acquire_query_memory();
         crate::sql::execute_named(self, sql, params)
+    }
+
+    pub(crate) fn query_params_bounded(
+        &self,
+        sql: &str,
+        params: &[Value],
+        max_rows: usize,
+    ) -> Result<crate::sql::QueryOutput> {
+        let _memory = self.acquire_query_memory();
+        crate::sql::execute_positional_bounded(self, sql, params, max_rows)
+    }
+
+    pub(crate) fn query_named_params_bounded(
+        &self,
+        sql: &str,
+        params: &Record,
+        max_rows: usize,
+    ) -> Result<crate::sql::QueryOutput> {
+        let _memory = self.acquire_query_memory();
+        crate::sql::execute_named_bounded(self, sql, params, max_rows)
     }
 
     /// Stream a snapshot-consistent single-table SELECT without materializing
@@ -4651,6 +5347,7 @@ impl Db {
                         ))
                     }
                 };
+                validate_short_string("record id", &id)?;
                 if previous_id
                     .as_deref()
                     .is_some_and(|previous| id.as_str() <= previous)
@@ -4666,7 +5363,7 @@ impl Db {
                     Error::InvalidArgument("bulk record payload exceeds 4 GiB".into())
                 })?;
                 let payload_rel =
-                    encode_entry_into(&mut segment_entry, version, table, &id, Some(&payload));
+                    encode_entry_into(&mut segment_entry, version, table, &id, Some(&payload))?;
                 encode_primary_key_into(table, &id, &mut primary_key_buf);
                 encode_primary_entry_into(
                     &VersionEntry {
@@ -4789,7 +5486,7 @@ impl Db {
             let mut st = self.shared.state.write().unwrap();
             st.committed_version = version;
             st.segments = new_segments;
-            st.readers.insert(next_segment_id, segment_reader);
+            st.readers.insert(next_segment_id, Arc::new(segment_reader));
             st.next_segment_id = next_segment_id.saturating_add(1);
             st.index.generation = generation;
             st.index.runs.push(PrimaryRun {
@@ -4891,7 +5588,8 @@ impl Db {
     }
 
     pub(crate) fn scan_unbudgeted(&self, table: &str) -> Result<Vec<(String, Record)>> {
-        shared_scan_at(&self.shared, table, u64::MAX)
+        let snapshot = self.snapshot();
+        shared_scan_at(&self.shared, table, snapshot.version)
     }
 
     /// At most `limit` visible records, ordered by id and strictly after
@@ -4904,7 +5602,8 @@ impl Db {
         limit: usize,
     ) -> Result<Vec<(String, Record)>> {
         let _memory = self.acquire_query_memory();
-        shared_scan_batch_at(&self.shared, table, u64::MAX, after_id, limit)
+        let snapshot = self.snapshot();
+        shared_scan_batch_at(&self.shared, table, snapshot.version, after_id, limit)
     }
 
     /// All records of a table as of a snapshot, ordered by id.
@@ -4966,7 +5665,19 @@ impl Db {
         column: &str,
         value: &Value,
     ) -> Result<Vec<(String, Record)>> {
+        // Register the exact generation while holding locks in the same order
+        // as compaction (snapshots -> state). This lets record decoding continue
+        // after the state lock is released without blob/segment GC invalidating
+        // the captured sources.
+        let mut snapshots = self.shared.snapshots.lock().unwrap();
         let st = self.shared.state.read().unwrap();
+        let version = st.committed_version;
+        *snapshots.entry(version).or_insert(0) += 1;
+        drop(snapshots);
+        let snapshot = Snapshot {
+            version,
+            shared: self.shared.clone(),
+        };
         let schema = st
             .catalog
             .table(table)
@@ -4977,27 +5688,47 @@ impl Db {
         if value.is_null() {
             return Ok(Vec::new());
         }
-        let mut out = Vec::new();
         if let Some(idx) = st.secondary.get(&(table.to_owned(), column.to_owned())) {
             let ids = idx.ids(&index_key(value))?;
+            let blobs = st.blobs.clone();
+            let mut readers = SegmentReaders::new();
+            let mut prepared = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Some(last) = st.latest_owned(table, &id)? {
+                if let Some(last) = st.visible_owned(table, &id, version)? {
                     if !last.is_tombstone() {
-                        let mut rec = read_record_kind(&st.blobs, &st.readers, &last.kind)?;
-                        rec.entry(ID_COLUMN.into())
-                            .or_insert_with(|| Value::Text(id.clone()));
-                        out.push((id, rec));
+                        if let VKind::SegPut { segment, .. } = &last.kind {
+                            let reader = st.readers.get(segment).ok_or_else(|| {
+                                Error::Corrupt(format!("missing segment {segment}"))
+                            })?;
+                            readers.entry(*segment).or_insert_with(|| reader.clone());
+                        }
+                        prepared.push((id, last.kind));
                     }
                 }
             }
-        } else if self.shared.opts.read_only {
-            // A read-only open intentionally tolerates truncated segments and
-            // indexes only their valid prefixes. Use those validated entry
-            // locations rather than walking the manifest's original lengths.
-            find_eq_via_primary_index(&st, table, column, value, &mut out)?;
-        } else {
-            find_eq_streaming(&self.shared, &st, table, column, value, &mut out)?;
+            drop(st);
+            let mut out = Vec::with_capacity(prepared.len());
+            for (id, kind) in prepared {
+                let mut record = read_record_kind(&blobs, &readers, &kind)?;
+                record
+                    .entry(ID_COLUMN.into())
+                    .or_insert_with(|| Value::Text(id.clone()));
+                out.push((id, record));
+            }
+            out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            return Ok(out);
         }
+
+        if self.shared.opts.read_only {
+            let mut out = Vec::new();
+            find_eq_via_primary_index(&st, table, column, value, &mut out)?;
+            out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            return Ok(out);
+        }
+
+        drop(st);
+        let mut out = shared_scan_at(&self.shared, table, snapshot.version)?;
+        out.retain(|(_, record)| record.get(column).unwrap_or(&Value::Null) == value);
         out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
@@ -5090,15 +5821,37 @@ impl Db {
     /// Drain committed in-memory data into a new immutable segment, publish a
     /// new manifest, and rotate the WAL.
     pub fn checkpoint(&self) -> Result<()> {
-        let mut cs = lock_commit_for_maintenance(&self.shared)?;
-        let _memory = Self::acquire_maintenance_memory(&self.shared);
-        let result = checkpoint_measured(&self.shared, &mut cs);
-        drop(cs);
-        if result.is_ok() {
-            refresh_compaction_debt_if_needed(&self.shared);
-            maybe_schedule_auto_compaction(&self.shared);
+        if self.shared.opts.read_only {
+            return Err(Error::ReadOnly);
         }
-        result
+        // Freeze each canonical generation while holding the commit mutex,
+        // then perform segment/WAL/manifest I/O on the checkpoint worker. New
+        // commits may proceed against the active generation while this method
+        // remains a barrier for everything committed before its freeze.
+        let primary_scheduled = {
+            let mut cs = lock_commit_for_maintenance(&self.shared)?;
+            wait_vector_indexing_shared(&self.shared)?;
+            let memory = Self::acquire_maintenance_memory(&self.shared);
+            schedule_frozen_checkpoint(&self.shared, &mut cs, memory)?
+        };
+        if primary_scheduled {
+            wait_for_background_checkpoint(&self.shared)?;
+        }
+
+        let derived_scheduled = {
+            let cs = lock_commit_for_maintenance(&self.shared)?;
+            wait_vector_indexing_shared(&self.shared)?;
+            let memory = Self::acquire_maintenance_memory(&self.shared);
+            let scheduled = schedule_frozen_derived(&self.shared, memory)?;
+            drop(cs);
+            scheduled
+        };
+        if derived_scheduled {
+            wait_for_background_derived(&self.shared)?;
+        }
+        refresh_compaction_debt_if_needed(&self.shared);
+        maybe_schedule_auto_compaction(&self.shared);
+        Ok(())
     }
 
     /// Cumulative checkpoint count and wall time for this open handle.
@@ -5126,14 +5879,34 @@ impl Db {
                     .commit_lock_wait_nanos
                     .load(AtomicOrdering::Relaxed),
             ),
+            commit_lock_hold_time: Duration::from_nanos(
+                self.shared
+                    .commit_lock_hold_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
             commit_prepare_time: Duration::from_nanos(
                 self.shared
                     .commit_prepare_nanos
                     .load(AtomicOrdering::Relaxed),
             ),
+            commit_locked_prepare_time: Duration::from_nanos(
+                self.shared
+                    .commit_locked_prepare_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
             commit_wal_time: Duration::from_nanos(
                 self.shared.commit_wal_nanos.load(AtomicOrdering::Relaxed),
             ),
+            commit_wal_append_time: Duration::from_nanos(
+                self.shared
+                    .commit_wal_append_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
+            wal_syncs: self.shared.wal_sync_count.load(AtomicOrdering::Relaxed),
+            grouped_commits: self
+                .shared
+                .grouped_commit_count
+                .load(AtomicOrdering::Relaxed),
             commit_apply_time: Duration::from_nanos(
                 self.shared.commit_apply_nanos.load(AtomicOrdering::Relaxed),
             ),
@@ -5227,6 +6000,15 @@ impl Db {
                 .shared
                 .text_checkpoint_bytes_written
                 .load(AtomicOrdering::Relaxed),
+            derived_publications: self
+                .shared
+                .derived_publication_count
+                .load(AtomicOrdering::Relaxed),
+            derived_publication_time: Duration::from_nanos(
+                self.shared
+                    .derived_publication_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
         }
     }
 
@@ -5536,7 +6318,7 @@ impl Db {
                             &out_table,
                             id,
                             payload.as_deref(),
-                        );
+                        )?;
                         let kind = match &payload {
                             Some(payload) => VKind::SegPut {
                                 segment: seg_id,
@@ -5573,7 +6355,7 @@ impl Db {
                 id: seg_id,
                 len: segment_position,
             });
-            new_readers.insert(seg_id, File::open(&seg_path)?);
+            new_readers.insert(seg_id, Arc::new(File::open(&seg_path)?));
         }
         fsync_dir(&shared.dir.join(SEGMENTS_DIR))?;
 
@@ -5695,7 +6477,11 @@ impl Db {
         // no HashSet proportional to the number of chunks is retained.
         let blobs_dir = shared.dir.join(BLOBS_DIR);
         if publication_error.is_none() {
+            let pending = shared.pending_blob_publications.lock().unwrap();
             gc_blob_files(&blobs_dir, |stem| {
+                if pending.contains(stem) {
+                    return true;
+                }
                 let mut found = false;
                 blob_refs_index
                     .visit_key(stem.as_bytes(), |_| {
@@ -5810,6 +6596,24 @@ impl Txn {
         crate::sql::execute_txn_named(self, sql, params)
     }
 
+    pub(crate) fn query_params_bounded(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        max_rows: usize,
+    ) -> Result<crate::sql::QueryOutput> {
+        crate::sql::execute_txn_positional_bounded(self, sql, params, max_rows)
+    }
+
+    pub(crate) fn query_named_bounded(
+        &mut self,
+        sql: &str,
+        params: &Record,
+        max_rows: usize,
+    ) -> Result<crate::sql::QueryOutput> {
+        crate::sql::execute_txn_named_bounded(self, sql, params, max_rows)
+    }
+
     /// Read through this transaction: staged writes first, then the snapshot.
     pub fn get(&self, table: &str, id: &str) -> Result<Option<Record>> {
         let has_implicit_id = self
@@ -5890,6 +6694,7 @@ impl Txn {
                 next.to_string()
             }
             (true, Some(Value::Text(s))) if !s.is_empty() => {
+                validate_short_string("record id", s)?;
                 if let Ok(explicit) = Ulid::from_string(s) {
                     let mut previous = self.shared.last_generated_id.lock().unwrap();
                     if explicit > *previous {
@@ -6391,8 +7196,8 @@ fn prepare_creation_directory(dir: &Path) -> Result<()> {
                 dir.display()
             )));
         }
-        let mut entries = fs::read_dir(dir)?;
-        if entries.next().transpose()?.is_some() {
+        let entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        if !entries.is_empty() {
             let owned_partial =
                 fs::read(dir.join(CREATION_FILE)).is_ok_and(|bytes| bytes == CREATION_MAGIC);
             if !owned_partial {
@@ -6401,8 +7206,22 @@ fn prepare_creation_directory(dir: &Path) -> Result<()> {
                     dir.display()
                 )));
             }
-            fs::remove_dir_all(dir)?;
-            fs::create_dir(dir)?;
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| !is_creation_artifact(&entry.file_name()))
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "refusing to remove unknown file '{}' while recovering an incomplete database creation",
+                    entry.path().display()
+                )));
+            }
+            for entry in entries {
+                if entry.file_type()?.is_dir() {
+                    fs::remove_dir_all(entry.path())?;
+                } else {
+                    fs::remove_file(entry.path())?;
+                }
+            }
         }
     } else {
         fs::create_dir(dir)?;
@@ -6412,6 +7231,28 @@ fn prepare_creation_directory(dir: &Path) -> Result<()> {
     journal.write_all(CREATION_MAGIC)?;
     journal.sync_all()?;
     fsync_dir(dir)
+}
+
+fn is_creation_artifact(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(
+            CREATION_FILE
+                | CATALOG_FILE
+                | "catalog.json.tmp"
+                | "manifest"
+                | "manifest.prev"
+                | "manifest.tmp"
+                | "manifest.prev.tmp"
+                | LOCK_FILE
+                | SEGMENTS_DIR
+                | WAL_DIR
+                | VECTORS_DIR
+                | INDEXES_DIR
+                | BLOBS_DIR
+                | ".ELITESQL.tmp"
+        )
+    )
 }
 
 fn cleanup_orphans(dir: &Path, manifest: &Manifest) -> Result<()> {
@@ -6438,11 +7279,10 @@ fn cleanup_orphans(dir: &Path, manifest: &Manifest) -> Result<()> {
         let name = name.to_string_lossy();
         if let Some(stem) = name.strip_suffix(".wal") {
             if let Ok(id) = stem.parse::<u32>() {
-                if id != manifest.wal_id
-                    && previous
-                        .as_ref()
-                        .is_none_or(|previous| id != previous.wal_id)
-                {
+                let is_previous = previous
+                    .as_ref()
+                    .is_some_and(|previous| id == previous.wal_id);
+                if id < manifest.wal_id && !is_previous {
                     let _ = fs::remove_file(dirent.path());
                 }
             }
@@ -6461,6 +7301,22 @@ fn cleanup_blob_staging(dir: &Path) {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.ends_with(".blob.tmp"))
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn cleanup_wal_bridge_staging(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir.join(WAL_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".wal.bridge.tmp"))
         {
             let _ = fs::remove_file(path);
         }
@@ -6526,9 +7382,14 @@ fn rewrite_payload_columns(
         fields.push((out_name, &payload[value_start..pos]));
     }
     let mut buf = Vec::with_capacity(payload.len());
-    buf.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+    let field_count = u16::try_from(fields.len())
+        .map_err(|_| Error::InvalidArgument("record has more than 65535 stored columns".into()))?;
+    buf.extend_from_slice(&field_count.to_le_bytes());
     for (name, value) in &fields {
-        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        let name_len = u16::try_from(name.len()).map_err(|_| {
+            Error::InvalidArgument("column name exceeds the 65535-byte storage limit".into())
+        })?;
+        buf.extend_from_slice(&name_len.to_le_bytes());
         buf.extend_from_slice(name.as_bytes());
         buf.extend_from_slice(value);
     }
@@ -6591,29 +7452,22 @@ fn shared_get_at(
 }
 
 fn shared_scan_at(shared: &Shared, table: &str, max_version: u64) -> Result<Vec<(String, Record)>> {
-    let st = shared.state.read().unwrap();
-    let schema = st
-        .catalog
-        .table(table)
-        .ok_or_else(|| Error::TableNotFound(table.into()))?;
-    let epoch = schema.epoch;
     let mut out = Vec::new();
-    st.index.visit_table(table, None, |id, versions| {
-        if let Some(entry) = versions
-            .iter()
-            .rev()
-            .find(|entry| entry.version <= max_version && entry.version > epoch)
-        {
-            if !entry.is_tombstone() {
-                let mut rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-                if schema.has_implicit_id() {
-                    rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
-                }
-                out.push((id.to_owned(), rec));
-            }
+    let mut after_id = None;
+    let batch_rows = shared.opts.memory.scan_batch_rows.max(1);
+    loop {
+        let batch =
+            shared_scan_batch_at(shared, table, max_version, after_id.as_deref(), batch_rows)?;
+        let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
+            break;
+        };
+        let complete = batch.len() < batch_rows;
+        out.extend(batch);
+        after_id = Some(last_id);
+        if complete {
+            break;
         }
-        Ok(true)
-    })?;
+    }
     Ok(out)
 }
 
@@ -6633,7 +7487,9 @@ fn shared_scan_batch_at(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let mut out = Vec::with_capacity(limit);
+    let implicit_id = schema.has_implicit_id();
+    let blobs = st.blobs.clone();
+    let mut prepared = Vec::with_capacity(limit);
     st.index.visit_table(table, after_id, |id, versions| {
         let Some(entry) = versions
             .iter()
@@ -6645,21 +7501,91 @@ fn shared_scan_batch_at(
         if entry.is_tombstone() {
             return Ok(true);
         }
-        let mut rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-        if schema.has_implicit_id() {
-            rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
-        }
-        out.push((id.to_owned(), rec));
-        if out.len() == limit {
+        prepared.push((id.to_owned(), entry.kind.clone()));
+        if prepared.len() == limit {
             return Ok(false);
         }
         Ok(true)
     })?;
+    let mut readers = SegmentReaders::new();
+    for (_, kind) in &prepared {
+        if let VKind::SegPut { segment, .. } = kind {
+            let reader = st
+                .readers
+                .get(segment)
+                .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
+            readers.entry(*segment).or_insert_with(|| reader.clone());
+        }
+    }
+    drop(st);
+
+    let mut out = Vec::with_capacity(prepared.len());
+    for (id, kind) in prepared {
+        let mut record = read_record_kind(&blobs, &readers, &kind)?;
+        if implicit_id {
+            record.insert(ID_COLUMN.into(), Value::Text(id.clone()));
+        }
+        out.push((id, record));
+    }
     Ok(out)
 }
 
 /// The optimistic commit path. Serialized by the commit mutex; readers are
 /// only blocked during the short in-memory apply at the end.
+fn finish_or_wait_wal_sync(
+    shared: &Arc<Shared>,
+    group: Arc<WalSyncGroup>,
+    leader: bool,
+) -> WalGroupResult {
+    if !leader {
+        return group.wait();
+    }
+
+    // Only a contended writer opens the coalescing window. Uncontended Safe
+    // commits retain their original one-sync latency.
+    if shared.commit_waiters.load(AtomicOrdering::Acquire) > 0 {
+        std::thread::sleep(GROUP_COMMIT_MAX_DELAY);
+    }
+
+    let mut cs = shared.commit.lock();
+    debug_assert!(
+        cs.wal_sync_group
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &group)),
+        "the elected WAL sync group stays active until its leader completes"
+    );
+    let outcome = cs.wal().sync_data();
+    cs.wal_sync_group = None;
+    shared.wal_sync_count.fetch_add(1, AtomicOrdering::Relaxed);
+    let commits = group.commits.load(AtomicOrdering::Acquire);
+    if commits > 1 {
+        shared
+            .grouped_commit_count
+            .fetch_add(commits, AtomicOrdering::Relaxed);
+    }
+    drop(cs);
+
+    let result = match outcome {
+        WalAppendOutcome::Complete => Ok(()),
+        WalAppendOutcome::SyncFailed(error) => Err(error.to_string()),
+    };
+    group.complete(result.clone());
+    result
+}
+
+fn lock_commit_for_transaction(shared: &Shared) -> TimedCommitGuard<'_> {
+    TimedCommitGuard {
+        guard: Some(shared.commit.lock()),
+        started: Instant::now(),
+        total_nanos: &shared.commit_lock_hold_nanos,
+        waiters: &shared.commit_waiters,
+        // Safe group commit benefits from allowing the current CPU to append
+        // several queued records before the elected leader fsyncs them. Fast
+        // and Balanced need fair handoff to bound mutex-tail latency instead.
+        fair_handoff: shared.opts.durability != Durability::Safe,
+    }
+}
+
 fn commit_staged(
     shared: &Arc<Shared>,
     snap_version: u64,
@@ -6720,13 +7646,123 @@ fn commit_staged(
         });
     }
     staged.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    // Most transactions do not advance an identity sequence. Encode their
+    // potentially large payloads before taking the global commit mutex, then
+    // patch the final version and CRC once conflict validation assigns it.
+    // Identity high-water marks are read under the mutex and therefore keep
+    // the legacy encoding path below.
+    let preencoded_wal = if staged
+        .iter()
+        .all(|table| !table.schema.columns.iter().any(|column| column.identity))
+    {
+        let wal_changes: Vec<(&str, &str, Option<&[u8]>)> = staged
+            .iter()
+            .flat_map(|table| {
+                table.changes.iter().map(|change| {
+                    (
+                        table.name.as_str(),
+                        change.id.as_str(),
+                        change.payload.as_deref().map(|payload| payload.as_slice()),
+                    )
+                })
+            })
+            .collect();
+        Some(encode_commit(0, &wal_changes, &[])?)
+    } else {
+        None
+    };
+    // Blob files are already individually synced. Publish their names and
+    // sync the blob directory before contending for the commit mutex; the
+    // pending set makes concurrent compaction GC treat them as referenced
+    // until either this commit applies or aborts.
+    let _pending_blobs = PendingBlobPublications::new(shared.clone(), &blob_sink);
+    blob_sink.publish()?;
+    #[cfg(test)]
+    {
+        shared
+            .blob_test_reached_publish
+            .store(true, AtomicOrdering::Release);
+        while shared
+            .blob_test_pause_after_publish
+            .load(AtomicOrdering::Acquire)
+        {
+            std::thread::yield_now();
+        }
+    }
+    // Decode prior indexed records optimistically while writers still prepare
+    // in parallel. Commit validation below re-reads each latest version under
+    // the serialization mutex; a cached record is used only when its version
+    // still matches, so concurrent updates remain conflicts and checkpoint
+    // representation changes remain safe.
+    let has_derived_indexes = staged.iter().any(|table| {
+        !table.schema.indexes.is_empty()
+            || !table.schema.text_indexes.is_empty()
+            || !table.schema.vector_indexes.is_empty()
+    });
+    let (incoming_index_bytes, optimistic_prior_records) = if has_derived_indexes {
+        let state = shared.state.read().unwrap();
+        let incoming_index_bytes = estimate_staged_index_bytes(&state, &staged)?;
+        let records = staged
+            .iter()
+            .map(|table| {
+                table
+                    .changes
+                    .iter()
+                    .map(|change| {
+                        if table.schema.indexes.is_empty() && table.schema.text_indexes.is_empty() {
+                            return Ok(None);
+                        }
+                        let previous = if state.id_is_above_high_watermark(&table.name, &change.id)
+                        {
+                            None
+                        } else {
+                            state.latest_owned(&table.name, &change.id)?
+                        };
+                        match previous {
+                            Some(entry) if !entry.is_tombstone() => Ok(Some((
+                                entry.version,
+                                read_record_kind(&state.blobs, &state.readers, &entry.kind)?,
+                            ))),
+                            _ => Ok(None),
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (incoming_index_bytes, records)
+    } else {
+        let bytes = staged
+            .iter()
+            .flat_map(|table| &table.changes)
+            .map(|change| {
+                change
+                    .id
+                    .len()
+                    .saturating_add(change.payload.as_ref().map_or(0, |value| value.len()))
+                    .saturating_add(144)
+            })
+            .fold(0usize, usize::saturating_add);
+        let records = staged
+            .iter()
+            .map(|table| vec![None; table.changes.len()])
+            .collect();
+        (bytes, records)
+    };
+    if incoming_index_bytes > shared.memory_governor.index_capacity() {
+        return Err(Error::MemoryLimit(format!(
+            "transaction needs an estimated {incoming_index_bytes} index-delta bytes, but the pool is {} bytes; split the transaction or raise memory.index_delta_pool_bytes",
+            shared.memory_governor.index_capacity()
+        )));
+    }
     let outside_prepare_time = prepare_started.elapsed();
 
     let mut lock_wait = Duration::ZERO;
     let mut locked_prepare_time = Duration::ZERO;
     let (mut cs, previous_entries, commit_version, incoming_index_bytes, identity_high_water) = loop {
         let lock_started = Instant::now();
-        let mut cs = shared.commit.lock().unwrap();
+        shared.commit_waiters.fetch_add(1, AtomicOrdering::AcqRel);
+        let mut cs = lock_commit_for_transaction(shared);
+        shared.commit_waiters.fetch_sub(1, AtomicOrdering::AcqRel);
         lock_wait = lock_wait.saturating_add(lock_started.elapsed());
         // Surface asynchronous I/O failure before this transaction reaches
         // its WAL durability point; reporting it after apply would make the
@@ -6735,9 +7771,9 @@ fn commit_staged(
         let locked_prepare_started = Instant::now();
         let mut previous_entries: Vec<Vec<(Option<VersionEntry>, Option<Record>)>> =
             Vec::with_capacity(staged.len());
-        let (commit_version, incoming_index_bytes, identity_high_water) = {
+        let (commit_version, identity_high_water) = {
             let st = shared.state.read().unwrap();
-            for table in &staged {
+            for (table_index, table) in staged.iter().enumerate() {
                 if st.catalog.table(&table.name) != Some(&table.schema) {
                     return Err(Error::Conflict(format!(
                         "schema for {} changed while the transaction was preparing",
@@ -6745,7 +7781,7 @@ fn commit_staged(
                     )));
                 }
                 let mut table_previous = Vec::with_capacity(table.changes.len());
-                for change in &table.changes {
+                for (change_index, change) in table.changes.iter().enumerate() {
                     // Write-write conflict: someone committed a change to this
                     // record after our snapshot.
                     let previous = if st.id_is_above_high_watermark(&table.name, &change.id) {
@@ -6771,7 +7807,12 @@ fn commit_staged(
                                 && (!table.schema.indexes.is_empty()
                                     || !table.schema.text_indexes.is_empty()) =>
                         {
-                            Some(read_record_kind(&st.blobs, &st.readers, &entry.kind)?)
+                            match &optimistic_prior_records[table_index][change_index] {
+                                Some((version, record)) if *version == entry.version => {
+                                    Some(record.clone())
+                                }
+                                _ => Some(read_record_kind(&st.blobs, &st.readers, &entry.kind)?),
+                            }
                         }
                         _ => None,
                     };
@@ -6790,30 +7831,51 @@ fn commit_staged(
                         .map(|value| (table.name.clone(), *value))
                 })
                 .collect();
-            (
-                st.committed_version + 1,
-                estimate_staged_index_bytes(&st, &staged)?,
-                identity_high_water,
-            )
+            (st.committed_version + 1, identity_high_water)
         };
         locked_prepare_time = locked_prepare_time.saturating_add(locked_prepare_started.elapsed());
-        if incoming_index_bytes > shared.memory_governor.index_capacity() {
-            return Err(Error::MemoryLimit(format!(
-                "transaction needs an estimated {incoming_index_bytes} index-delta bytes, but the pool is {} bytes; split the transaction or raise memory.index_delta_pool_bytes",
-                shared.memory_governor.index_capacity()
-            )));
-        }
         if shared
             .memory_governor
             .index_would_exceed(incoming_index_bytes)
         {
+            if let Some(group) = cs.wal_sync_group.clone() {
+                drop(cs);
+                let _ = group.wait();
+                continue;
+            }
+            let (derived_bytes, has_frozen_derived) = {
+                let state = shared.state.read().unwrap();
+                (
+                    state.derived_delta_memory_bytes(),
+                    state.has_frozen_derived(),
+                )
+            };
+            let derived_running = shared.background_derived.lock().unwrap().running;
+            if derived_running {
+                drop(cs);
+                wait_for_background_derived(shared)?;
+                continue;
+            }
+            if derived_bytes > 0 || has_frozen_derived {
+                wait_vector_indexing_shared(shared)?;
+                let memory = Db::acquire_maintenance_memory(shared);
+                if schedule_frozen_derived(shared, memory)? {
+                    drop(cs);
+                    wait_for_background_derived(shared)?;
+                    continue;
+                }
+            }
             if shared.state.read().unwrap().index.frozen.is_some() {
                 drop(cs);
                 wait_for_background_checkpoint(shared)?;
                 continue;
             }
-            let _memory = Db::acquire_maintenance_memory(shared);
-            consolidate_index_deltas_locked(shared, &mut cs)?;
+            let memory = Db::acquire_maintenance_memory(shared);
+            if schedule_frozen_checkpoint(shared, &mut cs, memory)? {
+                drop(cs);
+                wait_for_background_checkpoint(shared)?;
+                continue;
+            }
             if shared
                 .memory_governor
                 .index_would_exceed(incoming_index_bytes)
@@ -6832,38 +7894,54 @@ fn commit_staged(
             identity_high_water,
         );
     };
-    // Blob payloads are prepared outside the commit mutex so large values do
-    // not serialize writers. Promote their temporary files only now: a
-    // concurrent compaction holds this same mutex while running blob GC, so
-    // it can never delete a newly published chunk before the WAL references
-    // it. The directory sync happens before the WAL durability point.
-    blob_sink.publish()?;
     let prepare_time = outside_prepare_time.saturating_add(locked_prepare_time);
     // Durability point: the WAL record is the commit.
     let wal_started = Instant::now();
-    let wal_changes: Vec<(&str, &str, Option<&[u8]>)> = staged
-        .iter()
-        .flat_map(|table| {
-            table.changes.iter().map(|change| {
-                (
-                    table.name.as_str(),
-                    change.id.as_str(),
-                    change.payload.as_deref().map(|payload| payload.as_slice()),
-                )
-            })
-        })
-        .collect();
-    let identity_wal: Vec<(&str, i64)> = identity_high_water
-        .iter()
-        .map(|(table, value)| (table.as_str(), *value))
-        .collect();
-    let bytes = encode_commit(commit_version, &wal_changes, &identity_wal);
-    let wal_outcome = cs.wal().append_commit(
-        &bytes,
+    let mut bytes = match preencoded_wal {
+        Some(bytes) => bytes,
+        None => {
+            let wal_changes: Vec<(&str, &str, Option<&[u8]>)> = staged
+                .iter()
+                .flat_map(|table| {
+                    table.changes.iter().map(|change| {
+                        (
+                            table.name.as_str(),
+                            change.id.as_str(),
+                            change.payload.as_deref().map(|payload| payload.as_slice()),
+                        )
+                    })
+                })
+                .collect();
+            let identity_wal: Vec<(&str, i64)> = identity_high_water
+                .iter()
+                .map(|(table, value)| (table.as_str(), *value))
+                .collect();
+            encode_commit(commit_version, &wal_changes, &identity_wal)?
+        }
+    };
+    let wal_append_started = Instant::now();
+    set_encoded_commit_version(&mut bytes, commit_version);
+    cs.wal().append_commit_unflushed(&bytes)?;
+    let sync_due = cs.wal().sync_due(
         shared.opts.durability,
         shared.opts.balanced_sync_interval_ms,
-    )?;
-    let wal_time = wal_started.elapsed();
+    );
+    let sync_group = if sync_due {
+        match cs.wal_sync_group.as_ref() {
+            Some(group) => {
+                group.join();
+                Some((group.clone(), false))
+            }
+            None => {
+                let group = Arc::new(WalSyncGroup::new());
+                cs.wal_sync_group = Some(group.clone());
+                Some((group, true))
+            }
+        }
+    } else {
+        None
+    };
+    let wal_append_time = wal_append_started.elapsed();
 
     // Publish atomically to readers.
     let apply_started = Instant::now();
@@ -6961,16 +8039,43 @@ fn commit_staged(
     shared
         .memory_governor
         .add_index_delta_bytes(incoming_index_bytes);
+    let maintenance_needed = cs.memtable_bytes >= shared.opts.memtable_max_bytes;
+    let derived_schedule_needed = {
+        let memory = shared.memory_governor.stats();
+        memory.index_delta_bytes >= memory.index_delta_capacity_bytes / 2
+            && shared.state.read().unwrap().derived_delta_memory_bytes() > 0
+    };
+    drop(cs);
+
+    let wal_result = sync_group.map_or(Ok(()), |(group, leader)| {
+        finish_or_wait_wal_sync(shared, group, leader)
+    });
+    let wal_time = wal_started.elapsed();
+
     let maintenance_result = (|| -> Result<()> {
-        if cs.memtable_bytes >= shared.opts.memtable_max_bytes {
-            let frozen_running = shared.state.read().unwrap().index.frozen.is_some();
-            if !frozen_running {
-                let memory = Db::acquire_maintenance_memory(shared);
-                if !schedule_frozen_checkpoint(shared, &mut cs, memory)? {
-                    let _memory = Db::acquire_maintenance_memory(shared);
-                    checkpoint_measured(shared, &mut cs)?;
-                    refresh_compaction_debt_if_needed(shared);
-                    maybe_schedule_auto_compaction(shared);
+        if maintenance_needed || derived_schedule_needed {
+            let mut cs = lock_commit_after_group_sync(shared);
+            if derived_schedule_needed && !shared.background_derived.lock().unwrap().running {
+                if let Some(memory) = shared.memory_governor.try_acquire(
+                    MemoryPool::Maintenance,
+                    shared.opts.memory.maintenance_pool_bytes,
+                ) {
+                    let _ = schedule_frozen_derived(shared, memory)?;
+                }
+            }
+            if cs.memtable_bytes >= shared.opts.memtable_max_bytes {
+                // The derived worker owns the sole maintenance reservation
+                // and needs this mutex for its final publication. Defer the
+                // soft-threshold primary checkpoint instead of waiting for
+                // that reservation while holding the mutex. A later commit
+                // schedules it; hard index pressure waits outside the mutex.
+                if shared.background_derived.lock().unwrap().running {
+                    return Ok(());
+                }
+                let frozen_running = shared.state.read().unwrap().index.frozen.is_some();
+                if !frozen_running {
+                    let memory = Db::acquire_maintenance_memory(shared);
+                    let _ = schedule_frozen_checkpoint(shared, &mut cs, memory)?;
                 }
             }
         }
@@ -6982,6 +8087,7 @@ fn commit_staged(
         // failure that callers might retry. Defer it to the next write before
         // that write reaches its own durability point.
         let mut status = shared.background_checkpoint.lock().unwrap();
+        status.commit_unknown = matches!(&error, Error::CommitUnknown(_));
         status.last_error = Some(format!("post-commit maintenance failed: {error}"));
     }
     let elapsed_nanos = |duration: Duration| duration.as_nanos().min(u64::MAX as u128) as u64;
@@ -6997,37 +8103,26 @@ fn commit_staged(
         .commit_prepare_nanos
         .fetch_add(elapsed_nanos(prepare_time), AtomicOrdering::Relaxed);
     shared
+        .commit_locked_prepare_nanos
+        .fetch_add(elapsed_nanos(locked_prepare_time), AtomicOrdering::Relaxed);
+    shared
         .commit_wal_nanos
         .fetch_add(elapsed_nanos(wal_time), AtomicOrdering::Relaxed);
     shared
+        .commit_wal_append_nanos
+        .fetch_add(elapsed_nanos(wal_append_time), AtomicOrdering::Relaxed);
+    shared
         .commit_apply_nanos
         .fetch_add(elapsed_nanos(apply_time), AtomicOrdering::Relaxed);
-    match wal_outcome {
-        WalAppendOutcome::Complete => Ok(commit_version),
-        WalAppendOutcome::SyncFailed(error) => Err(Error::CommitUnknown(format!(
-            "version {commit_version} was published, but syncing its WAL record failed: {error}"
+    match wal_result {
+        Ok(()) => Ok(commit_version),
+        Err(error) => Err(Error::CommitUnknown(format!(
+            "version {commit_version} was published, but syncing its WAL group failed: {error}"
         ))),
     }
 }
 
 fn estimate_staged_index_bytes(st: &State, staged: &[PreparedTable]) -> Result<usize> {
-    if !st.catalog.tables.iter().any(|schema| {
-        !schema.indexes.is_empty()
-            || !schema.text_indexes.is_empty()
-            || !schema.vector_indexes.is_empty()
-    }) {
-        return Ok(staged
-            .iter()
-            .flat_map(|table| &table.changes)
-            .map(|change| {
-                change
-                    .id
-                    .len()
-                    .saturating_add(change.payload.as_ref().map_or(0, |value| value.len()))
-                    .saturating_add(144)
-            })
-            .fold(0usize, usize::saturating_add));
-    }
     let mut bytes = 0usize;
     for table in staged {
         for change in &table.changes {
@@ -7437,6 +8532,7 @@ fn apply_one_owned(
                     }
                 }
                 IndexingMode::Async => jobs.push(VecJob {
+                    version,
                     table: table.to_owned(),
                     column: vdef.column.clone(),
                     id: id_ref.to_owned(),
@@ -7457,7 +8553,10 @@ fn apply_one_owned(
 /// referencing it, and rotate the WAL. Runs under the commit mutex.
 fn checkpoint_measured(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
     let started = Instant::now();
-    let result = checkpoint_locked(shared, cs).and_then(|_| consolidate_derived_indexes(shared));
+    // Derived overlays have their own frozen background pipeline. Canonical
+    // checkpoint latency must not include serializing secondary/text/vector
+    // indexes under the commit mutex.
+    let result = checkpoint_locked(shared, cs);
     if result.is_ok() {
         let nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         shared
@@ -7479,6 +8578,9 @@ fn wait_for_background_checkpoint(shared: &Arc<Shared>) -> Result<()> {
             .unwrap_or_else(|poison| poison.into_inner());
     }
     if let Some(message) = status.last_error.take() {
+        if std::mem::take(&mut status.commit_unknown) {
+            return Err(Error::CommitUnknown(message));
+        }
         return Err(Error::Io(std::io::Error::other(format!(
             "background checkpoint failed: {message}"
         ))));
@@ -7490,6 +8592,9 @@ fn take_background_checkpoint_error(shared: &Shared) -> Result<()> {
     let mut status = shared.background_checkpoint.lock().unwrap();
     if !status.running {
         if let Some(message) = status.last_error.take() {
+            if std::mem::take(&mut status.commit_unknown) {
+                return Err(Error::CommitUnknown(message));
+            }
             return Err(Error::Io(std::io::Error::other(format!(
                 "background checkpoint failed: {message}"
             ))));
@@ -7498,15 +8603,47 @@ fn take_background_checkpoint_error(shared: &Shared) -> Result<()> {
     Ok(())
 }
 
-fn lock_commit_for_maintenance<'a>(shared: &'a Arc<Shared>) -> Result<MutexGuard<'a, CommitState>> {
+fn lock_commit_for_maintenance<'a>(shared: &'a Arc<Shared>) -> Result<CommitGuard<'a>> {
     ensure_canonical_writable(shared)?;
     loop {
         wait_for_background_checkpoint(shared)?;
-        let guard = shared.commit.lock().unwrap();
-        if shared.state.read().unwrap().index.frozen.is_none() {
+        wait_for_background_derived(shared)?;
+        let guard = lock_commit_after_group_sync(shared);
+        let derived_running = shared.background_derived.lock().unwrap().running;
+        if shared.state.read().unwrap().index.frozen.is_none() && !derived_running {
             return Ok(guard);
         }
         drop(guard);
+    }
+}
+
+fn wait_vector_indexing_shared(shared: &Shared) -> Result<()> {
+    while shared.vector_backlog.load(AtomicOrdering::SeqCst) > 0 {
+        if !shared.vector_worker_alive.load(AtomicOrdering::Acquire) {
+            let message = shared
+                .vector_worker_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+                .unwrap_or_else(|| "vector indexing worker stopped with pending work".into());
+            return Err(Error::Io(std::io::Error::other(message)));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+/// WAL rotation must never overtake a group whose callers still depend on the
+/// current generation's sync result. Ordinary run-manifest publication may
+/// use the raw mutex because it does not replace the WAL.
+fn lock_commit_after_group_sync(shared: &Arc<Shared>) -> CommitGuard<'_> {
+    loop {
+        let guard = shared.commit.lock();
+        let Some(group) = guard.wal_sync_group.clone() else {
+            return guard;
+        };
+        drop(guard);
+        let _ = group.wait();
     }
 }
 
@@ -7565,11 +8702,11 @@ fn fence_writes(shared: &Shared, message: impl Into<String>) {
 }
 
 fn background_checkpoint_supported(shared: &Shared) -> bool {
-    if shared.vector_backlog.load(AtomicOrdering::SeqCst) != 0 {
-        return false;
-    }
-    let state = shared.state.read().unwrap();
-    state.secondary.is_empty() && state.text.is_empty() && state.vector.is_empty()
+    // Canonical primary data can be frozen independently of disposable
+    // secondary/text/vector overlays. Async vector jobs are the only exception:
+    // their charged payloads have not reached the overlay yet, so freezing until
+    // they drain keeps memory accounting and index publication ordered.
+    shared.vector_backlog.load(AtomicOrdering::SeqCst) == 0
 }
 
 /// Freeze the active primary delta in O(1), transfer its memory charge to the
@@ -7589,7 +8726,8 @@ fn schedule_frozen_checkpoint(
         return Ok(false);
     }
     debug_assert!(status.last_error.is_none(), "checked before WAL commit");
-    let job = {
+    status.commit_unknown = false;
+    let (job, retained_index_bytes) = {
         let mut state = shared.state.write().unwrap();
         if state.index.frozen.is_some() || state.index.delta.is_empty() {
             return Ok(false);
@@ -7611,10 +8749,15 @@ fn schedule_frozen_checkpoint(
             version: job.version,
             delta: frozen,
         });
-        job
+        let retained = state.index_delta_memory_bytes();
+        (job, retained)
     };
     cs.memtable_bytes = 0;
-    shared.memory_governor.set_index_delta_bytes(0);
+    // Only the primary delta moved to the maintenance-owned frozen generation;
+    // derived overlays remain live and must stay charged to their pool.
+    shared
+        .memory_governor
+        .set_index_delta_bytes(retained_index_bytes);
     status.running = true;
     let sent = shared
         .checkpoint_tx
@@ -7633,7 +8776,7 @@ fn schedule_frozen_checkpoint(
 }
 
 fn thaw_frozen_checkpoint(shared: &Arc<Shared>) {
-    let _commit = shared.commit.lock().unwrap();
+    let _commit = shared.commit.lock();
     thaw_frozen_checkpoint_locked(shared);
 }
 
@@ -7674,6 +8817,21 @@ fn flush_frozen_checkpoint(shared: &Arc<Shared>, mut job: FrozenCheckpointJob) -
 }
 
 fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob) -> Result<()> {
+    struct ReservedWalFiles {
+        bridge: PathBuf,
+        active: PathBuf,
+        armed: bool,
+    }
+
+    impl Drop for ReservedWalFiles {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = fs::remove_file(&self.active);
+                let _ = fs::remove_file(&self.bridge);
+            }
+        }
+    }
+
     struct MemEntry {
         table_index: usize,
         id_start: usize,
@@ -7757,7 +8915,7 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
             table,
             id,
             entry.payload.as_deref().map(Vec::as_slice),
-        );
+        )?;
         locs[index] = (
             position + payload_rel,
             entry
@@ -7782,6 +8940,10 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
     });
     let generation = primary_generation(job.version, &new_segments, &job.catalog);
     let indexes_dir = shared.dir.join(INDEXES_DIR);
+    // Protect the prepared run from another publisher's orphan cleanup. This
+    // mutex never serializes ordinary commits, and primary compaction releases
+    // its maintenance memory before acquiring it, preserving lock order.
+    let _publication = shared.primary_manifest_publication.lock().unwrap();
     let file = if job.first_primary_run {
         "primary.pidx".to_owned()
     } else {
@@ -7843,40 +9005,88 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
     let primary_index = Arc::new(PagedIndex::open(&primary_path)?);
     let segment_reader = File::open(&seg_path)?;
 
-    // Stop WAL appends only for the short publication phase. The prefix up to
-    // wal_cutoff belongs to the frozen segment; the raw record-aligned tail
-    // is copied to the next WAL so concurrent commits remain recoverable.
-    let mut cs = shared.commit.lock().unwrap();
-    if cs.wal().id != job.wal_id || cs.wal().len < job.wal_cutoff {
-        return Err(Error::Corrupt(
-            "background checkpoint observed an unexpected WAL generation".into(),
-        ));
+    // Two durable empty successor WALs form a recovery bridge before the
+    // active writer is switched: a crash sees either the old manifest + old
+    // WAL + successors, or the new manifest + copied tail + active successor.
+    let bridge_wal_id = job
+        .wal_id
+        .checked_add(1)
+        .ok_or_else(|| Error::Corrupt("WAL id exhausted during checkpoint".into()))?;
+    let active_wal_id = job
+        .wal_id
+        .checked_add(2)
+        .ok_or_else(|| Error::Corrupt("WAL id exhausted during checkpoint".into()))?;
+    let wal_dir = shared.dir.join(WAL_DIR);
+    let bridge_path = wal_path(&shared.dir, bridge_wal_id);
+    let active_path = wal_path(&shared.dir, active_wal_id);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&bridge_path)?
+        .sync_all()?;
+    if let Err(error) = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&active_path)
+        .and_then(|file| file.sync_all())
+    {
+        let _ = fs::remove_file(&bridge_path);
+        return Err(error.into());
     }
-    let (still_frozen, mut new_primary_runs) = {
-        let state = shared.state.read().unwrap();
-        (
-            state.index.frozen.as_ref().is_some_and(|frozen| {
-                frozen.version == job.version && Arc::ptr_eq(&frozen.delta, &job.frozen)
-            }),
-            // Primary run compaction is allowed while the frozen segment is
-            // being written. It publishes under this same commit mutex, so
-            // the current run set—not the one captured at freeze time—is the
-            // authoritative base for the new L0 manifest.
-            state.index.run_metas(),
-        )
+    let mut reserved_wals = ReservedWalFiles {
+        bridge: bridge_path.clone(),
+        active: active_path.clone(),
+        armed: true,
     };
-    if !still_frozen {
-        return Err(Error::Corrupt(
-            "background checkpoint lost its frozen generation".into(),
-        ));
+    fsync_dir(&wal_dir)?;
+    let active_wal = WalWriter::open(&shared.dir, active_wal_id)?;
+
+    // The mutex is held only for validation and the in-memory writer swap.
+    // All WAL copying and manifest fsyncs happen after it is released.
+    let (mut old_wal, tail_len, mut new_primary_runs) = {
+        let mut cs = lock_commit_after_group_sync(shared);
+        if cs.wal().id != job.wal_id || cs.wal().len < job.wal_cutoff {
+            return Err(Error::Corrupt(
+                "background checkpoint observed an unexpected WAL generation".into(),
+            ));
+        }
+        let state = shared.state.read().unwrap();
+        let still_frozen = state.index.frozen.as_ref().is_some_and(|frozen| {
+            frozen.version == job.version && Arc::ptr_eq(&frozen.delta, &job.frozen)
+        });
+        if !still_frozen {
+            return Err(Error::Corrupt(
+                "background checkpoint lost its frozen generation".into(),
+            ));
+        }
+        let runs = state.index.run_metas();
+        drop(state);
+        let tail_len = cs.wal().len - job.wal_cutoff;
+        let old_wal = cs
+            .wal
+            .replace(active_wal)
+            .expect("writable checkpoint has an active WAL");
+        (old_wal, tail_len, runs)
+    };
+    // From this point forward the active writer may contain acknowledged
+    // commits. Neither successor may be removed on an error; recovery follows
+    // the consecutive WAL chain from the still-current manifest.
+    reserved_wals.armed = false;
+
+    if let WalAppendOutcome::SyncFailed(error) = old_wal.sync_data() {
+        let _commit = shared.commit.lock();
+        thaw_frozen_checkpoint_locked(shared);
+        return Err(error.into());
     }
-    let new_wal_id = job.wal_id + 1;
-    let new_wal_path = wal_path(&shared.dir, new_wal_id);
+
+    // Build the bridge through a temporary inode. Recovery can safely cross
+    // the durable empty placeholder while this copy is incomplete; the full
+    // duplicate tail appears atomically only after it has been synced.
+    let bridge_tmp = wal_dir.join(format!("{bridge_wal_id:06}.wal.bridge.tmp"));
     let mut source = File::open(wal_path(&shared.dir, job.wal_id))?;
     source.seek(SeekFrom::Start(job.wal_cutoff))?;
-    let tail_len = cs.wal().len - job.wal_cutoff;
     let mut raw_tail = source.take(tail_len);
-    let target = File::create(&new_wal_path)?;
+    let target = File::create(&bridge_tmp)?;
     let mut target = BufWriter::with_capacity(writer_bytes, target);
     let copied = std::io::copy(&mut raw_tail, &mut target)?;
     if copied != tail_len {
@@ -7889,45 +9099,95 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
         .into_inner()
         .map_err(|error| Error::Io(error.into_error()))?;
     target.sync_all()?;
-    fsync_dir(&shared.dir.join(WAL_DIR))?;
-    let next_wal = WalWriter::open(&shared.dir, new_wal_id)?;
+    fs::rename(&bridge_tmp, &bridge_path)?;
+    fsync_dir(&wal_dir)?;
+
+    #[cfg(test)]
+    {
+        shared
+            .primary_test_reached_manifest
+            .store(true, AtomicOrdering::Release);
+        while shared
+            .primary_test_pause_before_manifest
+            .load(AtomicOrdering::Acquire)
+        {
+            std::thread::yield_now();
+        }
+    }
 
     new_primary_runs.push(primary_meta.clone());
-    PrimaryRunManifest::new(generation, new_primary_runs).publish(&indexes_dir)?;
-    let manifest_outcome = Manifest {
+    let primary_publish_error = PrimaryRunManifest::new(generation, new_primary_runs)
+        .publish(&indexes_dir)
+        .err();
+    let published_manifest = Manifest {
         format_version: FORMAT_VERSION,
         committed_version: job.version,
         segments: new_segments.clone(),
-        wal_id: new_wal_id,
+        wal_id: bridge_wal_id,
         identity_high_water: job.identity_high_water.clone(),
         catalog: Some(job.catalog.clone()),
+    };
+    #[cfg(test)]
+    if shared
+        .primary_test_fail_before_manifest_rename
+        .swap(false, AtomicOrdering::AcqRel)
+    {
+        return Err(Error::Io(std::io::Error::other(
+            "injected primary manifest rename failure",
+        )));
     }
-    .publish(&shared.dir)?;
+    let manifest_outcome = match published_manifest.publish(&shared.dir) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _commit = shared.commit.lock();
+            thaw_frozen_checkpoint_locked(shared);
+            return Err(error);
+        }
+    };
+    #[cfg(test)]
+    let manifest_outcome = if shared
+        .primary_test_fail_after_manifest_rename
+        .swap(false, AtomicOrdering::AcqRel)
+    {
+        PublishOutcome::SyncFailed(std::io::Error::other(
+            "injected primary manifest directory sync failure",
+        ))
+    } else {
+        manifest_outcome
+    };
 
-    cs.wal = Some(next_wal);
-    let mut state = shared.state.write().unwrap();
-    if !new_segment_superseded {
-        new_segment_superseded = state.index.delta.iter().any(|(table, ids)| {
-            job.frozen
-                .get(table)
-                .is_some_and(|frozen_ids| ids.keys().any(|id| frozen_ids.contains_key(id)))
+    let retained = {
+        let _commit = shared.commit.lock();
+        let mut state = shared.state.write().unwrap();
+        let still_frozen = state.index.frozen.as_ref().is_some_and(|frozen| {
+            frozen.version == job.version && Arc::ptr_eq(&frozen.delta, &job.frozen)
         });
-    }
-    state.readers.insert(seg_id, segment_reader);
-    state.segments = new_segments;
-    state.next_segment_id = seg_id + 1;
-    if new_segment_superseded {
-        state.superseded_segments.insert(seg_id);
-    }
-    state.index.frozen = None;
-    state.index.generation = generation;
-    state.index.runs.push(PrimaryRun {
-        meta: primary_meta,
-        index: primary_index,
-    });
-    let retained = state.index_delta_memory_bytes();
-    drop(state);
-    drop(cs);
+        if !still_frozen {
+            return Err(Error::Corrupt(
+                "background checkpoint lost its frozen generation before adoption".into(),
+            ));
+        }
+        if !new_segment_superseded {
+            new_segment_superseded = state.index.delta.iter().any(|(table, ids)| {
+                job.frozen
+                    .get(table)
+                    .is_some_and(|frozen_ids| ids.keys().any(|id| frozen_ids.contains_key(id)))
+            });
+        }
+        state.readers.insert(seg_id, Arc::new(segment_reader));
+        state.segments = new_segments;
+        state.next_segment_id = seg_id + 1;
+        if new_segment_superseded {
+            state.superseded_segments.insert(seg_id);
+        }
+        state.index.frozen = None;
+        state.index.generation = generation;
+        state.index.runs.push(PrimaryRun {
+            meta: primary_meta,
+            index: primary_index,
+        });
+        state.index_delta_memory_bytes()
+    };
 
     let publication_error =
         publication_sync_error(shared, "background checkpoint manifest", manifest_outcome);
@@ -7938,7 +9198,7 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
                 format_version: FORMAT_VERSION,
                 committed_version: job.version,
                 segments: shared.state.read().unwrap().segments.clone(),
-                wal_id: new_wal_id,
+                wal_id: bridge_wal_id,
                 identity_high_water: job.identity_high_water.clone(),
                 catalog: Some(job.catalog.clone()),
             },
@@ -7951,6 +9211,15 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
     shared
         .checkpoint_count
         .fetch_add(1, AtomicOrdering::Relaxed);
+    if let Some(error) = primary_publish_error {
+        record_maintenance_error(
+            shared,
+            format!("primary run manifest will be rebuilt on reopen: {error}"),
+        );
+        shared
+            .index_maintenance_failures
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
     cleanup_primary_run_orphans(&shared.dir);
     maybe_schedule_primary_compaction(shared);
     refresh_compaction_debt_if_needed(shared);
@@ -8094,7 +9363,7 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
                 table,
                 id,
                 m.payload.as_ref().map(|p| p.as_slice()),
-            );
+            )?;
             locs[index] = (
                 position + payload_rel,
                 m.payload.as_ref().map_or(0, |p| p.len() as u32),
@@ -8227,9 +9496,11 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
         if let Some((seg_id, _)) = &written {
             st.readers.insert(
                 *seg_id,
-                prepared_segment_reader
-                    .take()
-                    .expect("reader prepared before canonical publication"),
+                Arc::new(
+                    prepared_segment_reader
+                        .take()
+                        .expect("reader prepared before canonical publication"),
+                ),
             );
             st.next_segment_id = seg_id + 1;
             if new_segment_superseded {
@@ -8289,30 +9560,483 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
     publication_error.map_or(Ok(()), Err)
 }
 
-/// Publish every mutable index delta as an immutable mmap run. The caller
-/// holds the commit mutex and a maintenance-memory permit, so commits cannot
-/// race the snapshot being published and concurrent maintenance cannot stack
-/// another large working set on top.
-fn consolidate_index_deltas_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
-    // Estimates for async vector jobs are charged at commit. Drain those jobs
-    // before reconciling against actual structures, otherwise resetting the
-    // counter here could forget already-admitted but not-yet-applied vectors.
-    while shared.vector_backlog.load(AtomicOrdering::SeqCst) > 0 {
-        if !shared.vector_worker_alive.load(AtomicOrdering::Acquire) {
-            let message = shared
-                .vector_worker_error
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .clone()
-                .unwrap_or_else(|| "vector worker stopped with pending work".into());
-            return Err(Error::Io(std::io::Error::other(message)));
+/// Move every mutable derived overlay into an immutable in-memory generation
+/// in O(number of indexes), then let the maintenance worker perform graph/run
+/// serialization without the commit mutex or state write lock.
+fn schedule_frozen_derived(shared: &Arc<Shared>, memory: MemoryPermit) -> Result<bool> {
+    let vector_ready = shared.vector_backlog.load(AtomicOrdering::SeqCst) == 0;
+    let mut status = shared.background_derived.lock().unwrap();
+    if status.running {
+        return Ok(false);
+    }
+    status.last_error = None;
+
+    let (secondary, text, vector, retained) = {
+        let mut state = shared.state.write().unwrap();
+        let version = state.committed_version;
+        let mut secondary = Vec::new();
+        for (key, index) in &mut state.secondary {
+            let frozen = index.frozen.clone().or_else(|| index.freeze_delta(version));
+            if let Some(frozen) = frozen {
+                secondary.push(FrozenSecondaryJob {
+                    key: key.clone(),
+                    frozen,
+                });
+            }
         }
+        let mut text = Vec::new();
+        for (key, index) in &mut state.text {
+            let frozen = index
+                .frozen_delta()
+                .or_else(|| index.freeze_delta_background(version));
+            if let Some(frozen) = frozen {
+                text.push(FrozenTextJob {
+                    key: key.clone(),
+                    frozen,
+                });
+            }
+        }
+        let definitions: HashMap<(String, String), VectorIndexDef> = state
+            .catalog
+            .tables
+            .iter()
+            .flat_map(|table| {
+                table
+                    .vector_indexes
+                    .iter()
+                    .cloned()
+                    .map(|def| ((table.name.clone(), def.column.clone()), def))
+            })
+            .collect();
+        let mut vector = Vec::new();
+        for (key, index) in &mut state.vector {
+            let frozen = index.frozen_delta().or_else(|| {
+                vector_ready
+                    .then(|| index.freeze_delta_background(version))
+                    .flatten()
+            });
+            if let (Some(frozen), Some(generation), Some(def)) =
+                (frozen, index.frozen_generation(), definitions.get(key))
+            {
+                vector.push(FrozenVectorJob {
+                    table: key.0.clone(),
+                    def: def.clone(),
+                    frozen,
+                    generation,
+                });
+            }
+        }
+        let retained = state.index_delta_memory_bytes();
+        (secondary, text, vector, retained)
+    };
+
+    if secondary.is_empty() && text.is_empty() && vector.is_empty() {
+        return Ok(false);
+    }
+    shared.memory_governor.set_index_delta_bytes(retained);
+    let job = DerivedCheckpointJob {
+        secondary,
+        text,
+        vector,
+        memory: Some(memory),
+    };
+    status.running = true;
+    let sent = shared
+        .derived_tx
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|sender| sender.send(job).is_ok());
+    if !sent {
+        status.running = false;
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "derived-index maintenance worker is unavailable",
+        )));
+    }
+    shared.memory_governor.record_index_consolidation();
+    Ok(true)
+}
+
+fn wait_for_background_derived(shared: &Arc<Shared>) -> Result<()> {
+    let mut status = shared.background_derived.lock().unwrap();
+    while status.running {
+        status = shared.background_derived_done.wait(status).unwrap();
+    }
+    if let Some(message) = status.last_error.take() {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "background derived-index publication failed: {message}"
+        ))));
+    }
+    Ok(())
+}
+
+fn flush_frozen_derived(shared: &Arc<Shared>, job: DerivedCheckpointJob) -> Result<()> {
+    let mut stage = "initializing derived-index publication".to_owned();
+    flush_frozen_derived_inner(shared, job, &mut stage)
+        .map_err(|error| Error::Io(std::io::Error::other(format!("{stage}: {error}"))))
+}
+
+#[cfg(test)]
+fn pause_derived_before_publish_for_test(shared: &Shared) {
+    shared
+        .derived_test_reached_publish
+        .store(true, AtomicOrdering::Release);
+    while shared
+        .derived_test_pause_before_publish
+        .load(AtomicOrdering::Acquire)
+    {
         std::thread::sleep(Duration::from_millis(1));
     }
-    checkpoint_measured(shared, cs)?;
+}
+
+#[cfg(not(test))]
+fn pause_derived_before_publish_for_test(_shared: &Shared) {}
+
+fn publish_background_derived_manifest(
+    _shared: &Shared,
+    manifest: PreparedDerivedRunManifest,
+) -> Result<PublishOutcome> {
+    #[cfg(test)]
+    if _shared
+        .derived_test_fail_before_manifest_rename
+        .swap(false, AtomicOrdering::AcqRel)
+    {
+        return Err(Error::Io(std::io::Error::other(
+            "injected derived manifest rename failure",
+        )));
+    }
+    let outcome = manifest.publish()?;
+    #[cfg(test)]
+    let outcome = if _shared
+        .derived_test_fail_after_manifest_rename
+        .swap(false, AtomicOrdering::AcqRel)
+    {
+        PublishOutcome::SyncFailed(std::io::Error::other(
+            "injected derived manifest directory sync failure",
+        ))
+    } else {
+        outcome
+    };
+    Ok(outcome)
+}
+
+fn flush_frozen_derived_inner(
+    shared: &Arc<Shared>,
+    mut job: DerivedCheckpointJob,
+    stage: &mut String,
+) -> Result<()> {
+    let _publication = shared.derived_manifest_publication.lock().unwrap();
+    let indexes_dir = shared.dir.join(INDEXES_DIR);
+    let vectors_dir = shared.dir.join(VECTORS_DIR);
+    fs::create_dir_all(&indexes_dir)?;
+    fs::create_dir_all(&vectors_dir)?;
+    let temp_dir = shared
+        .opts
+        .memory
+        .spill_directory
+        .clone()
+        .unwrap_or_else(|| indexes_dir.join("tmp"));
+    fs::create_dir_all(&temp_dir)?;
+    let budget = shared.opts.memory.maintenance_pool_bytes;
+
+    for frozen_job in &job.secondary {
+        *stage = format!(
+            "writing secondary index {}.{}",
+            frozen_job.key.0, frozen_job.key.1
+        );
+        let file = sidx_run_filename(&shared.dir, &frozen_job.key.0, &frozen_job.key.1, 0);
+        let path = indexes_dir.join(&file);
+        let prepared = path.with_file_name(format!("{file}.derived-pending"));
+        let tmp = path.with_file_name(format!("{file}.derived-pending.tmp"));
+        let generation = frozen_job.frozen.generation;
+        let mut writer = ExternalPagedWriter::new(&tmp, &temp_dir, generation, budget)?;
+        writer.add(SECONDARY_FORMAT_KEY, SECONDARY_FORMAT_VALUE)?;
+        for (value, ids) in &frozen_job.frozen.delta {
+            for id in ids {
+                writer.add(
+                    &secondary_pair_key(value, id),
+                    &secondary_operation(generation, SECONDARY_ADD),
+                )?;
+            }
+        }
+        for (value, ids) in &frozen_job.frozen.removed {
+            for id in ids {
+                writer.add(
+                    &secondary_pair_key(value, id),
+                    &secondary_operation(generation, SECONDARY_DELETE),
+                )?;
+            }
+        }
+        if let Err(error) = writer.finish() {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        fs::rename(&tmp, &prepared).map_err(|error| {
+            Error::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "publishing frozen secondary run {} -> {} failed: {error}",
+                    tmp.display(),
+                    prepared.display()
+                ),
+            ))
+        })?;
+        fsync_dir(&indexes_dir)?;
+        let mapped = Arc::new(PagedIndex::open(&prepared)?);
+        validate_secondary_run(&mapped)?;
+        *stage = format!(
+            "publishing secondary index {}.{}",
+            frozen_job.key.0, frozen_job.key.1
+        );
+        let bytes = fs::metadata(&prepared)?.len();
+        let (meta, manifest) = {
+            let _commit = shared.commit.lock();
+            let state = shared.state.read().unwrap();
+            let Some(index) = state.secondary.get(&frozen_job.key) else {
+                drop(state);
+                let _ = fs::remove_file(&prepared);
+                continue;
+            };
+            if !index.frozen_matches(&frozen_job.frozen) {
+                drop(state);
+                let _ = fs::remove_file(&prepared);
+                continue;
+            }
+            let meta = DerivedRunMeta {
+                file,
+                level: if index.runs.is_empty() {
+                    DERIVED_BASE_LEVEL
+                } else {
+                    0
+                },
+                bytes,
+                generation,
+            };
+            let mut metas = index.run_metas();
+            metas.push(meta.clone());
+            let manifest = DerivedRunManifest::new(
+                DerivedRunKind::Secondary,
+                &frozen_job.key.0,
+                &frozen_job.key.1,
+                generation,
+                metas,
+                [0, 0],
+            );
+            (meta, manifest)
+        };
+        *stage = format!(
+            "preparing secondary run manifest {}.{}",
+            frozen_job.key.0, frozen_job.key.1
+        );
+        let manifest = manifest.prepare(&sidx_manifest_path(
+            &shared.dir,
+            &frozen_job.key.0,
+            &frozen_job.key.1,
+        ))?;
+        pause_derived_before_publish_for_test(shared);
+        fs::rename(&prepared, &path)?;
+        fsync_dir(&indexes_dir)?;
+        let manifest_outcome = match publish_background_derived_manifest(shared, manifest) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        {
+            let _commit = shared.commit.lock();
+            let mut state = shared.state.write().unwrap();
+            let index = state.secondary.get_mut(&frozen_job.key).ok_or_else(|| {
+                Error::Corrupt("secondary index disappeared during background publication".into())
+            })?;
+            if !index.frozen_matches(&frozen_job.frozen) {
+                return Err(Error::Corrupt(
+                    "secondary frozen generation changed during background publication".into(),
+                ));
+            }
+            index.runs.push(SecRun {
+                meta: meta.clone(),
+                index: mapped,
+            });
+            index.generation = generation;
+            index.clear_frozen(&frozen_job.frozen);
+        }
+        shared
+            .secondary_checkpoint_bytes_written
+            .fetch_add(meta.bytes, AtomicOrdering::Relaxed);
+        if let PublishOutcome::SyncFailed(error) = manifest_outcome {
+            return Err(error.into());
+        }
+    }
+
+    for frozen_job in &job.text {
+        *stage = format!(
+            "writing text index {}.{}",
+            frozen_job.key.0, frozen_job.key.1
+        );
+        let file = tidx_run_filename(&shared.dir, &frozen_job.key.0, &frozen_job.key.1, 0);
+        let path = indexes_dir.join(&file);
+        let prepared = path.with_file_name(format!("{file}.derived-pending"));
+        let tmp = path.with_file_name(format!("{file}.derived-pending.tmp"));
+        if let Err(error) =
+            TextIdx::write_frozen_delta_paged(&frozen_job.frozen, &tmp, &temp_dir, budget)
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        fs::rename(&tmp, &prepared).map_err(|error| {
+            Error::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "publishing frozen text run {} -> {} failed: {error}",
+                    tmp.display(),
+                    prepared.display()
+                ),
+            ))
+        })?;
+        fsync_dir(&indexes_dir)?;
+        let mapped = Arc::new(PagedIndex::open(&prepared)?);
+        validate_text_run(&mapped)?;
+        *stage = format!(
+            "publishing text index {}.{}",
+            frozen_job.key.0, frozen_job.key.1
+        );
+        let generation = frozen_job.frozen.generation;
+        let bytes = fs::metadata(&prepared)?.len();
+        let (meta, manifest) = {
+            let _commit = shared.commit.lock();
+            let state = shared.state.read().unwrap();
+            let Some(index) = state.text.get(&frozen_job.key) else {
+                drop(state);
+                let _ = fs::remove_file(&prepared);
+                continue;
+            };
+            if !index.frozen_matches(&frozen_job.frozen) {
+                drop(state);
+                let _ = fs::remove_file(&prepared);
+                continue;
+            }
+            let meta = DerivedRunMeta {
+                file,
+                level: if index.runs.is_empty() {
+                    DERIVED_BASE_LEVEL
+                } else {
+                    0
+                },
+                bytes,
+                generation,
+            };
+            let mut metas = index.run_metas();
+            metas.push(meta.clone());
+            let (doc_count, total_len) = index.frozen_doc_stats();
+            let manifest = DerivedRunManifest::new(
+                DerivedRunKind::Text,
+                &frozen_job.key.0,
+                &frozen_job.key.1,
+                generation,
+                metas,
+                [doc_count, total_len],
+            );
+            (meta, manifest)
+        };
+        *stage = format!(
+            "preparing text run manifest {}.{}",
+            frozen_job.key.0, frozen_job.key.1
+        );
+        let manifest = manifest.prepare(&tidx_manifest_path(
+            &shared.dir,
+            &frozen_job.key.0,
+            &frozen_job.key.1,
+        ))?;
+        pause_derived_before_publish_for_test(shared);
+        fs::rename(&prepared, &path)?;
+        fsync_dir(&indexes_dir)?;
+        let manifest_outcome = match publish_background_derived_manifest(shared, manifest) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        {
+            let _commit = shared.commit.lock();
+            let mut state = shared.state.write().unwrap();
+            let index = state.text.get_mut(&frozen_job.key).ok_or_else(|| {
+                Error::Corrupt("text index disappeared during background publication".into())
+            })?;
+            if !index.frozen_matches(&frozen_job.frozen) {
+                return Err(Error::Corrupt(
+                    "text frozen generation changed during background publication".into(),
+                ));
+            }
+            index.runs.push(TextRun {
+                meta: meta.clone(),
+                index: mapped,
+            });
+            index.generation = generation;
+            index.clear_frozen(&frozen_job.frozen);
+        }
+        shared
+            .text_checkpoint_bytes_written
+            .fetch_add(meta.bytes, AtomicOrdering::Relaxed);
+        if let PublishOutcome::SyncFailed(error) = manifest_outcome {
+            return Err(error.into());
+        }
+    }
+
+    for frozen_job in &job.vector {
+        *stage = format!(
+            "writing vector index {}.{}",
+            frozen_job.table, frozen_job.def.column
+        );
+        let run = vectors_dir.join(format!("delta-{}.vidx.derived-pending", Ulid::new()));
+        frozen_job.frozen.dump_file(
+            &run,
+            &frozen_job.table,
+            &frozen_job.def.column,
+            &frozen_job.def,
+            frozen_job.generation,
+        )?;
+        fsync_dir(&vectors_dir)?;
+        let file = File::open(&run)?;
+        let mmap = unsafe { MmapOptions::new().map(&file) }?;
+        let (loaded, version) = VecIdx::load_mmap(
+            mmap,
+            &frozen_job.table,
+            &frozen_job.def.column,
+            &frozen_job.def,
+        )?;
+        if version != frozen_job.generation {
+            let _ = fs::remove_file(&run);
+            return Err(Error::Corrupt(
+                "background vector run has the wrong generation".into(),
+            ));
+        }
+        *stage = format!(
+            "publishing vector index {}.{}",
+            frozen_job.table, frozen_job.def.column
+        );
+        pause_derived_before_publish_for_test(shared);
+        let _cs = shared.commit.lock();
+        let mut state = shared.state.write().unwrap();
+        let key = (frozen_job.table.clone(), frozen_job.def.column.clone());
+        let published = state
+            .vector
+            .get_mut(&key)
+            .is_some_and(|index| index.publish_frozen_loaded(&frozen_job.frozen, loaded));
+        drop(state);
+        let _ = fs::remove_file(&run);
+        if !published {
+            continue;
+        }
+    }
+
+    drop(job.memory.take());
     let retained = shared.state.read().unwrap().index_delta_memory_bytes();
     shared.memory_governor.set_index_delta_bytes(retained);
-    shared.memory_governor.record_index_consolidation();
+    maybe_schedule_secondary_compaction(shared);
+    maybe_schedule_text_compaction(shared);
     Ok(())
 }
 
@@ -8759,7 +10483,7 @@ fn load_or_build_secondary_indexes(
     blobs: &Path,
     catalog: &Catalog,
     index: &PrimaryIdx,
-    readers: &HashMap<u32, File>,
+    readers: &SegmentReaders,
     committed_version: u64,
     read_only: bool,
     memory: &MemoryOptions,
@@ -8838,7 +10562,7 @@ fn write_secondary_from_canonical(
     table: &str,
     column: &str,
     index: &PrimaryIdx,
-    readers: &HashMap<u32, File>,
+    readers: &SegmentReaders,
 ) -> Result<()> {
     let mut writer = ExternalPagedWriter::new(target, temp_dir, dump_version, budget)?;
     writer.add(SECONDARY_FORMAT_KEY, SECONDARY_FORMAT_VALUE)?;
@@ -8905,7 +10629,7 @@ fn build_one_vector_index(
     table: &str,
     def: &VectorIndexDef,
     index: &PrimaryIdx,
-    readers: &HashMap<u32, File>,
+    readers: &SegmentReaders,
     budget: usize,
 ) -> Result<VecIdx> {
     let mut vidx = VecIdx::new(def.clone());
@@ -8945,7 +10669,7 @@ fn load_or_build_vector_indexes(
     blobs: &Path,
     catalog: &Catalog,
     index: &PrimaryIdx,
-    readers: &HashMap<u32, File>,
+    readers: &SegmentReaders,
     committed_version: u64,
     read_only: bool,
     memory: &MemoryOptions,
@@ -9054,7 +10778,7 @@ fn catch_up_vector_index(
     table: &str,
     def: &VectorIndexDef,
     index: &PrimaryIdx,
-    readers: &HashMap<u32, File>,
+    readers: &SegmentReaders,
     dir: &Path,
     budget: usize,
 ) -> Result<()> {
@@ -9199,7 +10923,7 @@ fn load_or_build_text_indexes(
     blobs: &Path,
     catalog: &Catalog,
     index: &PrimaryIdx,
-    readers: &HashMap<u32, File>,
+    readers: &SegmentReaders,
     committed_version: u64,
     read_only: bool,
     memory: &MemoryOptions,
@@ -9283,7 +11007,7 @@ fn build_one_text_index(
     table: &str,
     column: &str,
     index: &PrimaryIdx,
-    readers: &HashMap<u32, File>,
+    readers: &SegmentReaders,
     budget: usize,
 ) -> Result<TextIdx> {
     let mut out = TextIdx::new();
@@ -9318,7 +11042,7 @@ fn write_text_from_canonical(
     table: &str,
     column: &str,
     index: &PrimaryIdx,
-    readers: &HashMap<u32, File>,
+    readers: &SegmentReaders,
 ) -> Result<(u64, u64)> {
     let mut writer = ExternalPagedWriter::new(target, temp_dir, dump_version, budget)?;
     TextIdx::write_format(&mut writer)?;
@@ -9383,7 +11107,7 @@ fn cleanup_orphan_tidx(dir: &Path, catalog: &Catalog) {
     }
 }
 
-fn payload_bytes(readers: &HashMap<u32, File>, kind: &VKind) -> Result<Option<Vec<u8>>> {
+fn payload_bytes(readers: &SegmentReaders, kind: &VKind) -> Result<Option<Vec<u8>>> {
     match kind {
         VKind::MemPut(p) => Ok(Some(p.as_ref().clone())),
         VKind::SegPut {
@@ -9440,6 +11164,7 @@ fn find_eq_via_primary_index(
 /// file order through a buffered reader. For every latest visible record we
 /// decode only the predicate column; a full Record is built only on a match.
 /// Latest MemPut records are evaluated from their already-encoded payloads.
+#[allow(dead_code)] // retained for a future immutable State read-view fast path
 fn find_eq_streaming(
     shared: &Shared,
     st: &State,
@@ -9505,12 +11230,14 @@ fn find_eq_streaming(
     Ok(())
 }
 
+#[allow(dead_code)]
 struct EncodedEqPredicate<'a> {
     column: &'a str,
     ordinal: Option<usize>,
     value: &'a Value,
 }
 
+#[allow(dead_code)]
 fn scan_segment_for_eq(
     shared: &Shared,
     st: &State,
@@ -9588,6 +11315,7 @@ fn scan_segment_for_eq(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn take_segment_slice<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = pos
         .checked_add(len)
@@ -9598,6 +11326,7 @@ fn take_segment_slice<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Result
     Ok(value)
 }
 
+#[allow(dead_code)]
 fn latest_is_segment_put(st: &State, table: &str, id: &str, version: u64, segment: u32) -> bool {
     st.latest_owned(table, id)
         .ok()
@@ -9608,6 +11337,7 @@ fn latest_is_segment_put(st: &State, table: &str, id: &str, version: u64, segmen
         })
 }
 
+#[allow(dead_code)]
 fn encoded_record_column_eq(
     payload: &[u8],
     predicate: &EncodedEqPredicate<'_>,
@@ -9658,7 +11388,7 @@ fn encoded_record_column_eq(
     Ok(false)
 }
 
-fn read_record_kind(blobs: &Path, readers: &HashMap<u32, File>, kind: &VKind) -> Result<Record> {
+fn read_record_kind(blobs: &Path, readers: &SegmentReaders, kind: &VKind) -> Result<Record> {
     match kind {
         VKind::MemPut(p) => decode_record(p, Some(blobs)),
         VKind::SegPut { .. } => {
@@ -9693,12 +11423,26 @@ fn check_value(col: &crate::schema::Column, value: &Value) -> Result<()> {
             col.name, col.ty, value
         )));
     }
-    if let (Value::Vector(v), Some(dim)) = (value, col.dim) {
-        if v.len() != dim {
+    if let Value::Vector(v) = value {
+        if v.iter().any(|component| !component.is_finite()) {
+            return Err(Error::SchemaViolation(format!(
+                "column '{}' requires finite float32 vector components",
+                col.name
+            )));
+        }
+        if let Some(dim) = col.dim.filter(|dim| v.len() != *dim) {
             return Err(Error::SchemaViolation(format!(
                 "column '{}' expects vector<float32, {dim}>, got dimension {}",
                 col.name,
                 v.len()
+            )));
+        }
+    }
+    if let Value::Time(micros) = value {
+        if !(0..86_400_000_000).contains(micros) {
+            return Err(Error::SchemaViolation(format!(
+                "column '{}' requires a time within one day",
+                col.name
             )));
         }
     }
@@ -9772,6 +11516,43 @@ pub(crate) struct BlobSink {
     staged: Vec<(PathBuf, PathBuf)>,
 }
 
+struct PendingBlobPublications {
+    shared: Arc<Shared>,
+    names: Vec<String>,
+}
+
+impl PendingBlobPublications {
+    fn new(shared: Arc<Shared>, sink: &BlobSink) -> Self {
+        let names = sink
+            .staged
+            .iter()
+            .filter_map(|(_, final_path)| {
+                final_path
+                    .file_name()?
+                    .to_str()?
+                    .strip_suffix(".blob")
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            let mut pending = shared.pending_blob_publications.lock().unwrap();
+            pending.extend(names.iter().cloned());
+        }
+        Self { shared, names }
+    }
+}
+
+impl Drop for PendingBlobPublications {
+    fn drop(&mut self) {
+        if !self.names.is_empty() {
+            let mut pending = self.shared.pending_blob_publications.lock().unwrap();
+            for name in &self.names {
+                pending.remove(name);
+            }
+        }
+    }
+}
+
 impl BlobSink {
     fn new(db_dir: &Path, threshold: usize) -> BlobSink {
         BlobSink {
@@ -9827,14 +11608,19 @@ pub(crate) fn encode_record_ordered(
     mut sink: Option<&mut BlobSink>,
 ) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(64);
-    buf.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
+    let column_count = u16::try_from(schema.columns.len())
+        .map_err(|_| Error::InvalidArgument("record has more than 65535 stored columns".into()))?;
+    buf.extend_from_slice(&column_count.to_le_bytes());
     for col in &schema.columns {
-        buf.extend_from_slice(&(col.name.len() as u16).to_le_bytes());
+        let name_len = u16::try_from(col.name.len()).map_err(|_| {
+            Error::InvalidArgument("column name exceeds the 65535-byte storage limit".into())
+        })?;
+        buf.extend_from_slice(&name_len.to_le_bytes());
         buf.extend_from_slice(col.name.as_bytes());
         let value = record.get(&col.name).unwrap_or(&Value::Null);
         match (value, sink.as_deref_mut()) {
             (Value::Blob(content), Some(sink)) => match sink.maybe_externalize(content)? {
-                Some((name, crc)) => encode_blob_ref(&mut buf, &name, content.len() as u64, crc),
+                Some((name, crc)) => encode_blob_ref(&mut buf, &name, content.len() as u64, crc)?,
                 None => encode_value(&mut buf, value),
             },
             _ => encode_value(&mut buf, value),
@@ -9957,6 +11743,80 @@ mod primary_index_tests {
     }
 
     #[test]
+    fn compaction_gc_preserves_blob_published_before_commit_lock() {
+        struct ReleasePause(Arc<Shared>);
+        impl Drop for ReleasePause {
+            fn drop(&mut self) {
+                self.0
+                    .blob_test_pause_after_publish
+                    .store(false, AtomicOrdering::Release);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-blob-gc.esql");
+        let db = Arc::new(
+            Db::create_with(
+                &path,
+                DbOptions {
+                    external_blob_threshold: 1,
+                    ..DbOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::new("payload", ColumnType::Blob)],
+        ))
+        .unwrap();
+        db.shared
+            .blob_test_pause_after_publish
+            .store(true, AtomicOrdering::Release);
+        let release = ReleasePause(db.shared.clone());
+        let writer_db = db.clone();
+        let writer = std::thread::spawn(move || {
+            let mut record = Record::new();
+            record.insert("id".into(), Value::Text("blob".into()));
+            record.insert("payload".into(), Value::Blob(vec![7; 4 * 1024]));
+            writer_db.insert("docs", record)
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !db
+            .shared
+            .blob_test_reached_publish
+            .load(AtomicOrdering::Acquire)
+        {
+            assert!(Instant::now() < deadline, "blob publisher did not pause");
+            std::thread::yield_now();
+        }
+
+        db.compact().unwrap();
+        assert_eq!(
+            fs::read_dir(path.join(BLOBS_DIR))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "blob"))
+                .count(),
+            1,
+            "GC must retain a durable blob whose WAL publication is pending"
+        );
+        drop(release);
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            db.get("docs", "blob").unwrap().unwrap()["payload"],
+            Value::Blob(vec![7; 4 * 1024])
+        );
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(
+            reopened.get("docs", "blob").unwrap().unwrap()["payload"],
+            Value::Blob(vec![7; 4 * 1024])
+        );
+    }
+
+    #[test]
     fn sync_failure_is_reported_as_unknown_after_logical_publication() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sync-unknown.esql");
@@ -9966,12 +11826,7 @@ mod primary_index_tests {
             vec![Column::new("value", ColumnType::Int64)],
         ))
         .unwrap();
-        db.shared
-            .commit
-            .lock()
-            .unwrap()
-            .wal()
-            .fail_next_sync_for_test();
+        db.shared.commit.lock().wal().fail_next_sync_for_test();
 
         let mut first = Record::new();
         first.insert("id".into(), Value::Text("a".into()));
@@ -10012,7 +11867,9 @@ mod primary_index_tests {
         record.insert("value".into(), Value::Int64(1));
         db.insert("docs", record).unwrap();
 
-        crate::manifest::fail_next_previous_dir_sync_for_test();
+        db.shared
+            .primary_test_fail_after_manifest_rename
+            .store(true, AtomicOrdering::Release);
         assert!(matches!(db.checkpoint(), Err(Error::CommitUnknown(_))));
         assert!(
             wal_path(&path, 1).exists(),
@@ -10043,6 +11900,46 @@ mod primary_index_tests {
     }
 
     #[test]
+    fn checkpoint_manifest_rename_failure_thaws_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest-rename-retry.esql");
+        let db = Db::create(&path).unwrap();
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::new("value", ColumnType::Int64)],
+        ))
+        .unwrap();
+        let mut record = Record::new();
+        record.insert("id".into(), Value::Text("a".into()));
+        record.insert("value".into(), Value::Int64(1));
+        db.insert("docs", record).unwrap();
+
+        db.shared
+            .primary_test_fail_before_manifest_rename
+            .store(true, AtomicOrdering::Release);
+        let error = db.checkpoint().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected primary manifest rename failure"));
+        assert!(
+            db.shared.state.read().unwrap().index.frozen.is_none(),
+            "a pre-publication failure must thaw the queryable generation"
+        );
+        assert_eq!(
+            db.get("docs", "a").unwrap().unwrap()["value"],
+            Value::Int64(1)
+        );
+
+        db.checkpoint().unwrap();
+        drop(db);
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(
+            reopened.get("docs", "a").unwrap().unwrap()["value"],
+            Value::Int64(1)
+        );
+    }
+
+    #[test]
     fn dead_vector_worker_with_backlog_is_reported_instead_of_waiting_forever() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::create(dir.path().join("worker-failure.esql")).unwrap();
@@ -10064,5 +11961,511 @@ mod primary_index_tests {
         db.shared
             .vector_worker_alive
             .store(true, AtomicOrdering::Release);
+    }
+
+    #[test]
+    fn stale_async_vector_job_cannot_resurrect_a_deleted_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("stale-vector-job.esql")).unwrap();
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::vector("embedding", 2)],
+        ))
+        .unwrap();
+        db.create_vector_index(
+            "docs",
+            "embedding",
+            VectorIndexOptions {
+                mode: IndexingMode::Async,
+                ..VectorIndexOptions::default()
+            },
+        )
+        .unwrap();
+        let mut record = Record::new();
+        record.insert("id".into(), Value::Text("victim".into()));
+        record.insert("embedding".into(), Value::Vector(vec![1.0, 0.0]));
+        db.insert("docs", record).unwrap();
+        db.wait_vector_indexing().unwrap();
+        let stale_version = db.snapshot().version();
+        db.delete("docs", "victim").unwrap();
+
+        db.shared
+            .vector_backlog
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        db.shared
+            .vector_tx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(VecJob {
+                version: stale_version,
+                table: "docs".into(),
+                column: "embedding".into(),
+                id: "victim".into(),
+                vector: vec![1.0, 0.0],
+            })
+            .unwrap();
+        db.wait_vector_indexing().unwrap();
+
+        let state = db.shared.state.read().unwrap();
+        let ids = state
+            .vector
+            .get(&("docs".to_owned(), "embedding".to_owned()))
+            .unwrap()
+            .ids();
+        assert!(!ids.iter().any(|id| id == "victim"));
+    }
+
+    #[test]
+    fn commits_and_queries_continue_while_derived_overlays_publish() {
+        struct ReleasePause(Arc<Shared>);
+        impl Drop for ReleasePause {
+            fn drop(&mut self) {
+                self.0
+                    .derived_test_pause_before_publish
+                    .store(false, AtomicOrdering::Release);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("derived-background.esql");
+        let db = Db::create(&path).unwrap();
+        db.query(
+            "CREATE TABLE docs (tag text NOT NULL, body text NOT NULL, embedding vector(2) NOT NULL)",
+        )
+        .unwrap();
+        db.query("CREATE INDEX ON docs (tag)").unwrap();
+        db.create_text_index("docs", "body").unwrap();
+        db.create_vector_index("docs", "embedding", VectorIndexOptions::default())
+            .unwrap();
+        let mut transaction = db.begin();
+        for n in 0..100 {
+            let mut record = Record::new();
+            record.insert("id".into(), Value::Text(format!("doc-{n:03}")));
+            record.insert("tag".into(), Value::Text("old".into()));
+            record.insert("body".into(), Value::Text("frozen searchable text".into()));
+            record.insert("embedding".into(), Value::Vector(vec![1.0, 0.0]));
+            transaction.insert("docs", record).unwrap();
+        }
+        transaction.commit().unwrap();
+
+        db.shared
+            .derived_test_pause_before_publish
+            .store(true, AtomicOrdering::Release);
+        let _release = ReleasePause(db.shared.clone());
+        let cs = db.shared.commit.lock();
+        let memory = Db::acquire_maintenance_memory(&db.shared);
+        assert!(schedule_frozen_derived(&db.shared, memory).unwrap());
+        drop(cs);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !db
+            .shared
+            .derived_test_reached_publish
+            .load(AtomicOrdering::Acquire)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "derived worker did not reach publication"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Exercise the coincident-threshold path: primary maintenance must
+        // be deferred while the derived worker owns the maintenance pool.
+        db.shared.commit.lock().memtable_bytes = db.shared.opts.memtable_max_bytes;
+
+        let mut patch = Record::new();
+        patch.insert("tag".into(), Value::Text("new".into()));
+        patch.insert("body".into(), Value::Text("fresh generation token".into()));
+        patch.insert("embedding".into(), Value::Vector(vec![0.0, 1.0]));
+        db.update("docs", "doc-000", patch).unwrap();
+        db.delete("docs", "doc-001").unwrap();
+
+        let new_ids = db
+            .find_eq("docs", "tag", &Value::Text("new".into()))
+            .unwrap();
+        let old_ids = db
+            .find_eq("docs", "tag", &Value::Text("old".into()))
+            .unwrap();
+        let fresh = db.search_text("docs", "body", "fresh", 10, None).unwrap();
+        let nearest = db
+            .search_vector(
+                "docs",
+                "embedding",
+                &[0.0, 1.0],
+                1,
+                &VectorSearchOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(new_ids.len(), 1);
+        assert_eq!(old_ids.len(), 98);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].id, "doc-000");
+        assert_eq!(nearest[0].id, "doc-000");
+
+        // Maintenance must wait without owning the commit mutex: the derived
+        // worker owns its memory permit and needs that mutex to publish.
+        let maintenance_shared = db.shared.clone();
+        let (maintenance_done, maintenance_wait) = std::sync::mpsc::channel();
+        let maintenance_thread = std::thread::spawn(move || {
+            let ready = lock_commit_for_maintenance(&maintenance_shared)
+                .map(drop)
+                .is_ok();
+            maintenance_done.send(ready).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            maintenance_wait.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        drop(_release);
+        assert!(maintenance_wait
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap());
+        maintenance_thread.join().unwrap();
+        wait_for_background_derived(&db.shared).unwrap();
+        assert_eq!(db.maintenance_stats().derived_publications, 1);
+        assert_eq!(
+            db.find_eq("docs", "tag", &Value::Text("new".into()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_text("docs", "body", "fresh", 10, None).unwrap()[0].id,
+            "doc-000"
+        );
+        assert_eq!(
+            db.search_vector(
+                "docs",
+                "embedding",
+                &[0.0, 1.0],
+                1,
+                &VectorSearchOptions::default(),
+            )
+            .unwrap()[0]
+                .id,
+            "doc-000"
+        );
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .find_eq("docs", "tag", &Value::Text("new".into()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(reopened.get("docs", "doc-001").unwrap().is_none());
+    }
+
+    #[test]
+    fn commits_continue_and_recover_before_primary_manifest_publication() {
+        struct ReleasePause(Arc<Shared>);
+        impl Drop for ReleasePause {
+            fn drop(&mut self) {
+                self.0
+                    .primary_test_pause_before_manifest
+                    .store(false, AtomicOrdering::Release);
+            }
+        }
+
+        fn copy_tree(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary-publication.esql");
+        let crash_copy = dir.path().join("primary-publication-crash.esql");
+        let db = Db::create_with(
+            &path,
+            DbOptions {
+                durability: Durability::Safe,
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::new("value", ColumnType::Int64)],
+        ))
+        .unwrap();
+        let mut first = Record::new();
+        first.insert("id".into(), Value::Text("before".into()));
+        first.insert("value".into(), Value::Int64(1));
+        db.insert("docs", first).unwrap();
+
+        db.shared
+            .primary_test_pause_before_manifest
+            .store(true, AtomicOrdering::Release);
+        let release = ReleasePause(db.shared.clone());
+        {
+            let mut cs = db.shared.commit.lock();
+            let memory = Db::acquire_maintenance_memory(&db.shared);
+            assert!(schedule_frozen_checkpoint(&db.shared, &mut cs, memory).unwrap());
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !db
+            .shared
+            .primary_test_reached_manifest
+            .load(AtomicOrdering::Acquire)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "primary worker did not reach manifest publication"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // The worker owns only the primary publication mutex here. This Safe
+        // commit must complete and sync its active successor WAL independently.
+        let mut tail = Record::new();
+        tail.insert("id".into(), Value::Text("during".into()));
+        tail.insert("value".into(), Value::Int64(2));
+        db.insert("docs", tail).unwrap();
+
+        // Snapshot the durable files at the exact crash boundary: the old
+        // canonical manifest is still visible, while bridge + active WALs
+        // contain all acknowledged versions.
+        copy_tree(&path, &crash_copy);
+        let recovered = Db::open_with(
+            &crash_copy,
+            DbOptions {
+                durability: Durability::Safe,
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(recovered.scan("docs").unwrap().len(), 2);
+        assert_eq!(
+            recovered.get("docs", "during").unwrap().unwrap()["value"],
+            Value::Int64(2)
+        );
+        drop(recovered);
+
+        drop(release);
+        wait_for_background_checkpoint(&db.shared).unwrap();
+        assert_eq!(db.scan("docs").unwrap().len(), 2);
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(reopened.scan("docs").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn retried_derived_publication_preserves_the_frozen_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("derived-retry-spill");
+        let db = Db::create_with(
+            dir.path().join("derived-retry-generation.esql"),
+            DbOptions {
+                memory: MemoryOptions {
+                    spill_directory: Some(spill.clone()),
+                    ..MemoryOptions::default()
+                },
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
+        db.query("CREATE TABLE docs (tag text NOT NULL, body text NOT NULL, embedding vector(2) NOT NULL)")
+            .unwrap();
+        db.query("CREATE INDEX ON docs (tag)").unwrap();
+        db.create_text_index("docs", "body").unwrap();
+        db.create_vector_index("docs", "embedding", VectorIndexOptions::default())
+            .unwrap();
+
+        let mut record = Record::new();
+        record.insert("id".into(), Value::Text("doc".into()));
+        record.insert("tag".into(), Value::Text("old".into()));
+        record.insert("body".into(), Value::Text("old body".into()));
+        record.insert("embedding".into(), Value::Vector(vec![1.0, 0.0]));
+        db.insert("docs", record).unwrap();
+
+        let frozen_generation = {
+            let _commit = db.shared.commit.lock();
+            let mut state = db.shared.state.write().unwrap();
+            let generation = state.committed_version;
+            state
+                .secondary
+                .get_mut(&("docs".into(), "tag".into()))
+                .unwrap()
+                .freeze_delta(generation)
+                .unwrap();
+            state
+                .text
+                .get_mut(&("docs".into(), "body".into()))
+                .unwrap()
+                .freeze_delta_background(generation)
+                .unwrap();
+            state
+                .vector
+                .get_mut(&("docs".into(), "embedding".into()))
+                .unwrap()
+                .freeze_delta_background(generation)
+                .unwrap();
+            generation
+        };
+
+        let mut patch = Record::new();
+        patch.insert("tag".into(), Value::Text("new".into()));
+        patch.insert("body".into(), Value::Text("new body".into()));
+        patch.insert("embedding".into(), Value::Vector(vec![0.0, 1.0]));
+        db.update("docs", "doc", patch).unwrap();
+
+        if spill.is_dir() {
+            fs::remove_dir(&spill).unwrap();
+        }
+        fs::write(&spill, b"block create_dir_all").unwrap();
+        let commit = db.shared.commit.lock();
+        let memory = Db::acquire_maintenance_memory(&db.shared);
+        assert!(schedule_frozen_derived(&db.shared, memory).unwrap());
+        drop(commit);
+        assert!(wait_for_background_derived(&db.shared).is_err());
+        let retained_after_failure = {
+            let state = db.shared.state.read().unwrap();
+            assert!(state.has_frozen_derived());
+            state
+                .index
+                .delta_memory_bytes()
+                .saturating_add(state.derived_delta_memory_bytes_including_frozen())
+        };
+        let memory_after_failure = db.global_memory_stats();
+        assert_eq!(memory_after_failure.maintenance_in_use_bytes, 0);
+        assert_eq!(
+            memory_after_failure.index_delta_bytes,
+            retained_after_failure as u64
+        );
+
+        fs::remove_file(&spill).unwrap();
+        fs::create_dir(&spill).unwrap();
+        let commit = db.shared.commit.lock();
+        let memory = Db::acquire_maintenance_memory(&db.shared);
+        assert!(schedule_frozen_derived(&db.shared, memory).unwrap());
+        drop(commit);
+        wait_for_background_derived(&db.shared).unwrap();
+
+        let state = db.shared.state.read().unwrap();
+        assert_eq!(
+            state
+                .secondary
+                .get(&("docs".into(), "tag".into()))
+                .unwrap()
+                .runs
+                .last()
+                .unwrap()
+                .meta
+                .generation,
+            frozen_generation
+        );
+        assert_eq!(
+            state
+                .text
+                .get(&("docs".into(), "body".into()))
+                .unwrap()
+                .runs
+                .last()
+                .unwrap()
+                .meta
+                .generation,
+            frozen_generation
+        );
+        assert_eq!(
+            state
+                .vector
+                .get(&("docs".into(), "embedding".into()))
+                .unwrap()
+                .frozen_generation(),
+            None
+        );
+    }
+
+    #[test]
+    fn derived_manifest_rename_and_sync_failures_preserve_queryability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("derived-manifest-failures.esql");
+        let db = Db::create(&path).unwrap();
+        db.query("CREATE TABLE docs (tag text NOT NULL)").unwrap();
+        db.query("CREATE INDEX ON docs (tag)").unwrap();
+
+        let mut first = Record::new();
+        first.insert("id".into(), Value::Text("a".into()));
+        first.insert("tag".into(), Value::Text("kept".into()));
+        db.insert("docs", first).unwrap();
+        db.shared
+            .derived_test_fail_before_manifest_rename
+            .store(true, AtomicOrdering::Release);
+        let error = db.checkpoint().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected derived manifest rename failure"));
+        assert_eq!(
+            db.find_eq("docs", "tag", &Value::Text("kept".into()))
+                .unwrap()
+                .len(),
+            1,
+            "the frozen overlay remains queryable after a failed rename"
+        );
+
+        db.checkpoint().unwrap();
+        let mut second = Record::new();
+        second.insert("id".into(), Value::Text("b".into()));
+        second.insert("tag".into(), Value::Text("kept".into()));
+        db.insert("docs", second).unwrap();
+        db.shared
+            .derived_test_fail_after_manifest_rename
+            .store(true, AtomicOrdering::Release);
+        let error = db.checkpoint().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected derived manifest directory sync failure"));
+        assert_eq!(
+            db.find_eq("docs", "tag", &Value::Text("kept".into()))
+                .unwrap()
+                .len(),
+            2,
+            "a logically renamed disposable manifest is adopted before reporting fsync failure"
+        );
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .find_eq("docs", "tag", &Value::Text("kept".into()))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn open_cleans_only_abandoned_derived_publication_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-cleanup.esql");
+        drop(Db::create(&path).unwrap());
+
+        let pending_index = path.join(INDEXES_DIR).join("orphan.derived-pending");
+        let pending_vector = path.join(VECTORS_DIR).join("orphan.derived-pending.tmp");
+        let unrelated = path.join(INDEXES_DIR).join("keep.pending");
+        fs::write(&pending_index, b"pending").unwrap();
+        fs::write(&pending_vector, b"pending").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        drop(Db::open(&path).unwrap());
+        assert!(!pending_index.exists());
+        assert!(!pending_vector.exists());
+        assert!(unrelated.exists());
     }
 }

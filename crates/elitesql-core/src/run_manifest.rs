@@ -10,12 +10,12 @@ use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 use crate::error::{Error, Result};
-use crate::manifest::fsync_dir;
+use crate::manifest::{fsync_dir, PublishOutcome};
 
 pub(crate) const PRIMARY_RUN_MANIFEST: &str = "primary.runs";
-const PRIMARY_RUN_MANIFEST_TMP: &str = "primary.runs.tmp";
 const MAGIC: &[u8; 8] = b"ESQLRUN1";
 const DERIVED_MAGIC: &[u8; 8] = b"ESQLDRN1";
 const FORMAT: u32 = 1;
@@ -61,6 +61,30 @@ pub(crate) struct DerivedRunManifest {
     pub generation: u64,
     pub runs: Vec<DerivedRunMeta>,
     pub aux: [u64; 2],
+}
+
+pub(crate) struct PreparedDerivedRunManifest {
+    tmp: std::path::PathBuf,
+    target: std::path::PathBuf,
+    parent: std::path::PathBuf,
+}
+
+pub(crate) struct PreparedPrimaryRunManifest {
+    tmp: std::path::PathBuf,
+    target: std::path::PathBuf,
+    parent: std::path::PathBuf,
+}
+
+impl Drop for PreparedPrimaryRunManifest {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.tmp);
+    }
+}
+
+impl Drop for PreparedDerivedRunManifest {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.tmp);
+    }
 }
 
 impl PrimaryRunManifest {
@@ -129,17 +153,26 @@ impl PrimaryRunManifest {
     }
 
     pub(crate) fn publish(&self, indexes_dir: &Path) -> Result<()> {
+        self.prepare(indexes_dir)?.publish()
+    }
+
+    /// Write and sync a complete primary run-set replacement without exposing
+    /// it. The disposable manifest can be prepared while commits continue.
+    pub(crate) fn prepare(&self, indexes_dir: &Path) -> Result<PreparedPrimaryRunManifest> {
         fs::create_dir_all(indexes_dir)?;
-        let tmp = indexes_dir.join(PRIMARY_RUN_MANIFEST_TMP);
         let current = indexes_dir.join(PRIMARY_RUN_MANIFEST);
+        let tmp = indexes_dir.join(format!(
+            "{PRIMARY_RUN_MANIFEST}.{}.primary-pending.tmp",
+            Ulid::new()
+        ));
         let mut file = File::create(&tmp)?;
         file.write_all(&self.encode())?;
         file.sync_all()?;
-        // This manifest is disposable: one atomic replacement is sufficient.
-        // A damaged file is rebuilt from canonical segments, so keeping a
-        // second full run set would double disk residency after promotions.
-        fs::rename(&tmp, &current)?;
-        fsync_dir(indexes_dir)
+        Ok(PreparedPrimaryRunManifest {
+            tmp,
+            target: current,
+            parent: indexes_dir.to_owned(),
+        })
     }
 
     pub(crate) fn referenced_files(indexes_dir: &Path) -> Vec<String> {
@@ -148,6 +181,17 @@ impl PrimaryRunManifest {
             .flat_map(|manifest| manifest.runs)
             .map(|run| run.file)
             .collect()
+    }
+}
+
+impl PreparedPrimaryRunManifest {
+    pub(crate) fn publish(mut self) -> Result<()> {
+        // This manifest is disposable: one atomic replacement is sufficient.
+        // A damaged file is rebuilt from canonical segments, so keeping a
+        // second full run set would double disk residency after promotions.
+        fs::rename(&self.tmp, &self.target)?;
+        self.tmp.clear();
+        fsync_dir(&self.parent)
     }
 }
 
@@ -215,16 +259,32 @@ impl DerivedRunManifest {
     }
 
     pub(crate) fn publish(&self, path: &Path) -> Result<()> {
+        match self.prepare(path)?.publish()? {
+            PublishOutcome::Complete => Ok(()),
+            PublishOutcome::SyncFailed(error) => Err(error.into()),
+        }
+    }
+
+    /// Write and sync a complete replacement without making it visible.
+    /// The caller may perform this phase without holding the commit mutex.
+    pub(crate) fn prepare(&self, path: &Path) -> Result<PreparedDerivedRunManifest> {
         let parent = path
             .parent()
             .ok_or_else(|| Error::InvalidArgument("run manifest has no parent".into()))?;
         fs::create_dir_all(parent)?;
-        let tmp = path.with_extension("runs.tmp");
+        let target = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::InvalidArgument("run manifest has no utf8 filename".into()))?;
+        let tmp = parent.join(format!("{target}.{}.derived-pending.tmp", Ulid::new()));
         let mut file = File::create(&tmp)?;
         file.write_all(&self.encode())?;
         file.sync_all()?;
-        fs::rename(&tmp, path)?;
-        fsync_dir(parent)
+        Ok(PreparedDerivedRunManifest {
+            tmp,
+            target: path.to_owned(),
+            parent: parent.to_owned(),
+        })
     }
 
     pub(crate) fn referenced_files(
@@ -242,6 +302,21 @@ impl DerivedRunManifest {
             .flat_map(|manifest| manifest.runs)
             .map(|run| run.file)
             .collect()
+    }
+}
+
+impl PreparedDerivedRunManifest {
+    /// Atomically expose an already-synced replacement. A directory-sync
+    /// failure is distinguished because the rename has logically published
+    /// the disposable manifest even though crash persistence is uncertain.
+    pub(crate) fn publish(mut self) -> Result<PublishOutcome> {
+        fs::rename(&self.tmp, &self.target)?;
+        self.tmp.clear();
+        Ok(match fsync_dir(&self.parent) {
+            Ok(()) => PublishOutcome::Complete,
+            Err(Error::Io(error)) => PublishOutcome::SyncFailed(error),
+            Err(error) => PublishOutcome::SyncFailed(std::io::Error::other(error.to_string())),
+        })
     }
 }
 

@@ -114,12 +114,18 @@ target/release/elitesql serve app.esql /tmp/elitesql.sock
 from elitesql import SidecarClient
 db = SidecarClient("/tmp/elitesql.sock")    # one per worker
 db.query("SELECT count(*) AS n FROM notes")
+
+with db.streaming_cursor("SELECT id, body FROM notes", batch_rows=512) as rows:
+    for row in rows:
+        consume(row)
 ```
 
 ```js
 const { SidecarClient } = require('./bindings/node/elitesql');
 const db = await SidecarClient.connect('/tmp/elitesql.sock');
 await db.query('SELECT * FROM notes WHERE body = %s LIMIT %s', ['hello', 10]);
+const rows = await db.stream('SELECT id, body FROM notes');
+for await (const row of rows) consume(row);
 ```
 
 Reproducible demo with gunicorn and 4 workers: `examples/gunicorn_demo/run_demo.sh`.
@@ -142,9 +148,10 @@ db = SidecarClient(host="db-host", port=7070, token=os.environ["ELITESQL_TOKEN"]
 const db = await SidecarClient.connect({ host: 'db-host', port: 7070, token });
 ```
 
-The clients send the handshake for you, on connect and on reconnect. The server
-refuses every request until it succeeds, so nothing reaches the engine
-unauthenticated.
+The clients send the handshake when a connection is created. They do not
+automatically reconnect; after a disconnect, create a new client and retry only
+operations whose outcome is known to be safe. The server refuses every request
+until authentication succeeds, so nothing reaches the engine unauthenticated.
 
 Traffic is **not encrypted**. Bind loopback and cross machines through a tunnel:
 
@@ -165,9 +172,12 @@ filesystems provide neither reliably.
 
 | Mode | fsync | Loses on OS crash |
 |---|---|---|
-| `safe` (default) | per commit | nothing |
-| `balanced` | every ~25ms | last few ms |
+| `safe` (default) | per concurrent commit group | nothing |
+| `balanced` | every ~25ms, grouped | last few ms |
 | `fast` | at checkpoints | recent commits |
+
+Overlapping `safe` and due `balanced` commits can share one physical WAL sync;
+each commit waits for that shared sync to complete before it returns.
 
 `elitesql query app.esql --durability balanced "..."` or `DbOptions.durability`.
 

@@ -403,3 +403,42 @@ fn version_watermark_continues_across_checkpoints() {
         );
     }
 }
+
+#[test]
+fn incomplete_creation_never_removes_unknown_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("partial.esql");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(
+        path.join(".ELITESQL.creating"),
+        b"elitesql creation journal v1\n",
+    )
+    .unwrap();
+    std::fs::write(path.join("keep-me.txt"), b"important").unwrap();
+
+    assert!(matches!(Db::create(&path), Err(Error::InvalidArgument(_))));
+    assert_eq!(
+        std::fs::read(path.join("keep-me.txt")).unwrap(),
+        b"important"
+    );
+}
+
+#[test]
+fn incomplete_creation_can_clean_only_known_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("partial.esql");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(
+        path.join(".ELITESQL.creating"),
+        b"elitesql creation journal v1\n",
+    )
+    .unwrap();
+    std::fs::create_dir(path.join("segments")).unwrap();
+    std::fs::write(path.join("segments").join("partial.seg"), b"partial").unwrap();
+    std::fs::write(path.join("catalog.json.tmp"), b"partial").unwrap();
+
+    let db = Db::create(&path).unwrap();
+    assert!(db.scan("missing").is_err());
+    assert!(!path.join("segments").join("partial.seg").exists());
+    assert!(path.join("ELITESQL").exists());
+}

@@ -12,7 +12,7 @@ PYTHON_BINDING = Path(__file__).resolve().parents[1]
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PYTHON_BINDING))
 
-from elitesql import EliteSQL, EliteSQLError, _encode_params  # noqa: E402
+from elitesql import EliteSQL, EliteSQLError, SidecarQueryCursor, _encode_params  # noqa: E402
 
 
 LIB_NAME = {
@@ -81,6 +81,39 @@ class ParameterEncodingTests(unittest.TestCase):
         closer.join(2)
         self.assertTrue(closed.is_set())
         self.assertIsNone(db._handle)
+
+    def test_sidecar_streaming_cursor_pulls_batches_and_releases_connection(self):
+        class FakeSidecar:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.requests = []
+                self.batches = iter(
+                    [
+                        {"rows": [[1], [2]], "done": False},
+                        {"rows": [[3]], "done": True},
+                    ]
+                )
+
+            def _call(self, request, _locked=True):
+                self.requests.append(request)
+                if request["op"] == "query_open":
+                    return {"columns": ["n"]}
+                if request["op"] == "query_next":
+                    return next(self.batches)
+                if request["op"] == "query_close":
+                    return True
+                raise AssertionError(request)
+
+        client = FakeSidecar()
+        cursor = SidecarQueryCursor(client, "SELECT n FROM docs", None, 2)
+        self.assertEqual(cursor.columns, ["n"])
+        self.assertTrue(client._lock.locked())
+        self.assertEqual(cursor.fetchmany(2), [[1], [2]])
+        self.assertEqual(cursor.fetchall(), [[3]])
+        self.assertFalse(client._lock.locked())
+        self.assertEqual([request["op"] for request in client.requests], [
+            "query_open", "query_next", "query_next"
+        ])
 
 
 @unittest.skipUnless(LIB_PATH.is_file(), f"build {LIB_PATH} first")

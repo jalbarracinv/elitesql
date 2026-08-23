@@ -142,9 +142,16 @@ fn salvage_preserves_updates_and_deletes_when_segments_are_intact() {
         .unwrap()
         .flatten()
         .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|e| e == "wal"))
+        .filter(|p| p.extension().is_some_and(|e| e == "wal"))
+        // A background checkpoint retains an empty bridge before the active
+        // successor. The WAL-only commits above are in the highest successor.
+        .max()
         .unwrap();
     let mut bytes = std::fs::read(&wal).unwrap();
+    assert!(
+        !bytes.is_empty(),
+        "active WAL contains the post-checkpoint tail"
+    );
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;
     std::fs::write(&wal, &bytes).unwrap();
@@ -265,4 +272,32 @@ fn import_export_type_mapping() {
     assert_eq!(j["id"], serde_json::json!("r1"));
     assert_eq!(j["day"]["$t"], serde_json::json!("date"));
     assert_eq!(j["day"]["iso"], serde_json::json!("2026-08-07"));
+}
+
+#[test]
+fn jsonio_rejects_unrepresentable_temporal_and_vector_values() {
+    use elitesql_core::ColumnType;
+
+    for invalid in [
+        serde_json::json!({"$t": "date", "days": i64::from(i32::MAX) + 1}),
+        serde_json::json!({"$t": "date", "days": i64::from(i32::MIN) - 1}),
+        serde_json::json!({"$t": "time", "us": -1}),
+        serde_json::json!({"$t": "time", "us": 86_400_000_000_i64}),
+        serde_json::json!({"$t": "vector", "v": [1e308]}),
+    ] {
+        assert!(
+            jsonio::json_to_value(&invalid).is_err(),
+            "accepted {invalid}"
+        );
+    }
+
+    assert!(jsonio::json_to_value_for_type(
+        &serde_json::json!(i64::from(i32::MAX) + 1),
+        ColumnType::Date,
+    )
+    .is_err());
+    assert!(jsonio::json_to_value_for_type(&serde_json::json!(-1), ColumnType::Time,).is_err());
+    assert!(
+        jsonio::json_to_value_for_type(&serde_json::json!([1e308]), ColumnType::Vector,).is_err()
+    );
 }

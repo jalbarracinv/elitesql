@@ -41,7 +41,7 @@ pub(crate) fn encode_entry_into(
     table: &str,
     id: &str,
     payload: Option<&[u8]>,
-) -> u64 {
+) -> Result<u64> {
     let kind = if payload.is_some() {
         KIND_PUT
     } else {
@@ -52,16 +52,25 @@ pub(crate) fn encode_entry_into(
     buf.reserve(1 + 8 + 2 + table.len() + 2 + id.len() + 4 + payload.len() + 4);
     buf.push(kind);
     buf.extend_from_slice(&version.to_le_bytes());
-    buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    let table_len = u16::try_from(table.len()).map_err(|_| {
+        Error::InvalidArgument("table name exceeds the 65535-byte storage limit".into())
+    })?;
+    buf.extend_from_slice(&table_len.to_le_bytes());
     buf.extend_from_slice(table.as_bytes());
-    buf.extend_from_slice(&(id.len() as u16).to_le_bytes());
+    let id_len = u16::try_from(id.len()).map_err(|_| {
+        Error::InvalidArgument("record id exceeds the 65535-byte storage limit".into())
+    })?;
+    buf.extend_from_slice(&id_len.to_le_bytes());
     buf.extend_from_slice(id.as_bytes());
-    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        Error::InvalidArgument("segment payload exceeds the 4-GiB storage limit".into())
+    })?;
+    buf.extend_from_slice(&payload_len.to_le_bytes());
     let payload_offset = buf.len() as u64;
     buf.extend_from_slice(payload);
     let crc = crc32fast::hash(buf);
     buf.extend_from_slice(&crc.to_le_bytes());
-    payload_offset
+    Ok(payload_offset)
 }
 
 pub(crate) struct ScanOutcome {

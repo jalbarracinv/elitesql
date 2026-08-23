@@ -828,6 +828,11 @@ class SidecarClient:
     def cursor(self) -> "Cursor":
         return Cursor(self)
 
+    def streaming_cursor(self, sql: str, params: Any = None,
+                         batch_rows: int = 512) -> "SidecarQueryCursor":
+        """Open a bounded-memory SELECT cursor on this sidecar connection."""
+        return SidecarQueryCursor(self, sql, params, batch_rows)
+
     def transaction(self) -> "SidecarTransaction":
         """Begin a transaction pinned to this sidecar connection.
 
@@ -932,6 +937,114 @@ class SidecarClient:
         self._call({"op": "compact"})
 
 
+class SidecarQueryCursor:
+    """Bounded-memory rows pulled from ``query_open/query_next``.
+
+    One sidecar connection owns one server cursor, so its request lock stays
+    acquired until ``close`` or exhaustion.
+    """
+
+    def __init__(self, client: SidecarClient, sql: str, params: Any, batch_rows: int):
+        if batch_rows < 1 or batch_rows > 4096:
+            raise ValueError("batch_rows must be between 1 and 4096")
+        self._client = client
+        self._batch_rows = batch_rows
+        self._rows: list[list[Any]] = []
+        self._position = 0
+        self._done = False
+        self._active = False
+        request: dict[str, Any] = {"op": "query_open", "sql": sql}
+        if params is not None:
+            request["params"] = _encode_params(params)
+        client._lock.acquire()
+        try:
+            opened = client._call(request, _locked=False)
+            self.columns = list(opened.get("columns", []))
+            self._active = True
+        except Exception:
+            client._lock.release()
+            raise
+
+    def _fill(self, wanted: int) -> None:
+        while not self._done and len(self._rows) - self._position < wanted:
+            result = self._client._call(
+                {"op": "query_next", "max_rows": self._batch_rows},
+                _locked=False,
+            )
+            self._rows.extend(_decode_result({"rows": result.get("rows", [])})["rows"])
+            self._done = bool(result.get("done"))
+            if self._done:
+                self._finish()
+
+    def fetchone(self) -> Optional[list[Any]]:
+        if self._position >= len(self._rows):
+            self._fill(1)
+        if self._position >= len(self._rows):
+            return None
+        row = self._rows[self._position]
+        self._position += 1
+        if self._position == len(self._rows):
+            self._rows.clear()
+            self._position = 0
+        return row
+
+    def fetchmany(self, size: int = 1) -> list[list[Any]]:
+        size = max(0, size)
+        self._fill(size)
+        end = min(len(self._rows), self._position + size)
+        rows = self._rows[self._position:end]
+        self._position = end
+        if self._position == len(self._rows):
+            self._rows.clear()
+            self._position = 0
+        return rows
+
+    def fetchall(self) -> list[list[Any]]:
+        while not self._done:
+            self._fill(max(self._batch_rows, len(self._rows) - self._position + 1))
+        rows = self._rows[self._position:]
+        self._rows = []
+        self._position = 0
+        return rows
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> list[Any]:
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+    def _finish(self) -> None:
+        if self._active:
+            self._active = False
+            self._client._lock.release()
+
+    def close(self) -> None:
+        if self._active:
+            try:
+                self._client._call({"op": "query_close"}, _locked=False)
+            finally:
+                self._finish()
+        self._done = True
+        self._rows = []
+        self._position = 0
+
+    def __enter__(self) -> "SidecarQueryCursor":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def __del__(self):
+        if getattr(self, "_active", False):
+            try:
+                self.close()
+            except Exception:
+                self._finish()
+
+
 class SidecarTransaction:
     """Structured transaction bound to one sidecar connection."""
 
@@ -1024,8 +1137,8 @@ class Cursor:
     """Small Python DB-API-style cursor over ``EliteSQL.query``.
 
     Results are buffered because the underlying convenience query API returns
-    a complete result. Use the native streaming cursor APIs for unbounded
-    result sets.
+    a complete result. Use ``SidecarClient.streaming_cursor`` or the native
+    Rust streaming cursor APIs for unbounded result sets.
     """
 
     def __init__(self, connection: EliteSQL | SidecarClient | Transaction | SidecarTransaction):

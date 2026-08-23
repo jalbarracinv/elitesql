@@ -4,9 +4,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::error::{Error, Result};
 use crate::schema::{Catalog, FORMAT_VERSION};
 
@@ -15,9 +12,6 @@ pub(crate) const MANIFEST_PREV_FILE: &str = "manifest.prev";
 const MANIFEST_TMP_FILE: &str = "manifest.tmp";
 const MANIFEST_PREV_TMP_FILE: &str = "manifest.prev.tmp";
 const MAGIC: &[u8; 8] = b"ESQLMANI";
-
-#[cfg(test)]
-static FAIL_NEXT_PREVIOUS_DIR_SYNC: AtomicBool = AtomicBool::new(false);
 
 // On-disk layout: 8-byte magic, u32 crc32 of the JSON body, u32 body length,
 // JSON body. The manifest is the atomic pointer to the visible state; it is
@@ -182,22 +176,11 @@ impl Manifest {
         if let Err(error) = fs::rename(&tmp, dir.join(MANIFEST_PREV_FILE)) {
             return Ok(PublishOutcome::SyncFailed(error));
         }
-        #[cfg(test)]
-        if FAIL_NEXT_PREVIOUS_DIR_SYNC.swap(false, Ordering::AcqRel) {
-            return Ok(PublishOutcome::SyncFailed(std::io::Error::other(
-                "injected manifest fallback directory sync failure",
-            )));
-        }
         Ok(match fsync_dir(dir) {
             Ok(()) => PublishOutcome::Complete,
             Err(error) => PublishOutcome::SyncFailed(as_io(error)),
         })
     }
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_previous_dir_sync_for_test() {
-    FAIL_NEXT_PREVIOUS_DIR_SYNC.store(true, Ordering::Release);
 }
 
 fn as_io(error: Error) -> std::io::Error {

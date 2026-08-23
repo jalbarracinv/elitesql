@@ -359,3 +359,105 @@ fn record_map_with_btreemap_alias() {
     let r: Record = BTreeMap::new();
     assert!(r.is_empty());
 }
+
+#[test]
+fn durable_string_length_boundaries_are_checked_before_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lengths.esql");
+    {
+        let db = Db::create(&path).unwrap();
+        db.create_table(docs_schema()).unwrap();
+
+        let boundary_id = "x".repeat(u16::MAX as usize);
+        let mut at_boundary = record("largest valid id", 1);
+        at_boundary.insert("id".into(), Value::Text(boundary_id.clone()));
+        assert_eq!(db.insert("docs", at_boundary).unwrap(), boundary_id);
+        db.checkpoint().unwrap();
+
+        let too_long_id = "y".repeat(u16::MAX as usize + 1);
+        let mut too_long = record("must be rejected", 2);
+        too_long.insert("id".into(), Value::Text(too_long_id));
+        assert!(matches!(
+            db.insert("docs", too_long),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(db.scan("docs").unwrap().len(), 1);
+    }
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.scan("docs").unwrap().len(), 1);
+}
+
+#[test]
+fn oversized_schema_and_rename_names_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("names.esql")).unwrap();
+    let too_long = "n".repeat(u16::MAX as usize + 1);
+
+    assert!(matches!(
+        db.create_table(TableSchema::new(&too_long, vec![])),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        db.create_table(TableSchema::new(
+            "bad_column",
+            vec![Column::new(&too_long, ColumnType::Text)]
+        )),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    db.create_table(docs_schema()).unwrap();
+    assert!(matches!(
+        db.rename_table("docs", &too_long),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        db.rename_column("docs", "title", &too_long),
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[test]
+fn core_rejects_nonfinite_vectors_and_out_of_range_times() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("values.esql")).unwrap();
+    db.create_table(TableSchema::new(
+        "measurements",
+        vec![
+            Column::vector("embedding", 2),
+            Column::new("at", ColumnType::Time),
+        ],
+    ))
+    .unwrap();
+
+    let mut bad_vector = Record::new();
+    bad_vector.insert("embedding".into(), Value::Vector(vec![f32::INFINITY, 0.0]));
+    assert!(matches!(
+        db.insert("measurements", bad_vector),
+        Err(Error::SchemaViolation(_))
+    ));
+
+    let mut bad_time = Record::new();
+    bad_time.insert("at".into(), Value::Time(-1));
+    assert!(matches!(
+        db.insert("measurements", bad_time),
+        Err(Error::SchemaViolation(_))
+    ));
+
+    db.create_vector_index(
+        "measurements",
+        "embedding",
+        elitesql_core::VectorIndexOptions::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        db.search_vector(
+            "measurements",
+            "embedding",
+            &[f32::NAN, 0.0],
+            1,
+            &elitesql_core::VectorSearchOptions::default(),
+        ),
+        Err(Error::InvalidArgument(_))
+    ));
+}

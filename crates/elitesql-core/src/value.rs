@@ -256,12 +256,15 @@ pub(crate) struct BlobRef {
     pub crc: u32,
 }
 
-pub(crate) fn encode_blob_ref(buf: &mut Vec<u8>, name: &str, size: u64, crc: u32) {
+pub(crate) fn encode_blob_ref(buf: &mut Vec<u8>, name: &str, size: u64, crc: u32) -> Result<()> {
+    let name_len = u16::try_from(name.len())
+        .map_err(|_| Error::InvalidArgument("blob reference name exceeds 65535 bytes".into()))?;
     buf.push(TAG_BLOBREF);
-    buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&name_len.to_le_bytes());
     buf.extend_from_slice(name.as_bytes());
     buf.extend_from_slice(&size.to_le_bytes());
     buf.extend_from_slice(&crc.to_le_bytes());
+    Ok(())
 }
 
 fn read_blob_ref(buf: &[u8], pos: &mut usize) -> Result<BlobRef> {

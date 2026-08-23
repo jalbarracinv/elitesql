@@ -9,6 +9,8 @@
 //! Protocol (one JSON object per line, response per request in order):
 //!   -> {"op":"auth","token":"..."}            (TCP only; must come first)
 //!   -> {"op":"query","sql":"SELECT ...","params"?: [...] | {...}}
+//!   -> {"op":"query_open","sql":"SELECT ...","params"?: [...] | {...}}
+//!   -> {"op":"query_next","max_rows"?:512} | {"op":"query_close"}
 //!   -> {"op":"search_vector","table":...,"column":...,"vector":[...],...}
 //!   -> {"op":"checkpoint"} | {"op":"compact"} | {"op":"ping"}
 //!   <- {"ok":true,"result":...}
@@ -27,16 +29,55 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use elitesql_core::{jsonio, Db, Error, Txn};
+use elitesql_core::{jsonio, Db, Error, QueryCursor, QueryOutput, Record, Txn, Value};
 use serde_json::{json, Value as J};
 
 /// Protocol-level error code for authentication, outside the engine's range
 /// (`Error::code()` currently returns 1..=17) so clients can tell them apart.
 const AUTH_ERROR_CODE: u32 = 20;
 const SIDECAR_TXN_TIMEOUT: Duration = Duration::from_secs(30);
+const SIDECAR_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BUFFERED_ROWS: usize = 10_000;
+const DEFAULT_CURSOR_ROWS: usize = 512;
+const MAX_CURSOR_ROWS: usize = 4_096;
+
+struct SidecarCursor<'db> {
+    cursor: QueryCursor<'db>,
+    pending: Option<Vec<Value>>,
+}
+
+struct ResponseBuffer {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+impl ResponseBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(1024),
+            overflowed: false,
+        }
+    }
+}
+
+impl Write for ResponseBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > MAX_RESPONSE_BYTES {
+            self.overflowed = true;
+            return Err(std::io::Error::other("sidecar response limit exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 pub struct ServeOptions {
     /// Unix socket path to bind, when serving locally.
@@ -237,14 +278,25 @@ fn accept_loop<S: Stream>(
 }
 
 fn handle_connection<S: Stream>(db: Arc<Db>, stream: S, auth: Auth) {
-    handle_connection_with_timeout(db, stream, auth, SIDECAR_TXN_TIMEOUT)
+    handle_connection_with_timeouts(db, stream, auth, SIDECAR_TXN_TIMEOUT, SIDECAR_AUTH_TIMEOUT)
 }
 
+#[cfg(test)]
 fn handle_connection_with_timeout<S: Stream>(
     db: Arc<Db>,
     stream: S,
     auth: Auth,
     idle_timeout: Duration,
+) {
+    handle_connection_with_timeouts(db, stream, auth, idle_timeout, SIDECAR_AUTH_TIMEOUT)
+}
+
+fn handle_connection_with_timeouts<S: Stream>(
+    db: Arc<Db>,
+    stream: S,
+    auth: Auth,
+    idle_timeout: Duration,
+    auth_timeout: Duration,
 ) {
     if stream.set_timeouts(None).is_err() {
         return;
@@ -255,7 +307,9 @@ fn handle_connection_with_timeout<S: Stream>(
     });
     let mut writer = BufWriter::new(stream);
     let mut authenticated = matches!(auth, Auth::Trusted);
+    let auth_deadline = (!authenticated).then(|| Instant::now() + auth_timeout);
     let mut txn = None;
+    let mut cursor = None;
     loop {
         if reader
             .get_ref()
@@ -264,15 +318,11 @@ fn handle_connection_with_timeout<S: Stream>(
         {
             return;
         }
-        let mut line = String::new();
-        let read = match reader
-            .by_ref()
-            .take(MAX_REQUEST_BYTES + 1)
-            .read_line(&mut line)
-        {
-            Ok(read) => read,
-            Err(_) => return, // timeout/disconnect rolls back `txn` by drop
-        };
+        let (read, line) =
+            match read_request_line(&mut reader, auth_deadline.filter(|_| !authenticated)) {
+                Ok(read) => read,
+                Err(_) => return, // timeout/disconnect rolls back `txn` by drop
+            };
         if read == 0 {
             return;
         }
@@ -289,11 +339,168 @@ fn handle_connection_with_timeout<S: Stream>(
         if line.trim().is_empty() {
             continue;
         }
-        let response = dispatch_with_txn(&db, &line, &auth, &mut authenticated, &mut txn);
-        if writeln!(writer, "{response}").is_err() || writer.flush().is_err() {
+        let response =
+            dispatch_with_txn(&db, &line, &auth, &mut authenticated, &mut txn, &mut cursor);
+        if authenticated && writer.get_ref().set_timeouts(None).is_err() {
+            return;
+        }
+        let response = bounded_response_bytes(&response);
+        if writer.write_all(&response).is_err()
+            || writer.write_all(b"\n").is_err()
+            || writer.flush().is_err()
+        {
             return;
         }
     }
+}
+
+fn bounded_response_bytes(response: &J) -> Vec<u8> {
+    let mut encoded = ResponseBuffer::new();
+    match serde_json::to_writer(&mut encoded, response) {
+        Ok(()) => return encoded.bytes,
+        Err(error) if !encoded.overflowed => {
+            return serde_json::to_vec(&json!({
+                "ok": false,
+                "code": 8,
+                "error": format!("cannot encode response: {error}"),
+            }))
+            .expect("static error response is valid JSON");
+        }
+        Err(_) => {}
+    }
+    let mut replacement = json!({
+        "ok": false,
+        "code": 8,
+        "error": format!(
+            "response exceeds the {MAX_RESPONSE_BYTES}-byte limit; use query_open/query_next"
+        ),
+    });
+    if let (Some(id), Some(object)) = (response.get("id"), replacement.as_object_mut()) {
+        object.insert("id".into(), id.clone());
+    }
+    serde_json::to_vec(&replacement).expect("static error response is valid JSON")
+}
+
+fn open_query_cursor<'db>(
+    db: &'db Db,
+    sql: &str,
+    params: Option<&J>,
+) -> Result<QueryCursor<'db>, Error> {
+    match params {
+        None | Some(J::Null) => db.query_cursor(sql),
+        Some(J::Array(values)) => {
+            let values = values
+                .iter()
+                .map(jsonio::json_to_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            db.query_cursor_params(sql, &values)
+        }
+        Some(J::Object(values)) => {
+            let values = values
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), jsonio::json_to_value(value)?)))
+                .collect::<Result<Record, Error>>()?;
+            db.query_cursor_named_params(sql, &values)
+        }
+        Some(_) => Err(Error::InvalidArgument(
+            "SQL parameters must be a JSON array, object, or null".into(),
+        )),
+    }
+}
+
+/// Keep the compatibility `query` operation bounded for the naturally
+/// streaming SELECT subset. Complex SELECTs still use the spill-capable core
+/// executor, but their final caller-owned result is rejected before JSON
+/// duplication when it exceeds the sidecar row budget.
+fn sidecar_query(db: &Db, sql: &str, params: Option<&J>) -> Result<QueryOutput, Error> {
+    if let Ok(mut cursor) = open_query_cursor(db, sql, params) {
+        let columns = cursor.columns().to_vec();
+        let rows = cursor.next_batch(MAX_BUFFERED_ROWS + 1)?;
+        if rows.len() > MAX_BUFFERED_ROWS {
+            return Err(Error::MemoryLimit(format!(
+                "buffered query exceeds {MAX_BUFFERED_ROWS} rows; use query_open/query_next"
+            )));
+        }
+        return Ok(QueryOutput::Rows { columns, rows });
+    }
+
+    let output = jsonio::query_with_params_json_bounded(db, sql, params, MAX_BUFFERED_ROWS + 1)?;
+    if matches!(&output, QueryOutput::Rows { rows, .. } if rows.len() > MAX_BUFFERED_ROWS) {
+        return Err(Error::MemoryLimit(format!(
+            "buffered query exceeds {MAX_BUFFERED_ROWS} rows; add LIMIT or use query_open/query_next"
+        )));
+    }
+    Ok(output)
+}
+
+fn sidecar_cursor_next(
+    active: &mut SidecarCursor<'_>,
+    max_rows: usize,
+) -> Result<(Vec<Vec<Value>>, bool), Error> {
+    let mut rows = Vec::with_capacity(max_rows);
+    if let Some(row) = active.pending.take() {
+        rows.push(row);
+    }
+    while rows.len() <= max_rows {
+        match active.cursor.next() {
+            Some(Ok(row)) => rows.push(row),
+            Some(Err(error)) => return Err(error),
+            None => return Ok((rows, true)),
+        }
+    }
+    active.pending = rows.pop();
+    Ok((rows, false))
+}
+
+fn rows_to_json(rows: &[Vec<Value>]) -> Vec<Vec<J>> {
+    rows.iter()
+        .map(|row| row.iter().map(jsonio::value_to_json).collect())
+        .collect()
+}
+
+/// Read one protocol line while enforcing both the frame size and an optional
+/// absolute deadline. Recomputing the socket timeout after every buffered
+/// chunk prevents a peer from keeping an unauthenticated slot alive by
+/// sending one byte just before each ordinary read timeout.
+fn read_request_line<S: Stream>(
+    reader: &mut BufReader<S>,
+    deadline: Option<Instant>,
+) -> std::io::Result<(usize, String)> {
+    let mut bytes = Vec::new();
+    loop {
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "authentication deadline expired",
+                ));
+            }
+            reader.get_ref().set_timeouts(Some(remaining))?;
+        }
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let through_newline = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|position| position + 1);
+        let wanted = through_newline.unwrap_or(available.len());
+        let capacity = (MAX_REQUEST_BYTES as usize + 1).saturating_sub(bytes.len());
+        let consumed = wanted.min(capacity);
+        bytes.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if through_newline.is_some_and(|wanted| consumed == wanted)
+            || bytes.len() > MAX_REQUEST_BYTES as usize
+        {
+            break;
+        }
+    }
+    let read = bytes.len();
+    let line = String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok((read, line))
 }
 
 /// Applies the connection's auth state, then runs the request. Everything
@@ -302,15 +509,17 @@ fn handle_connection_with_timeout<S: Stream>(
 #[cfg(test)]
 fn dispatch(db: &Db, line: &str, auth: &Auth, authenticated: &mut bool) -> J {
     let mut txn = None;
-    dispatch_with_txn(db, line, auth, authenticated, &mut txn)
+    let mut cursor = None;
+    dispatch_with_txn(db, line, auth, authenticated, &mut txn, &mut cursor)
 }
 
-fn dispatch_with_txn(
-    db: &Db,
+fn dispatch_with_txn<'db>(
+    db: &'db Db,
     line: &str,
     auth: &Auth,
     authenticated: &mut bool,
     txn: &mut Option<Txn>,
+    cursor: &mut Option<SidecarCursor<'db>>,
 ) -> J {
     let request: J = match serde_json::from_str(line) {
         Ok(j) => j,
@@ -355,10 +564,16 @@ fn dispatch_with_txn(
             "authentication required: send {\"op\":\"auth\",\"token\":...} first",
         );
     }
-    handle_request(db, request, id, txn)
+    handle_request(db, request, id, txn, cursor)
 }
 
-fn handle_request(db: &Db, request: J, id: Option<J>, txn: &mut Option<Txn>) -> J {
+fn handle_request<'db>(
+    db: &'db Db,
+    request: J,
+    id: Option<J>,
+    txn: &mut Option<Txn>,
+    cursor: &mut Option<SidecarCursor<'db>>,
+) -> J {
     let op = request
         .get("op")
         .and_then(|o| o.as_str())
@@ -391,24 +606,70 @@ fn handle_request(db: &Db, request: J, id: Option<J>, txn: &mut Option<Txn>) -> 
             "an explicit transaction is active; use query_in_txn or commit/rollback".into(),
         )),
         "query" => match request.get("sql").and_then(|s| s.as_str()) {
-            Some(sql) => request
-                .get("params")
-                .map_or_else(
-                    || db.query(sql),
-                    |params| jsonio::query_with_params_json(db, sql, params),
-                )
+            Some(sql) => sidecar_query(db, sql, request.get("params"))
                 .map(|out| jsonio::output_to_json(&out)),
             None => Err(elitesql_core::Error::InvalidArgument(
                 "missing 'sql'".into(),
             )),
         },
+        "query_open" if txn.is_some() => Err(Error::InvalidArgument(
+            "query_open is not available inside an explicit transaction".into(),
+        )),
+        "query_open" if cursor.is_some() => Err(Error::InvalidArgument(
+            "a streaming cursor is already active; close it before opening another".into(),
+        )),
+        "query_open" => (|| {
+            let sql = required_string("sql")?;
+            let opened = open_query_cursor(db, sql, request.get("params"))?;
+            let columns = opened.columns().to_vec();
+            *cursor = Some(SidecarCursor {
+                cursor: opened,
+                pending: None,
+            });
+            Ok(json!({"columns": columns}))
+        })(),
+        "query_next" => (|| {
+            let requested = request
+                .get("max_rows")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(|| {
+                            Error::InvalidArgument("max_rows must be a positive integer".into())
+                        })
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_CURSOR_ROWS);
+            if requested == 0 || requested > MAX_CURSOR_ROWS {
+                return Err(Error::InvalidArgument(format!(
+                    "max_rows must be between 1 and {MAX_CURSOR_ROWS}"
+                )));
+            }
+            let active = cursor
+                .as_mut()
+                .ok_or_else(|| Error::InvalidArgument("no active streaming cursor".into()))?;
+            let (rows, done) = sidecar_cursor_next(active, requested)?;
+            if done {
+                cursor.take();
+            }
+            Ok(json!({"rows": rows_to_json(&rows), "done": done}))
+        })(),
+        "query_close" => {
+            let existed = cursor.take().is_some();
+            Ok(json!(existed))
+        }
         "search_vector" => jsonio::search_vector_json(db, &request),
         "create_vector_index" => jsonio::create_vector_index_json(db, &request),
         "search_text" => jsonio::search_text_json(db, &request),
         "create_text_index" => jsonio::create_text_index_json(db, &request),
         "search_hybrid" => jsonio::search_hybrid_json(db, &request),
         "begin" => {
-            if txn.is_some() {
+            if cursor.is_some() {
+                Err(Error::InvalidArgument(
+                    "close the active streaming cursor before beginning a transaction".into(),
+                ))
+            } else if txn.is_some() {
                 Err(Error::InvalidArgument(
                     "a transaction is already active on this connection".into(),
                 ))
@@ -422,10 +683,17 @@ fn handle_request(db: &Db, request: J, id: Option<J>, txn: &mut Option<Txn>) -> 
             let transaction = txn
                 .as_mut()
                 .ok_or_else(|| Error::InvalidArgument("no active transaction".into()))?;
-            let output = match request.get("params") {
-                Some(params) => jsonio::query_txn_with_params_json(transaction, sql, params),
-                None => transaction.query(sql),
-            }?;
+            let output = jsonio::query_txn_with_params_json_bounded(
+                transaction,
+                sql,
+                request.get("params"),
+                MAX_BUFFERED_ROWS + 1,
+            )?;
+            if matches!(&output, QueryOutput::Rows { rows, .. } if rows.len() > MAX_BUFFERED_ROWS) {
+                return Err(Error::MemoryLimit(format!(
+                    "buffered transaction query exceeds {MAX_BUFFERED_ROWS} rows; add LIMIT"
+                )));
+            }
             Ok(jsonio::output_to_json(&output))
         })(),
         "txn_insert" => (|| {
@@ -545,6 +813,101 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_streaming_cursor_returns_bounded_ordered_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("sidecar-cursor.esql")).unwrap();
+        db.query("CREATE TABLE docs (n int64 NOT NULL)").unwrap();
+        db.bulk_insert_sorted(
+            "docs",
+            (0..1_200).map(|n| {
+                let mut record = Record::new();
+                record.insert("id".into(), Value::Text(format!("row-{n:05}")));
+                record.insert("n".into(), Value::Int64(n));
+                record
+            }),
+        )
+        .unwrap();
+
+        let mut authenticated = true;
+        let mut transaction = None;
+        let mut cursor = None;
+        let opened = dispatch_with_txn(
+            &db,
+            &json!({"op": "query_open", "sql": "SELECT id, n FROM docs"}).to_string(),
+            &Auth::Trusted,
+            &mut authenticated,
+            &mut transaction,
+            &mut cursor,
+        );
+        assert_eq!(opened["result"]["columns"], json!(["id", "n"]));
+
+        let mut rows = Vec::new();
+        loop {
+            let batch = dispatch_with_txn(
+                &db,
+                &json!({"op": "query_next", "max_rows": 127}).to_string(),
+                &Auth::Trusted,
+                &mut authenticated,
+                &mut transaction,
+                &mut cursor,
+            );
+            assert_eq!(batch["ok"], true, "{batch}");
+            let returned = batch["result"]["rows"].as_array().unwrap();
+            assert!(returned.len() <= 127);
+            rows.extend(returned.iter().cloned());
+            if batch["result"]["done"] == true {
+                break;
+            }
+        }
+        assert_eq!(rows.len(), 1_200);
+        assert_eq!(rows.first().unwrap(), &json!(["row-00000", 0]));
+        assert_eq!(rows.last().unwrap(), &json!(["row-01199", 1199]));
+        assert!(
+            cursor.is_none(),
+            "exhaustion must release the server cursor"
+        );
+    }
+
+    #[test]
+    fn sidecar_replaces_an_oversized_response_and_preserves_request_id() {
+        let response = json!({
+            "ok": true,
+            "id": 42,
+            "result": "x".repeat(MAX_RESPONSE_BYTES),
+        });
+        let encoded = bounded_response_bytes(&response);
+        assert!(encoded.len() < 1024);
+        let decoded: J = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded["ok"], false);
+        assert_eq!(decoded["id"], 42);
+        assert!(decoded["error"].as_str().unwrap().contains("query_open"));
+    }
+
+    #[test]
+    fn sidecar_caps_a_blocking_select_before_returning_its_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("sidecar-bounded-select.esql")).unwrap();
+        db.query("CREATE TABLE docs (n int64 NOT NULL)").unwrap();
+        db.bulk_insert_sorted(
+            "docs",
+            (0..MAX_BUFFERED_ROWS + 1).map(|n| {
+                let mut record = Record::new();
+                record.insert("id".into(), Value::Text(format!("row-{n:05}")));
+                record.insert("n".into(), Value::Int64(n as i64));
+                record
+            }),
+        )
+        .unwrap();
+
+        let response = trusted(
+            &db,
+            json!({"op": "query", "sql": "SELECT n FROM docs ORDER BY n DESC"}),
+        );
+        assert_eq!(response["ok"], false);
+        assert!(response["error"].as_str().unwrap().contains("10000 rows"));
+    }
+
+    #[test]
     fn sidecar_connection_transaction_is_atomic_and_returns_identity() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::create(dir.path().join("sidecar-txn.esql")).unwrap();
@@ -554,13 +917,15 @@ mod tests {
         .unwrap();
         let mut authenticated = true;
         let mut txn = None;
-        let call = |request: J, authenticated: &mut bool, txn: &mut Option<Txn>| {
+        let mut cursor = None;
+        let mut call = |request: J, authenticated: &mut bool, txn: &mut Option<Txn>| {
             dispatch_with_txn(
                 &db,
                 &request.to_string(),
                 &Auth::Trusted,
                 authenticated,
                 txn,
+                &mut cursor,
             )
         };
 
@@ -702,6 +1067,33 @@ mod tests {
         drop(responses);
         drop(client);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn unauthenticated_connection_expires_even_with_a_partial_request() {
+        let (_dir, db, auth) = token_db();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            handle_connection_with_timeouts(
+                Arc::new(db),
+                server,
+                auth,
+                Duration::from_secs(1),
+                Duration::from_millis(30),
+            );
+            done_tx.send(()).unwrap();
+        });
+
+        client.write_all(b"{").unwrap();
+        client.flush().unwrap();
+        let finished = done_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+        drop(client);
+        worker.join().unwrap();
+        assert!(
+            finished,
+            "partial unauthenticated input held a connection slot"
+        );
     }
 
     #[test]

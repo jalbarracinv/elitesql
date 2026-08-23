@@ -63,40 +63,68 @@ pub(crate) fn encode_commit(
     version: u64,
     changes: &[(&str, &str, Option<&[u8]>)],
     identity_high_water: &[(&str, i64)],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(128);
     buf.extend_from_slice(&version.to_le_bytes());
     let count = changes
         .len()
         .checked_add(identity_high_water.len())
-        .expect("WAL change count overflow");
-    buf.extend_from_slice(&(count as u32).to_le_bytes());
+        .ok_or_else(|| Error::InvalidArgument("WAL change count overflow".into()))?;
+    let count = u32::try_from(count)
+        .map_err(|_| Error::InvalidArgument("WAL has more than u32::MAX changes".into()))?;
+    buf.extend_from_slice(&count.to_le_bytes());
     for (table, id, payload) in changes {
         buf.push(if payload.is_some() {
             KIND_PUT
         } else {
             KIND_TOMBSTONE
         });
-        buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
+        let table_len = u16::try_from(table.len()).map_err(|_| {
+            Error::InvalidArgument("table name exceeds the 65535-byte storage limit".into())
+        })?;
+        buf.extend_from_slice(&table_len.to_le_bytes());
         buf.extend_from_slice(table.as_bytes());
-        buf.extend_from_slice(&(id.len() as u16).to_le_bytes());
+        let id_len = u16::try_from(id.len()).map_err(|_| {
+            Error::InvalidArgument("record id exceeds the 65535-byte storage limit".into())
+        })?;
+        buf.extend_from_slice(&id_len.to_le_bytes());
         buf.extend_from_slice(id.as_bytes());
         let p = payload.unwrap_or(&[]);
-        buf.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        let payload_len = u32::try_from(p.len()).map_err(|_| {
+            Error::InvalidArgument("WAL payload exceeds the 4-GiB storage limit".into())
+        })?;
+        buf.extend_from_slice(&payload_len.to_le_bytes());
         buf.extend_from_slice(p);
     }
     for (table, value) in identity_high_water {
         buf.push(KIND_PUT);
         buf.extend_from_slice(&(IDENTITY_META_TABLE.len() as u16).to_le_bytes());
         buf.extend_from_slice(IDENTITY_META_TABLE.as_bytes());
-        buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
+        let table_len = u16::try_from(table.len()).map_err(|_| {
+            Error::InvalidArgument("table name exceeds the 65535-byte storage limit".into())
+        })?;
+        buf.extend_from_slice(&table_len.to_le_bytes());
         buf.extend_from_slice(table.as_bytes());
         buf.extend_from_slice(&(8u32).to_le_bytes());
         buf.extend_from_slice(&value.to_le_bytes());
     }
     let crc = crc32fast::hash(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
-    buf
+    Ok(buf)
+}
+
+/// Assign the serialized version after a WAL record was prepared. Updating
+/// the short header and CRC is cheaper than re-encoding every payload while
+/// holding the global commit mutex.
+pub(crate) fn set_encoded_commit_version(record: &mut [u8], version: u64) {
+    assert!(
+        record.len() >= 12,
+        "an encoded WAL commit includes a header and CRC"
+    );
+    record[..8].copy_from_slice(&version.to_le_bytes());
+    let crc_offset = record.len() - 4;
+    let crc = crc32fast::hash(&record[..crc_offset]);
+    record[crc_offset..].copy_from_slice(&crc.to_le_bytes());
 }
 
 pub(crate) struct WalScan {
@@ -266,12 +294,25 @@ impl WalWriter {
         self.fail_next_sync = true;
     }
 
+    #[cfg(test)]
     pub fn append_commit(
         &mut self,
         bytes: &[u8],
         durability: Durability,
         balanced_interval_ms: u64,
     ) -> Result<WalAppendOutcome> {
+        self.append_commit_unflushed(bytes)?;
+        if self.sync_due(durability, balanced_interval_ms) {
+            Ok(self.sync_data())
+        } else {
+            Ok(WalAppendOutcome::Complete)
+        }
+    }
+
+    /// Append one complete framed record without forcing it to storage. The
+    /// caller may subsequently group several appended records behind one
+    /// `sync_data` call.
+    pub fn append_commit_unflushed(&mut self, bytes: &[u8]) -> Result<u64> {
         if let Some(message) = &self.poisoned {
             return Err(Error::Io(std::io::Error::other(format!(
                 "WAL writer is unusable after an earlier append failure: {message}"
@@ -285,40 +326,40 @@ impl WalWriter {
             return Err(self.rollback_partial_append(start, write_error));
         }
         self.len = self.len.saturating_add(bytes.len() as u64);
-        let mut sync_attempted = false;
-        let sync_result = match durability {
-            Durability::Safe => {
-                sync_attempted = true;
-                self.file.sync_data()
-            }
+        Ok(self.len)
+    }
+
+    pub fn sync_due(&self, durability: Durability, balanced_interval_ms: u64) -> bool {
+        match durability {
+            Durability::Safe => true,
             Durability::Balanced => {
-                if self.last_sync.elapsed().as_millis() as u64 >= balanced_interval_ms {
-                    sync_attempted = true;
-                    self.file.sync_data()
-                } else {
-                    Ok(())
-                }
+                self.last_sync.elapsed().as_millis() as u64 >= balanced_interval_ms
             }
-            Durability::Fast => Ok(()),
-        };
+            Durability::Fast => false,
+        }
+    }
+
+    /// Synchronize every record appended so far. A sync failure leaves the
+    /// fully framed records in place and therefore has the same ambiguous
+    /// outcome as the legacy per-commit path.
+    pub fn sync_data(&mut self) -> WalAppendOutcome {
+        let sync_result = self.file.sync_data();
         #[cfg(test)]
-        let sync_result = if sync_attempted && std::mem::take(&mut self.fail_next_sync) {
+        let sync_result = if std::mem::take(&mut self.fail_next_sync) {
             Err(std::io::Error::other("injected WAL sync failure"))
         } else {
             sync_result
         };
         match sync_result {
             Ok(()) => {
-                if sync_attempted {
-                    self.last_sync = Instant::now();
-                }
-                Ok(WalAppendOutcome::Complete)
+                self.last_sync = Instant::now();
+                WalAppendOutcome::Complete
             }
             // The full framed record is already part of this process's WAL.
             // Rolling it back would make its outcome even less knowable and
             // permit version reuse. Publish it logically and tell the caller
             // that crash durability is unknown.
-            Err(error) => Ok(WalAppendOutcome::SyncFailed(error)),
+            Err(error) => WalAppendOutcome::SyncFailed(error),
         }
     }
 }
@@ -329,9 +370,9 @@ mod tests {
 
     #[test]
     fn scan_stops_before_duplicate_or_regressing_versions() {
-        let first = encode_commit(7, &[("t", "a", Some(b"one"))], &[]);
-        let duplicate = encode_commit(7, &[("t", "b", Some(b"two"))], &[]);
-        let later = encode_commit(8, &[("t", "c", Some(b"three"))], &[]);
+        let first = encode_commit(7, &[("t", "a", Some(b"one"))], &[]).unwrap();
+        let duplicate = encode_commit(7, &[("t", "b", Some(b"two"))], &[]).unwrap();
+        let later = encode_commit(8, &[("t", "c", Some(b"three"))], &[]).unwrap();
         let mut bytes = first.clone();
         bytes.extend_from_slice(&duplicate);
         bytes.extend_from_slice(&later);
@@ -348,12 +389,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(WAL_DIR)).unwrap();
         let mut writer = WalWriter::open(dir.path(), 1).unwrap();
-        let torn = encode_commit(1, &[("t", "a", Some(b"one"))], &[]);
+        let torn = encode_commit(1, &[("t", "a", Some(b"one"))], &[]).unwrap();
         writer.file.write_all(&torn[..torn.len() / 2]).unwrap();
         let _ = writer.rollback_partial_append(0, std::io::Error::other("injected partial write"));
         assert_eq!(std::fs::metadata(wal_path(dir.path(), 1)).unwrap().len(), 0);
 
-        let complete = encode_commit(1, &[("t", "b", Some(b"two"))], &[]);
+        let complete = encode_commit(1, &[("t", "b", Some(b"two"))], &[]).unwrap();
         assert!(matches!(
             writer
                 .append_commit(&complete, Durability::Fast, 0)
@@ -367,5 +408,28 @@ mod tests {
         assert_eq!(scan.records.len(), 1);
         assert_eq!(scan.records[0].version, 1);
         assert_eq!(scan.records[0].changes[0].id, "b");
+    }
+
+    #[test]
+    fn encoder_rejects_strings_that_do_not_fit_its_frame() {
+        let too_long = "x".repeat(u16::MAX as usize + 1);
+        assert!(encode_commit(1, &[("t", &too_long, None)], &[]).is_err());
+        assert!(encode_commit(1, &[(&too_long, "id", None)], &[]).is_err());
+        assert!(encode_commit(1, &[], &[(&too_long, 1)]).is_err());
+    }
+
+    #[test]
+    fn an_encoded_commit_can_be_assigned_its_final_version() {
+        let mut encoded = encode_commit(0, &[("t", "a", Some(b"one"))], &[]).unwrap();
+        set_encoded_commit_version(&mut encoded, 42);
+
+        let scanned = scan_wal(&encoded);
+        assert!(scanned.clean);
+        assert_eq!(scanned.records.len(), 1);
+        assert_eq!(scanned.records[0].version, 42);
+        assert_eq!(
+            scanned.records[0].changes[0].payload.as_deref(),
+            Some(b"one".as_slice())
+        );
     }
 }

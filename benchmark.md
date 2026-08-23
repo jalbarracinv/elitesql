@@ -17,12 +17,15 @@ transactional workload EliteSQL took 1.535x SQLite's total load time. In the
 concurrent-writer workload it delivered 1.86x–2.40x SQLite's throughput and
 stayed within 2% of its pre-compatibility throughput at every writer count.
 
-Post-reference architectural change (2026-08-08): primary-only automatic
-checkpoints now freeze one bounded memtable generation and flush it on a
+Post-reference architectural change (updated 2026-08-23): automatic and
+explicit checkpoints freeze one bounded memtable generation and flush it on a
 dedicated worker while later commits fill a fresh active generation. The
-frozen heap is charged to the maintenance pool, and manifest publication
-rotates only the complete WAL tail written after the freeze. Explicit
-checkpoint remains the end-to-end barrier used by this benchmark. A 1M-row
+frozen heap is charged to the maintenance pool. Two durable successor WALs
+bridge the unlocked publication window: recovery can follow the old manifest,
+the atomic copied tail and the active WAL, or the new manifest and its
+successors. Segment, WAL-copy and manifest I/O therefore happen without the
+global commit mutex; `checkpoint()` remains an end-to-end barrier for the
+generation it freezes. A 1M-row
 release sanity run (`fast`, 10K rows/transaction, former 128 MiB default)
 measured 1.980 s ingest + 0.051 s final checkpoint = 2.031 s total, versus the
 prior 2.044 s local result. That small 0.6% change is directional, not a
@@ -236,6 +239,54 @@ EliteSQL harness gives the bounded delta 384 bytes per fixture row and asserts
 that no consolidation occurred before timing ended; SQLite likewise disables
 automatic WAL checkpoints. This isolates commit concurrency rather than
 silently charging maintenance to only one engine.
+For EliteSQL rows, current CSV/output also reports physical `wal_syncs` and the
+number of commits served by multi-commit sync groups. This makes `Safe` and
+`Balanced` group-commit efficiency observable instead of inferring it from
+throughput alone.
+
+### 2026-08-23 commit-mutex and tail-latency repeat
+
+A focused before/after run used 40K rows, 10 rows/transaction, Fast durability,
+three fresh repetitions and writer counts 1/2/4/8/16. The only scheduling
+change between these two CSVs is the commit mutex: Safe retains the standard
+mutex behavior that favors fsync coalescing, while Fast/Balanced use adaptive
+spinning and hand the lock fairly to an already queued writer. Values below
+are medians of the three EliteSQL repetitions.
+
+| Writers | Baseline rows/s | Fair rows/s | Baseline p95 | Fair p95 | Baseline p99 | Fair p99 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 429,863 | 438,859 | 28.5 µs | 27.7 µs | 34.4 µs | 31.7 µs |
+| 2 | 378,170 | 376,130 | 66.1 µs | 68.2 µs | 71.4 µs | 75.9 µs |
+| 4 | 351,370 | 382,868 | 179.3 µs | 110.5 µs | 235.1 µs | 127.0 µs |
+| 8 | 364,122 | 379,243 | 542.5 µs | 221.0 µs | 833.1 µs | 240.6 µs |
+| 16 | 365,455 | 373,521 | 1186.7 µs | 446.0 µs | 1957.5 µs | 486.8 µs |
+
+At 4/8/16 writers, throughput improved 9.0%/4.2%/2.2%, p95 fell
+38.4%/59.3%/62.4%, and p99 fell 46.0%/71.1%/75.1%. The two-writer difference
+is within 1% throughput, with a small latency tradeoff. Instrumentation also
+shows why throughput still plateaus: at 16 writers the average critical hold
+is 18.5 µs, of which about 7.6 µs is WAL append and 6.6 µs is in-memory apply;
+parallel preparation is no longer the dominant serialized cost.
+
+The exact raw repetitions are
+[`concurrent-writers-mutex-baseline-2026-08-23.csv`](benchmark-results/concurrent-writers-mutex-baseline-2026-08-23.csv)
+and
+[`concurrent-writers-fair-2026-08-23.csv`](benchmark-results/concurrent-writers-fair-2026-08-23.csv).
+Balanced and Safe validation runs are retained in
+[`concurrent-writers-balanced-2026-08-23.csv`](benchmark-results/concurrent-writers-balanced-2026-08-23.csv)
+and
+[`concurrent-writers-safe-smoke-2026-08-23.csv`](benchmark-results/concurrent-writers-safe-smoke-2026-08-23.csv).
+Reproduce the focused Fast run with:
+
+```sh
+cargo bench -p elitesql-core --bench concurrent_writers -- \
+  --rows 40000 --batch-size 10 --repetitions 3 \
+  --writers 1,2,4,8,16 --durability fast \
+  --csv benchmark-results/concurrent-writers-fair-2026-08-23.csv
+```
+
+This focused matrix is an architectural acceptance run, not a replacement for
+the larger 200K-row EliteSQL/SQLite comparison below.
 
 | Writers | EliteSQL rows/s | SQLite rows/s | EliteSQL / SQLite | Change vs prior EliteSQL |
 |---:|---:|---:|---:|---:|
@@ -409,11 +460,14 @@ transaction-local table interning, direct checkpoint run generation and raw
 disjoint-page promotion close the measured SQL and physical memory gaps.
 Remaining work is narrower:
 
-1. **Implemented for primary-only automatic checkpoints.** Repeat the full 10M
-   matrix and profile why the 1M end-to-end gain is only 0.6%; checkpoint work
-   remains included through the explicit final barrier, not hidden in drain.
-2. Improve p99 commit latency with four to eight writers while preserving the
-   current 1.82x–2.46x throughput and sub-millisecond worst-tail advantage.
+1. **Implemented for automatic and explicit checkpoints.** Repeat the full 10M
+   matrix with the WAL-bridge publication protocol; checkpoint work remains
+   included through the explicit final barrier, not hidden in drain.
+2. **Implemented for the measured Fast writer queue.** Adaptive fair handoff
+   cut median p99 by 46%–75% at 4/8/16 writers while preserving or increasing
+   throughput. The remaining serialized floor is WAL append + in-memory apply;
+   a future batch coordinator would need a pending visibility overlay to move
+   either phase safely outside version order.
 3. Extend primary/equality/BM25 byte/time counters to vector, segment and fsync
    work, and add a dedicated derived-index throughput benchmark.
 4. Make large HNSW construction more incremental: the 250K Potion build safely

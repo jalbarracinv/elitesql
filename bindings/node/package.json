@@ -4,6 +4,9 @@
   "description": "EliteSQL Node client for the sidecar mode (elitesql serve) — zero dependencies",
   "main": "elitesql.js",
   "types": "elitesql.d.ts",
+  "scripts": {
+    "test": "node test.js"
+  },
   "license": "(MIT OR Apache-2.0)",
   "keywords": ["database", "embedded", "vector-search", "full-text", "elitesql"],
   "engines": {

@@ -56,6 +56,17 @@ pub(crate) struct TextIdx {
     removed_total_len: u64,
     persisted_doc_count: u64,
     persisted_total_len: u64,
+    frozen: Option<Arc<FrozenTextDelta>>,
+}
+
+pub(crate) struct FrozenTextDelta {
+    pub(crate) generation: u64,
+    doc_count: u64,
+    total_len: u64,
+    postings: HashMap<String, BTreeMap<String, u32>>,
+    doc_len: HashMap<String, u32>,
+    removed: HashSet<String>,
+    removed_postings: HashMap<String, BTreeSet<String>>,
 }
 
 pub(crate) struct TextRun {
@@ -76,6 +87,7 @@ impl TextIdx {
             removed_total_len: 0,
             persisted_doc_count: 0,
             persisted_total_len: 0,
+            frozen: None,
         }
     }
 
@@ -99,6 +111,7 @@ impl TextIdx {
             removed_total_len: 0,
             persisted_doc_count,
             persisted_total_len,
+            frozen: None,
         })
     }
 
@@ -123,6 +136,31 @@ impl TextIdx {
             .saturating_add(lengths)
             .saturating_add(removed)
             .saturating_add(removed_postings)
+    }
+
+    pub(crate) fn frozen_delta_memory_bytes(&self) -> usize {
+        self.frozen.as_ref().map_or(0, |frozen| {
+            let postings = frozen
+                .postings
+                .iter()
+                .map(|(term, ids)| {
+                    term.len() + 96 + ids.keys().map(|id| id.len() + 56).sum::<usize>()
+                })
+                .sum::<usize>();
+            let lengths = frozen.doc_len.keys().map(|id| id.len() + 48).sum::<usize>();
+            let removed = frozen.removed.iter().map(|id| id.len() + 48).sum::<usize>();
+            let removed_postings = frozen
+                .removed_postings
+                .iter()
+                .map(|(term, ids)| {
+                    term.len() + 96 + ids.iter().map(|id| id.len() + 48).sum::<usize>()
+                })
+                .sum::<usize>();
+            postings
+                .saturating_add(lengths)
+                .saturating_add(removed)
+                .saturating_add(removed_postings)
+        })
     }
 
     /// Index (or re-index) a document. `remove` must be called first when
@@ -159,7 +197,10 @@ impl TextIdx {
             return;
         }
         let len = tokenize(old_text).len() as u64;
-        if !self.runs.is_empty() && len > 0 && self.removed.insert(id.to_owned()) {
+        if (!self.runs.is_empty() || self.frozen.is_some())
+            && len > 0
+            && self.removed.insert(id.to_owned())
+        {
             self.removed_total_len += len;
             let mut terms = tokenize(old_text);
             terms.sort_unstable();
@@ -286,6 +327,89 @@ impl TextIdx {
         writer.finish()
     }
 
+    pub(crate) fn write_frozen_delta_paged(
+        frozen: &FrozenTextDelta,
+        target: &Path,
+        temp_dir: &Path,
+        budget: usize,
+    ) -> Result<()> {
+        let mut writer = ExternalPagedWriter::new(target, temp_dir, frozen.generation, budget)?;
+        write_format(&mut writer)?;
+        for (id, &dl) in &frozen.doc_len {
+            writer.add(&doc_key(id), &document_value(frozen.generation, ADD, dl))?;
+        }
+        for id in &frozen.removed {
+            writer.add(&doc_key(id), &document_value(frozen.generation, DELETE, 0))?;
+        }
+        for (term, ids) in &frozen.postings {
+            for (id, &tf) in ids {
+                let dl = *frozen.doc_len.get(id).unwrap_or(&1);
+                writer.add(
+                    &posting_key(term, id),
+                    &posting_value(frozen.generation, ADD, tf, dl),
+                )?;
+            }
+        }
+        for (term, ids) in &frozen.removed_postings {
+            for id in ids {
+                writer.add(
+                    &posting_key(term, id),
+                    &posting_value(frozen.generation, DELETE, 0, 0),
+                )?;
+            }
+        }
+        writer.finish()
+    }
+
+    pub(crate) fn freeze_delta_background(
+        &mut self,
+        generation: u64,
+    ) -> Option<Arc<FrozenTextDelta>> {
+        if self.frozen.is_some() || self.delta_memory_bytes() == 0 {
+            return None;
+        }
+        let next_doc_count = self.doc_count();
+        let next_total_len = self.total_len();
+        let frozen = Arc::new(FrozenTextDelta {
+            generation,
+            doc_count: next_doc_count,
+            total_len: next_total_len,
+            postings: std::mem::take(&mut self.postings),
+            doc_len: std::mem::take(&mut self.doc_len),
+            removed: std::mem::take(&mut self.removed),
+            removed_postings: std::mem::take(&mut self.removed_postings),
+        });
+        self.delta_total_len = 0;
+        self.removed_total_len = 0;
+        self.persisted_doc_count = next_doc_count;
+        self.persisted_total_len = next_total_len;
+        self.frozen = Some(frozen.clone());
+        Some(frozen)
+    }
+
+    pub(crate) fn frozen_matches(&self, frozen: &Arc<FrozenTextDelta>) -> bool {
+        self.frozen
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, frozen))
+    }
+
+    pub(crate) fn frozen_delta(&self) -> Option<Arc<FrozenTextDelta>> {
+        self.frozen.clone()
+    }
+
+    pub(crate) fn frozen_doc_stats(&self) -> (u64, u64) {
+        self.frozen.as_ref().map_or(
+            (self.persisted_doc_count, self.persisted_total_len),
+            |frozen| (frozen.doc_count, frozen.total_len),
+        )
+    }
+
+    pub(crate) fn clear_frozen(&mut self, frozen: &Arc<FrozenTextDelta>) {
+        if self.frozen_matches(frozen) {
+            self.frozen = None;
+        }
+    }
+
     pub(crate) fn freeze_delta(&mut self, generation: u64) {
         self.persisted_doc_count = self.doc_count();
         self.persisted_total_len = self.total_len();
@@ -296,6 +420,7 @@ impl TextIdx {
         self.removed.clear();
         self.removed_postings.clear();
         self.removed_total_len = 0;
+        self.frozen = None;
     }
 
     pub(crate) fn write_document(
@@ -355,6 +480,8 @@ struct TermStream<'a> {
     persisted: Vec<TextPostingCursor<'a>>,
     delta: Option<btree_map::Iter<'a, String, u32>>,
     delta_head: Option<Posting>,
+    frozen_delta: Option<btree_map::Iter<'a, String, u32>>,
+    frozen_head: Option<Posting>,
 }
 
 struct TextPostingCursor<'a> {
@@ -403,7 +530,13 @@ impl<'a> TermStream<'a> {
                 .collect::<Result<Vec<_>>>()?,
             delta: index.postings.get(term).map(BTreeMap::iter),
             delta_head: None,
+            frozen_delta: index
+                .frozen
+                .as_ref()
+                .and_then(|frozen| frozen.postings.get(term).map(BTreeMap::iter)),
+            frozen_head: None,
         };
+        stream.advance_frozen();
         stream.advance_delta();
         Ok(stream)
     }
@@ -416,8 +549,10 @@ impl<'a> TermStream<'a> {
                 .filter_map(|cursor| cursor.head.as_ref().map(|head| head.0.as_str()))
                 .min();
             let next_delta = self.delta_head.as_ref().map(|posting| posting.id.as_str());
+            let next_frozen = self.frozen_head.as_ref().map(|posting| posting.id.as_str());
             let Some(id) = next_persisted
                 .into_iter()
+                .chain(next_frozen)
                 .chain(next_delta)
                 .min()
                 .map(str::to_owned)
@@ -434,6 +569,34 @@ impl<'a> TermStream<'a> {
                     }
                     cursor.advance()?;
                 }
+            }
+            if self
+                .frozen_head
+                .as_ref()
+                .is_some_and(|posting| posting.id == id)
+            {
+                let posting = self.frozen_head.take().expect("matching frozen posting");
+                let generation = self
+                    .index
+                    .frozen
+                    .as_ref()
+                    .expect("frozen iterator has generation")
+                    .generation;
+                newest = Some((generation, ADD, posting.tf, posting.dl));
+                self.advance_frozen();
+            } else if self
+                .index
+                .frozen
+                .as_ref()
+                .is_some_and(|frozen| frozen.removed.contains(&id))
+            {
+                let generation = self
+                    .index
+                    .frozen
+                    .as_ref()
+                    .expect("checked above")
+                    .generation;
+                newest = Some((generation, DELETE, 0, 0));
             }
             if self
                 .delta_head
@@ -464,6 +627,24 @@ impl<'a> TermStream<'a> {
                 id: id.clone(),
                 tf,
                 dl: *self.index.doc_len.get(id).unwrap_or(&1),
+            });
+    }
+
+    fn advance_frozen(&mut self) {
+        self.frozen_head = self
+            .frozen_delta
+            .as_mut()
+            .and_then(Iterator::next)
+            .map(|(id, &tf)| Posting {
+                id: id.clone(),
+                tf,
+                dl: self
+                    .index
+                    .frozen
+                    .as_ref()
+                    .and_then(|frozen| frozen.doc_len.get(id))
+                    .copied()
+                    .unwrap_or(1),
             });
     }
 }

@@ -1,4 +1,6 @@
 use elitesql_core::{Column, ColumnType, Db, Error, Record, TableSchema, Value};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 fn schema() -> TableSchema {
     TableSchema::new(
@@ -89,4 +91,51 @@ fn derived_indexes_must_be_created_after_bulk_load() {
     let error = db.bulk_insert_sorted("docs", [record(1)]).unwrap_err();
     assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
     assert!(db.scan("docs").unwrap().is_empty());
+}
+
+#[test]
+fn a_large_scan_yields_the_state_lock_to_a_concurrent_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("scan-writer.esql")).unwrap();
+    db.create_table(schema()).unwrap();
+    let body = "x".repeat(768);
+    db.bulk_insert_sorted(
+        "docs",
+        (0..20_000).map(|i| {
+            let mut row = record(i);
+            row.insert("title".into(), Value::Text(body.clone()));
+            row
+        }),
+    )
+    .unwrap();
+
+    let baseline_started = Instant::now();
+    assert_eq!(db.scan("docs").unwrap().len(), 20_000);
+    let baseline = baseline_started.elapsed();
+
+    let db = Arc::new(db);
+    let scanner = db.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let rows = scanner.scan("docs").unwrap();
+        done_tx.send(rows.len()).unwrap();
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let commit_started = Instant::now();
+    db.insert("docs", record(20_001)).unwrap();
+    let commit_elapsed = commit_started.elapsed();
+    assert!(
+        commit_elapsed < baseline / 2,
+        "commit waited {commit_elapsed:?} behind a scan whose baseline is {baseline:?}"
+    );
+    assert!(
+        done_rx.try_recv().is_err(),
+        "the scan fixture finished before the concurrent commit could demonstrate progress"
+    );
+    assert_eq!(done_rx.recv().unwrap(), 20_000);
+    worker.join().unwrap();
 }

@@ -119,6 +119,7 @@ class SidecarClient {
   constructor(socket) {
     this._socket = socket;
     this._pending = [];
+    this._cursorActive = false;
     const rl = readline.createInterface({ input: socket });
     rl.on('line', (line) => {
       const waiter = this._pending.shift();
@@ -179,6 +180,12 @@ class SidecarClient {
   }
 
   _call(request) {
+    if (this._cursorActive && !['query_open', 'query_next', 'query_close'].includes(request.op)) {
+      return Promise.reject(new EliteSQLError(
+        8,
+        'a streaming cursor owns this connection until it is exhausted or closed',
+      ));
+    }
     return new Promise((resolve, reject) => {
       this._pending.push({ resolve, reject });
       this._socket.write(JSON.stringify(request) + '\n');
@@ -193,6 +200,25 @@ class SidecarClient {
     const request = { op: 'query', sql };
     if (params !== undefined) request.params = encodeParams(params);
     return decodeResult(await this._call(request));
+  }
+
+  async stream(sql, params, { batchRows = 512 } = {}) {
+    if (!Number.isInteger(batchRows) || batchRows < 1 || batchRows > 4096) {
+      throw new RangeError('batchRows must be between 1 and 4096');
+    }
+    if (this._cursorActive) {
+      throw new EliteSQLError(8, 'a streaming cursor is already active');
+    }
+    this._cursorActive = true;
+    const request = { op: 'query_open', sql };
+    if (params !== undefined) request.params = encodeParams(params);
+    try {
+      const opened = await this._call(request);
+      return new SidecarQueryCursor(this, opened.columns, batchRows);
+    } catch (error) {
+      this._cursorActive = false;
+      throw error;
+    }
   }
 
   async searchVector(table, column, vector, { topK = 10, efSearch, filter } = {}) {
@@ -245,4 +271,51 @@ class SidecarClient {
   }
 }
 
-module.exports = { SidecarClient, EliteSQLError, decodeValue, encodeParam, encodeParams };
+class SidecarQueryCursor {
+  constructor(client, columns, batchRows) {
+    this.client = client;
+    this.columns = columns;
+    this.batchRows = batchRows;
+    this.done = false;
+  }
+
+  async nextBatch(maxRows = this.batchRows) {
+    if (this.done) return [];
+    if (!Number.isInteger(maxRows) || maxRows < 1 || maxRows > 4096) {
+      throw new RangeError('maxRows must be between 1 and 4096');
+    }
+    const result = await this.client._call({ op: 'query_next', max_rows: maxRows });
+    const rows = result.rows.map((row) => row.map(decodeValue));
+    if (result.done) {
+      this.done = true;
+      this.client._cursorActive = false;
+    }
+    return rows;
+  }
+
+  async close() {
+    if (this.done) return;
+    try {
+      await this.client._call({ op: 'query_close' });
+    } finally {
+      this.done = true;
+      this.client._cursorActive = false;
+    }
+  }
+
+  async *[Symbol.asyncIterator]() {
+    while (!this.done) {
+      const rows = await this.nextBatch();
+      for (const row of rows) yield row;
+    }
+  }
+}
+
+module.exports = {
+  SidecarClient,
+  SidecarQueryCursor,
+  EliteSQLError,
+  decodeValue,
+  encodeParam,
+  encodeParams,
+};

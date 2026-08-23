@@ -351,6 +351,11 @@ from elitesql import SidecarClient
 db = SidecarClient("/tmp/elitesql.sock")
 db.query("INSERT INTO visits (who) VALUES ('ana')")
 db.query("SELECT count(*) AS n FROM visits")
+
+# Large unordered results stay bounded on both server and client.
+with db.streaming_cursor("SELECT id, who FROM visits", batch_rows=512) as rows:
+    for row in rows:
+        consume(row)
 ```
 
 Reproducible demo with real gunicorn (4 workers, concurrent visitors reading and writing without blocking): `examples/gunicorn_demo/run_demo.sh`.
@@ -380,6 +385,11 @@ Two limits to plan around, neither of which the Unix socket had:
 - **Latency changes the performance profile.** A point lookup is ~4 µs; a network round trip is ~0.5 ms in a datacenter and 10–50 ms across regions. Over TCP the network dominates by orders of magnitude and the engine stops behaving like an embedded one. If you only need several workers, keep them on one host with the Unix socket.
 
 `--max-connections` (default 128) caps concurrent connections on **both** transports, since each one costs a thread; past the cap the server answers with a refusal instead of queueing.
+
+Requests and responses are each capped at 8 MiB. Compatibility `query` calls
+also cap buffered SELECT results at 10,000 rows. For larger unordered SELECTs,
+the protocol exposes `query_open`, `query_next` and `query_close`; Python wraps
+them with `streaming_cursor()` and Node with `stream()`/`nextBatch()`.
 
 **Do not** put a database directory on NFS or SMB and open it from two machines. Durability relies on `fsync` plus atomic `rename`, and immutable index bases are read through `mmap`; network filesystems do not provide either reliably. The sidecar is the supported way to reach a database from elsewhere.
 
@@ -441,9 +451,13 @@ const hits = await db.searchVector('notes', 'emb', embedding, { topK: 10 });
 
 | Mode | fsync | On process crash | On OS crash |
 |---|---|---|---|
-| `Safe` (default) | Every commit | Loses nothing | Loses nothing |
-| `Balanced` | Every ~25 ms | Loses nothing | May lose the last few ms |
+| `Safe` (default) | Every commit group | Loses nothing | Loses nothing |
+| `Balanced` | Every ~25 ms, grouped | Loses nothing | May lose the last few ms |
 | `Fast` | Checkpoints only | Loses nothing | May lose recent commits |
+
+Concurrent `Safe`/`Balanced` commits share a physical WAL sync when they overlap;
+every caller still waits for that group's sync result before returning. This
+reduces sync amplification without weakening the selected durability contract.
 
 ```rust
 use elitesql_core::{Db, DbOptions, Durability};
@@ -523,16 +537,22 @@ publication, and the whole imported batch becomes visible at one commit
 version.
 
 The MVCC primary directory is a set of immutable, checksummed paged runs opened
-read-only with `mmap`, plus a bounded mutable delta. For primary-only workloads,
+read-only with `mmap`, plus a bounded mutable delta. For automatic checkpoints,
 an automatic checkpoint moves that delta to one immutable frozen generation in
 O(1), lets commits continue in a fresh active delta, and flushes the frozen
 generation on a dedicated worker. Reads merge active + frozen + mmap runs until
 publication. The frozen heap and writer own the maintenance-pool reservation,
-so there is never an unbudgeted second memtable. At publication EliteSQL copies
-the record-aligned WAL tail written after the freeze into the next WAL before
-swapping the manifest. Explicit checkpoints, DDL, compaction and close wait for
-the worker. Tables with equality, BM25 or vector deltas currently retain the
-synchronous checkpoint path. A background worker promotes groups of sixteen same-level primary
+so there is never an unbudgeted second memtable. Before releasing the commit
+mutex, EliteSQL installs durable empty bridge + active WAL successors. It then
+copies the record-aligned old-WAL tail and atomically publishes the manifest
+without blocking later commits; recovery follows either manifest generation
+through the consecutive WAL chain. Explicit checkpoints, DDL, compaction and
+close wait for the worker. Equality, BM25 and vector overlays have a matching freeze pipeline:
+the current overlay becomes an immutable queryable generation in O(number of
+indexes), commits continue into a fresh active overlay, and a dedicated worker
+serializes runs/graphs outside the commit mutex. Manifest preparation and I/O
+are ordered by dedicated publication mutexes; the global commit mutex is used
+only for short validation, WAL-writer swap and in-memory adoption. A background worker promotes groups of sixteen same-level primary
 runs, while equality/BM25 retain fanout eight. Disjoint V2 primary ranges copy
 their already checksummed pages directly instead of decoding and rebuilding
 every entry. The atomic `primary.runs` manifest selects one exact generation.
@@ -582,7 +602,9 @@ let opts = DbOptions {
 `Db::maintenance_stats()` reports the current debt, estimated reclaimable
 bytes, segment count, completed/failed automatic compactions, elapsed time, and
 bytes reclaimed, plus current run counts and checkpoint/promotion bytes for
-primary, equality and BM25. The `wait_for_*_compaction()` barriers provide
+primary, equality and BM25. It also exposes physical WAL syncs, commits served
+by shared sync groups, and completed/background derived-publication time. The
+`wait_for_*_compaction()` barriers provide
 explicit graceful-shutdown/testing synchronization.
 
 ## On-disk format
@@ -648,8 +670,9 @@ An isolated 10M transactional run stayed inside every logical pool
 65.56 MiB peak physical footprint. Max RSS was 879.47 MiB because it includes
 clean file-backed mmap pages touched during the historical run; those pages are
 reclaimable and intentionally not equivalent to mandatory heap. Remaining
-performance work centers on synchronous checkpoint work, a dedicated
-identity/FK benchmark, and p99/max commit latency with four to eight writers.
+performance work centers on a dedicated identity/FK benchmark,
+primary-manifest publication latency, and p99/max commit latency with four to
+eight writers.
 Re-run the scale matrix for the current 384/512 MiB profiles before comparing
 them directly with the former-profile results.
 

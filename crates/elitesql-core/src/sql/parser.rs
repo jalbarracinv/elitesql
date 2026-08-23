@@ -2,6 +2,9 @@
 //! the subset is rejected at parse time with an explicit message, per the
 //! design principle: "hacer facil lo comun y explicito lo avanzado".
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
+
 use crate::error::{Error, Result};
 use crate::value::ColumnType;
 
@@ -9,6 +12,9 @@ use super::ast::*;
 use super::lexer::{lex, Lexed, Tok};
 
 const MAX_EXPR_DEPTH: u32 = 64;
+const PARSE_CACHE_ENTRIES: usize = 256;
+const PARSE_CACHE_BYTES: usize = 1024 * 1024;
+const MAX_CACHED_SQL_BYTES: usize = 64 * 1024;
 type ParsedColumnType = (
     ColumnType,
     Option<usize>,
@@ -89,6 +95,72 @@ pub(crate) fn parse(sql: &str) -> Result<Statement> {
     }
     Ok(stmt)
 }
+
+struct ParseCache {
+    statements: HashMap<String, Statement>,
+    insertion_order: VecDeque<String>,
+    sql_bytes: usize,
+}
+
+impl ParseCache {
+    fn new() -> Self {
+        Self {
+            statements: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            sql_bytes: 0,
+        }
+    }
+
+    fn insert(&mut self, sql: &str, statement: Statement) {
+        if sql.len() > MAX_CACHED_SQL_BYTES || self.statements.contains_key(sql) {
+            return;
+        }
+        while self.statements.len() >= PARSE_CACHE_ENTRIES
+            || self.sql_bytes.saturating_add(sql.len()) > PARSE_CACHE_BYTES
+        {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if self.statements.remove(&oldest).is_some() {
+                self.sql_bytes = self.sql_bytes.saturating_sub(oldest.len());
+            }
+        }
+        if self.sql_bytes.saturating_add(sql.len()) <= PARSE_CACHE_BYTES {
+            self.sql_bytes = self.sql_bytes.saturating_add(sql.len());
+            self.insertion_order.push_back(sql.to_owned());
+            self.statements.insert(sql.to_owned(), statement);
+        }
+    }
+}
+
+static PARSE_CACHE: OnceLock<Mutex<ParseCache>> = OnceLock::new();
+
+/// Parse SQL through a bounded process-wide AST cache. Binding always mutates
+/// a clone, so parameter values and statement timestamps can never leak across
+/// executions or database handles.
+pub(crate) fn parse_cached(sql: &str) -> Result<Statement> {
+    let cache = PARSE_CACHE.get_or_init(|| Mutex::new(ParseCache::new()));
+    if let Some(statement) = cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .statements
+        .get(sql)
+        .cloned()
+    {
+        #[cfg(test)]
+        PARSE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(statement);
+    }
+    let statement = parse(sql)?;
+    cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(sql, statement.clone());
+    Ok(statement)
+}
+
+#[cfg(test)]
+static PARSE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct Parser {
     toks: Vec<Lexed>,
@@ -1350,5 +1422,25 @@ impl Parser {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_sql_uses_a_fresh_clone_from_the_bounded_cache() {
+        let sql = "SELECT n FROM cache_probe WHERE n = %s /* parse-cache-test */";
+        let before = PARSE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut first = parse_cached(sql).unwrap();
+        let second = parse_cached(sql).unwrap();
+        assert!(PARSE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed) > before);
+
+        // Mutating/binding one returned AST must not mutate the cached copy.
+        if let Statement::Select(select) = &mut first {
+            select.limit = Some(LimitValue::Literal(1));
+        }
+        assert_ne!(format!("{first:?}"), format!("{second:?}"));
     }
 }

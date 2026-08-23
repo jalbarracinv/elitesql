@@ -192,7 +192,7 @@ pub(crate) fn execute(db: &Db, sql: &str) -> Result<QueryOutput> {
 
 pub(crate) fn execute_positional(db: &Db, sql: &str, params: &[Value]) -> Result<QueryOutput> {
     let statement_timestamp = current_timestamp_micros()?;
-    let mut statement = parser::parse(sql)?;
+    let mut statement = parser::parse_cached(sql)?;
     bind_statement(
         &mut statement,
         SuppliedParams::Positional(params),
@@ -203,13 +203,62 @@ pub(crate) fn execute_positional(db: &Db, sql: &str, params: &[Value]) -> Result
 
 pub(crate) fn execute_named(db: &Db, sql: &str, params: &Record) -> Result<QueryOutput> {
     let statement_timestamp = current_timestamp_micros()?;
-    let mut statement = parser::parse(sql)?;
+    let mut statement = parser::parse_cached(sql)?;
     bind_statement(
         &mut statement,
         SuppliedParams::Named(params),
         statement_timestamp,
     )?;
     execute_statement(db, statement, statement_timestamp)
+}
+
+pub(crate) fn execute_positional_bounded(
+    db: &Db,
+    sql: &str,
+    params: &[Value],
+    max_rows: usize,
+) -> Result<QueryOutput> {
+    let statement_timestamp = current_timestamp_micros()?;
+    let mut statement = parser::parse_cached(sql)?;
+    bind_statement(
+        &mut statement,
+        SuppliedParams::Positional(params),
+        statement_timestamp,
+    )?;
+    cap_select_rows(&mut statement, max_rows);
+    execute_statement(db, statement, statement_timestamp)
+}
+
+pub(crate) fn execute_named_bounded(
+    db: &Db,
+    sql: &str,
+    params: &Record,
+    max_rows: usize,
+) -> Result<QueryOutput> {
+    let statement_timestamp = current_timestamp_micros()?;
+    let mut statement = parser::parse_cached(sql)?;
+    bind_statement(
+        &mut statement,
+        SuppliedParams::Named(params),
+        statement_timestamp,
+    )?;
+    cap_select_rows(&mut statement, max_rows);
+    execute_statement(db, statement, statement_timestamp)
+}
+
+fn cap_select_rows(statement: &mut Statement, max_rows: usize) {
+    let Statement::Select(select) = statement else {
+        return;
+    };
+    let cap = u64::try_from(max_rows).unwrap_or(u64::MAX);
+    select.limit = Some(match select.limit.take() {
+        Some(LimitValue::Literal(limit)) => LimitValue::Literal(limit.min(cap)),
+        // Binding has already replaced every valid placeholder.
+        Some(LimitValue::PositionalParam | LimitValue::NamedParam(_)) => {
+            unreachable!("LIMIT parameters are bound before applying an output cap")
+        }
+        None => LimitValue::Literal(cap),
+    });
 }
 
 pub(crate) fn execute_txn(txn: &mut Txn, sql: &str) -> Result<QueryOutput> {
@@ -222,7 +271,7 @@ pub(crate) fn execute_txn_positional(
     params: &[Value],
 ) -> Result<QueryOutput> {
     let statement_timestamp = current_timestamp_micros()?;
-    let mut statement = parser::parse(sql)?;
+    let mut statement = parser::parse_cached(sql)?;
     bind_statement(
         &mut statement,
         SuppliedParams::Positional(params),
@@ -233,12 +282,46 @@ pub(crate) fn execute_txn_positional(
 
 pub(crate) fn execute_txn_named(txn: &mut Txn, sql: &str, params: &Record) -> Result<QueryOutput> {
     let statement_timestamp = current_timestamp_micros()?;
-    let mut statement = parser::parse(sql)?;
+    let mut statement = parser::parse_cached(sql)?;
     bind_statement(
         &mut statement,
         SuppliedParams::Named(params),
         statement_timestamp,
     )?;
+    execute_txn_statement(txn, statement, statement_timestamp)
+}
+
+pub(crate) fn execute_txn_positional_bounded(
+    txn: &mut Txn,
+    sql: &str,
+    params: &[Value],
+    max_rows: usize,
+) -> Result<QueryOutput> {
+    let statement_timestamp = current_timestamp_micros()?;
+    let mut statement = parser::parse_cached(sql)?;
+    bind_statement(
+        &mut statement,
+        SuppliedParams::Positional(params),
+        statement_timestamp,
+    )?;
+    cap_select_rows(&mut statement, max_rows);
+    execute_txn_statement(txn, statement, statement_timestamp)
+}
+
+pub(crate) fn execute_txn_named_bounded(
+    txn: &mut Txn,
+    sql: &str,
+    params: &Record,
+    max_rows: usize,
+) -> Result<QueryOutput> {
+    let statement_timestamp = current_timestamp_micros()?;
+    let mut statement = parser::parse_cached(sql)?;
+    bind_statement(
+        &mut statement,
+        SuppliedParams::Named(params),
+        statement_timestamp,
+    )?;
+    cap_select_rows(&mut statement, max_rows);
     execute_txn_statement(txn, statement, statement_timestamp)
 }
 
@@ -424,7 +507,7 @@ fn execute_cursor_with<'db>(
 ) -> Result<QueryCursor<'db>> {
     let memory_permit = db.acquire_query_memory();
     let statement_timestamp = current_timestamp_micros()?;
-    let mut statement = parser::parse(sql)?;
+    let mut statement = parser::parse_cached(sql)?;
     bind_statement(&mut statement, params, statement_timestamp)?;
     let Statement::Select(stmt) = statement else {
         return Err(Error::Sql(
@@ -855,6 +938,14 @@ fn bound_value_for_column(value: &Value, ty: ColumnType, col: &str) -> Result<Va
                         "vector parameter for '{col}' contains a non-numeric component"
                     )));
                 };
+                if !component.is_finite()
+                    || component < f32::MIN as f64
+                    || component > f32::MAX as f64
+                {
+                    return Err(Error::Sql(format!(
+                        "vector parameter for '{col}' contains a component outside finite float32"
+                    )));
+                }
                 vector.push(component as f32);
             }
             Some(Value::Vector(vector))

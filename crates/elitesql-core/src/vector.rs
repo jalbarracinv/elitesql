@@ -419,9 +419,10 @@ impl HnswIndex {
         ef: usize,
         layer: usize,
     ) -> Vec<(f32, u32)> {
-        let mut visited: VisitedSet = HashSet::default();
-        let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new(); // min-heap
-        let mut results: BinaryHeap<Cand> = BinaryHeap::new(); // max-heap of best ef
+        let mut visited: VisitedSet =
+            HashSet::with_capacity_and_hasher(ef.saturating_mul(2), BuildHasherDefault::default());
+        let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::with_capacity(ef);
+        let mut results: BinaryHeap<Cand> = BinaryHeap::with_capacity(ef); // max-heap of best ef
         for &(d, l) in eps {
             if visited.insert(l) {
                 candidates.push(Reverse(Cand(d, l)));
@@ -567,6 +568,11 @@ pub(crate) struct VecIdx {
     /// Labels superseded by updates or deletes. `Vec<bool>` is a packed bitmap,
     /// avoiding one hash-table entry per tombstone.
     deleted: Vec<bool>,
+    /// Resident HNSW generation owned by background publication.
+    frozen: Option<Arc<VecIdx>>,
+    frozen_generation: Option<u64>,
+    /// Newer updates/deletes that hide ids still present in `frozen`.
+    frozen_removed: HashSet<Arc<str>>,
 }
 
 impl VecIdx {
@@ -577,6 +583,9 @@ impl VecIdx {
             labels: Vec::new(),
             id_to_label: HashMap::new(),
             deleted: Vec::new(),
+            frozen: None,
+            frozen_generation: None,
+            frozen_removed: HashSet::new(),
         }
     }
 
@@ -585,6 +594,13 @@ impl VecIdx {
     pub fn insert(&mut self, id: &str, v: &[f32]) {
         for mapped in &mut self.mapped {
             mapped.remove(id);
+        }
+        if self
+            .frozen
+            .as_ref()
+            .is_some_and(|frozen| frozen.id_to_label.contains_key(id))
+        {
+            self.frozen_removed.insert(Arc::from(id));
         }
         if let Some(old) = self.id_to_label.get(id) {
             self.deleted[*old] = true;
@@ -605,17 +621,34 @@ impl VecIdx {
         if let Some(label) = self.id_to_label.remove(id) {
             self.deleted[label] = true;
         }
+        if self
+            .frozen
+            .as_ref()
+            .is_some_and(|frozen| frozen.id_to_label.contains_key(id))
+        {
+            self.frozen_removed.insert(Arc::from(id));
+        }
     }
 
     pub fn live_len(&self) -> usize {
-        self.mapped.iter().map(MappedHnsw::live_len).sum::<usize>() + self.id_to_label.len()
+        self.mapped.iter().map(MappedHnsw::live_len).sum::<usize>()
+            + self.id_to_label.len()
+            + self.frozen.as_ref().map_or(0, |frozen| {
+                frozen
+                    .id_to_label
+                    .keys()
+                    .filter(|id| !self.frozen_removed.contains(id.as_ref()))
+                    .count()
+            })
     }
 
     /// Total labels in the backend, including tombstoned ones. Over-fetch
     /// escalation must cap here, not at `live_len`, or a search could give
     /// up while only tombstones have been pulled.
     pub fn total_len(&self) -> usize {
-        self.mapped.iter().map(MappedHnsw::len).sum::<usize>() + self.labels.len()
+        self.mapped.iter().map(MappedHnsw::len).sum::<usize>()
+            + self.labels.len()
+            + self.frozen.as_ref().map_or(0, |frozen| frozen.labels.len())
     }
 
     /// Ids currently indexed (latest labels only).
@@ -623,6 +656,15 @@ impl VecIdx {
         let mut ids = Vec::new();
         for mapped in &self.mapped {
             ids.extend(mapped.ids());
+        }
+        if let Some(frozen) = &self.frozen {
+            ids.extend(
+                frozen
+                    .id_to_label
+                    .keys()
+                    .filter(|id| !self.frozen_removed.contains(id.as_ref()))
+                    .map(|id| id.to_string()),
+            );
         }
         ids.extend(self.id_to_label.keys().map(|id| id.to_string()));
         ids
@@ -638,6 +680,14 @@ impl VecIdx {
         let mut out = Vec::new();
         for mapped in &self.mapped {
             out.extend(mapped.search(q, k, ef.max(k)));
+        }
+        if let Some(frozen) = &self.frozen {
+            out.extend(
+                frozen
+                    .search_raw(q, k, ef.max(k))
+                    .into_iter()
+                    .filter(|(id, _)| !self.frozen_removed.contains(id.as_str())),
+            );
         }
         let raw = self.backend.search(q, k, ef.max(k));
         for (label, distance) in raw {
@@ -694,6 +744,79 @@ impl VecIdx {
             .saturating_add(self.backend.norms.len() * std::mem::size_of::<f32>())
             .saturating_add(self.deleted.len().div_ceil(8))
             .saturating_add(overlay_metadata)
+            .saturating_add(
+                self.frozen_removed
+                    .iter()
+                    .map(|id| id.len() + 48)
+                    .sum::<usize>(),
+            )
+    }
+
+    pub(crate) fn frozen_delta_memory_bytes(&self) -> usize {
+        self.frozen
+            .as_ref()
+            .map_or(0, |frozen| frozen.delta_memory_bytes())
+    }
+
+    pub(crate) fn freeze_delta_background(&mut self, generation: u64) -> Option<Arc<VecIdx>> {
+        if self.frozen.is_some() || self.labels.is_empty() {
+            return None;
+        }
+        let empty_backend = HnswIndex::new(
+            self.backend.metric,
+            self.backend.m,
+            self.backend.ef_construction,
+            matches!(self.backend.store, VecStore::I8 { .. }),
+        );
+        let frozen = Arc::new(VecIdx {
+            mapped: Vec::new(),
+            backend: std::mem::replace(&mut self.backend, empty_backend),
+            labels: std::mem::take(&mut self.labels),
+            id_to_label: std::mem::take(&mut self.id_to_label),
+            deleted: std::mem::take(&mut self.deleted),
+            frozen: None,
+            frozen_generation: None,
+            frozen_removed: HashSet::new(),
+        });
+        self.frozen_removed.clear();
+        self.frozen = Some(frozen.clone());
+        self.frozen_generation = Some(generation);
+        Some(frozen)
+    }
+
+    pub(crate) fn frozen_matches(&self, frozen: &Arc<VecIdx>) -> bool {
+        self.frozen
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, frozen))
+    }
+
+    pub(crate) fn frozen_delta(&self) -> Option<Arc<VecIdx>> {
+        self.frozen.clone()
+    }
+
+    pub(crate) fn frozen_generation(&self) -> Option<u64> {
+        self.frozen_generation
+    }
+
+    pub(crate) fn publish_frozen_loaded(
+        &mut self,
+        frozen: &Arc<VecIdx>,
+        mut loaded: VecIdx,
+    ) -> bool {
+        if !self.frozen_matches(frozen) {
+            return false;
+        }
+        let Some(mut mapped) = loaded.mapped.pop() else {
+            return false;
+        };
+        for id in &self.frozen_removed {
+            mapped.remove(id);
+        }
+        self.mapped.push(mapped);
+        self.frozen = None;
+        self.frozen_generation = None;
+        self.frozen_removed.clear();
+        true
     }
 
     /// Freeze only the mutable overlay as another mmap graph. The canonical
@@ -740,6 +863,10 @@ impl VecIdx {
 // --- mmap-native graph format (V4) -----------------------------------------
 
 const MMAP_HEADER_FIXED: usize = 72;
+// For tiny immutable runs the parsed navigation tables can cost more memory
+// than the graph traversal they save. Keep the cache for substantial graphs;
+// small overlays use the validated mmap framing directly.
+const MIN_MMAP_NAV_CACHE_NODES: usize = 256;
 
 struct MappedHnsw {
     mmap: Mmap,
@@ -748,10 +875,28 @@ struct MappedHnsw {
     node_count: usize,
     directory_offset: usize,
     levels: Vec<u8>,
+    nodes: Vec<MappedNodeMeta>,
+    link_levels: Vec<MappedLinkLevel>,
     entry: Option<u32>,
     top_level: u8,
     id_to_label: HashMap<Arc<str>, usize>,
     deleted: Vec<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct MappedNodeMeta {
+    norm: f32,
+    dim: usize,
+    vector_pos: usize,
+    scale: f32,
+    first_link_level: usize,
+    level_count: u8,
+}
+
+#[derive(Clone, Copy)]
+struct MappedLinkLevel {
+    bytes_pos: usize,
+    count: usize,
 }
 
 struct MappedNode<'a> {
@@ -786,6 +931,16 @@ impl VecIdx {
         if table.len() > u16::MAX as usize || column.len() > u16::MAX as usize {
             return Err(Error::InvalidArgument("vidx: identity too long".into()));
         }
+        let table_len = u16::try_from(table.len())
+            .map_err(|_| Error::InvalidArgument("vidx: table name too long".into()))?;
+        let column_len = u16::try_from(column.len())
+            .map_err(|_| Error::InvalidArgument("vidx: column name too long".into()))?;
+        let node_count = u32::try_from(count)
+            .map_err(|_| Error::InvalidArgument("vidx: too many nodes".into()))?;
+        let m = u32::try_from(def.m)
+            .map_err(|_| Error::InvalidArgument("vidx: m exceeds u32::MAX".into()))?;
+        let ef_construction = u32::try_from(def.ef_construction)
+            .map_err(|_| Error::InvalidArgument("vidx: ef_construction exceeds u32::MAX".into()))?;
         let raw_file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -796,19 +951,25 @@ impl VecIdx {
         let mut offsets = Vec::with_capacity(count.saturating_add(1));
         for node in 0..count {
             offsets.push(file.position());
-            file.write(&(self.labels[node].len() as u16).to_le_bytes())?;
+            let label_len = u16::try_from(self.labels[node].len())
+                .map_err(|_| Error::InvalidArgument("vidx: record id too long".into()))?;
+            file.write(&label_len.to_le_bytes())?;
             file.write(self.labels[node].as_bytes())?;
             file.write(&[self.deleted[node] as u8])?;
             file.write(&backend.norms[node].to_le_bytes())?;
             match &backend.store {
                 VecStore::F32 { .. } => {
                     let vector = backend.store.f32_at(node);
-                    file.write(&(vector.len() as u32).to_le_bytes())?;
+                    let vector_len = u32::try_from(vector.len())
+                        .map_err(|_| Error::InvalidArgument("vidx: vector too large".into()))?;
+                    file.write(&vector_len.to_le_bytes())?;
                     write_f32_slice(&mut file, vector)?;
                 }
                 VecStore::I8 { .. } => {
                     let (vector, scale) = backend.store.i8_at(node);
-                    file.write(&(vector.len() as u32).to_le_bytes())?;
+                    let vector_len = u32::try_from(vector.len())
+                        .map_err(|_| Error::InvalidArgument("vidx: vector too large".into()))?;
+                    file.write(&vector_len.to_le_bytes())?;
                     file.write(&scale.to_le_bytes())?;
                     // i8 and u8 have identical byte representation.
                     let bytes = unsafe {
@@ -838,18 +999,18 @@ impl VecIdx {
         header.extend_from_slice(&body_crc.to_le_bytes());
         header.extend_from_slice(&(header_len as u32).to_le_bytes());
         header.extend_from_slice(&dump_version.to_le_bytes());
-        header.extend_from_slice(&(count as u32).to_le_bytes());
+        header.extend_from_slice(&node_count.to_le_bytes());
         header.extend_from_slice(&directory_offset.to_le_bytes());
         header.push(backend.top_level);
         header.push(metric_code(def.metric));
         header.push(def.quantized as u8);
         header.push(0);
         header.extend_from_slice(&backend.entry.unwrap_or(u32::MAX).to_le_bytes());
-        header.extend_from_slice(&(def.m as u32).to_le_bytes());
-        header.extend_from_slice(&(def.ef_construction as u32).to_le_bytes());
+        header.extend_from_slice(&m.to_le_bytes());
+        header.extend_from_slice(&ef_construction.to_le_bytes());
         header.extend_from_slice(&backend.rng.to_le_bytes());
-        header.extend_from_slice(&(table.len() as u16).to_le_bytes());
-        header.extend_from_slice(&(column.len() as u16).to_le_bytes());
+        header.extend_from_slice(&table_len.to_le_bytes());
+        header.extend_from_slice(&column_len.to_le_bytes());
         header.extend_from_slice(table.as_bytes());
         header.extend_from_slice(column.as_bytes());
         debug_assert_eq!(header.len(), header_len);
@@ -928,6 +1089,8 @@ impl VecIdx {
         }
 
         let mut levels = Vec::with_capacity(node_count);
+        let mut nodes = Vec::with_capacity(node_count);
+        let mut link_levels = Vec::new();
         let mut deleted = Vec::with_capacity(node_count);
         let mut id_to_label = HashMap::with_capacity(node_count);
         let mut dimension = None;
@@ -943,6 +1106,31 @@ impl VecIdx {
                 return Err(Error::Corrupt("vidx: inconsistent dimensions".into()));
             }
             levels.push(node.level_count);
+            let first_link_level = link_levels.len();
+            let mut links_pos = node.levels_pos + 1;
+            for _ in 0..node.level_count {
+                let count = fixed_u32(&mmap, links_pos)? as usize;
+                links_pos += 4;
+                link_levels.push(MappedLinkLevel {
+                    bytes_pos: links_pos,
+                    count,
+                });
+                links_pos = links_pos
+                    .checked_add(
+                        count
+                            .checked_mul(4)
+                            .ok_or_else(|| Error::Corrupt("vidx: link count overflow".into()))?,
+                    )
+                    .ok_or_else(|| Error::Corrupt("vidx: link offset overflow".into()))?;
+            }
+            nodes.push(MappedNodeMeta {
+                norm: node.norm,
+                dim: node.dim,
+                vector_pos: node.vector_pos,
+                scale: node.scale,
+                first_link_level,
+                level_count: node.level_count,
+            });
             deleted.push(node.deleted);
             if !node.deleted {
                 id_to_label.insert(Arc::from(node.id), label);
@@ -955,19 +1143,27 @@ impl VecIdx {
         } else {
             Some(entry_raw)
         };
-        let mapped = MappedHnsw {
+        let mut mapped = MappedHnsw {
             mmap,
             metric,
             quantized,
             node_count,
             directory_offset,
             levels,
+            nodes,
+            link_levels,
             entry,
             top_level,
             id_to_label,
             deleted,
         };
         mapped.validate_links()?;
+        if mapped.node_count < MIN_MMAP_NAV_CACHE_NODES {
+            mapped.nodes.clear();
+            mapped.nodes.shrink_to_fit();
+            mapped.link_levels.clear();
+            mapped.link_levels.shrink_to_fit();
+        }
         // The global integrity pass has just touched the whole graph. Release
         // those clean file-backed pages so steady-state residency is driven by
         // actual ANN traversal, not by validation at open.
@@ -982,6 +1178,9 @@ impl VecIdx {
                 labels: Vec::new(),
                 id_to_label: HashMap::new(),
                 deleted: Vec::new(),
+                frozen: None,
+                frozen_generation: None,
+                frozen_removed: HashSet::new(),
             },
             dump_version,
         ))
@@ -992,6 +1191,16 @@ impl MappedHnsw {
     fn metadata_memory_bytes(&self) -> usize {
         self.levels
             .len()
+            .saturating_add(
+                self.nodes
+                    .len()
+                    .saturating_mul(std::mem::size_of::<MappedNodeMeta>()),
+            )
+            .saturating_add(
+                self.link_levels
+                    .len()
+                    .saturating_mul(std::mem::size_of::<MappedLinkLevel>()),
+            )
             .saturating_add(self.deleted.len().div_ceil(8))
             .saturating_add(
                 self.id_to_label
@@ -1045,24 +1254,56 @@ impl MappedHnsw {
     }
 
     fn neighbors(&self, label: u32, layer: usize) -> MappedNeighbors<'_> {
-        let node = self.node(label as usize);
-        let mut pos = node.levels_pos + 1;
-        for current in 0..node.level_count as usize {
-            let count = fixed_u32(&self.mmap, pos).expect("validated link count") as usize;
-            pos += 4;
-            if current == layer {
-                return MappedNeighbors {
-                    bytes: &self.mmap[pos..pos + count * 4],
-                    pos: 0,
-                };
-            }
-            pos += count * 4;
+        let label = label as usize;
+        if label >= self.node_count {
+            return MappedNeighbors { bytes: &[], pos: 0 };
         }
-        MappedNeighbors { bytes: &[], pos: 0 }
+        if self.nodes.is_empty() {
+            let node = self.node(label);
+            if layer >= node.level_count as usize {
+                return MappedNeighbors { bytes: &[], pos: 0 };
+            }
+            let mut links_pos = node.levels_pos + 1;
+            for _ in 0..layer {
+                let count = fixed_u32(&self.mmap, links_pos)
+                    .expect("mapped graph was validated on open")
+                    as usize;
+                links_pos += 4 + count * 4;
+            }
+            let count = fixed_u32(&self.mmap, links_pos)
+                .expect("mapped graph was validated on open") as usize;
+            links_pos += 4;
+            return MappedNeighbors {
+                bytes: &self.mmap[links_pos..links_pos + count * 4],
+                pos: 0,
+            };
+        }
+        let node = self.nodes[label];
+        if layer >= node.level_count as usize {
+            return MappedNeighbors { bytes: &[], pos: 0 };
+        }
+        let links = self.link_levels[node.first_link_level + layer];
+        MappedNeighbors {
+            bytes: &self.mmap[links.bytes_pos..links.bytes_pos + links.count * 4],
+            pos: 0,
+        }
     }
 
     fn dist_raw(&self, query: &[f32], query_norm: f32, label: u32) -> f32 {
-        let node = self.node(label as usize);
+        let parsed;
+        let node = if self.nodes.is_empty() {
+            parsed = self.node(label as usize);
+            MappedNodeMeta {
+                norm: parsed.norm,
+                dim: parsed.dim,
+                vector_pos: parsed.vector_pos,
+                scale: parsed.scale,
+                first_link_level: 0,
+                level_count: parsed.level_count,
+            }
+        } else {
+            self.nodes[label as usize]
+        };
         if self.quantized {
             let vector = &self.mmap[node.vector_pos..node.vector_pos + node.dim];
             match self.metric {
@@ -1162,9 +1403,10 @@ impl MappedHnsw {
         entry: (f32, u32),
         ef: usize,
     ) -> Vec<(f32, u32)> {
-        let mut visited: VisitedSet = HashSet::default();
-        let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
-        let mut results: BinaryHeap<Cand> = BinaryHeap::new();
+        let mut visited: VisitedSet =
+            HashSet::with_capacity_and_hasher(ef.saturating_mul(2), BuildHasherDefault::default());
+        let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::with_capacity(ef);
+        let mut results: BinaryHeap<Cand> = BinaryHeap::with_capacity(ef);
         visited.insert(entry.1);
         candidates.push(Reverse(Cand(entry.0, entry.1)));
         results.push(Cand(entry.0, entry.1));
@@ -1662,6 +1904,9 @@ impl VecIdx {
                 labels,
                 id_to_label,
                 deleted,
+                frozen: None,
+                frozen_generation: None,
+                frozen_removed: HashSet::new(),
             },
             dump_version,
         ))

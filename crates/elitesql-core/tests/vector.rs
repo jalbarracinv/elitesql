@@ -456,6 +456,17 @@ fn sql_creates_and_fills_vector_columns() {
         .query("INSERT INTO items (emb) VALUES ('[1.0, 2.0]')")
         .unwrap_err();
     assert!(matches!(err, Error::SchemaViolation(_)), "{err}");
+    let err = db
+        .query("INSERT INTO items (emb) VALUES ('[1e308, 0.0, 0.0]')")
+        .unwrap_err();
+    assert!(err.to_string().contains("finite float32"), "{err}");
+    let err = db
+        .query_params(
+            "INSERT INTO items (emb) VALUES (?)",
+            &[Value::Json(serde_json::json!([1e308, 0.0, 0.0]))],
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Sql(_)), "{err}");
     // vector requires a dimension.
     let err = db.query("CREATE TABLE bad (v vector)").unwrap_err();
     assert!(err.to_string().contains("vector(N)"), "{err}");

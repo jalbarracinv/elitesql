@@ -8,6 +8,16 @@ use crate::error::{Error, Result};
 use crate::value::{parse_date_str, parse_time_str, parse_timestamp_str, ymd_from_days};
 use crate::{ColumnType, QueryOutput, Record, Value};
 
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+fn finite_f32(value: &J) -> Option<f32> {
+    let value = value.as_f64()?;
+    if !value.is_finite() || value < f32::MIN as f64 || value > f32::MAX as f64 {
+        return None;
+    }
+    Some(value as f32)
+}
+
 pub fn format_date(days: i32) -> String {
     let (y, m, d) = ymd_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
@@ -103,7 +113,9 @@ fn tagged_to_value(map: &Map<String, J>) -> Result<Value> {
             map.get("days").and_then(|n| n.as_i64()),
             map.get("iso").and_then(|s| s.as_str()),
         ) {
-            (Some(days), _) => Value::Date(days as i32),
+            (Some(days), _) => Value::Date(
+                i32::try_from(days).map_err(|_| bad("days outside the int32 storage range"))?,
+            ),
             (None, Some(iso)) => Value::Date(parse_date_str(iso).ok_or_else(|| bad("bad iso"))?),
             _ => return Err(bad("missing days/iso")),
         },
@@ -111,7 +123,8 @@ fn tagged_to_value(map: &Map<String, J>) -> Result<Value> {
             map.get("us").and_then(|n| n.as_i64()),
             map.get("iso").and_then(|s| s.as_str()),
         ) {
-            (Some(us), _) => Value::Time(us),
+            (Some(us), _) if (0..MICROS_PER_DAY).contains(&us) => Value::Time(us),
+            (Some(_), _) => return Err(bad("us must be within one day")),
             (None, Some(iso)) => Value::Time(parse_time_str(iso).ok_or_else(|| bad("bad iso"))?),
             _ => return Err(bad("missing us/iso")),
         },
@@ -123,7 +136,10 @@ fn tagged_to_value(map: &Map<String, J>) -> Result<Value> {
                 .ok_or_else(|| bad("missing v"))?;
             let mut out = Vec::with_capacity(arr.len());
             for x in arr {
-                out.push(x.as_f64().ok_or_else(|| bad("non-numeric component"))? as f32);
+                out.push(
+                    finite_f32(x)
+                        .ok_or_else(|| bad("component is non-numeric or outside finite float32"))?,
+                );
             }
             Value::Vector(out)
         }
@@ -164,11 +180,17 @@ pub fn json_to_value_for_type(j: &J, ty: ColumnType) -> Result<Value> {
         (ColumnType::Timestamp, J::String(s)) => {
             Value::parse_timestamp(s.trim_end_matches('Z')).ok_or_else(|| mismatch(j))?
         }
-        (ColumnType::Date, J::Number(n)) => {
-            Value::Date(n.as_i64().ok_or_else(|| mismatch(j))? as i32)
-        }
+        (ColumnType::Date, J::Number(n)) => Value::Date(
+            i32::try_from(n.as_i64().ok_or_else(|| mismatch(j))?).map_err(|_| mismatch(j))?,
+        ),
         (ColumnType::Date, J::String(s)) => Value::parse_date(s).ok_or_else(|| mismatch(j))?,
-        (ColumnType::Time, J::Number(n)) => Value::Time(n.as_i64().ok_or_else(|| mismatch(j))?),
+        (ColumnType::Time, J::Number(n)) => {
+            let micros = n.as_i64().ok_or_else(|| mismatch(j))?;
+            if !(0..MICROS_PER_DAY).contains(&micros) {
+                return Err(mismatch(j));
+            }
+            Value::Time(micros)
+        }
         (ColumnType::Time, J::String(s)) => Value::parse_time(s).ok_or_else(|| mismatch(j))?,
         (ColumnType::Json, other) if !matches!(other, J::Object(m) if m.contains_key("$t")) => {
             Value::Json(other.clone())
@@ -176,7 +198,7 @@ pub fn json_to_value_for_type(j: &J, ty: ColumnType) -> Result<Value> {
         (ColumnType::Vector, J::Array(arr)) => {
             let mut out = Vec::with_capacity(arr.len());
             for x in arr {
-                out.push(x.as_f64().ok_or_else(|| mismatch(j))? as f32);
+                out.push(finite_f32(x).ok_or_else(|| mismatch(j))?);
             }
             Value::Vector(out)
         }
@@ -266,6 +288,38 @@ pub fn query_with_params_json(db: &crate::Db, sql: &str, params: &J) -> Result<Q
     }
 }
 
+/// Sidecar-oriented query execution with a hard cap on returned SELECT rows.
+/// The executor applies the cap before building the caller-owned result, so a
+/// complex SELECT cannot allocate an unbounded response and only then be
+/// rejected by the transport.
+pub fn query_with_params_json_bounded(
+    db: &crate::Db,
+    sql: &str,
+    params: Option<&J>,
+    max_rows: usize,
+) -> Result<QueryOutput> {
+    match params {
+        None | Some(J::Null) => db.query_params_bounded(sql, &[], max_rows),
+        Some(J::Array(values)) => {
+            let values = values
+                .iter()
+                .map(json_to_value)
+                .collect::<Result<Vec<_>>>()?;
+            db.query_params_bounded(sql, &values, max_rows)
+        }
+        Some(J::Object(values)) => {
+            let values = values
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), json_to_value(value)?)))
+                .collect::<Result<Record>>()?;
+            db.query_named_params_bounded(sql, &values, max_rows)
+        }
+        Some(_) => Err(Error::InvalidArgument(
+            "SQL parameters must be a JSON array, object, or null".into(),
+        )),
+    }
+}
+
 /// Transactional counterpart of [`query_with_params_json`].
 pub fn query_txn_with_params_json(
     txn: &mut crate::Txn,
@@ -289,6 +343,34 @@ pub fn query_txn_with_params_json(
             txn.query_named(sql, &values)
         }
         _ => Err(Error::InvalidArgument(
+            "SQL parameters must be a JSON array, object, or null".into(),
+        )),
+    }
+}
+
+pub fn query_txn_with_params_json_bounded(
+    txn: &mut crate::Txn,
+    sql: &str,
+    params: Option<&J>,
+    max_rows: usize,
+) -> Result<QueryOutput> {
+    match params {
+        None | Some(J::Null) => txn.query_params_bounded(sql, &[], max_rows),
+        Some(J::Array(values)) => {
+            let values = values
+                .iter()
+                .map(json_to_value)
+                .collect::<Result<Vec<_>>>()?;
+            txn.query_params_bounded(sql, &values, max_rows)
+        }
+        Some(J::Object(values)) => {
+            let values = values
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), json_to_value(value)?)))
+                .collect::<Result<Record>>()?;
+            txn.query_named_bounded(sql, &values, max_rows)
+        }
+        Some(_) => Err(Error::InvalidArgument(
             "SQL parameters must be a JSON array, object, or null".into(),
         )),
     }
@@ -418,7 +500,7 @@ pub fn search_hybrid_json(db: &crate::Db, params: &J) -> Result<J> {
                 .and_then(|a| a.as_array())
                 .ok_or_else(|| Error::InvalidArgument("vector: missing 'vector'".into()))?
                 .iter()
-                .map(|x| x.as_f64().map(|f| f as f32))
+                .map(finite_f32)
                 .collect::<Option<_>>()
                 .ok_or_else(|| Error::InvalidArgument("vector: non-numeric component".into()))?;
             Some((column, vec))
@@ -459,7 +541,7 @@ pub fn search_vector_json(db: &crate::Db, params: &J) -> Result<J> {
         .and_then(|v| v.as_array())
         .ok_or_else(|| Error::InvalidArgument("missing 'vector'".into()))?
         .iter()
-        .map(|x| x.as_f64().map(|f| f as f32))
+        .map(finite_f32)
         .collect::<Option<_>>()
         .ok_or_else(|| Error::InvalidArgument("non-numeric vector component".into()))?;
     let top_k = params.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;

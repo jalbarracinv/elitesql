@@ -21,8 +21,14 @@ export class EliteSQLError extends Error {
 
 export class SidecarClient {
   static connect(socketPath: string): Promise<SidecarClient>;
+  static connect(target: { host?: string; port: number; token: string }): Promise<SidecarClient>;
   ping(): Promise<boolean>;
   query(sql: string, params?: unknown[] | Record<string, unknown>): Promise<QueryResult>;
+  stream(
+    sql: string,
+    params?: unknown[] | Record<string, unknown>,
+    opts?: { batchRows?: number },
+  ): Promise<SidecarQueryCursor>;
   createVectorIndex(
     table: string,
     column: string,
@@ -54,6 +60,14 @@ export class SidecarClient {
   checkpoint(): Promise<unknown>;
   compact(): Promise<unknown>;
   close(): void;
+}
+
+export class SidecarQueryCursor implements AsyncIterable<unknown[]> {
+  readonly columns: string[];
+  readonly done: boolean;
+  nextBatch(maxRows?: number): Promise<unknown[][]>;
+  close(): Promise<void>;
+  [Symbol.asyncIterator](): AsyncIterator<unknown[]>;
 }
 
 export function decodeValue(v: unknown): unknown;

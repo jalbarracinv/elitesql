@@ -19,7 +19,7 @@ fn record(id: &str, payload: &str, generation: i64) -> Record {
 }
 
 #[test]
-fn frozen_memtable_stays_queryable_while_wal_tail_keeps_growing() {
+fn indexed_frozen_memtable_stays_queryable_while_wal_tail_keeps_growing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("background.esql");
     let options = DbOptions {
@@ -31,6 +31,7 @@ fn frozen_memtable_stays_queryable_while_wal_tail_keeps_growing() {
     {
         let db = Db::create_with(&path, options.clone()).unwrap();
         db.create_table(schema()).unwrap();
+        db.create_index("events", "generation", false).unwrap();
         let payload = "x".repeat(1024);
 
         // One commit crosses the threshold and hands its complete generation
@@ -52,6 +53,13 @@ fn frozen_memtable_stays_queryable_while_wal_tail_keeps_growing() {
             db.get("events", "e-00042").unwrap().unwrap()["generation"],
             Value::Int64(0),
             "reads must merge the frozen and active generations"
+        );
+        assert_eq!(
+            db.find_eq("events", "generation", &Value::Int64(0))
+                .unwrap()
+                .len(),
+            3_000,
+            "the derived overlay remains live while the primary generation flushes"
         );
 
         // These commits land after the frozen WAL boundary. Publication must
@@ -80,4 +88,11 @@ fn frozen_memtable_stays_queryable_while_wal_tail_keeps_growing() {
     assert_eq!(updated["generation"], Value::Int64(1));
     assert_eq!(updated["payload"], Value::Text("newer".into()));
     assert!(reopened.get("events", "e-03099").unwrap().is_some());
+    assert_eq!(
+        reopened
+            .find_eq("events", "generation", &Value::Int64(1))
+            .unwrap()
+            .len(),
+        101
+    );
 }

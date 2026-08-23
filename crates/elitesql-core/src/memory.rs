@@ -106,6 +106,33 @@ impl MemoryGovernor {
         }
     }
 
+    pub(crate) fn try_acquire(
+        self: &Arc<Self>,
+        pool: MemoryPool,
+        bytes: usize,
+    ) -> Option<MemoryPermit> {
+        let capacity = self.capacity(pool);
+        debug_assert!(bytes <= capacity, "validated reservation exceeds its pool");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let target = match pool {
+            MemoryPool::Query => &mut state.query,
+            MemoryPool::Maintenance => &mut state.maintenance,
+        };
+        if target.used.saturating_add(bytes) > capacity {
+            return None;
+        }
+        target.used += bytes;
+        target.peak = target.peak.max(target.used);
+        Some(MemoryPermit {
+            governor: self.clone(),
+            pool,
+            bytes,
+        })
+    }
+
     pub(crate) fn index_would_exceed(&self, additional: usize) -> bool {
         let state = self
             .state

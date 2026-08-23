@@ -146,6 +146,10 @@ elitesql serve app.esql --tcp 127.0.0.1:7070   # another host (needs a token)
 db = SidecarClient("/tmp/elitesql.sock")                    # Unix socket
 db = SidecarClient(host="db-host", port=7070, token=tok)    # TCP
 db.query("SELECT name FROM users WHERE email = %s", ["ana@x.com"])
+
+with db.streaming_cursor("SELECT id, name FROM users", batch_rows=512) as rows:
+    for row in rows:
+        consume(row)
 ```
 
 **The SQL behaves identically over either transport, and identically to the
@@ -161,8 +165,10 @@ none of them is a semantic difference:
 | Encryption | not applicable (never leaves the host) | none — use an SSH tunnel or a VPN |
 | Round trip | tens of microseconds | ~0.5 ms local, 10–50 ms across regions |
 
-The token handshake is sent by the clients themselves, on connect and on
-reconnect, so application code is the same for both transports.
+The token handshake is sent by the clients themselves when a connection is
+created. The clients do not automatically reconnect: after a disconnect,
+create a new `SidecarClient` and decide at the application level whether an
+operation is safe to retry.
 
 The latency line is the one to design around. A point lookup is ~4 µs, so over
 TCP the network costs about a hundred times more than the query. That does not
@@ -183,6 +189,10 @@ Current limits of the server mode, so you can tell what it is not:
 - **Connections are capped** (`--max-connections`, default 128) because each one
   costs a thread. Past the cap the server answers with a refusal rather than
   queueing.
+- **Frames are bounded.** Requests and responses are limited to 8 MiB and the
+  compatibility `query` operation buffers at most 10,000 rows. Use
+  `query_open/query_next/query_close`, Python `streaming_cursor()`, or Node
+  `stream()` for larger unordered results.
 
 Never share a database directory over NFS or SMB instead of using the sidecar.
 Durability relies on `fsync` plus atomic `rename`, and immutable index bases are
@@ -536,16 +546,19 @@ The default 384 MiB envelope assigns 128 MiB each to mutable indexes and
 maintenance. This retains the complete measured 100K x 64-dimensional HNSW
 graph across restart; smaller envelopes remain an explicit deployment choice.
 
-On a table without derived equality, text or vector indexes, crossing the
-memtable threshold freezes the current primary delta and flushes it on a
+Crossing the memtable threshold freezes the current primary delta and flushes it on a
 dedicated worker while later commits use a fresh active delta. Both generations
 remain queryable. The frozen generation consumes the maintenance pool rather
 than duplicating memory outside the configured envelope; if the new active
 delta fills before publication, writers wait with backpressure. `checkpoint()`,
 DDL, compaction and database close are barriers. The WAL is cut at a complete
 commit boundary and its later tail is copied into the newly published WAL, so
-the overlap does not weaken crash recovery. Derived-index workloads currently
-use the synchronous checkpoint path.
+the overlap does not weaken crash recovery. Equality, BM25 and vector overlays
+use their own background freeze: the immutable frozen generation remains
+queryable, later commits update a new active overlay, and run/HNSW serialization
+happens without the commit mutex. Publication briefly serializes only the
+validated file and manifest swap. Frozen memory is owned by the maintenance
+permit, so writers receive bounded backpressure if they outpace publication.
 
 For sustained transactional ingest on machines where a 512 MiB envelope is
 acceptable, use the larger preset:
