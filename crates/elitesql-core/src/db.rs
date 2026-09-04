@@ -6,10 +6,10 @@ use std::os::unix::fs::FileExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use memmap2::{Advice, MmapOptions};
+use memmap2::{Advice, Mmap, MmapOptions};
 use parking_lot::{Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
 use ulid::Ulid;
 
@@ -675,7 +675,7 @@ impl PrimaryIdx {
             .collect();
         let mut heads: Vec<_> = cursors
             .iter_mut()
-            .map(PrimaryTableCursor::next_group)
+            .map(|cursor| cursor.next_group_into(String::new(), Vec::new()))
             .collect::<Result<_>>()?;
         let mut deltas = Vec::with_capacity(2);
         if let Some(ids) = self
@@ -696,6 +696,11 @@ impl PrimaryIdx {
         }
         let mut delta_heads: Vec<_> = deltas.iter_mut().map(Iterator::next).collect();
 
+        // The merge reuses one id buffer and one version buffer across rows,
+        // and every run cursor recycles its own group buffers, so a steady
+        // scan performs no heap allocation per visited record.
+        let mut next_id = String::new();
+        let mut versions: Vec<VersionEntry> = Vec::new();
         loop {
             let run_id = heads
                 .iter()
@@ -705,20 +710,22 @@ impl PrimaryIdx {
                 .iter()
                 .filter_map(|head| head.as_ref().map(|(id, _)| id.as_str()))
                 .min();
-            let next_id = match (run_id, delta_id) {
+            let smallest = match (run_id, delta_id) {
                 (None, None) => break,
-                (Some(id), None) | (None, Some(id)) => id.to_owned(),
-                (Some(run), Some(delta)) => run.min(delta).to_owned(),
+                (Some(id), None) | (None, Some(id)) => id,
+                (Some(run), Some(delta)) => run.min(delta),
             };
-            let mut versions = Vec::new();
+            next_id.clear();
+            next_id.push_str(smallest);
+            versions.clear();
             for (cursor, head) in cursors.iter_mut().zip(&mut heads) {
                 if head
                     .as_ref()
                     .is_some_and(|(id, _)| id.as_str() == next_id.as_str())
                 {
-                    let (_, run_versions) = head.take().expect("matching run head");
-                    versions.extend(run_versions);
-                    *head = cursor.next_group()?;
+                    let (id, mut run_versions) = head.take().expect("matching run head");
+                    versions.append(&mut run_versions);
+                    *head = cursor.next_group_into(id, run_versions)?;
                 }
             }
             for (delta, head) in deltas.iter_mut().zip(&mut delta_heads) {
@@ -770,6 +777,9 @@ struct PrimaryTableCursor<'a> {
     cursor: PagedPrefixCursor<'a>,
     table: &'a str,
     pending: Option<(String, VersionEntry)>,
+    /// Recycled id buffers, so grouping consecutive versions of one record
+    /// does not allocate a fresh `String` per index entry.
+    spare_ids: Vec<String>,
 }
 
 impl<'a> PrimaryTableCursor<'a> {
@@ -778,26 +788,46 @@ impl<'a> PrimaryTableCursor<'a> {
             cursor,
             table,
             pending: None,
+            spare_ids: Vec::new(),
         }
     }
 
-    fn next_group(&mut self) -> Result<Option<(String, Vec<VersionEntry>)>> {
+    /// Next record id with all of its versions in this run. `id` and
+    /// `versions` are caller-provided buffers whose capacity is reused; the
+    /// returned pair owns them until the caller hands them back.
+    fn next_group_into(
+        &mut self,
+        mut id: String,
+        mut versions: Vec<VersionEntry>,
+    ) -> Result<Option<(String, Vec<VersionEntry>)>> {
+        versions.clear();
         let first = match self.pending.take() {
             Some(entry) => Some(entry),
             None => self.next_entry()?,
         };
-        let Some((id, first)) = first else {
+        let Some((first_id, first)) = first else {
+            self.recycle(id);
             return Ok(None);
         };
-        let mut versions = vec![first];
+        id.clear();
+        id.push_str(&first_id);
+        self.recycle(first_id);
+        versions.push(first);
         while let Some((next_id, entry)) = self.next_entry()? {
             if next_id != id {
                 self.pending = Some((next_id, entry));
                 break;
             }
+            self.recycle(next_id);
             versions.push(entry);
         }
         Ok(Some((id, versions)))
+    }
+
+    fn recycle(&mut self, id: String) {
+        if self.spare_ids.len() < 4 {
+            self.spare_ids.push(id);
+        }
     }
 
     fn next_entry(&mut self) -> Result<Option<(String, VersionEntry)>> {
@@ -810,7 +840,10 @@ impl<'a> PrimaryTableCursor<'a> {
                 "primary index: table prefix mismatch".into(),
             ));
         }
-        Ok(Some((id.to_owned(), decode_primary_entry(value)?)))
+        let mut owned = self.spare_ids.pop().unwrap_or_default();
+        owned.clear();
+        owned.push_str(id);
+        Ok(Some((owned, decode_primary_entry(value)?)))
     }
 }
 
@@ -1898,11 +1931,68 @@ struct State {
     next_segment_id: u32,
 }
 
+/// Read handle for one immutable canonical segment. Payload reads go through
+/// a lazily created read-only mapping, so point reads and scans avoid one
+/// `pread` system call plus a heap copy per record. The file handle stays
+/// available for metadata and as a fallback when the segment cannot be mapped
+/// (for example an empty file). Segments are write-once after publication, so
+/// a mapping never observes a change in length or content.
+struct SegmentReader {
+    file: File,
+    map: OnceLock<Option<Mmap>>,
+}
+
+impl SegmentReader {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            map: OnceLock::new(),
+        }
+    }
+
+    fn mapped(&self) -> Option<&Mmap> {
+        self.map
+            .get_or_init(|| {
+                let len = self.file.metadata().ok()?.len();
+                if len == 0 {
+                    return None;
+                }
+                // SAFETY: canonical segment files are immutable after manifest
+                // publication. Compaction writes a new inode and only removes
+                // this one after snapshots/readers can no longer reference it.
+                unsafe { MmapOptions::new().map(&self.file) }.ok()
+            })
+            .as_ref()
+    }
+
+    /// Runs `f` over one payload, borrowing it from the mapping when present.
+    fn with_payload<R>(
+        &self,
+        offset: u64,
+        len: u32,
+        f: impl FnOnce(&[u8]) -> Result<R>,
+    ) -> Result<R> {
+        let len = len as usize;
+        if let Some(map) = self.mapped() {
+            let start = usize::try_from(offset)
+                .map_err(|_| Error::Corrupt("segment payload offset overflow".into()))?;
+            let bytes = start
+                .checked_add(len)
+                .and_then(|end| map.get(start..end))
+                .ok_or_else(|| Error::Corrupt("segment payload out of range".into()))?;
+            return f(bytes);
+        }
+        let mut buf = vec![0u8; len];
+        self.file.read_exact_at(&mut buf, offset)?;
+        f(&buf)
+    }
+}
+
 /// Open immutable segment handles. Keeping them behind `Arc` lets read paths
-/// retain exactly the files they need after releasing the global state lock.
-/// Compaction may unlink an old segment meanwhile, but the open descriptor
-/// remains valid until the last in-flight reader drops its clone.
-type SegmentReaders = HashMap<u32, Arc<File>>;
+/// retain exactly the readers they need after releasing the global state lock.
+/// Compaction may unlink an old segment meanwhile, but the open descriptor and
+/// its mapping remain valid until the last in-flight reader drops its clone.
+type SegmentReaders = HashMap<u32, Arc<SegmentReader>>;
 
 impl State {
     fn id_is_above_high_watermark(&self, table: &str, id: &str) -> bool {
@@ -3455,7 +3545,7 @@ impl Db {
             if !outcome.clean || outcome.valid_len != meta.len {
                 preloaded_primary_valid = false;
             }
-            readers.insert(meta.id, Arc::new(file));
+            readers.insert(meta.id, Arc::new(SegmentReader::new(file)));
         }
         if ro && preloaded_primary.is_some() && !preloaded_primary_valid {
             // The persisted directory may reference bytes beyond a damaged
@@ -3464,11 +3554,11 @@ impl Db {
             index.clear();
             read_only_index_bytes = 0;
             for meta in &manifest.segments {
-                let Some(file) = readers.get(&meta.id) else {
+                let Some(reader) = readers.get(&meta.id) else {
                     continue;
                 };
-                let file_len = file.metadata()?.len();
-                let data = unsafe { MmapOptions::new().map(file) }?;
+                let file_len = reader.file.metadata()?.len();
+                let data = unsafe { MmapOptions::new().map(&reader.file) }?;
                 let valid = &data[..meta.len.min(file_len) as usize];
                 visit_segment(valid, |entry| {
                     let Some(schema) = catalog.table(&entry.table) else {
@@ -5705,7 +5795,8 @@ impl Db {
             let mut st = self.shared.state.write().unwrap();
             st.committed_version = version;
             st.segments = new_segments;
-            st.readers.insert(next_segment_id, Arc::new(segment_reader));
+            st.readers
+                .insert(next_segment_id, Arc::new(SegmentReader::new(segment_reader)));
             st.next_segment_id = next_segment_id.saturating_add(1);
             st.index.generation = generation;
             st.index.runs.push(PrimaryRun {
@@ -5953,7 +6044,7 @@ impl Db {
         // latest-version directory stable for the duration; the scan is
         // read-only and therefore remains concurrent with other readers.
         let mut out = Vec::new();
-        find_eq_streaming(&self.shared, &st, table, column, value, &mut out)?;
+        find_eq_streaming(&st, table, column, value, &mut out)?;
         out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
@@ -6014,6 +6105,10 @@ impl Db {
             return Ok(out);
         }
 
+        // Evaluate the equality on the encoded payload and decode only the
+        // matching records; a non-matching row costs a cursor step and a
+        // column probe instead of a full record materialization.
+        let predicate = encoded_eq_predicate(&st, table, column, value);
         st.index.visit_table(table, after_id, |id, versions| {
             let Some(entry) = versions
                 .iter()
@@ -6025,10 +6120,17 @@ impl Db {
             if entry.is_tombstone() {
                 return Ok(true);
             }
-            let mut record = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-            if record.get(column).unwrap_or(&Value::Null) != value {
+            let matched = with_payload(&st.readers, &entry.kind, |payload| {
+                if encoded_record_column_eq(payload, &predicate, &st.blobs)? {
+                    decode_record(payload, Some(&st.blobs)).map(Some)
+                } else {
+                    Ok(None)
+                }
+            })?
+            .flatten();
+            let Some(mut record) = matched else {
                 return Ok(true);
-            }
+            };
             record
                 .entry(ID_COLUMN.into())
                 .or_insert_with(|| Value::Text(id.to_owned()));
@@ -6614,7 +6716,10 @@ impl Db {
                 id: seg_id,
                 len: segment_position,
             });
-            new_readers.insert(seg_id, Arc::new(File::open(&seg_path)?));
+            new_readers.insert(
+                seg_id,
+                Arc::new(SegmentReader::new(File::open(&seg_path)?)),
+            );
         }
         fsync_dir(&shared.dir.join(SEGMENTS_DIR))?;
 
@@ -9880,7 +9985,9 @@ fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob
                     .is_some_and(|frozen_ids| ids.keys().any(|id| frozen_ids.contains_key(id)))
             });
         }
-        state.readers.insert(seg_id, Arc::new(segment_reader));
+        state
+            .readers
+            .insert(seg_id, Arc::new(SegmentReader::new(segment_reader)));
         state.segments = new_segments;
         state.next_segment_id = seg_id + 1;
         if new_segment_superseded {
@@ -10202,11 +10309,11 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
         if let Some((seg_id, _)) = &written {
             st.readers.insert(
                 *seg_id,
-                Arc::new(
+                Arc::new(SegmentReader::new(
                     prepared_segment_reader
                         .take()
                         .expect("reader prepared before canonical publication"),
-                ),
+                )),
             );
             st.next_segment_id = seg_id + 1;
             if new_segment_superseded {
@@ -11813,23 +11920,34 @@ fn cleanup_orphan_tidx(dir: &Path, catalog: &Catalog) {
     }
 }
 
-fn payload_bytes(readers: &SegmentReaders, kind: &VKind) -> Result<Option<Vec<u8>>> {
+/// Runs `f` over the payload behind `kind` without copying it: resident
+/// payloads are borrowed from the delta and segment payloads from the mapped
+/// file. Tombstones yield `None`.
+fn with_payload<R>(
+    readers: &SegmentReaders,
+    kind: &VKind,
+    f: impl FnOnce(&[u8]) -> Result<R>,
+) -> Result<Option<R>> {
     match kind {
-        VKind::MemPut(p) => Ok(Some(p.as_ref().clone())),
+        VKind::MemPut(p) => f(p).map(Some),
         VKind::SegPut {
             segment,
             payload_offset,
             payload_len,
         } => {
-            let file = readers
+            let reader = readers
                 .get(segment)
                 .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
-            let mut buf = vec![0u8; *payload_len as usize];
-            file.read_exact_at(&mut buf, *payload_offset)?;
-            Ok(Some(buf))
+            reader
+                .with_payload(*payload_offset, *payload_len, f)
+                .map(Some)
         }
         VKind::MemTombstone | VKind::SegTombstone => Ok(None),
     }
+}
+
+fn payload_bytes(readers: &SegmentReaders, kind: &VKind) -> Result<Option<Vec<u8>>> {
+    with_payload(readers, kind, |bytes| Ok(bytes.to_vec()))
 }
 
 /// Legacy logical scan used by tolerant read-only opens. Normal read-write
@@ -11871,26 +11989,15 @@ fn find_eq_via_primary_index(
 /// decode only the predicate column; a full Record is built only on a match.
 /// Latest MemPut records are evaluated from their already-encoded payloads.
 fn find_eq_streaming(
-    shared: &Shared,
     st: &State,
     table: &str,
     column: &str,
     value: &Value,
     out: &mut Vec<(String, Record)>,
 ) -> Result<()> {
-    let ordinal = st.catalog.table(table).and_then(|schema| {
-        schema
-            .columns
-            .iter()
-            .position(|candidate| candidate.name == column)
-    });
-    let predicate = EncodedEqPredicate {
-        column,
-        ordinal,
-        value,
-    };
+    let predicate = encoded_eq_predicate(st, table, column, value);
     for meta in &st.segments {
-        scan_segment_for_eq(shared, st, meta, table, &predicate, out)?;
+        scan_segment_for_eq(st, meta, table, &predicate, out)?;
     }
 
     // Segment entries have already been visited above. Only the bounded
@@ -11941,8 +12048,29 @@ struct EncodedEqPredicate<'a> {
     value: &'a Value,
 }
 
+/// Equality test evaluated directly on encoded payloads. The schema ordinal
+/// lets the common case skip straight to the column; older layouts fall back
+/// to a name match inside `encoded_record_column_eq`.
+fn encoded_eq_predicate<'a>(
+    st: &State,
+    table: &str,
+    column: &'a str,
+    value: &'a Value,
+) -> EncodedEqPredicate<'a> {
+    let ordinal = st.catalog.table(table).and_then(|schema| {
+        schema
+            .columns
+            .iter()
+            .position(|candidate| candidate.name == column)
+    });
+    EncodedEqPredicate {
+        column,
+        ordinal,
+        value,
+    }
+}
+
 fn scan_segment_for_eq(
-    shared: &Shared,
     st: &State,
     meta: &SegmentMeta,
     wanted_table: &str,
@@ -11954,18 +12082,25 @@ fn scan_segment_for_eq(
         .table(wanted_table)
         .ok_or_else(|| Error::TableNotFound(wanted_table.into()))?
         .epoch;
-    let path = shared
-        .dir
-        .join(SEGMENTS_DIR)
-        .join(segment_file_name(meta.id));
-    let file = File::open(path)?;
+    let segment_len = usize::try_from(meta.len)
+        .map_err(|_| Error::Corrupt("segment length exceeds address space".into()))?;
+    if segment_len == 0 {
+        return Ok(());
+    }
+    let reader = st
+        .readers
+        .get(&meta.id)
+        .ok_or_else(|| Error::Corrupt(format!("missing segment {}", meta.id)))?;
+    // This walk touches every byte of the segment exactly once, so it uses a
+    // private mapping with sequential advice and drops it afterwards. The
+    // shared point-read mapping is left alone: sequential advice would hurt
+    // its random access pattern, and keeping multi-gigabyte scans resident in
+    // that mapping would turn every full scan into process RSS.
     // SAFETY: canonical segment files are immutable after manifest
     // publication. Compaction writes a new inode and only removes this one
     // after snapshots/readers can no longer reference it.
-    let mapped = unsafe { MmapOptions::new().map(&file) }?;
+    let mapped = unsafe { MmapOptions::new().map(&reader.file) }?;
     let _ = mapped.advise(Advice::Sequential);
-    let segment_len = usize::try_from(meta.len)
-        .map_err(|_| Error::Corrupt("segment length exceeds address space".into()))?;
     let data = mapped
         .get(..segment_len)
         .ok_or_else(|| Error::Corrupt(format!("segment {} is truncated", meta.id)))?;
@@ -12089,15 +12224,9 @@ fn encoded_record_column_eq(
 }
 
 fn read_record_kind(blobs: &Path, readers: &SegmentReaders, kind: &VKind) -> Result<Record> {
-    match kind {
-        VKind::MemPut(p) => decode_record(p, Some(blobs)),
-        VKind::SegPut { .. } => {
-            let bytes = payload_bytes(readers, kind)?.expect("put has payload");
-            decode_record(&bytes, Some(blobs))
-        }
-        VKind::MemTombstone | VKind::SegTombstone => {
-            Err(Error::Corrupt("attempted to read a tombstone".into()))
-        }
+    match with_payload(readers, kind, |bytes| decode_record(bytes, Some(blobs)))? {
+        Some(record) => Ok(record),
+        None => Err(Error::Corrupt("attempted to read a tombstone".into())),
     }
 }
 
@@ -12307,7 +12436,10 @@ pub(crate) fn encode_record_ordered(
     record: &Record,
     mut sink: Option<&mut BlobSink>,
 ) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(64);
+    // Size the payload up front: the encoding is a fixed function of the
+    // column names and values, so one exact reservation replaces the chain of
+    // doubling reallocations that otherwise dominates encoding time.
+    let mut buf = Vec::with_capacity(encoded_record_len_hint(schema, record));
     let column_count = u16::try_from(schema.columns.len())
         .map_err(|_| Error::InvalidArgument("record has more than 65535 stored columns".into()))?;
     buf.extend_from_slice(&column_count.to_le_bytes());
@@ -12327,6 +12459,28 @@ pub(crate) fn encode_record_ordered(
         }
     }
     Ok(buf)
+}
+
+/// Encoded size of a record in schema order, or a generous estimate when a
+/// value (JSON) only knows its size after serialization. Out-of-line blob
+/// references are shorter than the inline value they replace, so the hint is
+/// never too small for those.
+fn encoded_record_len_hint(schema: &TableSchema, record: &Record) -> usize {
+    let mut total = 2usize;
+    for col in &schema.columns {
+        total += 2 + col.name.len();
+        total += match record.get(&col.name).unwrap_or(&Value::Null) {
+            Value::Null => 1,
+            Value::Bool(_) => 2,
+            Value::Int64(_) | Value::Float64(_) | Value::Timestamp(_) | Value::Time(_) => 9,
+            Value::Date(_) => 5,
+            Value::Text(text) => 5 + text.len(),
+            Value::Blob(blob) => 5 + blob.len(),
+            Value::Vector(vector) => 5 + vector.len() * 4,
+            Value::Json(_) => 64,
+        };
+    }
+    total
 }
 
 pub(crate) fn decode_record(buf: &[u8], blobs: Option<&Path>) -> Result<Record> {

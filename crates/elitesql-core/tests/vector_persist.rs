@@ -147,14 +147,17 @@ fn stale_dump_catches_up_with_newer_commits() {
     std::fs::write(&dump_path, &stale_dump).unwrap();
 
     let db = Db::open(&path).unwrap();
+    // `winner` and the updated `ids[40]` are both exactly parallel to the
+    // query, so their cosine distances tie at 0 and the order between them is
+    // decided by id, not by relevance. Check membership, not position.
     let top = search_ids(&db, &near, 2);
-    assert_eq!(
-        top[0], winner,
-        "record committed after the dump is searchable"
+    assert!(
+        top.contains(&winner),
+        "record committed after the dump is searchable: {top:?}"
     );
-    assert_eq!(
-        top[1], ids[40],
-        "update committed after the dump is reflected"
+    assert!(
+        top.contains(&ids[40]),
+        "update committed after the dump is reflected: {top:?}"
     );
     // Deletions after the dump never resurface.
     let all = search_ids(&db, &rng.vec(DIM), 71);

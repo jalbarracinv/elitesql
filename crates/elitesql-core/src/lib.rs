@@ -54,6 +54,7 @@ mod check;
 mod collate;
 mod db;
 mod ddl;
+mod distance;
 mod error;
 pub mod jsonio;
 mod manifest;

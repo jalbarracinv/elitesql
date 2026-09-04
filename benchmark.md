@@ -1,7 +1,7 @@
 # EliteSQL current benchmarks
 
 This document publishes the complete current acceptance run collected on
-2026-08-23, plus clearly labeled historical and focused diagnostic results.
+2026-09-04, plus clearly labeled historical and focused diagnostic results.
 The current run uses the 384 MiB default and covers scale, bulk load, all three
 durability modes, concurrent reads/writes, mutation/index contention, SQL and
 synthetic ANN. Older artifacts are retained for comparison rather than
@@ -13,11 +13,13 @@ BM25 retain fanout eight. Non-overlapping V2 primary runs are promoted by
 copying already checksummed pages without decoding and rebuilding every entry.
 The implementation also has a direct sorted bulk loader, streaming
 unindexed equality scans, compact mmap page directories, transaction-local
-table interning and allocation-light checkpoint snapshots. In the current 10M
-transactional workload EliteSQL took 1.132x SQLite's total load time; the
-direct sorted bulk path was 1.640x faster. Current Fast/Balanced throughput
-beat SQLite at every measured writer count. Safe is compared separately using
-the same macOS `F_FULLFSYNC` primitive on both engines.
+table interning, allocation-light checkpoint snapshots, mapped segment payload
+reads and vectorized HNSW distance kernels. In the current 10M transactional
+workload EliteSQL's ingest wall is 1.202x SQLite's, while its total load
+(7.330 s) beat SQLite's (8.631 s) because SQLite's deferred checkpoint took
+2.626 s; the direct sorted bulk path was 1.599x faster. Current Fast/Balanced
+throughput beat SQLite at every measured writer count. Safe is compared
+separately using the same macOS `F_FULLFSYNC` primitive on both engines.
 
 Post-reference architectural change (updated 2026-08-23): automatic and
 explicit checkpoints freeze one bounded memtable generation and flush it on a
@@ -33,20 +35,129 @@ generation it freezes.
 
 - MacBook Air, Apple M5, 10 cores (4 performance + 6 efficiency)
 - 16 GiB RAM
-- macOS 26.5.2 (25F84), arm64
+- macOS 26.6.2 (25G83), arm64
 - Rust/Cargo 1.93.1, release benchmark profile
 - SQLite 3.45.0 through `rusqlite`'s bundled build
-- EliteSQL 0.0.1 dirty worktree on top of commit `b09de5b`
+- EliteSQL 0.0.1 dirty worktree on top of commit `fcdcde7`
 
 The worktree contains the changes being measured; the commit hash alone is not
 sufficient to reproduce these numbers until those changes are committed.
 Benchmarks ran sequentially on the same machine. No benchmark ran in parallel
 with another measurement.
 
-## Full acceptance rerun — 2026-08-23
+## Hot-path optimizations — 2026-09-04
 
-A complete local rerun was performed on AC power after the current writer and
-ANN work. It covers every Cargo benchmark in `elitesql-core`: 1M/10M scale
+A targeted pass over the read, ANN and ingest hot paths, measured as A/B runs
+against the committed tree at `fcdcde7` on an Apple M5 laptop (10 cores,
+16 GiB, macOS 26.6.2, Rust 1.93.1). Each pair of runs used the same harness in
+the same session and never overlapped another measurement. This is not a full
+acceptance rerun: durability semantics, on-disk formats and the memory budget
+contracts are unchanged, and the tables below replace nothing in the sections
+that follow.
+
+What changed:
+
+1. Segment payload reads go through one lazily created read-only `mmap` per
+   immutable segment instead of one `pread` system call plus a heap copy per
+   record. The streaming equality scan keeps its own private sequential
+   mapping per pass: an earlier attempt to share the point-read mapping doubled
+   the 10M full scan and would have kept multi-gigabyte scans resident.
+2. Unindexed equality scans that walk the primary directory (`find_eq_batch`,
+   the SQL `WHERE col = v` path without an index) evaluate the predicate on the
+   encoded payload and decode only matching records.
+3. The primary-directory merge (`visit_table`) reuses its id and version
+   buffers, so a steady scan performs no heap allocation per visited record.
+4. HNSW distance kernels use lane-parallel accumulators that the compiler can
+   vectorize (`distance.rs`), the per-search visited set is a reusable bitmap
+   instead of a hash set, and vector-index memory accounting is incremental.
+   The previous accounting walked every adjacency list after each insert,
+   which made index builds and catch-up on open quadratic in the node count.
+5. Record encoding reserves the exact payload size up front instead of
+   growing the buffer through repeated reallocation.
+
+SQL over 1M rows (`sql.rs`, Criterion central estimates; "before" is the
+committed tree measured in the same session):
+
+| Query | Before | After | Change |
+|---|---:|---:|---:|
+| Unique-index point lookup, bound values | 4.003 µs | 3.701 µs | -7.5% |
+| Indexed join, ~100 matching orders, top 10 | 243.87 µs | 187.80 µs | -23.0% |
+| Indexed join, bound values | 240.05 µs | 187.38 µs | -21.9% |
+| Unindexed 1M-row filter, `LIMIT 5` | 294.77 ms | 33.82 ms | -88.5% |
+
+Synthetic ANN (`vector.rs`, 100K vectors, dimension 64, default construction):
+
+| Metric | Before | After |
+|---|---:|---:|
+| Indexed ingest | 15.17 s | 9.38 s |
+| Open with persisted graph | 22.97 s | 10.49 s |
+| Mean search, `ef_search` 64 | 311.3 µs | 234.4 µs |
+| Mean search, `ef_search` 128 | 586.8 µs | 402.3 µs |
+| Mean search, `ef_search` 256 | 1037.4 µs | 701.5 µs |
+| Mean search, `ef_search` 512 | 1809.4 µs | 1327.8 µs |
+
+Recall@10 was identical before and after at every `ef_search`
+(0.9520/0.9940/0.9980/1.0000). The lane-parallel kernels change the floating
+point summation order by a few ulps; one persistence test that compared two
+vectors exactly parallel to its query now asserts membership instead of a
+rounding-dependent tie order.
+
+Transactional ingest (`scale_vs_sqlite.rs`, 4M rows, `fast`, 10K-row
+transactions, EliteSQL only, median of three runs). This pair isolates change
+5 above: "before" already includes changes 1-4.
+
+| Phase | Before | After | Change |
+|---|---:|---:|---:|
+| Commit prepare | 0.690 s | 0.486 s | -29.6% |
+| Commit total | 1.647 s | 1.452 s | -11.8% |
+| Ingest wall | 3.053 s | 2.799 s | -8.3% |
+
+The complete `elitesql-core` suite (327 tests) passes after these changes. One
+timing fixture (`a_large_scan_yields_the_state_lock_to_a_concurrent_writer`)
+scans 50K rows instead of 20K and bounds its sleep by the measured baseline,
+because the mapped segment reads made the original 20K-row scan finish before
+the concurrent commit it was meant to overlap.
+
+## Full acceptance rerun — 2026-09-04
+
+A complete local rerun was performed on AC power after the hot-path
+optimizations described above, using the same harnesses, parameters and
+sequential procedure as the 2026-08-23 run. The immutable environment, result
+summary and artifact inventory are in
+[`current-acceptance-2026-09-04.md`](benchmark-results/current-acceptance-2026-09-04.md);
+all raw files use the `current-2026-09-04-*` prefix. The 2026-08-23 artifacts
+remain in place for comparison.
+
+Headline results from the current run:
+
+- At 10M rows, the transactional path completed in 7.330 s versus SQLite's
+  8.631 s. EliteSQL's ingest wall (7.220 s) is still 1.202x SQLite's (6.005 s);
+  the total flips because SQLite's deferred checkpoint took 2.626 s in this
+  run (1.611 s on 2026-08-23) while EliteSQL's final checkpoint took 0.111 s.
+  Direct sorted bulk completed in 4.559 s versus SQLite's 7.289 s (1.599x
+  faster). Warm 10M point reads measured 31.0 us versus 52.3 us.
+- Fast and Balanced EliteSQL throughput beat SQLite at every writer count, by
+  1.82-5.06x and 1.45-4.48x, within the spread of the previous matrix. Safe
+  strict reached 1.03x/1.52x/3.61x/7.21x/12.75x at 1/2/4/8/16 writers with
+  1.00/1.64/4.00/8.00/15.75 commits per sync.
+- The 16-reader/four-writer run measured 2,526,321 reads/s, 101,053 inserted
+  rows/s and 0.487 ms writer p99. Read-only throughput peaked at 3,583,376
+  reads/s with 16 readers (1,216,481 with four readers was the previous peak).
+- Warm writer p99 across insert/update/delete/identity/FK/derived profiles was
+  0.420/1.085/0.954/0.963/0.812/1.514 ms, with read throughput roughly doubled
+  in every profile. Every run validated final data and, where applicable,
+  derived-index queries.
+- ANN recall@10 was 0.952/0.994/0.998/1.000 at requested `ef_search`
+  64/128/256/512, identical to the previous run. Mean search was
+  0.237/0.416/0.773/1.353 ms. Indexed ingestion took 9.198 s and persisted
+  open took 10.937 s.
+- SQL over 1M rows: unique-index point lookup 4.36/3.66 us (literal/bound),
+  indexed join 187.1/184.7 us, unindexed filter 34.23 ms.
+
+## Previous acceptance rerun — 2026-08-23
+
+A complete local rerun was performed on AC power after the writer and ANN work
+of that date. It covers every Cargo benchmark in `elitesql-core`: 1M/10M scale
 versus SQLite with the 384 MiB default, direct bulk load, the SQLite
 microbenchmark, SQL over 1M rows, writers 1/2/4/8/16 under all three durability
 modes, the complete 5x3 reader/writer matrix, all six mutation/index profiles
@@ -59,7 +170,7 @@ are in
 All raw current-run files use the `current-2026-08-23-*` prefix. Older CSVs and
 historical tables below remain available for longitudinal comparison.
 
-Headline results from the current run:
+Headline results from that run (superseded by the 2026-09-04 tables below):
 
 - At 10M rows, the transactional path completed in 8.623 s versus SQLite's
   7.615 s (1.132x SQLite time). Direct sorted bulk completed in 5.190 s versus
@@ -128,18 +239,20 @@ disabled; `total load` includes the explicit final checkpoint.
 
 | Rows | Engine | Ingest wall | Final checkpoint | Total load | Rows/s | Point read | Full scan |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1M | EliteSQL | 0.866 s | 0.098 s | 0.963 s | 1,037,936 | 1.796 µs | 0.020 s |
-| 1M | SQLite | 0.593 s | 0.125 s | 0.718 s | 1,392,530 | 2.378 µs | 0.027 s |
-| 10M | EliteSQL | 8.510 s | 0.113 s | 8.623 s | 1,159,697 | 53.769 µs | 0.748 s |
-| 10M | SQLite | 6.004 s | 1.611 s | 7.615 s | 1,313,120 | 57.933 µs | 0.801 s |
+| 1M | EliteSQL | 0.728 s | 0.104 s | 0.832 s | 1,202,018 | 1.856 µs | 0.019 s |
+| 1M | SQLite | 0.596 s | 0.123 s | 0.719 s | 1,390,903 | 2.417 µs | 0.027 s |
+| 10M | EliteSQL | 7.220 s | 0.111 s | 7.330 s | 1,364,219 | 31.014 µs | 0.690 s |
+| 10M | SQLite | 6.005 s | 2.626 s | 8.631 s | 1,158,656 | 52.326 µs | 0.736 s |
 
-At 10M rows EliteSQL's ingest wall is 1.417x SQLite's. EliteSQL performs 3.746 s
-of checkpoint work and 0.446 s of promotion work during ingest, while SQLite
-defers its 1.611 s checkpoint until after ingest. End-to-end, EliteSQL takes
-1.132x SQLite's total load time. Raw data:
-[`current-2026-08-23-scale-default-1m.csv`](benchmark-results/current-2026-08-23-scale-default-1m.csv)
+At 10M rows EliteSQL's ingest wall is 1.202x SQLite's. EliteSQL performs 3.606 s
+of checkpoint work and 0.433 s of promotion work during ingest, while SQLite
+defers its checkpoint until after ingest; that checkpoint took 2.626 s here
+against 1.611 s on 2026-08-23 with an identical SQLite ingest wall, so the
+end-to-end result (EliteSQL 0.849x SQLite's total load time) depends on that
+flush. At 1M rows EliteSQL takes 1.157x SQLite's total load time. Raw data:
+[`current-2026-09-04-scale-default-1m.csv`](benchmark-results/current-2026-09-04-scale-default-1m.csv)
 and
-[`current-2026-08-23-scale-default-10m.csv`](benchmark-results/current-2026-08-23-scale-default-10m.csv).
+[`current-2026-09-04-scale-default-10m.csv`](benchmark-results/current-2026-09-04-scale-default-10m.csv).
 
 ### Direct sorted bulk path
 
@@ -149,15 +262,16 @@ and one primary run with bounded memory.
 
 | Rows | Engine | Total load | Rows/s | Point read | Full scan |
 |---:|---|---:|---:|---:|---:|
-| 1M | EliteSQL bulk | 0.579 s | 1,726,969 | 1.814 µs | 0.019 s |
-| 1M | SQLite | 0.741 s | 1,348,770 | 2.422 µs | 0.028 s |
-| 10M | EliteSQL bulk | 5.190 s | 1,926,836 | 6.442 µs | 0.380 s |
-| 10M | SQLite | 8.513 s | 1,174,728 | 51.981 µs | 0.744 s |
+| 1M | EliteSQL bulk | 0.525 s | 1,904,250 | 1.835 µs | 0.019 s |
+| 1M | SQLite | 0.713 s | 1,401,958 | 2.367 µs | 0.027 s |
+| 10M | EliteSQL bulk | 4.559 s | 2,193,550 | 2.187 µs | 0.201 s |
+| 10M | SQLite | 7.289 s | 1,371,974 | 38.026 µs | 0.605 s |
 
-At 10M rows EliteSQL bulk is 1.640x faster end-to-end. Raw data:
-[`current-2026-08-23-scale-bulk-1m.csv`](benchmark-results/current-2026-08-23-scale-bulk-1m.csv)
+At 10M rows EliteSQL bulk is 1.599x faster end-to-end (1.358x at 1M). Raw
+data:
+[`current-2026-09-04-scale-bulk-1m.csv`](benchmark-results/current-2026-09-04-scale-bulk-1m.csv)
 and
-[`current-2026-08-23-scale-bulk-10m.csv`](benchmark-results/current-2026-08-23-scale-bulk-10m.csv).
+[`current-2026-09-04-scale-bulk-10m.csv`](benchmark-results/current-2026-09-04-scale-bulk-10m.csv).
 
 ### Small transaction and primary-key microbenchmark
 
@@ -196,7 +310,20 @@ differ between engines and remain supporting evidence. Prepared primary-key
 reads averaged 0.360 us in EliteSQL versus 1.418 us in SQLite, making EliteSQL
 3.94x faster in that microbenchmark.
 
-Raw historical and optimized fixed-workload runs are retained together in
+The 2026-09-04 acceptance run repeated the same five-run fixed workload after
+the hot-path pass: EliteSQL median ingest 0.802 s, final checkpoint 0.097 s and
+total load 0.900 s (1,111,522 rows/s) against SQLite's 0.641/0.128/0.769 s
+(1,299,940 rows/s), so the total-time ratio is now 1.170x SQLite. The warmed
+Criterion steady diagnostic in that run measured 0.991 ms (generated ids) and
+1.033 ms (explicit ids) against SQLite's 0.719 ms with broad EliteSQL
+intervals (0.87-1.05 and 0.93-1.10 ms); the fixed workload remains the primary
+result. Raw data:
+[`current-2026-09-04-small-transactions-fixed.csv`](benchmark-results/current-2026-09-04-small-transactions-fixed.csv)
+and
+[`current-2026-09-04-criterion.csv`](benchmark-results/current-2026-09-04-criterion.csv).
+
+Raw historical and optimized fixed-workload runs from 2026-08-23 are retained
+together in
 [`current-2026-08-23-small-transactions-fixed.csv`](benchmark-results/current-2026-08-23-small-transactions-fixed.csv).
 The complete new Criterion central estimates and confidence intervals are in
 [`current-2026-08-23-small-transactions-criterion.csv`](benchmark-results/current-2026-08-23-small-transactions-criterion.csv);
@@ -213,15 +340,19 @@ It now compares interpolated benchmark literals with the equivalent safe
 
 | Query | Literal SQL | Bound values | Difference |
 |---|---:|---:|---:|
-| Unique-index point lookup | 4.706 µs | 4.029 µs | -14.4% |
-| Indexed join, ~100 matching orders, top 10 | 233.30 µs | 228.41 µs | -2.1% |
-| Unindexed 1M-row filter, `LIMIT 5` | 291.25 ms | — | — |
+| Unique-index point lookup | 4.357 µs | 3.656 µs | -16.1% |
+| Indexed join, ~100 matching orders, top 10 | 187.05 µs | 184.73 µs | -1.2% |
+| Unindexed 1M-row filter, `LIMIT 5` | 34.23 ms | — | — |
 
 The bound point-lookup confidence interval does not overlap the literal path in
-this run; the indexed join improvement is small. Neither result indicates a
-binding penalty. The bound path should still be chosen for type preservation
+this run; the indexed join difference is inside noise. Neither result indicates
+a binding penalty. The bound path should still be chosen for type preservation
 and injection safety. The table reports Criterion's measured query intervals,
-not fixture-build time.
+not fixture-build time. The unindexed filter fell from 291.25 ms on
+2026-08-23 because the primary-directory scan now tests the predicate on the
+encoded payload, borrows segment bytes from a mapping instead of one `pread`
+per row, and merges runs without per-record allocation. Raw estimates:
+[`current-2026-09-04-criterion.csv`](benchmark-results/current-2026-09-04-criterion.csv).
 
 ## Concurrent writers
 
@@ -238,23 +369,28 @@ number of commits served by multi-commit sync groups. This makes `Safe` and
 `Balanced` group-commit efficiency observable instead of inferring it from
 throughput alone.
 
-### Current Fast and Balanced matrix — 2026-08-23
+### Current Fast and Balanced matrix — 2026-09-04
 
 Values are median rows/s from three fresh 200K-row repetitions. SQLite uses the
 matching `synchronous=OFF`/`NORMAL` profile for Fast/Balanced.
 
 | Writers | EliteSQL Fast | SQLite Fast | Ratio | EliteSQL Balanced | SQLite Balanced | Ratio |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 822,577 | 445,393 | 1.85x | 711,126 | 438,676 | 1.62x |
-| 2 | 703,584 | 374,428 | 1.88x | 604,841 | 406,949 | 1.49x |
-| 4 | 695,985 | 327,307 | 2.13x | 612,479 | 327,989 | 1.87x |
-| 8 | 755,724 | 266,866 | 2.83x | 643,297 | 267,526 | 2.40x |
-| 16 | 889,721 | 175,264 | 5.08x | 749,281 | 174,811 | 4.29x |
+| 1 | 908,883 | 433,806 | 2.10x | 738,731 | 434,920 | 1.70x |
+| 2 | 725,236 | 398,894 | 1.82x | 583,086 | 401,658 | 1.45x |
+| 4 | 681,175 | 325,371 | 2.09x | 574,563 | 283,223 | 2.03x |
+| 8 | 759,007 | 264,338 | 2.87x | 677,290 | 266,580 | 2.54x |
+| 16 | 889,489 | 175,909 | 5.06x | 789,294 | 176,202 | 4.48x |
 
-Raw repetitions:
-[`current-2026-08-23-concurrent-writers-fast.csv`](benchmark-results/current-2026-08-23-concurrent-writers-fast.csv)
+These points are within the run-to-run spread of the 2026-08-23 matrix
+(822,577/703,584/695,985/755,724/889,721 Fast and
+711,126/604,841/612,479/643,297/749,281 Balanced); the 2026-09-04 changes
+target reads and index maintenance rather than the commit path. Raw
+repetitions:
+[`current-2026-09-04-concurrent-writers-fast.csv`](benchmark-results/current-2026-09-04-concurrent-writers-fast.csv)
 and
-[`current-2026-08-23-concurrent-writers-balanced.csv`](benchmark-results/current-2026-08-23-concurrent-writers-balanced.csv).
+[`current-2026-09-04-concurrent-writers-balanced.csv`](benchmark-results/current-2026-09-04-concurrent-writers-balanced.csv);
+the previous run's files keep the `current-2026-08-23-` prefix.
 
 ### 2026-08-23 commit-mutex and tail-latency repeat
 
@@ -342,18 +478,19 @@ in the CSV as a separately labeled non-equivalent baseline.
 
 | Writers | EliteSQL Safe rows/s | SQLite strict rows/s | Ratio | Commits/sync | EliteSQL p99 |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 2,518 | 2,517 | 1.00x | 1.00 | 4.15 ms |
-| 2 | 2,596 | 2,509 | 1.03x | 1.03 | 8.24 ms |
-| 4 | 9,804 | 2,616 | 3.75x | 3.99 | 5.07 ms |
-| 8 | 19,221 | 2,683 | 7.16x | 7.97 | 5.14 ms |
-| 16 | 35,910 | 2,605 | 13.79x | 15.69 | 9.39 ms |
+| 1 | 2,954 | 2,858 | 1.03x | 1.00 | 4.25 ms |
+| 2 | 4,319 | 2,845 | 1.52x | 1.64 | 8.04 ms |
+| 4 | 9,960 | 2,760 | 3.61x | 4.00 | 4.94 ms |
+| 8 | 19,829 | 2,749 | 7.21x | 8.00 | 5.00 ms |
+| 16 | 36,045 | 2,826 | 12.75x | 15.75 | 6.09 ms |
 
 Single-writer throughput remains limited by the measured 3.4-3.9 ms hardware
-flush. The current two-writer point grouped almost no commits and therefore
-shows roughly double the transaction latency; this is a real result rather
-than an averaged-away outlier. At 16 writers, coordination reduces 4,000
-logical commits to a median 255 physical barriers and exceeds the 14
-commits/sync acceptance target.
+flush. In the 2026-08-23 run the two-writer point grouped almost no commits
+(1.03 per sync) and showed roughly double the transaction latency; the
+2026-09-04 rerun groups 1.64 commits per sync at two writers while its p99
+stays near two flushes. At 16 writers, coordination reduces 4,000 logical
+commits to a median 254 physical barriers and exceeds the 14 commits/sync
+acceptance target.
 
 The coalescing sweep retained 200 us: with 16 writers it reached 15.75
 commits/sync and 38.7K rows/s in the focused run; 500 us added latency and
@@ -363,9 +500,11 @@ artifacts for 1/10/100/1000 rows per transaction are retained separately.
 
 Raw data:
 
-- [`current-2026-08-23-concurrent-writers-safe-strict.csv`](benchmark-results/current-2026-08-23-concurrent-writers-safe-strict.csv)
+- [`current-2026-09-04-concurrent-writers-safe-strict.csv`](benchmark-results/current-2026-09-04-concurrent-writers-safe-strict.csv)
+  (previous run: [`current-2026-08-23-concurrent-writers-safe-strict.csv`](benchmark-results/current-2026-08-23-concurrent-writers-safe-strict.csv))
 - [`safe-delay-200us-2026-08-23.csv`](benchmark-results/safe-delay-200us-2026-08-23.csv)
-- [`current-2026-08-23-wal-preallocation.csv`](benchmark-results/current-2026-08-23-wal-preallocation.csv)
+- [`current-2026-09-04-wal-preallocation.csv`](benchmark-results/current-2026-09-04-wal-preallocation.csv)
+  (previous run: [`current-2026-08-23-wal-preallocation.csv`](benchmark-results/current-2026-08-23-wal-preallocation.csv))
 - [`safe-batch-1-2026-08-23.csv`](benchmark-results/safe-batch-1-2026-08-23.csv), [`safe-batch-100-2026-08-23.csv`](benchmark-results/safe-batch-100-2026-08-23.csv), and [`safe-batch-1000-2026-08-23.csv`](benchmark-results/safe-batch-1000-2026-08-23.csv)
 
 The new
@@ -382,16 +521,22 @@ rows, 10 rows per transaction and three repetitions. Selected medians are:
 
 | Readers | Writers | Reads/s | Reader p99 | Writes/s | Writer p99 |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 0 | 788,527 | 1.54 us | — | — |
-| 4 | 0 | 1,216,481 | 4.58 us | — | — |
-| 16 | 0 | 1,116,670 | 12.42 us | — | — |
-| 4 | 1 | 1,124,173 | 21.21 us | 44,967 | 151.96 us |
-| 16 | 1 | 919,977 | 121.71 us | 36,799 | 437.25 us |
-| 4 | 4 | 1,112,474 | 15.54 us | 44,499 | 736.67 us |
-| 16 | 4 | 1,031,466 | 91.96 us | 41,259 | 424.58 us |
+| 1 | 0 | 998,841 | 1.29 us | — | — |
+| 4 | 0 | 1,934,787 | 2.71 us | — | — |
+| 16 | 0 | 3,583,376 | 4.12 us | — | — |
+| 4 | 1 | 1,671,339 | 18.04 us | 66,854 | 172.54 us |
+| 16 | 1 | 1,937,466 | 88.42 us | 77,499 | 857.96 us |
+| 4 | 4 | 1,803,611 | 10.29 us | 72,144 | 397.71 us |
+| 16 | 4 | 2,526,321 | 70.54 us | 101,053 | 486.88 us |
 
+Point reads now borrow their payload from a read-only segment mapping instead
+of issuing one `pread` system call per record, which is why read throughput
+keeps scaling to 16 readers (the 2026-08-23 run peaked at 1,216,481 reads/s
+with four readers and 1,031,466 reads/s with 16 readers and four writers).
 Raw full matrix:
-[`current-2026-08-23-concurrent-rw.csv`](benchmark-results/current-2026-08-23-concurrent-rw.csv).
+[`current-2026-09-04-concurrent-rw.csv`](benchmark-results/current-2026-09-04-concurrent-rw.csv)
+(previous run:
+[`current-2026-08-23-concurrent-rw.csv`](benchmark-results/current-2026-08-23-concurrent-rw.csv)).
 
 The following two paragraphs retain the earlier 200K-read focused history that
 motivated CPU-aware admission; they are not the current full-matrix values.
@@ -443,25 +588,32 @@ query all three indexes.
 
 | Profile | Cache mode | Reads/s | Writes/s | Reader p99 | Writer p99 |
 |---|---|---:|---:|---:|---:|
-| Insert | warm | 988,867 | 49,443 | 117.4 us | 424.5 us |
-| Insert | reopened | 983,295 | 49,165 | 114.0 us | 413.0 us |
-| Update | warm | 843,696 | 42,185 | 179.5 us | 1,362.8 us |
-| Update | reopened | 885,888 | 44,294 | 169.4 us | 1,335.5 us |
-| Delete | warm | 890,002 | 44,500 | 170.1 us | 2,417.8 us |
-| Delete | reopened | 883,608 | 44,180 | 159.6 us | 1,237.8 us |
-| Identity | warm | 659,171 | 32,959 | 272.0 us | 1,257.5 us |
-| Identity | reopened | 657,477 | 32,874 | 251.0 us | 1,215.1 us |
-| Foreign key | warm | 853,877 | 42,694 | 162.5 us | 748.3 us |
-| Foreign key | reopened | 907,389 | 45,369 | 144.2 us | 735.0 us |
-| Derived indexes | warm | 563,235 | 28,162 | 389.3 us | 1,612.2 us |
-| Derived indexes | reopened | 620,597 | 31,030 | 344.3 us | 1,035.4 us |
+| Insert | warm | 2,105,668 | 105,283 | 92.6 us | 419.9 us |
+| Insert | reopened | 2,150,931 | 107,547 | 91.2 us | 1,087.5 us |
+| Update | warm | 1,565,250 | 78,263 | 132.5 us | 1,085.2 us |
+| Update | reopened | 1,637,955 | 81,898 | 112.1 us | 1,227.8 us |
+| Delete | warm | 1,725,273 | 86,264 | 120.7 us | 954.1 us |
+| Delete | reopened | 1,782,535 | 89,127 | 114.1 us | 1,137.8 us |
+| Identity | warm | 1,221,203 | 61,060 | 190.5 us | 963.0 us |
+| Identity | reopened | 1,280,003 | 64,000 | 174.8 us | 914.0 us |
+| Foreign key | warm | 1,702,481 | 85,124 | 120.8 us | 812.0 us |
+| Foreign key | reopened | 2,276,854 | 113,843 | 46.3 us | 751.8 us |
+| Derived indexes | warm | 909,027 | 45,451 | 297.2 us | 1,513.5 us |
+| Derived indexes | reopened | 1,077,327 | 53,866 | 252.4 us | 915.2 us |
+
+Read and write throughput roughly doubled in every profile against the
+2026-08-23 matrix (988,867/843,696/890,002/659,171/853,877/563,235 warm
+reads/s), with writer p99 equal or lower except the reopened insert point,
+where one repetition carried a 1.1 ms tail.
 
 `cold` always closes/reopens the database and skips warmup. On Linux/Android it
 also requests `POSIX_FADV_DONTNEED` for every database file and records
 attempted/successful evictions. macOS lacks that API, so this machine reports
 `evict=0/0`: those rows prove reopen/recovery behavior but are **not** a valid
 OS-cold-versus-warm comparison. Raw data:
-[`current-2026-08-23-contention-matrix.csv`](benchmark-results/current-2026-08-23-contention-matrix.csv).
+[`current-2026-09-04-contention-matrix.csv`](benchmark-results/current-2026-09-04-contention-matrix.csv)
+(previous run:
+[`current-2026-08-23-contention-matrix.csv`](benchmark-results/current-2026-08-23-contention-matrix.csv)).
 
 The first matrix exposed a separate identity tail: reservation changed state
 before commit admission became active. Announcing that short write section to
@@ -519,7 +671,11 @@ Raw repetitions are in
 [`benchmark-results/concurrent-writers-relational-compat-2026-08-09.csv`](benchmark-results/concurrent-writers-relational-compat-2026-08-09.csv).
 The pre-compatibility baseline remains in
 [`benchmark-results/concurrent-writers-2026-08-08.csv`](benchmark-results/concurrent-writers-2026-08-08.csv).
-The charts were regenerated from the 2026-08-09 CSV:
+The charts below show the current Fast matrix: they were regenerated from
+[`current-2026-09-04-concurrent-writers-fast.csv`](benchmark-results/current-2026-09-04-concurrent-writers-fast.csv)
+with `scripts/plot-concurrent-benchmark.py` (which now accepts the
+`SQLite-fsync` engine label the current CSVs use). The 2026-08-09 values remain
+in the table above and in its CSV:
 
 ![Concurrent write throughput](benchmark-results/concurrent-throughput.svg)
 
@@ -535,18 +691,21 @@ against brute-force top-10 ground truth over 50 queries.
 
 | `ef_search` | Recall@10 | Mean search interval |
 |---:|---:|---:|
-| 64 | 0.9520 | 0.326 ms |
-| 128 | 0.9940 | 0.587 ms |
-| 256 | 0.9980 | 1.066 ms |
-| 512 | 1.0000 | 1.828 ms |
+| 64 | 0.9520 | 0.237 ms |
+| 128 | 0.9940 | 0.416 ms |
+| 256 | 0.9980 | 0.773 ms |
+| 512 | 1.0000 | 1.353 ms |
 
-Indexed ingestion took 15.347 s and opening the persisted graph took 22.606 s.
-Every recall gate passed. The 0.994 value at `ef=128` matches the historical
-accepted point; `ef=256` is 0.002 below the older 1.000 observation but remains
-above its 0.995 gate. Raw current quality and central Criterion estimates are
-in
-[`current-2026-08-23-ann.csv`](benchmark-results/current-2026-08-23-ann.csv);
-earlier diagnostic values remain in
+Indexed ingestion took 9.198 s and opening the persisted graph took 10.937 s
+(15.347 s and 22.606 s on 2026-08-23). Every recall gate passed with recall
+identical to the previous run at every `ef_search`: the vectorized distance
+kernels change only the floating-point summation order, and the visited bitmap
+and incremental memory accounting do not touch graph construction. Raw current
+quality and central Criterion estimates are in
+[`current-2026-09-04-ann.csv`](benchmark-results/current-2026-09-04-ann.csv);
+the previous run is in
+[`current-2026-08-23-ann.csv`](benchmark-results/current-2026-08-23-ann.csv)
+and earlier diagnostic values remain in
 [`ann-quality-history-2026-08-23.csv`](benchmark-results/ann-quality-history-2026-08-23.csv).
 
 ### Memory sizing on AWS t3.large
@@ -688,13 +847,13 @@ Every follow-up must preserve the bounded-memory and crash-recovery contracts.
 cargo bench -p elitesql-core --bench scale_vs_sqlite -- \
   --rows 10m --durability fast --batch-size 10k \
   --point-reads 10k --full-scans 3 \
-  --csv benchmark-results/current-2026-08-23-scale-default-10m.csv
+  --csv benchmark-results/current-2026-09-04-scale-default-10m.csv
 
 # Direct sorted bulk load
 cargo bench -p elitesql-core --bench scale_vs_sqlite -- \
   --rows 10m --durability fast --bulk-sorted \
   --point-reads 10k --full-scans 3 \
-  --csv benchmark-results/current-2026-08-23-scale-bulk-10m.csv
+  --csv benchmark-results/current-2026-09-04-scale-bulk-10m.csv
 
 /usr/bin/time -l target/release/deps/scale_vs_sqlite-<hash> \
   --rows 10m --durability fast --batch-size 10k \
@@ -702,7 +861,7 @@ cargo bench -p elitesql-core --bench scale_vs_sqlite -- \
 
 # Sustained transaction Criterion microbenchmarks
 cargo bench -p elitesql-core --bench vs_sqlite -- \
-  --save-baseline current-small-txn-2026-08-23
+  --save-baseline current-small-txn-2026-09-04
 
 # Fixed sustained workload; repeat five times with a fresh output filename
 cargo bench -p elitesql-core --bench scale_vs_sqlite -- \
@@ -712,29 +871,29 @@ cargo bench -p elitesql-core --bench scale_vs_sqlite -- \
 
 # SQL, including bound parameters
 cargo bench -p elitesql-core --bench sql -- \
-  --save-baseline current-2026-08-23
+  --save-baseline current-2026-09-04
 
 # Concurrent writers and charts
 cargo bench -p elitesql-core --bench concurrent_writers -- \
   --rows 200k --batch-size 10 --repetitions 3 --durability fast \
   --writers 1,2,4,8,16 \
-  --csv benchmark-results/current-2026-08-23-concurrent-writers-fast.csv
+  --csv benchmark-results/current-2026-09-04-concurrent-writers-fast.csv
 
 cargo bench -p elitesql-core --bench concurrent_writers -- \
   --rows 40k --batch-size 10 --repetitions 3 --durability safe \
   --writers 1,2,4,8,16 --sqlite-sync both --safe-group-delay-us 200 \
-  --csv benchmark-results/current-2026-08-23-concurrent-writers-safe-strict.csv
+  --csv benchmark-results/current-2026-09-04-concurrent-writers-safe-strict.csv
 cargo bench -p elitesql-core --bench wal_preallocation -- \
-  "$PWD/benchmark-results/current-2026-08-23-wal-preallocation.csv"
+  "$PWD/benchmark-results/current-2026-09-04-wal-preallocation.csv"
 python3 scripts/plot-concurrent-benchmark.py \
-  benchmark-results/current-2026-08-23-concurrent-writers-fast.csv \
+  benchmark-results/current-2026-09-04-concurrent-writers-fast.csv \
   --output-dir benchmark-results
 
 # Persisted concurrent readers and mixed readers/writers
 cargo bench -p elitesql-core --bench concurrent_rw -- \
   --rows 100k --read-operations 1m --write-rows 40k --batch-size 10 \
   --readers 1,2,4,8,16 --writers 0,1,4 --repetitions 3 \
-  --csv benchmark-results/current-2026-08-23-concurrent-rw.csv
+  --csv benchmark-results/current-2026-09-04-concurrent-rw.csv
 
 # Updates/deletes, identity/FK, derived indexes and warm/reopened cache modes
 cargo bench -p elitesql-core --bench contention_matrix -- \
@@ -742,11 +901,11 @@ cargo bench -p elitesql-core --bench contention_matrix -- \
   --cache warm,cold --readers 16 --writers 4 --rows 50k \
   --read-operations 100k --write-rows 5k --batch-size 10 \
   --repetitions 3 \
-  --csv benchmark-results/current-2026-08-23-contention-matrix.csv
+  --csv benchmark-results/current-2026-09-04-contention-matrix.csv
 
 # Synthetic ANN
 cargo bench -p elitesql-core --bench vector -- \
-  --save-baseline current-2026-08-23
+  --save-baseline current-2026-09-04
 ```
 
 For the exact executable path used by `/usr/bin/time`, first run

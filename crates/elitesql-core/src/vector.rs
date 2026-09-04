@@ -16,10 +16,10 @@
 //! nodes): stale labels are tombstoned, filtered at search time, and dropped
 //! for real when compaction rebuilds.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -27,6 +27,10 @@ use std::sync::Arc;
 use memmap2::{Advice, Mmap, UncheckedAdvice};
 use serde::{Deserialize, Serialize};
 
+use crate::distance::{
+    bytes_as_i8, dot_f32, dot_f32_i8, dot_f32_le_bytes, dot_i8, l2_squared_f32,
+    l2_squared_f32_i8, l2_squared_f32_le_bytes, l2_squared_i8_scaled,
+};
 use crate::error::{Error, Result};
 use crate::value::{read_u16, read_u32, read_u64, read_u8};
 
@@ -121,26 +125,75 @@ pub struct VectorHit {
     pub record: crate::Record,
 }
 
-// --- fast integer hashing for visited sets --------------------------------------
+// --- visited sets ------------------------------------------------------------------
 
+/// Reusable visited bitmap for one beam search. Marking a label is a shift and
+/// a mask instead of a hash-table probe, and resetting clears only the words
+/// touched by the previous search, so the cost does not grow with the graph.
+/// The buffer lives in a thread-local so searches on `&self` and inserts on
+/// `&mut self` share it without allocating per call.
 #[derive(Default)]
-struct U32Hasher(u64);
+struct Visited {
+    words: Vec<u64>,
+    touched: Vec<u32>,
+}
 
-impl Hasher for U32Hasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+impl Visited {
+    fn reset(&mut self, len: usize) {
+        for &word in &self.touched {
+            self.words[word as usize] = 0;
+        }
+        self.touched.clear();
+        let words = len.div_ceil(64);
+        if self.words.len() < words {
+            self.words.resize(words, 0);
         }
     }
-    fn write_u32(&mut self, n: u32) {
-        self.0 = (n as u64 ^ 0x5851_F42D_4C95_7F2D).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+    /// Marks `label`, returning `true` when it had not been visited yet. A
+    /// label outside the graph reports "visited" so a corrupt neighbor list
+    /// is skipped rather than followed.
+    #[inline]
+    fn insert(&mut self, label: u32) -> bool {
+        let index = (label >> 6) as usize;
+        let bit = 1u64 << (label & 63);
+        let Some(word) = self.words.get_mut(index) else {
+            return false;
+        };
+        if *word & bit != 0 {
+            return false;
+        }
+        if *word == 0 {
+            self.touched.push(index as u32);
+        }
+        *word |= bit;
+        true
     }
 }
 
-type VisitedSet = HashSet<u32, BuildHasherDefault<U32Hasher>>;
+thread_local! {
+    static VISITED: RefCell<Visited> = RefCell::new(Visited::default());
+}
+
+fn with_visited<R>(len: usize, f: impl FnOnce(&mut Visited) -> R) -> R {
+    let mut f = Some(f);
+    let shared = VISITED.try_with(|cell| {
+        let mut visited = cell.try_borrow_mut().ok()?;
+        visited.reset(len);
+        let f = f.take().expect("closure is available on first use");
+        Some(f(&mut visited))
+    });
+    match shared {
+        Ok(Some(result)) => result,
+        // Re-entrant use or thread teardown: fall back to a private buffer.
+        Ok(None) | Err(_) => {
+            let f = f.take().expect("closure was not consumed");
+            let mut visited = Visited::default();
+            visited.reset(len);
+            f(&mut visited)
+        }
+    }
+}
 
 // --- HNSW ------------------------------------------------------------------------
 
@@ -262,6 +315,12 @@ struct HnswIndex {
     entry: Option<u32>,
     top_level: u8,
     rng: u64,
+    /// Running total of neighbor entries across `links`, so memory accounting
+    /// is O(1) per call instead of walking every adjacency list; callers such
+    /// as index builds check the budget after every insert.
+    link_entries: usize,
+    /// Number of adjacency lists (one per node level) in `links`.
+    link_lists: usize,
 }
 
 impl HnswIndex {
@@ -290,6 +349,8 @@ impl HnswIndex {
             entry: None,
             top_level: 0,
             rng: 0x9E37_79B9_7F4A_7C15,
+            link_entries: 0,
+            link_lists: 0,
         }
     }
 
@@ -311,26 +372,12 @@ impl HnswIndex {
                 let (qb, sb) = self.store.i8_at(b as usize);
                 match self.metric {
                     VectorMetric::Cosine => {
-                        let dot_i: i64 =
-                            qa.iter().zip(qb).map(|(&x, &y)| x as i64 * y as i64).sum();
-                        let dot = dot_i as f32 * sa * sb;
+                        let dot = dot_i8(qa, qb) as f32 * sa * sb;
                         1.0 - dot
                             / (self.norms[a as usize] * self.norms[b as usize]).max(f32::EPSILON)
                     }
-                    VectorMetric::Dot => {
-                        let dot_i: i64 =
-                            qa.iter().zip(qb).map(|(&x, &y)| x as i64 * y as i64).sum();
-                        1.0 - dot_i as f32 * sa * sb
-                    }
-                    VectorMetric::L2 => qa
-                        .iter()
-                        .zip(qb)
-                        .map(|(&x, &y)| {
-                            let d = x as f32 * sa - y as f32 * sb;
-                            d * d
-                        })
-                        .sum::<f32>()
-                        .sqrt(),
+                    VectorMetric::Dot => 1.0 - dot_i8(qa, qb) as f32 * sa * sb,
+                    VectorMetric::L2 => l2_squared_i8_scaled(qa, sa, qb, sb).sqrt(),
                 }
             }
         }
@@ -342,43 +389,21 @@ impl HnswIndex {
                 let w = self.store.f32_at(label as usize);
                 match self.metric {
                     VectorMetric::Cosine => {
-                        let dot: f32 = v.iter().zip(w).map(|(x, y)| x * y).sum();
-                        1.0 - dot / (vnorm * self.norms[label as usize]).max(f32::EPSILON)
+                        1.0 - dot_f32(v, w) / (vnorm * self.norms[label as usize]).max(f32::EPSILON)
                     }
-                    VectorMetric::Dot => {
-                        let dot: f32 = v.iter().zip(w).map(|(x, y)| x * y).sum();
-                        1.0 - dot
-                    }
-                    VectorMetric::L2 => v
-                        .iter()
-                        .zip(w)
-                        .map(|(x, y)| (x - y) * (x - y))
-                        .sum::<f32>()
-                        .sqrt(),
+                    VectorMetric::Dot => 1.0 - dot_f32(v, w),
+                    VectorMetric::L2 => l2_squared_f32(v, w).sqrt(),
                 }
             }
             VecStore::I8 { .. } => {
                 let (q, scale) = self.store.i8_at(label as usize);
                 match self.metric {
                     VectorMetric::Cosine => {
-                        let dot: f32 =
-                            v.iter().zip(q).map(|(x, &y)| x * y as f32).sum::<f32>() * scale;
+                        let dot = dot_f32_i8(v, q) * scale;
                         1.0 - dot / (vnorm * self.norms[label as usize]).max(f32::EPSILON)
                     }
-                    VectorMetric::Dot => {
-                        let dot: f32 =
-                            v.iter().zip(q).map(|(x, &y)| x * y as f32).sum::<f32>() * scale;
-                        1.0 - dot
-                    }
-                    VectorMetric::L2 => v
-                        .iter()
-                        .zip(q)
-                        .map(|(x, &y)| {
-                            let d = x - y as f32 * scale;
-                            d * d
-                        })
-                        .sum::<f32>()
-                        .sqrt(),
+                    VectorMetric::Dot => 1.0 - dot_f32_i8(v, q) * scale,
+                    VectorMetric::L2 => l2_squared_f32_i8(v, q, scale).sqrt(),
                 }
             }
         }
@@ -421,42 +446,43 @@ impl HnswIndex {
         ef: usize,
         layer: usize,
     ) -> Vec<(f32, u32)> {
-        let mut visited: VisitedSet =
-            HashSet::with_capacity_and_hasher(ef.saturating_mul(2), BuildHasherDefault::default());
-        let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::with_capacity(ef);
-        let mut results: BinaryHeap<Cand> = BinaryHeap::with_capacity(ef); // max-heap of best ef
-        for &(d, l) in eps {
-            if visited.insert(l) {
-                candidates.push(Reverse(Cand(d, l)));
-                results.push(Cand(d, l));
-            }
-        }
-        while results.len() > ef {
-            results.pop();
-        }
-        while let Some(Reverse(Cand(cd, cl))) = candidates.pop() {
-            let worst = results.peek().map(|c| c.0).unwrap_or(f32::INFINITY);
-            if cd > worst && results.len() >= ef {
-                break;
-            }
-            for &n in &self.links[cl as usize][layer] {
-                if !visited.insert(n) {
-                    continue;
+        with_visited(self.links.len(), |visited| {
+            let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::with_capacity(ef);
+            let mut results: BinaryHeap<Cand> = BinaryHeap::with_capacity(ef); // max-heap of best ef
+            for &(d, l) in eps {
+                if visited.insert(l) {
+                    candidates.push(Reverse(Cand(d, l)));
+                    results.push(Cand(d, l));
                 }
-                let d = self.dist_raw(v, vnorm, n);
+            }
+            while results.len() > ef {
+                results.pop();
+            }
+            while let Some(Reverse(Cand(cd, cl))) = candidates.pop() {
                 let worst = results.peek().map(|c| c.0).unwrap_or(f32::INFINITY);
-                if results.len() < ef || d < worst {
-                    candidates.push(Reverse(Cand(d, n)));
-                    results.push(Cand(d, n));
-                    if results.len() > ef {
-                        results.pop();
+                if cd > worst && results.len() >= ef {
+                    break;
+                }
+                for &n in &self.links[cl as usize][layer] {
+                    if !visited.insert(n) {
+                        continue;
+                    }
+                    let d = self.dist_raw(v, vnorm, n);
+                    let worst = results.peek().map(|c| c.0).unwrap_or(f32::INFINITY);
+                    if results.len() < ef || d < worst {
+                        candidates.push(Reverse(Cand(d, n)));
+                        results.push(Cand(d, n));
+                        if results.len() > ef {
+                            results.pop();
+                        }
                     }
                 }
             }
-        }
-        let mut out: Vec<(f32, u32)> = results.into_iter().map(|Cand(d, l)| (d, l)).collect();
-        out.sort_by(|a, b| a.0.total_cmp(&b.0));
-        out
+            let mut out: Vec<(f32, u32)> =
+                results.into_iter().map(|Cand(d, l)| (d, l)).collect();
+            out.sort_by(|a, b| a.0.total_cmp(&b.0));
+            out
+        })
     }
 
     /// Algorithm 4: diversity-preserving neighbor selection, with pruned
@@ -494,6 +520,7 @@ impl HnswIndex {
         self.norms.push(stored_norm);
         self.links
             .push((0..=level as usize).map(|_| Vec::new()).collect());
+        self.link_lists += level as usize + 1;
 
         let Some(entry) = self.entry else {
             self.entry = Some(label);
@@ -517,10 +544,12 @@ impl HnswIndex {
             let neighbors = self.select_neighbors(&candidates, self.m);
             for &n in &neighbors {
                 self.links[n as usize][l].push(label);
+                self.link_entries += 1;
                 if self.links[n as usize][l].len() > mmax {
                     self.prune(n, l, mmax);
                 }
             }
+            self.link_entries += neighbors.len();
             self.links[label as usize][l] = neighbors;
             eps = candidates;
         }
@@ -532,13 +561,16 @@ impl HnswIndex {
     }
 
     fn prune(&mut self, node: u32, layer: usize, mmax: usize) {
-        let current = self.links[node as usize][layer].clone();
+        let current = std::mem::take(&mut self.links[node as usize][layer]);
+        self.link_entries -= current.len();
         let mut with_dist: Vec<(f32, u32)> = current
             .into_iter()
             .map(|n| (self.dist_between(node, n), n))
             .collect();
         with_dist.sort_by(|a, b| a.0.total_cmp(&b.0));
-        self.links[node as usize][layer] = self.select_neighbors(&with_dist, mmax);
+        let selected = self.select_neighbors(&with_dist, mmax);
+        self.link_entries += selected.len();
+        self.links[node as usize][layer] = selected;
     }
 
     fn search(&self, v: &[f32], k: usize, ef: usize) -> Vec<(u32, f32)> {
@@ -573,8 +605,13 @@ pub(crate) struct VecIdx {
     /// Resident HNSW generation owned by background publication.
     frozen: Option<Arc<VecIdx>>,
     frozen_generation: Option<u64>,
-    /// Newer updates/deletes that hide ids still present in `frozen`.
+    /// Newer updates/deletes that hide ids still present in `frozen`. Every
+    /// member is also a key of `frozen.id_to_label`.
     frozen_removed: HashSet<Arc<str>>,
+    /// Estimated heap bytes of `labels`, maintained incrementally.
+    label_bytes: usize,
+    /// Estimated heap bytes of `frozen_removed`, maintained incrementally.
+    frozen_removed_bytes: usize,
 }
 
 impl VecIdx {
@@ -588,6 +625,20 @@ impl VecIdx {
             frozen: None,
             frozen_generation: None,
             frozen_removed: HashSet::new(),
+            label_bytes: 0,
+            frozen_removed_bytes: 0,
+        }
+    }
+
+    /// Hide `id` from the frozen generation when it is still present there.
+    fn hide_frozen(&mut self, id: &str) {
+        if self
+            .frozen
+            .as_ref()
+            .is_some_and(|frozen| frozen.id_to_label.contains_key(id))
+            && self.frozen_removed.insert(Arc::from(id))
+        {
+            self.frozen_removed_bytes += id.len() + 48;
         }
     }
 
@@ -597,19 +648,14 @@ impl VecIdx {
         for mapped in &mut self.mapped {
             mapped.remove(id);
         }
-        if self
-            .frozen
-            .as_ref()
-            .is_some_and(|frozen| frozen.id_to_label.contains_key(id))
-        {
-            self.frozen_removed.insert(Arc::from(id));
-        }
+        self.hide_frozen(id);
         if let Some(old) = self.id_to_label.get(id) {
             self.deleted[*old] = true;
         }
         let label = self.backend.insert(v) as usize;
         debug_assert_eq!(label, self.labels.len());
         let id: Arc<str> = Arc::from(id);
+        self.label_bytes += id.len() + 40;
         self.labels.push(id.clone());
         self.deleted.push(false);
         self.id_to_label.insert(id, label);
@@ -623,24 +669,19 @@ impl VecIdx {
         if let Some(label) = self.id_to_label.remove(id) {
             self.deleted[label] = true;
         }
-        if self
-            .frozen
-            .as_ref()
-            .is_some_and(|frozen| frozen.id_to_label.contains_key(id))
-        {
-            self.frozen_removed.insert(Arc::from(id));
-        }
+        self.hide_frozen(id);
     }
 
     pub fn live_len(&self) -> usize {
         self.mapped.iter().map(MappedHnsw::live_len).sum::<usize>()
             + self.id_to_label.len()
             + self.frozen.as_ref().map_or(0, |frozen| {
+                // Every hidden id is a key of the frozen map, so the live
+                // count is a subtraction rather than a filtered walk.
                 frozen
                     .id_to_label
-                    .keys()
-                    .filter(|id| !self.frozen_removed.contains(id.as_ref()))
-                    .count()
+                    .len()
+                    .saturating_sub(self.frozen_removed.len())
             })
     }
 
@@ -728,12 +769,10 @@ impl VecIdx {
         };
         let link_bytes = self
             .backend
-            .links
-            .iter()
-            .flat_map(|levels| levels.iter())
-            .map(|links| links.len() * std::mem::size_of::<u32>() + 24)
-            .sum::<usize>();
-        let label_bytes = self.labels.iter().map(|id| id.len() + 40).sum::<usize>();
+            .link_entries
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(self.backend.link_lists.saturating_mul(24));
+        let label_bytes = self.label_bytes;
         let overlay_metadata = self
             .mapped
             .iter()
@@ -746,12 +785,7 @@ impl VecIdx {
             .saturating_add(self.backend.norms.len() * std::mem::size_of::<f32>())
             .saturating_add(self.deleted.len().div_ceil(8))
             .saturating_add(overlay_metadata)
-            .saturating_add(
-                self.frozen_removed
-                    .iter()
-                    .map(|id| id.len() + 48)
-                    .sum::<usize>(),
-            )
+            .saturating_add(self.frozen_removed_bytes)
     }
 
     pub(crate) fn frozen_delta_memory_bytes(&self) -> usize {
@@ -779,8 +813,11 @@ impl VecIdx {
             frozen: None,
             frozen_generation: None,
             frozen_removed: HashSet::new(),
+            label_bytes: std::mem::take(&mut self.label_bytes),
+            frozen_removed_bytes: 0,
         });
         self.frozen_removed.clear();
+        self.frozen_removed_bytes = 0;
         self.frozen = Some(frozen.clone());
         self.frozen_generation = Some(generation);
         Some(frozen)
@@ -818,6 +855,7 @@ impl VecIdx {
         self.frozen = None;
         self.frozen_generation = None;
         self.frozen_removed.clear();
+        self.frozen_removed_bytes = 0;
         true
     }
 
@@ -851,6 +889,7 @@ impl VecIdx {
             .push(loaded.mapped.pop().expect("one mapped run"));
         self.backend = HnswIndex::new(def.metric, def.m, def.ef_construction, def.quantized);
         self.labels.clear();
+        self.label_bytes = 0;
         self.id_to_label.clear();
         self.deleted.clear();
         // The mapping keeps the inode alive on supported Unix platforms; a
@@ -883,6 +922,8 @@ struct MappedHnsw {
     top_level: u8,
     id_to_label: HashMap<Arc<str>, usize>,
     deleted: Vec<bool>,
+    /// Estimated heap bytes of `id_to_label`, maintained incrementally.
+    id_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1095,6 +1136,7 @@ impl VecIdx {
         let mut link_levels = Vec::new();
         let mut deleted = Vec::with_capacity(node_count);
         let mut id_to_label = HashMap::with_capacity(node_count);
+        let mut id_bytes = 0usize;
         let mut dimension = None;
         for label in 0..node_count {
             let node = parse_mapped_node(&mmap, directory_offset, node_count, quantized, label)?;
@@ -1135,6 +1177,7 @@ impl VecIdx {
             });
             deleted.push(node.deleted);
             if !node.deleted {
+                id_bytes += node.id.len() + 56;
                 id_to_label.insert(Arc::from(node.id), label);
             }
         }
@@ -1158,6 +1201,7 @@ impl VecIdx {
             top_level,
             id_to_label,
             deleted,
+            id_bytes,
         };
         mapped.validate_links()?;
         if mapped.node_count < MIN_MMAP_NAV_CACHE_NODES {
@@ -1183,6 +1227,8 @@ impl VecIdx {
                 frozen: None,
                 frozen_generation: None,
                 frozen_removed: HashSet::new(),
+                label_bytes: 0,
+                frozen_removed_bytes: 0,
             },
             dump_version,
         ))
@@ -1204,12 +1250,7 @@ impl MappedHnsw {
                     .saturating_mul(std::mem::size_of::<MappedLinkLevel>()),
             )
             .saturating_add(self.deleted.len().div_ceil(8))
-            .saturating_add(
-                self.id_to_label
-                    .keys()
-                    .map(|id| id.len() + 56)
-                    .sum::<usize>(),
-            )
+            .saturating_add(self.id_bytes)
     }
 
     fn len(&self) -> usize {
@@ -1227,6 +1268,7 @@ impl MappedHnsw {
     fn remove(&mut self, id: &str) {
         if let Some(label) = self.id_to_label.remove(id) {
             self.deleted[label] = true;
+            self.id_bytes = self.id_bytes.saturating_sub(id.len() + 56);
         }
     }
 
@@ -1307,69 +1349,24 @@ impl MappedHnsw {
             self.nodes[label as usize]
         };
         if self.quantized {
-            let vector = &self.mmap[node.vector_pos..node.vector_pos + node.dim];
+            let vector = bytes_as_i8(&self.mmap[node.vector_pos..node.vector_pos + node.dim]);
             match self.metric {
                 VectorMetric::Cosine => {
-                    let dot = query
-                        .iter()
-                        .zip(vector)
-                        .map(|(x, value)| *x * (*value as i8 as f32))
-                        .sum::<f32>()
-                        * node.scale;
+                    let dot = dot_f32_i8(query, vector) * node.scale;
                     1.0 - dot / (query_norm * node.norm).max(f32::EPSILON)
                 }
-                VectorMetric::Dot => {
-                    let dot = query
-                        .iter()
-                        .zip(vector)
-                        .map(|(x, value)| *x * (*value as i8 as f32))
-                        .sum::<f32>()
-                        * node.scale;
-                    1.0 - dot
-                }
-                VectorMetric::L2 => query
-                    .iter()
-                    .zip(vector)
-                    .map(|(x, value)| {
-                        let delta = *x - (*value as i8 as f32) * node.scale;
-                        delta * delta
-                    })
-                    .sum::<f32>()
-                    .sqrt(),
+                VectorMetric::Dot => 1.0 - dot_f32_i8(query, vector) * node.scale,
+                VectorMetric::L2 => l2_squared_f32_i8(query, vector, node.scale).sqrt(),
             }
         } else {
             let bytes = &self.mmap[node.vector_pos..node.vector_pos + node.dim * 4];
             match self.metric {
                 VectorMetric::Cosine => {
-                    let dot = query
-                        .iter()
-                        .zip(bytes.chunks_exact(4))
-                        .map(|(x, bytes)| {
-                            *x * f32::from_le_bytes(bytes.try_into().expect("four bytes"))
-                        })
-                        .sum::<f32>();
+                    let dot = dot_f32_le_bytes(query, bytes);
                     1.0 - dot / (query_norm * node.norm).max(f32::EPSILON)
                 }
-                VectorMetric::Dot => {
-                    let dot = query
-                        .iter()
-                        .zip(bytes.chunks_exact(4))
-                        .map(|(x, bytes)| {
-                            *x * f32::from_le_bytes(bytes.try_into().expect("four bytes"))
-                        })
-                        .sum::<f32>();
-                    1.0 - dot
-                }
-                VectorMetric::L2 => query
-                    .iter()
-                    .zip(bytes.chunks_exact(4))
-                    .map(|(x, bytes)| {
-                        let value = f32::from_le_bytes(bytes.try_into().expect("four bytes"));
-                        let delta = *x - value;
-                        delta * delta
-                    })
-                    .sum::<f32>()
-                    .sqrt(),
+                VectorMetric::Dot => 1.0 - dot_f32_le_bytes(query, bytes),
+                VectorMetric::L2 => l2_squared_f32_le_bytes(query, bytes).sqrt(),
             }
         }
     }
@@ -1405,45 +1402,45 @@ impl MappedHnsw {
         entry: (f32, u32),
         ef: usize,
     ) -> Vec<(f32, u32)> {
-        let mut visited: VisitedSet =
-            HashSet::with_capacity_and_hasher(ef.saturating_mul(2), BuildHasherDefault::default());
-        let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::with_capacity(ef);
-        let mut results: BinaryHeap<Cand> = BinaryHeap::with_capacity(ef);
-        visited.insert(entry.1);
-        candidates.push(Reverse(Cand(entry.0, entry.1)));
-        results.push(Cand(entry.0, entry.1));
-        while let Some(Reverse(Cand(distance, label))) = candidates.pop() {
-            let worst = results
-                .peek()
-                .map(|candidate| candidate.0)
-                .unwrap_or(f32::INFINITY);
-            if distance > worst && results.len() >= ef {
-                break;
-            }
-            for neighbor in self.neighbors(label, 0) {
-                if !visited.insert(neighbor) {
-                    continue;
-                }
-                let distance = self.dist_raw(query, norm, neighbor);
+        with_visited(self.node_count, |visited| {
+            let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::with_capacity(ef);
+            let mut results: BinaryHeap<Cand> = BinaryHeap::with_capacity(ef);
+            visited.insert(entry.1);
+            candidates.push(Reverse(Cand(entry.0, entry.1)));
+            results.push(Cand(entry.0, entry.1));
+            while let Some(Reverse(Cand(distance, label))) = candidates.pop() {
                 let worst = results
                     .peek()
                     .map(|candidate| candidate.0)
                     .unwrap_or(f32::INFINITY);
-                if results.len() < ef || distance < worst {
-                    candidates.push(Reverse(Cand(distance, neighbor)));
-                    results.push(Cand(distance, neighbor));
-                    if results.len() > ef {
-                        results.pop();
+                if distance > worst && results.len() >= ef {
+                    break;
+                }
+                for neighbor in self.neighbors(label, 0) {
+                    if !visited.insert(neighbor) {
+                        continue;
+                    }
+                    let distance = self.dist_raw(query, norm, neighbor);
+                    let worst = results
+                        .peek()
+                        .map(|candidate| candidate.0)
+                        .unwrap_or(f32::INFINITY);
+                    if results.len() < ef || distance < worst {
+                        candidates.push(Reverse(Cand(distance, neighbor)));
+                        results.push(Cand(distance, neighbor));
+                        if results.len() > ef {
+                            results.pop();
+                        }
                     }
                 }
             }
-        }
-        let mut output: Vec<_> = results
-            .into_iter()
-            .map(|Cand(distance, label)| (distance, label))
-            .collect();
-        output.sort_by(|left, right| left.0.total_cmp(&right.0));
-        output
+            let mut output: Vec<_> = results
+                .into_iter()
+                .map(|Cand(distance, label)| (distance, label))
+                .collect();
+            output.sort_by(|left, right| left.0.total_cmp(&right.0));
+            output
+        })
     }
 
     fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(String, f32)> {
@@ -1886,6 +1883,13 @@ impl VecIdx {
         }
 
         let m = def.m.clamp(2, 256);
+        let link_lists = links.iter().map(Vec::len).sum::<usize>();
+        let link_entries = links
+            .iter()
+            .flat_map(|levels| levels.iter())
+            .map(Vec::len)
+            .sum::<usize>();
+        let label_bytes = labels.iter().map(|id| id.len() + 40).sum::<usize>();
         let backend = HnswIndex {
             metric: def.metric,
             m,
@@ -1898,6 +1902,8 @@ impl VecIdx {
             entry,
             top_level,
             rng,
+            link_entries,
+            link_lists,
         };
         Ok((
             VecIdx {
@@ -1909,6 +1915,8 @@ impl VecIdx {
                 frozen: None,
                 frozen_generation: None,
                 frozen_removed: HashSet::new(),
+                label_bytes,
+                frozen_removed_bytes: 0,
             },
             dump_version,
         ))

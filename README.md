@@ -246,8 +246,8 @@ WHERE id = 'note-42';
 The replacement vector must have the column's declared dimension (768 above).
 
 The current 100K-vector synthetic benchmark (dim 64) obtains recall@10 of
-0.994 at `ef_search=128` and 1.0 at 256, with mean search intervals of about
-2.0 ms and 3.4 ms respectively. An `Async` mode is available so commits do not
+0.994 at `ef_search=128` and 0.998 at 256 (1.0 at 512), with mean search
+intervals of about 0.42 ms and 0.77 ms respectively. An `Async` mode is available so commits do not
 wait for indexing, plus a `quantized` (int8) option for roughly 4x smaller
 vector payloads. See [benchmark.md](benchmark.md) for the measured memory,
 latency, and quality trade-offs.
@@ -686,6 +686,22 @@ result is tied at about 2.5K rows/s and EliteSQL reaches 36.7K rows/s at 16
 writers by averaging 15.7 commits per strict sync. ANN search became
 5.3-6.6x faster while recall and persisted reopen regressed, so that result is
 not quality-neutral. See the [full acceptance report](benchmark-results/full-acceptance-2026-08-23.md).
+
+The 2026-09-04 acceptance rerun followed a hot-path pass that reads segment
+payloads through read-only mappings instead of one `pread` per record, tests
+unindexed equality predicates on encoded payloads, merges primary runs without
+per-record allocation, vectorizes the HNSW distance kernels and makes vector
+index memory accounting incremental. Against the 2026-08-23 run, the SQL
+unindexed 1M-row filter fell from 291 ms to 34 ms, read-only point-read
+throughput peaked at 3.58M reads/s with 16 readers (1.22M before), the
+16-reader/four-writer mix sustained 2.53M reads/s and 101K rows/s, ANN search
+became 27-31% faster with identical recall, HNSW ingest fell from 15.3 s to
+9.2 s and persisted reopen from 22.6 s to 10.9 s. The 10M transactional load
+completed in 7.330 s versus SQLite's 8.631 s (ingest wall 7.220 s versus
+6.005 s; SQLite's deferred checkpoint took 2.626 s in that run) and direct
+sorted bulk in 4.559 s versus 7.289 s. Fast/Balanced/Safe writer throughput
+stayed within the previous matrix's spread. See the
+[current acceptance report](benchmark-results/current-acceptance-2026-09-04.md).
 
 Historical results remain useful: the former 256 MiB ingest profile completed
 in 18.798 s, and `Db::bulk_insert_sorted` completed in 9.968 s versus SQLite's

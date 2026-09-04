@@ -1,0 +1,16 @@
+benchmark,mean_ns,ci_lower_ns,ci_upper_ns
+insert_1k_rows/elitesql,10681578.818,9080050.566,11961699.346
+insert_1k_rows/elitesql_single_txn,2614997.606,2399387.160,2837965.732
+insert_1k_rows/sqlite_autocommit,8523943.420,8480080.480,8565494.374
+insert_1k_rows/sqlite_single_txn,652599.233,632113.255,677418.746
+get_by_id/elitesql,350.624,349.387,351.933
+get_by_id/sqlite,1403.571,1399.947,1408.163
+sql_1m/point_by_unique_index,4357.315,4318.743,4409.888
+sql_1m/point_by_unique_index_bound,3655.629,3630.952,3681.520
+sql_1m/indexed_join_100_of_1m,187053.048,186092.451,187941.499
+sql_1m/indexed_join_100_of_1m_bound,184725.087,184017.651,185440.382
+sql_1m/full_scan_filter_1m,34230840.916,33565560.270,35088605.466
+vector_100k/search_top10_ef64,236559.500,233106.937,240741.139
+vector_100k/search_top10_ef128,416414.048,412319.596,421159.062
+vector_100k/search_top10_ef256,772760.115,755670.709,797907.996
+vector_100k/search_top10_ef512,1353192.751,1337663.453,1372660.064

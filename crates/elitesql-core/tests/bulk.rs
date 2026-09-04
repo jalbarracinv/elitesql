@@ -99,9 +99,10 @@ fn a_large_scan_yields_the_state_lock_to_a_concurrent_writer() {
     let db = Db::create(dir.path().join("scan-writer.esql")).unwrap();
     db.create_table(schema()).unwrap();
     let body = "x".repeat(768);
+    const ROWS: usize = 50_000;
     db.bulk_insert_sorted(
         "docs",
-        (0..20_000).map(|i| {
+        (0..ROWS).map(|i| {
             let mut row = record(i);
             row.insert("title".into(), Value::Text(body.clone()));
             row
@@ -110,7 +111,7 @@ fn a_large_scan_yields_the_state_lock_to_a_concurrent_writer() {
     .unwrap();
 
     let baseline_started = Instant::now();
-    assert_eq!(db.scan("docs").unwrap().len(), 20_000);
+    assert_eq!(db.scan("docs").unwrap().len(), ROWS);
     let baseline = baseline_started.elapsed();
 
     let db = Arc::new(db);
@@ -123,10 +124,12 @@ fn a_large_scan_yields_the_state_lock_to_a_concurrent_writer() {
         done_tx.send(rows.len()).unwrap();
     });
     started_rx.recv().unwrap();
-    std::thread::sleep(Duration::from_millis(10));
+    // Let the scan get under way, but never sleep long enough for it to
+    // finish: mapped segment reads make even this fixture scan fast.
+    std::thread::sleep((baseline / 5).min(Duration::from_millis(10)));
 
     let commit_started = Instant::now();
-    db.insert("docs", record(20_001)).unwrap();
+    db.insert("docs", record(ROWS + 1)).unwrap();
     let commit_elapsed = commit_started.elapsed();
     assert!(
         commit_elapsed < baseline / 2,
@@ -136,6 +139,6 @@ fn a_large_scan_yields_the_state_lock_to_a_concurrent_writer() {
         done_rx.try_recv().is_err(),
         "the scan fixture finished before the concurrent commit could demonstrate progress"
     );
-    assert_eq!(done_rx.recv().unwrap(), 20_000);
+    assert_eq!(done_rx.recv().unwrap(), ROWS);
     worker.join().unwrap();
 }

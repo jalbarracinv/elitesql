@@ -38,6 +38,13 @@ def args() -> argparse.Namespace:
 def load(path: Path) -> tuple[list[dict[str, str]], list[int]]:
     with path.open(newline="", encoding="utf-8") as source:
         rows = list(csv.DictReader(source))
+    # Current CSVs label the ordinary SQLite profile "SQLite-fsync" (the strict
+    # F_FULLFSYNC profile is "SQLite-fullfsync"); the charts compare the
+    # ordinary profile, as the older files did under the plain "SQLite" label.
+    for row in rows:
+        if row["engine"] == "SQLite-fsync":
+            row["engine"] = "SQLite"
+    rows = [row for row in rows if row["engine"] in ENGINES]
     if not rows:
         raise SystemExit(f"no benchmark rows in {path}")
     writers = sorted({int(row["writers"]) for row in rows})
