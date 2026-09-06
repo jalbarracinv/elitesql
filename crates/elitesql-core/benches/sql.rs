@@ -159,6 +159,27 @@ fn bench_sql(c: &mut Criterion) {
         })
     });
 
+    g.bench_function("group_by_997_groups_1m", |b| {
+        b.iter(|| {
+            let out = db
+                .query("SELECT amount, count(*) FROM orders GROUP BY amount")
+                .unwrap();
+            assert_eq!(rows_len(black_box(out)), 997);
+        })
+    });
+
+    g.bench_function("group_by_10k_groups_1m", |b| {
+        b.iter(|| {
+            let out = db
+                .query(
+                    "SELECT user_id, count(*), sum(amount), max(amount) FROM orders \
+                     GROUP BY user_id",
+                )
+                .unwrap();
+            assert_eq!(rows_len(black_box(out)), USERS);
+        })
+    });
+
     g.finish();
 }
 

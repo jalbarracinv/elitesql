@@ -116,26 +116,38 @@ impl Clustered {
     }
 }
 
+/// Newest generation, total nodes and total bytes across every durable HNSW
+/// graph of the index: the base written on close plus the immutable runs the
+/// background publisher flushed while the database ran.
 fn persisted_base(db_path: &std::path::Path) -> Result<(u64, u32, u64), String> {
-    let path = fs::read_dir(db_path.join("vectors"))
+    let graphs: Vec<_> = fs::read_dir(db_path.join("vectors"))
         .map_err(|error| error.to_string())?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "vidx")
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".vidx") || name.ends_with(".vidx.run"))
         })
-        .ok_or_else(|| "no durable .vidx base found".to_owned())?;
-    let bytes = fs::metadata(&path)
-        .map_err(|error| error.to_string())?
-        .len();
-    let mut header = [0_u8; 36];
-    File::open(path)
-        .and_then(|mut file| file.read_exact(&mut header))
-        .map_err(|error| error.to_string())?;
-    let dump_version = u64::from_le_bytes(header[24..32].try_into().unwrap());
-    let nodes = u32::from_le_bytes(header[32..36].try_into().unwrap());
-    Ok((dump_version, nodes, bytes))
+        .collect();
+    if graphs.is_empty() {
+        return Err("no durable .vidx graph found".to_owned());
+    }
+    let mut newest_version = 0_u64;
+    let mut total_nodes = 0_u32;
+    let mut total_bytes = 0_u64;
+    for path in graphs {
+        total_bytes += fs::metadata(&path)
+            .map_err(|error| error.to_string())?
+            .len();
+        let mut header = [0_u8; 36];
+        File::open(path)
+            .and_then(|mut file| file.read_exact(&mut header))
+            .map_err(|error| error.to_string())?;
+        newest_version = newest_version.max(u64::from_le_bytes(header[24..32].try_into().unwrap()));
+        total_nodes += u32::from_le_bytes(header[32..36].try_into().unwrap());
+    }
+    Ok((newest_version, total_nodes, total_bytes))
 }
 
 fn run(args: Args) -> Result<(), String> {

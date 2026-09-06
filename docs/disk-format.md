@@ -13,6 +13,8 @@ app.esql/
   wal/NNNNNN.wal  # durable commits since the last checkpoint
   segments/NNNNNN.seg   # immutable data (created at checkpoint/compaction)
   vectors/XXXXXXXX.vidx # persisted ANN graphs (derived, disposable)
+  vectors/XXXXXXXX-<ulid>.vidx.run  # immutable HNSW runs published while running
+  vectors/XXXXXXXX.vidx.runs        # run manifest: which runs cover which generation
   blobs/<ulid>.blob     # large-blob chunks (out-of-line)
 ```
 
@@ -89,10 +91,47 @@ GC at compaction: chunks not referenced by any surviving payload are deleted
 `ESQLVIDX` + crc + length + body: the index identity (table, column, metric,
 m, ef_construction, quantized), the dump's commit version, and the full
 graph (f32 or int8+scale vectors, levels and neighbors, tombstones).
-Written on database close and at compaction. On open: if it validates and
-is not newer than the state, it is loaded and caught up with everything
-committed afterwards; on any problem it is rebuilt from canonical data.
 File name: crc32 of "table\0column" in hex.
+
+An index is a set of these immutable graphs. The first is written when the
+index is created over existing rows, on compaction, or when a database with
+no usable graph is opened; every later flush of the mutable HNSW overlay (a
+background publication while the mutable index pool fills, and the clean
+close) writes another graph as `<stem>-<ulid>.vidx.run`. Searches merge all
+of them; an id present in a newer run supersedes its copies in older ones.
+`<stem>.vidx.runs` (`ESQLDRN1` envelope, kind `Vector`) lists the runs in
+generation order with the commit version the set covers completely. It is
+published under the commit mutex, so a crash leaves either the previous
+manifest or the new one, never a partial set.
+
+On open: if the manifest validates and is not newer than the state, every
+run is mapped (a 100K x 64 graph opens in tens of milliseconds) and the
+index is caught up with the commits after the manifest generation, including
+records whose vector was removed while the runs were being written. Without
+a manifest the single base file is loaded and caught up as before. Any
+missing or corrupt file falls back to a rebuild from canonical data. Runs no
+longer listed by a valid manifest are removed at open, and dropping the index
+removes all of its files.
+
+The maintenance worker bounds how many runs accumulate. Runs are size-tiered
+by live vectors: whenever four or more runs lie within a factor of two of
+each other (runs with no live vector always qualify) and the rebuilt graph
+fits the maintenance pool, one background merge re-inserts their live
+vectors into a fresh graph, written as another `.vidx.run`. The merge plans
+under the state lock (which ids each run currently owns), rebuilds from the
+run files without any lock, and publishes under the commit mutex: ids that
+stopped being live meanwhile are dropped from the new run, the old runs are
+unmapped and unlinked, and the manifest is republished at its previous
+generation, which the new set still covers. A merged run is stamped with the
+commit version of its snapshot, so the invariant used by catch-up (a vector
+committed at version `v` lives in a run stamped at or after `v`) holds; the
+manifest loader accepts run generations up to the committed version for that
+reason. Total re-insertion work over an index's life is O(n log n), and a
+search visits a few runs per size tier instead of one per publication. A
+merge reserves only its estimated footprint from the maintenance pool (at
+most half of it) and never the maintenance exclusion, so commits scheduling a
+checkpoint or a publication do not wait for it; a rebuilt graph must fit that
+half, which bounds the largest run a merge can produce.
 
 ## Versioning policy
 

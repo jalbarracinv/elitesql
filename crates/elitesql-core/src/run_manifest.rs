@@ -39,6 +39,10 @@ pub(crate) struct PrimaryRunManifest {
 pub(crate) enum DerivedRunKind {
     Secondary,
     Text,
+    /// Immutable HNSW graphs; `generation` is the newest commit the run set
+    /// covers completely, and the set stays usable as a prefix of any later
+    /// committed state.
+    Vector,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +254,31 @@ impl DerivedRunManifest {
             || manifest.table != table
             || manifest.column != column
             || manifest.generation != expected_generation
+        {
+            return Err(Error::Corrupt(
+                "derived run manifest: stale or mismatched identity".into(),
+            ));
+        }
+        Ok(manifest)
+    }
+
+    /// Like [`Self::load`], but accepts any generation up to
+    /// `committed_version`. Vector run sets remain valid as a prefix: every
+    /// change committed after the manifest generation is replayed from the
+    /// canonical data on open, so a manifest that predates the last commits
+    /// (a crash before the clean-close publication) still avoids a rebuild.
+    pub(crate) fn load_at_most(
+        path: &Path,
+        kind: DerivedRunKind,
+        table: &str,
+        column: &str,
+        committed_version: u64,
+    ) -> Result<Self> {
+        let manifest = Self::decode(&fs::read(path)?)?;
+        if manifest.kind != kind
+            || manifest.table != table
+            || manifest.column != column
+            || manifest.generation > committed_version
         {
             return Err(Error::Corrupt(
                 "derived run manifest: stale or mismatched identity".into(),

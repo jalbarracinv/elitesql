@@ -1,0 +1,3 @@
+engine,rows,batch_size,point_reads,full_scans,durability,bulk_sorted,total_memory_mib,index_delta_mib,maintenance_mib,memtable_mib,ingest_wall_seconds,final_checkpoint_seconds,maintenance_drain_seconds,checkpoint_work_seconds,checkpoint_count,promotion_work_seconds,promotion_count,total_load_seconds,rows_per_second,point_reads_seconds,point_read_us,full_scans_seconds,full_scan_seconds,disk_bytes
+EliteSQL,1000000,10000,10000,3,fast,false,,,,,0.686359000,0.102477542,0.000001208,0.357942167,3,0.000000000,0,0.788837750,1267687.810,0.018182333,1.818,0.049511458,0.016503819,234810662
+SQLite,1000000,10000,10000,3,fast,false,,,,,0.576626958,0.123606791,0.000000000,0.123606791,1,0.000000000,0,0.700233749,1428094.549,0.024060167,2.406,0.080454916,0.026818305,158801920

@@ -133,11 +133,20 @@ impl Iterator for QueryCursor<'_> {
                 return Some(Ok(project_row(&row, &self.extract)));
             }
 
+            // Without predicates every scanned row is emitted, so the last
+            // batch only needs what OFFSET and LIMIT still allow.
+            let fetch = match self.limit_remaining {
+                Some(remaining) if self.predicates.is_empty() => self
+                    .batch_rows
+                    .min(self.offset_remaining.saturating_add(remaining))
+                    .max(1),
+                _ => self.batch_rows,
+            };
             let next_batch = match self.db.scan_batch_at_unbudgeted(
                 &self.snapshot,
                 &self.table,
                 self.after_id.as_deref(),
-                self.batch_rows,
+                fetch,
             ) {
                 Ok(batch) => batch,
                 Err(error) => {
@@ -1191,36 +1200,46 @@ fn resolve_operand(tables: &[TableCtx], op: &Operand) -> Result<RVal> {
 
 type ExecRow = Vec<Option<Record>>;
 
-fn col_value(row: &ExecRow, ti: usize, col: &str) -> Value {
+/// Stand-in for an absent column or table slot. Predicate evaluation borrows
+/// every operand from the row, the plan or this constant, so comparing a text
+/// column against a literal no longer copies the string for each row.
+static NULL_VALUE: Value = Value::Null;
+
+fn col_value_ref<'a>(row: &'a ExecRow, ti: usize, col: &str) -> &'a Value {
     row.get(ti)
         .and_then(|r| r.as_ref())
-        .and_then(|r| r.get(col).cloned())
-        .unwrap_or(Value::Null)
+        .and_then(|r| r.get(col))
+        .unwrap_or(&NULL_VALUE)
+}
+
+fn col_value(row: &ExecRow, ti: usize, col: &str) -> Value {
+    col_value_ref(row, ti, col).clone()
 }
 
 /// Evaluation context for HAVING: grouped column values + aggregate results.
 type HavingCtx<'a> = (&'a HashMap<(usize, String), Value>, &'a [Value]);
 
-fn rval_value(row: &ExecRow, rv: &RVal, having: Option<HavingCtx>) -> Value {
+fn rval_value<'a>(row: &'a ExecRow, rv: &'a RVal, having: Option<HavingCtx<'a>>) -> &'a Value {
     match rv {
         RVal::Col(ti, col) => match having {
-            Some((groups, _)) => groups
-                .get(&(*ti, col.clone()))
-                .cloned()
-                .unwrap_or(Value::Null),
-            None => col_value(row, *ti, col),
+            Some((groups, _)) => groups.get(&(*ti, col.clone())).unwrap_or(&NULL_VALUE),
+            None => col_value_ref(row, *ti, col),
         },
-        RVal::Val(v) => v.clone(),
+        RVal::Val(v) => v,
         RVal::Agg(i) => having
-            .and_then(|(_, aggs)| aggs.get(*i).cloned())
-            .unwrap_or(Value::Null),
+            .and_then(|(_, aggs)| aggs.get(*i))
+            .unwrap_or(&NULL_VALUE),
     }
 }
 
-fn ctx_col_value(row: &ExecRow, col: &(usize, String), having: Option<HavingCtx>) -> Value {
+fn ctx_col_value<'a>(
+    row: &'a ExecRow,
+    col: &(usize, String),
+    having: Option<HavingCtx<'a>>,
+) -> &'a Value {
     match having {
-        Some((groups, _)) => groups.get(col).cloned().unwrap_or(Value::Null),
-        None => col_value(row, col.0, &col.1),
+        Some((groups, _)) => groups.get(col).unwrap_or(&NULL_VALUE),
+        None => col_value_ref(row, col.0, &col.1),
     }
 }
 
@@ -1286,7 +1305,7 @@ fn eval_ctx(row: &ExecRow, e: &RExpr, having: Option<HavingCtx>) -> Result<Truth
             }
             Truth::of(match op {
                 CmpOp::Eq | CmpOp::Neq => {
-                    let eq = eq_vals(&a, &b).ok_or_else(|| not_comparable(&a, &b))?;
+                    let eq = eq_vals(a, b).ok_or_else(|| not_comparable(a, b))?;
                     if *op == CmpOp::Eq {
                         eq
                     } else {
@@ -1294,7 +1313,7 @@ fn eval_ctx(row: &ExecRow, e: &RExpr, having: Option<HavingCtx>) -> Result<Truth
                     }
                 }
                 _ => {
-                    let ord = cmp_vals(&a, &b).ok_or_else(|| not_comparable(&a, &b))?;
+                    let ord = cmp_vals(a, b).ok_or_else(|| not_comparable(a, b))?;
                     match op {
                         CmpOp::Lt => ord == Ordering::Less,
                         CmpOp::Le => ord != Ordering::Greater,
@@ -1322,7 +1341,7 @@ fn eval_ctx(row: &ExecRow, e: &RExpr, having: Option<HavingCtx>) -> Result<Truth
                     saw_null = true;
                     continue;
                 }
-                if eq_vals(&v, item).ok_or_else(|| not_comparable(&v, item))? {
+                if eq_vals(v, item).ok_or_else(|| not_comparable(v, item))? {
                     hit = true;
                     break;
                 }
@@ -2154,22 +2173,30 @@ fn exec_single_table_select(
     let mut sequence = 0u64;
     let mut skipped = 0usize;
     let mut out = Vec::new();
+    // When the access path already enforces every predicate and no sort is
+    // pending, a bounded query needs at most `offset + limit` rows in total.
+    // The last batch is trimmed to that remainder instead of decoding a full
+    // batch and discarding most of it; the predicates are still re-checked.
+    let driver_is_exact = residual.is_empty()
+        && (pushed.is_empty()
+            || (pushed.len() == 1 && matches!(driver, TableDriver::Equality(..))));
+    let needed_total = limit.map(|n| offset.saturating_add(n));
+    let mut row: ExecRow = vec![None];
 
     loop {
-        let batch = driven_batch(
-            db,
-            &snapshot,
-            &tables[0],
-            &driver,
-            cursor.as_deref(),
-            batch_rows,
-        )?;
+        let fetch = match needed_total {
+            Some(total) if driver_is_exact && sorter.is_none() => batch_rows
+                .min(total.saturating_sub(skipped + out.len()))
+                .max(1),
+            _ => batch_rows,
+        };
+        let batch = driven_batch(db, &snapshot, &tables[0], &driver, cursor.as_deref(), fetch)?;
         let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
             break;
         };
         cursor = Some(last_id);
         for (_, record) in batch {
-            let row = vec![Some(record)];
+            row[0] = Some(record);
             if !eval_all(&row, pushed)? || !eval_all(&row, residual)? {
                 continue;
             }
@@ -2211,23 +2238,40 @@ fn visit_single_table_rows(
     residual: &[RExpr],
     mut visit: impl FnMut(&ExecRow) -> Result<()>,
 ) -> Result<()> {
+    let snapshot = db.snapshot();
+    visit_single_table_rows_at(db, &snapshot, table, pushed, residual, |row| {
+        visit(row).map(|()| true)
+    })
+}
+
+/// Stream the filtered rows of one table as of `snapshot`. The visitor
+/// returns `false` to stop early; sharing the snapshot lets a caller retry a
+/// different strategy over exactly the same data.
+fn visit_single_table_rows_at(
+    db: &Db,
+    snapshot: &Snapshot,
+    table: &TableCtx,
+    pushed: &[RExpr],
+    residual: &[RExpr],
+    mut visit: impl FnMut(&ExecRow) -> Result<bool>,
+) -> Result<()> {
     let memory = db.memory_options();
     let batch_rows = memory
         .scan_batch_rows
         .min((memory.query_working_bytes / 1024).max(1));
-    let snapshot = db.snapshot();
     let driver = table_driver(table, 0, pushed);
     let mut cursor: Option<String> = None;
+    let mut row: ExecRow = vec![None];
     loop {
-        let batch = driven_batch(db, &snapshot, table, &driver, cursor.as_deref(), batch_rows)?;
+        let batch = driven_batch(db, snapshot, table, &driver, cursor.as_deref(), batch_rows)?;
         let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
             return Ok(());
         };
         cursor = Some(last_id);
         for (_, record) in batch {
-            let row = vec![Some(record)];
-            if eval_all(&row, pushed)? && eval_all(&row, residual)? {
-                visit(&row)?;
+            row[0] = Some(record);
+            if eval_all(&row, pushed)? && eval_all(&row, residual)? && !visit(&row)? {
+                return Ok(());
             }
         }
     }
@@ -2344,7 +2388,7 @@ fn exec_single_indexed_join_select(
         };
         left_cursor = Some(last_id);
         for (_, left_record) in batch {
-            let left_row = vec![Some(left_record)];
+            let mut left_row = vec![Some(left_record)];
             if !eval_all(&left_row, &pushdown[0])? {
                 continue;
             }
@@ -2386,13 +2430,18 @@ fn exec_single_indexed_join_select(
                 };
                 right_cursor = Some(last_right_id);
                 for (_, right_record) in matches {
-                    let right_row = vec![None, Some(right_record)];
-                    if !eval_all(&right_row, &pushdown[1])? {
+                    let mut row = vec![None, Some(right_record)];
+                    if !eval_all(&row, &pushdown[1])? {
                         continue;
                     }
                     matched = true;
-                    let row = vec![left_row[0].clone(), right_row[1].clone()];
+                    // The left record is lent to the joined row while this
+                    // match is evaluated and projected, then moved back, so
+                    // emitting a row copies only the projected values instead
+                    // of deep-cloning both records.
+                    row[0] = left_row[0].take();
                     if !eval_all(&row, residual)? {
+                        left_row[0] = row[0].take();
                         continue;
                     }
                     if let Some(sorter) = sorter.as_mut() {
@@ -2411,8 +2460,11 @@ fn exec_single_indexed_join_select(
                         output.push(project_row(&row, &extract));
                         if limit.is_some_and(|value| output.len() == value) {
                             complete = true;
-                            break;
                         }
+                    }
+                    left_row[0] = row[0].take();
+                    if complete {
+                        break;
                     }
                 }
                 if complete || (fresh.1 == ID_COLUMN && tables[1].schema.has_implicit_id()) {
@@ -2423,7 +2475,7 @@ fn exec_single_indexed_join_select(
                 break;
             }
             if !matched && join.kind == JoinKind::Left {
-                let row = vec![left_row[0].clone(), None];
+                let row = vec![left_row[0].take(), None];
                 if !eval_all(&row, residual)? {
                     continue;
                 }
@@ -3059,17 +3111,20 @@ impl AggState {
     }
 
     /// SQL NULL semantics: COUNT(col)/SUM/AVG/MIN/MAX ignore NULLs;
-    /// COUNT(*) counts rows.
-    fn update(&mut self, spec: &AggSpec, row: &ExecRow) -> Result<()> {
+    /// COUNT(*) counts rows. Returns the heap bytes the state grew by, so a
+    /// budgeted hash aggregation can account for DISTINCT sets and retained
+    /// MIN/MAX values.
+    fn update(&mut self, spec: &AggSpec, row: &ExecRow) -> Result<usize> {
         let value = spec
             .arg
             .as_ref()
-            .map(|(ti, col)| col_value(row, *ti, col))
-            .unwrap_or(Value::Null);
-        self.update_value(spec, &value)
+            .map(|(ti, col)| col_value_ref(row, *ti, col))
+            .unwrap_or(&NULL_VALUE);
+        self.update_value(spec, value)
     }
 
-    fn update_value(&mut self, spec: &AggSpec, value: &Value) -> Result<()> {
+    fn update_value(&mut self, spec: &AggSpec, value: &Value) -> Result<usize> {
+        let mut retained = 0usize;
         match self {
             AggState::Count(n) => match &spec.arg {
                 None => *n += 1,
@@ -3084,7 +3139,10 @@ impl AggState {
                 if !value.is_null() {
                     let mut encoded = Vec::new();
                     encode_value(&mut encoded, value);
-                    values.insert(encoded);
+                    let len = encoded.len();
+                    if values.insert(encoded) {
+                        retained = len + size_of::<Vec<u8>>() + 16;
+                    }
                 }
             }
             AggState::Sum {
@@ -3119,10 +3177,13 @@ impl AggState {
             },
             AggState::MinMax { best, is_min } => {
                 if value.is_null() {
-                    return Ok(());
+                    return Ok(0);
                 }
                 match best {
-                    None => *best = Some(value.clone()),
+                    None => {
+                        retained = value_heap_bytes(value);
+                        *best = Some(value.clone());
+                    }
                     Some(b) => {
                         let ord = cmp_vals(b, value).ok_or_else(|| not_comparable(b, value))?;
                         let replace = if *is_min {
@@ -3131,13 +3192,14 @@ impl AggState {
                             ord == Ordering::Less
                         };
                         if replace {
+                            retained = value_heap_bytes(value);
                             *best = Some(value.clone());
                         }
                     }
                 }
             }
         }
-        Ok(())
+        Ok(retained)
     }
 
     fn finish(self) -> Result<Value> {
@@ -3458,9 +3520,90 @@ fn queue_aggregate_group(
     })
 }
 
-/// Sort-based aggregation for the single-table path. Input rows are streamed;
-/// GROUP BY keys are externally sorted under the query budget, so cardinality
-/// does not translate into an unbounded HashMap.
+/// One group of a budgeted hash aggregation.
+struct HashedGroup {
+    values: Vec<Value>,
+    states: Vec<AggState>,
+    first_sequence: u64,
+}
+
+/// Hash aggregation over one table while the group table fits `budget`.
+/// Groups keep first-seen order and the sequence of their first row, which
+/// is exactly what the sort-merge path produces, so the two strategies are
+/// interchangeable. Returns `None` as soon as the estimated group table
+/// exceeds the budget; the caller then re-scans the same snapshot with the
+/// bounded external sort.
+#[allow(clippy::too_many_arguments)]
+fn hash_aggregate_single_table(
+    db: &Db,
+    snapshot: &Snapshot,
+    table: &TableCtx,
+    pushed: &[RExpr],
+    residual: &[RExpr],
+    group_cols: &[(usize, String)],
+    specs: &[AggSpec],
+    budget: usize,
+) -> Result<Option<Vec<HashedGroup>>> {
+    let mut slots: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut groups: Vec<HashedGroup> = Vec::new();
+    let mut key = Vec::new();
+    let mut bytes = 0usize;
+    let mut sequence = 0u64;
+    let mut within_budget = true;
+    visit_single_table_rows_at(db, snapshot, table, pushed, residual, |row| {
+        key.clear();
+        for (ti, column) in group_cols {
+            encode_value(&mut key, col_value_ref(row, *ti, column));
+        }
+        let slot = match slots.get(key.as_slice()) {
+            Some(&slot) => slot,
+            None => {
+                let values: Vec<Value> = group_cols
+                    .iter()
+                    .map(|(ti, column)| col_value(row, *ti, column))
+                    .collect();
+                let states: Vec<AggState> = specs.iter().map(AggState::new).collect();
+                bytes += key.len()
+                    + size_of::<Vec<u8>>()
+                    + size_of::<usize>()
+                    + 16
+                    + size_of::<HashedGroup>()
+                    + values.iter().map(value_heap_bytes).sum::<usize>()
+                    + states.len() * size_of::<AggState>();
+                slots.insert(key.clone(), groups.len());
+                groups.push(HashedGroup {
+                    values,
+                    states,
+                    first_sequence: sequence,
+                });
+                groups.len() - 1
+            }
+        };
+        let group = &mut groups[slot];
+        for (index, spec) in specs.iter().enumerate() {
+            let value = spec
+                .arg
+                .as_ref()
+                .map(|(ti, column)| col_value_ref(row, *ti, column))
+                .unwrap_or(&NULL_VALUE);
+            bytes += group.states[index].update_value(spec, value)?;
+        }
+        sequence = sequence.saturating_add(1);
+        if bytes > budget {
+            within_budget = false;
+            return Ok(false);
+        }
+        Ok(true)
+    })?;
+    db.record_query_buffer(bytes);
+    Ok(within_budget.then_some(groups))
+}
+
+/// Aggregation for the single-table path. Input rows are streamed. Groups
+/// are hashed while the group table fits the query budget (the common case:
+/// one probe per row); a cardinality that outgrows it falls back to an
+/// external sort of every input row over the same snapshot, so memory stays
+/// bounded whatever the data looks like.
 fn exec_single_table_aggregate(
     db: &Db,
     tables: &[TableCtx],
@@ -3559,9 +3702,39 @@ fn exec_single_table_aggregate(
             0,
         )?;
     } else {
+        let snapshot = db.snapshot();
+        let budget = db.memory_options().query_working_bytes;
+        if let Some(groups) = hash_aggregate_single_table(
+            db,
+            &snapshot,
+            &tables[0],
+            pushed,
+            residual,
+            &group_cols,
+            &specs,
+            budget,
+        )? {
+            for group in groups {
+                queue_aggregate_group(
+                    &mut output_sorter,
+                    &group_cols,
+                    &out_cols,
+                    having.as_ref(),
+                    &order_positions,
+                    group.values,
+                    group.states,
+                    group.first_sequence,
+                )?;
+            }
+            return Ok(QueryOutput::Rows {
+                columns: headers,
+                rows: output_sorter.finish(offset, limit)?,
+            });
+        }
+
         let mut input_sorter = SpillSorter::new(db, vec![SortSpec::ascending()], None)?;
         let mut sequence = 0u64;
-        visit_single_table_rows(db, &tables[0], pushed, residual, |row| {
+        visit_single_table_rows_at(db, &snapshot, &tables[0], pushed, residual, |row| {
             let group_values: Vec<Value> = group_cols
                 .iter()
                 .map(|(ti, column)| col_value(row, *ti, column))
@@ -3585,7 +3758,7 @@ fn exec_single_table_aggregate(
                 sequence,
             })?;
             sequence = sequence.saturating_add(1);
-            Ok(())
+            Ok(true)
         })?;
 
         let mut current_key: Option<Vec<u8>> = None;

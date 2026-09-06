@@ -50,7 +50,7 @@ db.open("app.esql")
 | Phase 5 | BM25 full-text, hybrid search (RRF), int8 vectors, blob chunking | Complete |
 | Cross-cutting | Database-wide memory governor, bounded SQL/index maintenance, typed SQL parameters | Complete |
 
-Current verification: 269 total Rust and doc tests (MVCC, recovery, sorted bulk loading, bounded-memory execution,
+Current verification: 376 total Rust and doc tests (MVCC, recovery, sorted bulk loading, bounded-memory execution,
 compaction, salvage, backup/restore, randomized model, SQL and parameter suites,
 query plans, three-valued NULL logic, text collation, sidecar auth and transport
 parity, vector recall, BM25/hybrid, blobs and read-only), crash injection with real
@@ -625,6 +625,9 @@ app.esql/
     *.sidx.runs   # equality run manifests; *.sidx.run are immutable levels
     *.tidx.runs   # BM25 run manifests; *.tidx.run are immutable levels
   vectors/        # persisted ANN graphs (CRC; disposable and rebuildable)
+    *.vidx        # base graph written when an index is created over rows
+    *-<ulid>.vidx.run   # immutable HNSW runs published or merged while running
+    *.vidx.runs   # vector run manifests (which runs cover which generation)
   blobs/          # out-of-line blob chunks (CRC)
 ```
 
@@ -702,6 +705,39 @@ completed in 7.330 s versus SQLite's 8.631 s (ingest wall 7.220 s versus
 sorted bulk in 4.559 s versus 7.289 s. Fast/Balanced/Safe writer throughput
 stayed within the previous matrix's spread. See the
 [current acceptance report](benchmark-results/current-acceptance-2026-09-04.md).
+
+A 2026-09-05 pass (A/B against that tree, documented in
+[benchmark.md](benchmark.md#hot-path-optimizations--2026-09-05)) made the
+persisted HNSW graph durable across restarts: the immutable runs published
+while the database runs now stay on disk under a small run manifest, so the
+100K-vector reopen that previously rebuilt the whole graph in 10.8 s maps it in
+61 ms with identical results. The same pass prefetches neighbour vectors in
+the HNSW beam search (search 27-30% faster, recall unchanged), stops cloning
+column values and joined records in the SQL executor (indexed join -18%),
+trims the last scan batch of bounded queries (`LIMIT 5` over an unindexed
+1M-row filter from 33.4 ms to 0.31 ms), releases the state lock before point
+reads decode their record, and builds releases with fat LTO. Two follow-ups
+the same day: the maintenance worker merges comparably sized HNSW runs in the
+background (13 unmerged runs searched 2.8x slower than the merged set, and
+the run count no longer grows with publications), and single-table GROUP BY
+aggregates into a budgeted hash table before falling back to the external
+sort (997 and 10K groups over 1M rows: -63%, identical output). A sustained
+1M-vector ingest then showed merges stalling commits for up to 20 s while
+they held the whole maintenance pool; frozen heaps are now accounted without
+waiting, the exclusion between maintenance tasks is an explicit lease, a
+merge reserves only its estimated footprint, and background publications
+need a run's worth of delta. The same ingest finishes with no commit above
+166 ms.
+
+The complete acceptance sequence was then rerun on 2026-09-05 (see the
+[acceptance report](benchmark-results/current-acceptance-2026-09-05.md)):
+10M transactional rows loaded in 7.363 s versus SQLite's 7.693 s (ingest wall
+7.207 s versus 5.855 s), direct sorted bulk in 4.388 s versus 6.821 s, Fast and
+Balanced writers beat SQLite at every count by 1.77-6.06x and 1.68-4.90x, Safe
+strict reached 13.47x at 16 writers, 16 readers with four writers sustained
+2.62M reads/s and 105K rows/s with a 342 us writer p99, ANN recall was
+identical with searches 11-24% faster, and the 100K-vector graph opened in
+74.5 ms.
 
 Historical results remain useful: the former 256 MiB ingest profile completed
 in 18.798 s, and `Db::bulk_insert_sorted` completed in 9.968 s versus SQLite's

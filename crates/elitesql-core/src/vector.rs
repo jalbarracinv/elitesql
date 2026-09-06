@@ -32,6 +32,7 @@ use crate::distance::{
     l2_squared_f32_i8, l2_squared_f32_le_bytes, l2_squared_i8_scaled,
 };
 use crate::error::{Error, Result};
+use crate::run_manifest::DerivedRunMeta;
 use crate::value::{read_u16, read_u32, read_u64, read_u8};
 
 /// Distance metric for a vector index. Scores returned by searches are
@@ -192,6 +193,48 @@ fn with_visited<R>(len: usize, f: impl FnOnce(&mut Visited) -> R) -> R {
             visited.reset(len);
             f(&mut visited)
         }
+    }
+}
+
+// --- Prefetch -----------------------------------------------------------------
+
+/// Neighbour lists are expanded in chunks of this many labels: every
+/// unvisited label's vector is prefetched first, then the distances are
+/// computed in the same order the one-pass loop used. `m0` is 32 for the
+/// default `m`, so one chunk usually covers a whole list.
+const PREFETCH_BATCH: usize = 32;
+
+/// Start loading one cache line without waiting for it. Beam search spends
+/// most of its time on neighbour vectors that are not in cache; issuing the
+/// loads for a whole neighbour list before computing any distance lets the
+/// core overlap the misses instead of taking them one at a time.
+#[inline(always)]
+fn prefetch_line(ptr: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: PRFM is a hint. It has no architectural side effects and never
+    // faults, whatever the address.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: PREFETCHT0 is a hint with no side effects on any address.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = ptr;
+}
+
+/// Prefetch the first and last cache lines of one stored vector.
+#[inline(always)]
+fn prefetch_slice<T>(values: &[T]) {
+    if let (Some(first), Some(last)) = (values.first(), values.last()) {
+        prefetch_line((first as *const T).cast::<u8>());
+        prefetch_line((last as *const T).cast::<u8>());
     }
 }
 
@@ -383,6 +426,24 @@ impl HnswIndex {
         }
     }
 
+    /// Start loading the stored vector for `label`; see [`prefetch_line`].
+    #[inline]
+    fn prefetch(&self, label: u32) {
+        let index = label as usize;
+        match &self.store {
+            VecStore::F32 { dim, values } => {
+                if let Some(vector) = values.get(index * dim..(index + 1) * dim) {
+                    prefetch_slice(vector);
+                }
+            }
+            VecStore::I8 { dim, values, .. } => {
+                if let Some(vector) = values.get(index * dim..(index + 1) * dim) {
+                    prefetch_slice(vector);
+                }
+            }
+        }
+    }
+
     fn dist_raw(&self, v: &[f32], vnorm: f32, label: u32) -> f32 {
         match &self.store {
             VecStore::F32 { .. } => {
@@ -422,6 +483,9 @@ impl HnswIndex {
         loop {
             let mut improved = false;
             let neighbours = &self.links[ep as usize][layer];
+            for &n in neighbours {
+                self.prefetch(n);
+            }
             for &n in neighbours {
                 let d = self.dist_raw(v, vnorm, n);
                 if d < ep_dist {
@@ -463,17 +527,27 @@ impl HnswIndex {
                 if cd > worst && results.len() >= ef {
                     break;
                 }
-                for &n in &self.links[cl as usize][layer] {
-                    if !visited.insert(n) {
-                        continue;
+                for chunk in self.links[cl as usize][layer].chunks(PREFETCH_BATCH) {
+                    // Mark and prefetch first; the decisions below then run
+                    // in the original order over the same unvisited labels.
+                    let mut pending = [0u32; PREFETCH_BATCH];
+                    let mut count = 0usize;
+                    for &n in chunk {
+                        if visited.insert(n) {
+                            self.prefetch(n);
+                            pending[count] = n;
+                            count += 1;
+                        }
                     }
-                    let d = self.dist_raw(v, vnorm, n);
-                    let worst = results.peek().map(|c| c.0).unwrap_or(f32::INFINITY);
-                    if results.len() < ef || d < worst {
-                        candidates.push(Reverse(Cand(d, n)));
-                        results.push(Cand(d, n));
-                        if results.len() > ef {
-                            results.pop();
+                    for &n in &pending[..count] {
+                        let d = self.dist_raw(v, vnorm, n);
+                        let worst = results.peek().map(|c| c.0).unwrap_or(f32::INFINITY);
+                        if results.len() < ef || d < worst {
+                            candidates.push(Reverse(Cand(d, n)));
+                            results.push(Cand(d, n));
+                            if results.len() > ef {
+                                results.pop();
+                            }
                         }
                     }
                 }
@@ -612,6 +686,21 @@ pub(crate) struct VecIdx {
     label_bytes: usize,
     /// Estimated heap bytes of `frozen_removed`, maintained incrementally.
     frozen_removed_bytes: usize,
+    /// Commit version the durable run set on disk covers completely, as
+    /// recorded by the last published or loaded run manifest.
+    pub(crate) durable_generation: Option<u64>,
+}
+
+/// Live `(id, label)` pairs of one immutable run, as captured for a merge.
+pub(crate) type LiveLabels = Vec<(Arc<str>, usize)>;
+
+/// One immutable run as seen by merge planning.
+pub(crate) struct MappedRunSummary {
+    pub file: String,
+    pub bytes: u64,
+    pub nodes: usize,
+    /// Ids whose current vector lives in this run.
+    pub live: usize,
 }
 
 impl VecIdx {
@@ -627,6 +716,7 @@ impl VecIdx {
             frozen_removed: HashSet::new(),
             label_bytes: 0,
             frozen_removed_bytes: 0,
+            durable_generation: None,
         }
     }
 
@@ -694,23 +784,16 @@ impl VecIdx {
             + self.frozen.as_ref().map_or(0, |frozen| frozen.labels.len())
     }
 
-    /// Ids currently indexed (latest labels only).
-    pub fn ids(&self) -> Vec<String> {
-        let mut ids = Vec::new();
-        for mapped in &self.mapped {
-            ids.extend(mapped.ids());
-        }
-        if let Some(frozen) = &self.frozen {
-            ids.extend(
-                frozen
-                    .id_to_label
-                    .keys()
-                    .filter(|id| !self.frozen_removed.contains(id.as_ref()))
-                    .map(|id| id.to_string()),
-            );
-        }
-        ids.extend(self.id_to_label.keys().map(|id| id.to_string()));
-        ids
+    /// Whether `id` currently has a live vector in any generation.
+    #[cfg(test)]
+    pub(crate) fn contains_id(&self, id: &str) -> bool {
+        self.mapped
+            .iter()
+            .any(|run| run.id_to_label.contains_key(id))
+            || self.id_to_label.contains_key(id)
+            || self.frozen.as_ref().is_some_and(|frozen| {
+                frozen.id_to_label.contains_key(id) && !self.frozen_removed.contains(id)
+            })
     }
 
     /// Raw ANN candidates with tombstones and stale labels filtered out,
@@ -760,6 +843,13 @@ impl VecIdx {
         !self.mapped.is_empty()
     }
 
+    /// Heap retained by the mutable overlay: what a publication can turn into
+    /// an immutable run. The navigation caches of the mapped runs are not
+    /// counted here. They are a resident index of the graph, proportional to
+    /// the vectors it holds however many runs they are spread over, and the
+    /// base run's cache was never charged to the delta pool; now that every
+    /// run is durable and background merges bound their number, all of them
+    /// are accounted like the base. See [`Self::mapped_metadata_bytes`].
     pub(crate) fn delta_memory_bytes(&self) -> usize {
         let vector_bytes = match &self.backend.store {
             VecStore::F32 { values, .. } => values.len() * std::mem::size_of::<f32>(),
@@ -773,19 +863,21 @@ impl VecIdx {
             .saturating_mul(std::mem::size_of::<u32>())
             .saturating_add(self.backend.link_lists.saturating_mul(24));
         let label_bytes = self.label_bytes;
-        let overlay_metadata = self
-            .mapped
-            .iter()
-            .skip(1)
-            .map(MappedHnsw::metadata_memory_bytes)
-            .sum::<usize>();
         vector_bytes
             .saturating_add(link_bytes)
             .saturating_add(label_bytes)
             .saturating_add(self.backend.norms.len() * std::mem::size_of::<f32>())
             .saturating_add(self.deleted.len().div_ceil(8))
-            .saturating_add(overlay_metadata)
             .saturating_add(self.frozen_removed_bytes)
+    }
+
+    /// Estimated heap of the mapped runs' navigation caches and id maps.
+    /// Reported for observability; not part of the mutable delta.
+    pub(crate) fn mapped_metadata_bytes(&self) -> usize {
+        self.mapped
+            .iter()
+            .map(MappedHnsw::metadata_memory_bytes)
+            .sum()
     }
 
     pub(crate) fn frozen_delta_memory_bytes(&self) -> usize {
@@ -815,6 +907,7 @@ impl VecIdx {
             frozen_removed: HashSet::new(),
             label_bytes: std::mem::take(&mut self.label_bytes),
             frozen_removed_bytes: 0,
+            durable_generation: None,
         });
         self.frozen_removed.clear();
         self.frozen_removed_bytes = 0;
@@ -859,12 +952,14 @@ impl VecIdx {
         true
     }
 
-    /// Freeze only the mutable overlay as another mmap graph. The canonical
-    /// base file remains the durable restart point; this run is intentionally
-    /// unlinked after mapping because WAL/segments can reconstruct it after a
-    /// crash. Multiple immutable runs are searched and merged exactly like a
-    /// single base, keeping the write-time graph bounded without rebuilding
-    /// every old vector.
+    /// Freeze the mutable overlay as another immutable mmap graph at `path`.
+    /// The file is written to a temporary sibling and renamed into place, so
+    /// a crash leaves either the complete run or nothing. Runs stay on disk:
+    /// the vector run manifest lists them, and the next open maps the whole
+    /// set instead of re-inserting every vector committed since the base.
+    /// Multiple immutable runs are searched and merged exactly like a single
+    /// base, keeping the write-time graph bounded without rebuilding every
+    /// old vector.
     pub(crate) fn flush_delta_mmap(
         &mut self,
         path: &Path,
@@ -872,15 +967,27 @@ impl VecIdx {
         column: &str,
         def: &VectorIndexDef,
         dump_version: u64,
-        remove_after_map: bool,
     ) -> Result<()> {
         if self.labels.is_empty() {
             return Ok(());
         }
-        self.dump_file(path, table, column, def, dump_version)?;
-        let file = File::open(path)?;
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }?;
-        let (mut loaded, version) = Self::load_mmap(mmap, table, column, def)?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::InvalidArgument("vidx: run path has no utf8 filename".into()))?;
+        let tmp = path.with_file_name(format!("{name}.tmp"));
+        if let Err(error) = self.dump_file(&tmp, table, column, def, dump_version) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        std::fs::rename(&tmp, path)?;
+        let (mut loaded, version) = match Self::load_mmap_file(path, table, column, def) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let _ = std::fs::remove_file(path);
+                return Err(error);
+            }
+        };
         if version != dump_version || loaded.mapped.len() != 1 {
             let _ = std::fs::remove_file(path);
             return Err(Error::Corrupt("invalid vector delta generation".into()));
@@ -892,13 +999,268 @@ impl VecIdx {
         self.label_bytes = 0;
         self.id_to_label.clear();
         self.deleted.clear();
-        // The mapping keeps the inode alive on supported Unix platforms; a
-        // restart intentionally rebuilds this non-durable overlay from WAL.
-        if remove_after_map {
-            let _ = std::fs::remove_file(path);
-        }
         Ok(())
     }
+
+    /// Map one durable run file, remembering its name for the run manifest.
+    pub(crate) fn load_mmap_file(
+        path: &Path,
+        table: &str,
+        column: &str,
+        def: &VectorIndexDef,
+    ) -> Result<(Self, u64)> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::InvalidArgument("vidx: run path has no utf8 filename".into()))?
+            .to_owned();
+        let file = File::open(path)?;
+        // SAFETY: run files are immutable once published. Writers create a
+        // new inode and rename it into place; nothing rewrites a mapped file.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }?;
+        let (mut loaded, version) = Self::load_mmap(mmap, table, column, def)?;
+        for mapped in &mut loaded.mapped {
+            mapped.file = name.clone();
+        }
+        Ok((loaded, version))
+    }
+
+    /// Assemble an index from durable runs in ascending generation order. An
+    /// id present in a newer run supersedes its copies in older runs, exactly
+    /// as live updates tombstoned them while the previous process ran.
+    pub(crate) fn from_mapped_runs(def: &VectorIndexDef, runs: Vec<VecIdx>) -> VecIdx {
+        let mut mapped: Vec<MappedHnsw> = Vec::with_capacity(runs.len());
+        for run in runs {
+            mapped.extend(run.mapped);
+        }
+        for newer in 1..mapped.len() {
+            let (older, rest) = mapped.split_at_mut(newer);
+            for id in rest[0].id_to_label.keys() {
+                for run in older.iter_mut() {
+                    run.remove(id);
+                }
+            }
+        }
+        VecIdx {
+            mapped,
+            backend: HnswIndex::new(def.metric, def.m, def.ef_construction, def.quantized),
+            labels: Vec::new(),
+            id_to_label: HashMap::new(),
+            deleted: Vec::new(),
+            frozen: None,
+            frozen_generation: None,
+            frozen_removed: HashSet::new(),
+            label_bytes: 0,
+            frozen_removed_bytes: 0,
+            durable_generation: None,
+        }
+    }
+
+    /// Number of immutable runs a search has to visit.
+    pub(crate) fn mapped_run_count(&self) -> usize {
+        self.mapped.len()
+    }
+
+    /// Planning view of the immutable runs, in mapped order.
+    pub(crate) fn mapped_run_summaries(&self) -> Vec<MappedRunSummary> {
+        self.mapped
+            .iter()
+            .map(|run| MappedRunSummary {
+                file: run.file.clone(),
+                bytes: run.bytes,
+                nodes: run.node_count,
+                live: run.id_to_label.len(),
+            })
+            .collect()
+    }
+
+    /// Current live `(id, label)` pairs of the named runs, or `None` when a
+    /// name is not mapped. This is the snapshot a background merge rebuilds
+    /// from; anything removed afterwards is filtered again at publication.
+    pub(crate) fn live_labels_of(&self, files: &[String]) -> Option<Vec<LiveLabels>> {
+        files
+            .iter()
+            .map(|file| {
+                let run = self.mapped.iter().find(|run| run.file == *file)?;
+                let mut live: LiveLabels = run
+                    .id_to_label
+                    .iter()
+                    .map(|(id, label)| (id.clone(), *label))
+                    .collect();
+                live.sort_unstable_by_key(|(_, label)| *label);
+                Some(live)
+            })
+            .collect()
+    }
+
+    /// Build one resident graph holding exactly the given live vectors of the
+    /// named run files, re-reading them from disk so no lock is held while
+    /// the graph is constructed. Quantized components are dequantized and
+    /// re-quantized to the identical bytes, because the stored scale maps the
+    /// largest component to exactly 127.
+    pub(crate) fn merge_runs_from_files(
+        vectors_dir: &Path,
+        table: &str,
+        column: &str,
+        def: &VectorIndexDef,
+        selected: &[(String, LiveLabels)],
+        budget: usize,
+    ) -> Result<VecIdx> {
+        let mut merged = VecIdx::new(def.clone());
+        for (file, live) in selected {
+            let (mut loaded, _) =
+                Self::load_mmap_file(&vectors_dir.join(file), table, column, def)?;
+            let run = loaded
+                .mapped
+                .pop()
+                .ok_or_else(|| Error::Corrupt("vidx: run file holds no graph".into()))?;
+            for (id, label) in live {
+                if *label >= run.node_count {
+                    return Err(Error::Corrupt("vidx: live label outside its run".into()));
+                }
+                let vector = run.vector_f32(*label);
+                merged.insert(id, &vector);
+                if merged.delta_memory_bytes() > budget {
+                    return Err(Error::MemoryLimit(format!(
+                        "merging vector runs of {table}.{column} exceeds the {budget}-byte maintenance pool; raise memory.maintenance_pool_bytes"
+                    )));
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Swap the named runs for `merged` (one loaded run, or `None` when the
+    /// merge produced no live vector). Ids that stopped being live in the old
+    /// runs since the merge snapshot are removed from the new run first, so
+    /// the visible set is unchanged. Returns `false`, changing nothing, when
+    /// the run set no longer matches the plan.
+    pub(crate) fn replace_mapped_runs(&mut self, files: &[String], merged: Option<VecIdx>) -> bool {
+        let Some(positions) = files
+            .iter()
+            .map(|file| self.mapped.iter().position(|run| run.file == *file))
+            .collect::<Option<Vec<usize>>>()
+        else {
+            return false;
+        };
+        let mut merged_run = match merged {
+            Some(mut merged) => match (merged.mapped.pop(), merged.mapped.is_empty()) {
+                (Some(run), true) => Some(run),
+                _ => return false,
+            },
+            None => None,
+        };
+        if let Some(run) = merged_run.as_mut() {
+            let stale: Vec<Arc<str>> = run
+                .id_to_label
+                .keys()
+                .filter(|id| {
+                    !positions.iter().any(|&position| {
+                        self.mapped[position].id_to_label.contains_key(id.as_ref())
+                    })
+                })
+                .cloned()
+                .collect();
+            for id in stale {
+                run.remove(&id);
+            }
+        }
+        let mut descending = positions;
+        descending.sort_unstable_by(|a, b| b.cmp(a));
+        for position in descending {
+            self.mapped.remove(position);
+        }
+        if let Some(run) = merged_run {
+            let at = self
+                .mapped
+                .iter()
+                .position(|existing| existing.generation > run.generation)
+                .unwrap_or(self.mapped.len());
+            self.mapped.insert(at, run);
+        }
+        true
+    }
+
+    /// Whether a durable run written at or after `version` holds `id`. A
+    /// vector committed at `version` can only live in such a run, so a
+    /// negative answer means the record lost its vector afterwards.
+    pub(crate) fn mapped_holds_since(&self, id: &str, version: u64) -> bool {
+        self.mapped
+            .iter()
+            .any(|run| run.generation >= version && run.id_to_label.contains_key(id))
+    }
+
+    /// Manifest entries for the immutable runs, oldest first. Runs mapped
+    /// from anonymous buffers have no file and are omitted.
+    pub(crate) fn mapped_run_metas(&self) -> Vec<DerivedRunMeta> {
+        self.mapped
+            .iter()
+            .filter(|run| !run.file.is_empty())
+            .map(|run| DerivedRunMeta {
+                file: run.file.clone(),
+                level: 0,
+                bytes: run.bytes,
+                generation: run.generation,
+            })
+            .collect()
+    }
+
+    /// True when every immutable run is backed by a named file, which is
+    /// what makes a run manifest meaningful.
+    pub(crate) fn mapped_runs_are_durable(&self) -> bool {
+        self.mapped.iter().all(|run| !run.file.is_empty())
+    }
+
+    /// File names of the immutable runs currently mapped.
+    pub(crate) fn mapped_run_files(&self) -> impl Iterator<Item = &str> {
+        self.mapped
+            .iter()
+            .filter(|run| !run.file.is_empty())
+            .map(|run| run.file.as_str())
+    }
+
+    /// Start a liveness pass over the mapped runs; see [`Self::mark_alive`].
+    pub(crate) fn begin_liveness(&self) -> MappedLiveness {
+        MappedLiveness {
+            marks: self
+                .mapped
+                .iter()
+                .map(|run| vec![false; run.node_count])
+                .collect(),
+        }
+    }
+
+    /// Record that the canonical record `id` is alive. After every live id
+    /// has been marked, [`Self::remove_unmarked`] drops the mapped entries
+    /// whose records vanished without a newer version (compacted-away
+    /// tombstones, a table recreated under the same name).
+    pub(crate) fn mark_alive(&self, id: &str, liveness: &mut MappedLiveness) {
+        for (run, marks) in self.mapped.iter().zip(&mut liveness.marks) {
+            if let Some(&label) = run.id_to_label.get(id) {
+                marks[label] = true;
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn remove_unmarked(&mut self, liveness: &MappedLiveness) {
+        for (run, marks) in self.mapped.iter_mut().zip(&liveness.marks) {
+            let stale: Vec<Arc<str>> = run
+                .id_to_label
+                .iter()
+                .filter(|(_, &label)| !marks[label])
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in stale {
+                run.remove(&id);
+            }
+        }
+    }
+}
+
+/// Per-run liveness bitmap for a catch-up pass over mapped runs.
+pub(crate) struct MappedLiveness {
+    marks: Vec<Vec<bool>>,
 }
 
 // --- mmap-native graph format (V4) -----------------------------------------
@@ -924,6 +1286,13 @@ struct MappedHnsw {
     deleted: Vec<bool>,
     /// Estimated heap bytes of `id_to_label`, maintained incrementally.
     id_bytes: usize,
+    /// File name inside the vectors directory when this run is durable.
+    /// Empty for mappings created from an anonymous buffer.
+    file: String,
+    /// Every vector in the run committed at or before this version.
+    generation: u64,
+    /// Mapped length, recorded in the run manifest.
+    bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1188,6 +1557,7 @@ impl VecIdx {
         } else {
             Some(entry_raw)
         };
+        let bytes = mmap.len() as u64;
         let mut mapped = MappedHnsw {
             mmap,
             metric,
@@ -1202,6 +1572,9 @@ impl VecIdx {
             id_to_label,
             deleted,
             id_bytes,
+            file: String::new(),
+            generation: dump_version,
+            bytes,
         };
         mapped.validate_links()?;
         if mapped.node_count < MIN_MMAP_NAV_CACHE_NODES {
@@ -1229,6 +1602,7 @@ impl VecIdx {
                 frozen_removed: HashSet::new(),
                 label_bytes: 0,
                 frozen_removed_bytes: 0,
+                durable_generation: None,
             },
             dump_version,
         ))
@@ -1261,14 +1635,34 @@ impl MappedHnsw {
         self.id_to_label.len()
     }
 
-    fn ids(&self) -> Vec<String> {
-        self.id_to_label.keys().map(|id| id.to_string()).collect()
-    }
-
     fn remove(&mut self, id: &str) {
         if let Some(label) = self.id_to_label.remove(id) {
             self.deleted[label] = true;
             self.id_bytes = self.id_bytes.saturating_sub(id.len() + 56);
+        }
+    }
+
+    /// The stored vector of `label` as f32 components. Quantized runs are
+    /// dequantized; feeding the result back through quantization reproduces
+    /// the same bytes, so a merged run loses no precision.
+    fn vector_f32(&self, label: usize) -> Vec<f32> {
+        let (vector_pos, dim, scale) = match self.nodes.get(label) {
+            Some(node) => (node.vector_pos, node.dim, node.scale),
+            None => {
+                let node = self.node(label);
+                (node.vector_pos, node.dim, node.scale)
+            }
+        };
+        if self.quantized {
+            bytes_as_i8(&self.mmap[vector_pos..vector_pos + dim])
+                .iter()
+                .map(|component| *component as f32 * scale)
+                .collect()
+        } else {
+            self.mmap[vector_pos..vector_pos + dim * 4]
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+                .collect()
         }
     }
 
@@ -1333,6 +1727,24 @@ impl MappedHnsw {
         }
     }
 
+    /// Start loading the mapped vector for `label`; see [`prefetch_line`].
+    /// Small graphs without the navigation cache skip this: locating the
+    /// vector would cost a directory parse, which is what the cache avoids.
+    #[inline]
+    fn prefetch(&self, label: u32) {
+        let Some(node) = self.nodes.get(label as usize) else {
+            return;
+        };
+        let len = if self.quantized {
+            node.dim
+        } else {
+            node.dim * 4
+        };
+        if let Some(bytes) = self.mmap.get(node.vector_pos..node.vector_pos + len) {
+            prefetch_slice(bytes);
+        }
+    }
+
     fn dist_raw(&self, query: &[f32], query_norm: f32, label: u32) -> f32 {
         let parsed;
         let node = if self.nodes.is_empty() {
@@ -1382,6 +1794,9 @@ impl MappedHnsw {
         loop {
             let mut improved = false;
             for neighbor in self.neighbors(entry, layer) {
+                self.prefetch(neighbor);
+            }
+            for neighbor in self.neighbors(entry, layer) {
                 let candidate = self.dist_raw(query, norm, neighbor);
                 if candidate < distance {
                     entry = neighbor;
@@ -1416,21 +1831,40 @@ impl MappedHnsw {
                 if distance > worst && results.len() >= ef {
                     break;
                 }
-                for neighbor in self.neighbors(label, 0) {
-                    if !visited.insert(neighbor) {
-                        continue;
-                    }
-                    let distance = self.dist_raw(query, norm, neighbor);
-                    let worst = results
-                        .peek()
-                        .map(|candidate| candidate.0)
-                        .unwrap_or(f32::INFINITY);
-                    if results.len() < ef || distance < worst {
-                        candidates.push(Reverse(Cand(distance, neighbor)));
-                        results.push(Cand(distance, neighbor));
-                        if results.len() > ef {
-                            results.pop();
+                let mut neighbors = self.neighbors(label, 0);
+                loop {
+                    // Mark and prefetch a chunk first; the decisions below
+                    // then run in the original order over the same labels.
+                    let mut pending = [0u32; PREFETCH_BATCH];
+                    let mut count = 0usize;
+                    let mut exhausted = false;
+                    while count < PREFETCH_BATCH {
+                        let Some(neighbor) = neighbors.next() else {
+                            exhausted = true;
+                            break;
+                        };
+                        if visited.insert(neighbor) {
+                            self.prefetch(neighbor);
+                            pending[count] = neighbor;
+                            count += 1;
                         }
+                    }
+                    for &neighbor in &pending[..count] {
+                        let distance = self.dist_raw(query, norm, neighbor);
+                        let worst = results
+                            .peek()
+                            .map(|candidate| candidate.0)
+                            .unwrap_or(f32::INFINITY);
+                        if results.len() < ef || distance < worst {
+                            candidates.push(Reverse(Cand(distance, neighbor)));
+                            results.push(Cand(distance, neighbor));
+                            if results.len() > ef {
+                                results.pop();
+                            }
+                        }
+                    }
+                    if exhausted {
+                        break;
                     }
                 }
             }
@@ -1917,6 +2351,7 @@ impl VecIdx {
                 frozen_removed: HashSet::new(),
                 label_bytes,
                 frozen_removed_bytes: 0,
+                durable_generation: None,
             },
             dump_version,
         ))

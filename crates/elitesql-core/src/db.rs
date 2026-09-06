@@ -41,7 +41,8 @@ use crate::value::{
     read_u8, skip_value, write_blob_file_bytes, BlobRef, ColumnType, Value, TAG_NULL,
 };
 use crate::vector::{
-    IndexingMode, VecIdx, VectorHit, VectorIndexDef, VectorIndexOptions, VectorSearchOptions,
+    IndexingMode, LiveLabels, MappedRunSummary, VecIdx, VectorHit, VectorIndexDef,
+    VectorIndexOptions, VectorSearchOptions,
 };
 use crate::wal::{
     encode_commit, scan_wal, set_encoded_commit_version, wal_path, Durability, WalAppendOutcome,
@@ -433,6 +434,17 @@ pub struct MaintenanceStats {
     pub text_run_compaction_bytes_read: u64,
     pub text_run_compaction_bytes_written: u64,
     pub text_checkpoint_bytes_written: u64,
+    /// Immutable HNSW graphs currently searched across every vector index.
+    pub vector_runs: usize,
+    /// Estimated resident heap of those graphs' navigation caches and id
+    /// maps. Like the base graph always was, this is proportional to the
+    /// indexed vectors and is not part of the mutable index-delta pool.
+    pub vector_run_metadata_bytes: usize,
+    /// Completed background merges of comparably sized vector runs.
+    pub vector_run_merges: u64,
+    pub vector_run_merge_time: Duration,
+    pub vector_run_merge_bytes_read: u64,
+    pub vector_run_merge_bytes_written: u64,
     /// Frozen secondary/text/vector generations successfully serialized and
     /// published by the dedicated background worker.
     pub derived_publications: u64,
@@ -2386,7 +2398,77 @@ struct FrozenCheckpointJob {
     first_primary_run: bool,
     wal_id: u32,
     wal_cutoff: u64,
-    memory: Option<MemoryPermit>,
+    memory: Option<MaintenanceLease>,
+}
+
+/// Mutual exclusion between checkpoints, derived publications and explicit
+/// maintenance (compaction, index builds, DDL rewrites). Reserving the whole
+/// maintenance pool used to provide it implicitly; frozen heaps are now
+/// accounted without blocking, so the exclusion is explicit here instead.
+/// Background run merges only share the memory pool and never take this.
+struct MaintenanceSerial {
+    busy: Mutex<bool>,
+    idle: Condvar,
+}
+
+impl MaintenanceSerial {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            busy: Mutex::new(false),
+            idle: Condvar::new(),
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> SerialLease {
+        let mut busy = self
+            .busy
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while *busy {
+            busy = self
+                .idle
+                .wait(busy)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        *busy = true;
+        SerialLease(self.clone())
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<SerialLease> {
+        let mut busy = self
+            .busy
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *busy {
+            return None;
+        }
+        *busy = true;
+        Some(SerialLease(self.clone()))
+    }
+}
+
+struct SerialLease(Arc<MaintenanceSerial>);
+
+impl Drop for SerialLease {
+    fn drop(&mut self) {
+        let mut busy = self
+            .0
+            .busy
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *busy = false;
+        self.0.idle.notify_all();
+    }
+}
+
+/// One maintenance task's right to run: the serial exclusion plus its memory
+/// accounting. Explicit maintenance reserves the whole pool and waits for it;
+/// a frozen heap scheduled from the commit path is accounted at its own size
+/// without waiting, because that memory already exists and only the
+/// consolidation it is waiting for can free it.
+pub(crate) struct MaintenanceLease {
+    _serial: SerialLease,
+    _memory: MemoryPermit,
 }
 
 struct FrozenSecondaryJob {
@@ -2410,7 +2492,7 @@ struct DerivedCheckpointJob {
     secondary: Vec<FrozenSecondaryJob>,
     text: Vec<FrozenTextJob>,
     vector: Vec<FrozenVectorJob>,
-    memory: Option<MemoryPermit>,
+    memory: Option<MaintenanceLease>,
 }
 
 #[derive(Debug, Default)]
@@ -2439,6 +2521,7 @@ enum MaintenanceJob {
     CompactPrimaryRuns,
     CompactSecondaryRuns,
     CompactTextRuns,
+    MergeVectorRuns,
 }
 
 impl CommitState {
@@ -2451,6 +2534,9 @@ impl CommitState {
 
 struct Shared {
     dir: PathBuf,
+    /// `dir/blobs`, resolved once so read paths that release the state lock
+    /// before decoding do not rebuild the path per record.
+    blobs: PathBuf,
     opts: DbOptions,
     memory_governor: Arc<MemoryGovernor>,
     /// Held for the lifetime of the Db: process-level exclusion.
@@ -2537,6 +2623,11 @@ struct Shared {
     /// Orders equality/BM25 run-set replacements without making ordinary
     /// commits wait for manifest writes or directory syncs.
     derived_manifest_publication: Mutex<()>,
+    /// See [`MaintenanceSerial`].
+    maintenance_serial: Arc<MaintenanceSerial>,
+    /// Run files whose merge exceeded its memory estimate in this process;
+    /// they are not selected again, so a mis-estimate costs one rebuild.
+    vector_merge_rejected: Mutex<HashSet<String>>,
     derived_publication_count: AtomicU64,
     derived_publication_nanos: AtomicU64,
     #[cfg(test)]
@@ -2580,6 +2671,11 @@ struct Shared {
     text_run_compaction_bytes_read: AtomicU64,
     text_run_compaction_bytes_written: AtomicU64,
     text_checkpoint_bytes_written: AtomicU64,
+    vector_merge_scheduled: AtomicBool,
+    vector_run_merge_count: AtomicU64,
+    vector_run_merge_nanos: AtomicU64,
+    vector_run_merge_bytes_read: AtomicU64,
+    vector_run_merge_bytes_written: AtomicU64,
     auto_compaction_state: Mutex<AutoCompactionState>,
     checkpoint_count: AtomicU64,
     checkpoint_nanos: AtomicU64,
@@ -2741,6 +2837,35 @@ struct PreparedCommit {
 struct ApplyRecordState<'a> {
     put: Option<(&'a Arc<Vec<u8>>, &'a Record)>,
     prior: Option<Record>,
+}
+
+/// Owned `(table, column)` keys for one table's derived indexes, built once
+/// per applied table. The per-record loop runs under the global state write
+/// lock, so it must not allocate two strings per index per record just to
+/// probe the index maps.
+struct DerivedIndexKeys {
+    secondary: Vec<(String, String)>,
+    text: Vec<(String, String)>,
+    vector: Vec<(String, String)>,
+}
+
+impl DerivedIndexKeys {
+    fn new(table: &str, schema: &TableSchema) -> Self {
+        let key = |column: &str| (table.to_owned(), column.to_owned());
+        Self {
+            secondary: schema.indexes.iter().map(|def| key(&def.column)).collect(),
+            text: schema
+                .text_indexes
+                .iter()
+                .map(|def| key(&def.column))
+                .collect(),
+            vector: schema
+                .vector_indexes
+                .iter()
+                .map(|def| key(&def.column))
+                .collect(),
+        }
+    }
 }
 
 /// An embedded EliteSQL database backed by a self-contained directory.
@@ -2964,6 +3089,38 @@ fn finish_db(shared: Arc<Shared>) -> Db {
                             .store(false, AtomicOrdering::Release);
                         if !failed {
                             maybe_schedule_text_compaction(&maintenance_shared);
+                        }
+                    }
+                    MaintenanceJob::MergeVectorRuns => {
+                        // A merge that made no progress (the run set changed
+                        // under it) is not retried in a loop; the next
+                        // publication schedules it again.
+                        let mut reschedule = true;
+                        while vector_merge_needed(&maintenance_shared) {
+                            match merge_one_vector_run_group(&maintenance_shared) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    reschedule = false;
+                                    break;
+                                }
+                                Err(_) => {
+                                    record_maintenance_error(
+                                        &maintenance_shared,
+                                        "vector run merge failed",
+                                    );
+                                    reschedule = false;
+                                    maintenance_shared
+                                        .index_maintenance_failures
+                                        .fetch_add(1, AtomicOrdering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }
+                        maintenance_shared
+                            .vector_merge_scheduled
+                            .store(false, AtomicOrdering::Release);
+                        if reschedule {
+                            maybe_schedule_vector_merge(&maintenance_shared);
                         }
                     }
                 }
@@ -3218,6 +3375,7 @@ impl Db {
         let wal = Some(WalWriter::open(&dir, manifest.wal_id)?);
         let blobs_dir = dir.join(BLOBS_DIR);
         let db = finish_db(Arc::new(Shared {
+            blobs: dir.join(BLOBS_DIR),
             dir,
             opts: opts.clone(),
             memory_governor,
@@ -3292,6 +3450,8 @@ impl Db {
             background_derived: Mutex::new(BackgroundDerivedState::default()),
             background_derived_done: Condvar::new(),
             derived_manifest_publication: Mutex::new(()),
+            maintenance_serial: MaintenanceSerial::new(),
+            vector_merge_rejected: Mutex::new(HashSet::new()),
             derived_publication_count: AtomicU64::new(0),
             derived_publication_nanos: AtomicU64::new(0),
             #[cfg(test)]
@@ -3333,6 +3493,11 @@ impl Db {
             text_run_compaction_bytes_read: AtomicU64::new(0),
             text_run_compaction_bytes_written: AtomicU64::new(0),
             text_checkpoint_bytes_written: AtomicU64::new(0),
+            vector_merge_scheduled: AtomicBool::new(false),
+            vector_run_merge_count: AtomicU64::new(0),
+            vector_run_merge_nanos: AtomicU64::new(0),
+            vector_run_merge_bytes_read: AtomicU64::new(0),
+            vector_run_merge_bytes_written: AtomicU64::new(0),
             auto_compaction_state: Mutex::new(AutoCompactionState::default()),
             checkpoint_count: AtomicU64::new(0),
             checkpoint_nanos: AtomicU64::new(0),
@@ -3349,6 +3514,7 @@ impl Db {
         refresh_compaction_debt(&db.shared);
         maybe_schedule_auto_compaction(&db.shared);
         maybe_schedule_primary_compaction(&db.shared);
+        maybe_schedule_vector_merge(&db.shared);
         maybe_schedule_secondary_compaction(&db.shared);
         maybe_schedule_text_compaction(&db.shared);
         Ok(db)
@@ -3823,6 +3989,7 @@ impl Db {
             })?;
         }
         let db = finish_db(Arc::new(Shared {
+            blobs: dir.join(BLOBS_DIR),
             dir,
             opts: opts.clone(),
             memory_governor,
@@ -3897,6 +4064,8 @@ impl Db {
             background_derived: Mutex::new(BackgroundDerivedState::default()),
             background_derived_done: Condvar::new(),
             derived_manifest_publication: Mutex::new(()),
+            maintenance_serial: MaintenanceSerial::new(),
+            vector_merge_rejected: Mutex::new(HashSet::new()),
             derived_publication_count: AtomicU64::new(0),
             derived_publication_nanos: AtomicU64::new(0),
             #[cfg(test)]
@@ -3938,6 +4107,11 @@ impl Db {
             text_run_compaction_bytes_read: AtomicU64::new(0),
             text_run_compaction_bytes_written: AtomicU64::new(0),
             text_checkpoint_bytes_written: AtomicU64::new(0),
+            vector_merge_scheduled: AtomicBool::new(false),
+            vector_run_merge_count: AtomicU64::new(0),
+            vector_run_merge_nanos: AtomicU64::new(0),
+            vector_run_merge_bytes_read: AtomicU64::new(0),
+            vector_run_merge_bytes_written: AtomicU64::new(0),
             auto_compaction_state: Mutex::new(AutoCompactionState::default()),
             checkpoint_count: AtomicU64::new(0),
             checkpoint_nanos: AtomicU64::new(0),
@@ -3959,6 +4133,7 @@ impl Db {
         refresh_compaction_debt(&db.shared);
         maybe_schedule_auto_compaction(&db.shared);
         maybe_schedule_primary_compaction(&db.shared);
+        maybe_schedule_vector_merge(&db.shared);
         maybe_schedule_secondary_compaction(&db.shared);
         maybe_schedule_text_compaction(&db.shared);
         Ok(db)
@@ -4356,9 +4531,15 @@ impl Db {
             vidx.dump_file(&tmp, table, column, &def, st.committed_version)?;
             fs::rename(&tmp, &path)?;
             fsync_dir(&self.shared.dir.join(VECTORS_DIR))?;
-            let file = File::open(&path)?;
-            let mmap = unsafe { MmapOptions::new().map(&file) }?;
-            let (mapped, _) = VecIdx::load_mmap(mmap, table, column, &def)?;
+            let (mut mapped, _) = VecIdx::load_mmap_file(&path, table, column, &def)?;
+            publish_vector_manifest(
+                &self.shared.dir,
+                table,
+                column,
+                st.committed_version,
+                &mut mapped,
+            )?;
+            cleanup_vector_run_orphans(&self.shared.dir, table, column, &mapped);
             st.vector.insert((table.into(), column.into()), mapped);
             Ok(())
         })();
@@ -4561,7 +4742,7 @@ impl Db {
             .set_index_delta_bytes(retained_delta_bytes);
         drop(cs);
         for column in &vector_columns {
-            let _ = fs::remove_file(vidx_path(&self.shared.dir, table, column));
+            remove_vector_index_files(&self.shared.dir, table, column);
         }
         cleanup_orphan_sidx(&self.shared.dir, &cleanup_catalog);
         cleanup_orphan_tidx(&self.shared.dir, &cleanup_catalog);
@@ -4670,7 +4851,7 @@ impl Db {
                 cleanup_orphan_sidx(&self.shared.dir, &cleanup_catalog);
             }
             IndexKind::Vector => {
-                let _ = fs::remove_file(vidx_path(&self.shared.dir, table, column));
+                remove_vector_index_files(&self.shared.dir, table, column);
             }
             IndexKind::Text => {
                 cleanup_orphan_tidx(&self.shared.dir, &cleanup_catalog);
@@ -6083,7 +6264,10 @@ impl Db {
         if value.is_null() || limit == 0 {
             return Ok(Vec::new());
         }
-        let mut out = Vec::with_capacity(limit);
+        // Equality probes (index nested-loop joins issue one per outer row)
+        // usually yield a few rows, so the output grows on demand instead of
+        // reserving a full batch of `(String, Record)` slots per call.
+        let mut out = Vec::new();
         if let Some(index) = st.secondary.get(&(table.to_owned(), column.to_owned())) {
             let ids = index.ids_batch(&index_key(value), after_id, limit)?;
             if ids.is_empty() {
@@ -6187,13 +6371,19 @@ impl Db {
             let auto = self.shared.auto_compaction_state.lock().unwrap();
             (auto.debt_operations, auto.estimated_reclaimable_bytes)
         };
-        let (segments, primary_runs, secondary_runs, text_runs) = {
+        let (segments, primary_runs, secondary_runs, text_runs, vector_runs, vector_metadata) = {
             let state = self.shared.state.read().unwrap();
             (
                 state.segments.len(),
                 state.index.runs.len(),
                 state.secondary.values().map(|index| index.runs.len()).sum(),
                 state.text.values().map(|index| index.runs.len()).sum(),
+                state.vector.values().map(VecIdx::mapped_run_count).sum(),
+                state
+                    .vector
+                    .values()
+                    .map(VecIdx::mapped_metadata_bytes)
+                    .sum(),
             )
         };
         MaintenanceStats {
@@ -6361,6 +6551,25 @@ impl Db {
                 .shared
                 .text_checkpoint_bytes_written
                 .load(AtomicOrdering::Relaxed),
+            vector_runs,
+            vector_run_metadata_bytes: vector_metadata,
+            vector_run_merges: self
+                .shared
+                .vector_run_merge_count
+                .load(AtomicOrdering::Relaxed),
+            vector_run_merge_time: Duration::from_nanos(
+                self.shared
+                    .vector_run_merge_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
+            vector_run_merge_bytes_read: self
+                .shared
+                .vector_run_merge_bytes_read
+                .load(AtomicOrdering::Relaxed),
+            vector_run_merge_bytes_written: self
+                .shared
+                .vector_run_merge_bytes_written
+                .load(AtomicOrdering::Relaxed),
             derived_publications: self
                 .shared
                 .derived_publication_count
@@ -6370,6 +6579,39 @@ impl Db {
                     .derived_publication_nanos
                     .load(AtomicOrdering::Relaxed),
             ),
+        }
+    }
+
+    /// Wait until every currently eligible background merge of vector runs
+    /// has published. Searches keep working on the unmerged runs meanwhile.
+    pub fn wait_for_vector_run_merge(&self) -> Result<()> {
+        let initial_failures = self
+            .shared
+            .index_maintenance_failures
+            .load(AtomicOrdering::Relaxed);
+        loop {
+            if !self
+                .shared
+                .maintenance_worker_alive
+                .load(AtomicOrdering::Acquire)
+                || self
+                    .shared
+                    .index_maintenance_failures
+                    .load(AtomicOrdering::Relaxed)
+                    .saturating_sub(initial_failures)
+                    >= MAX_MAINTENANCE_WAIT_RETRIES
+            {
+                return Err(maintenance_wait_error(&self.shared, "vector run merge"));
+            }
+            maybe_schedule_vector_merge(&self.shared);
+            let scheduled = self
+                .shared
+                .vector_merge_scheduled
+                .load(AtomicOrdering::Acquire);
+            if !scheduled && !vector_merge_needed(&self.shared) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -6498,13 +6740,47 @@ impl Db {
         )
     }
 
-    fn acquire_maintenance_memory(shared: &Arc<Shared>) -> MemoryPermit {
-        shared.memory_governor.acquire(
+    /// Exclusive maintenance with the whole pool reserved; waits for both.
+    fn acquire_maintenance_memory(shared: &Arc<Shared>) -> MaintenanceLease {
+        let serial = shared.maintenance_serial.acquire();
+        let memory = shared.memory_governor.acquire(
             MemoryPool::Maintenance,
             shared.opts.memory.maintenance_pool_bytes,
-        )
+        );
+        MaintenanceLease {
+            _serial: serial,
+            _memory: memory,
+        }
     }
+}
 
+/// Exclusive maintenance for a frozen heap of `bytes`: waits only for the
+/// serial exclusion, never for pool capacity (see [`MaintenanceLease`]).
+fn acquire_frozen_lease(shared: &Arc<Shared>, bytes: usize) -> MaintenanceLease {
+    let serial = shared.maintenance_serial.acquire();
+    let memory = shared
+        .memory_governor
+        .acquire_unbounded(MemoryPool::Maintenance, bytes);
+    MaintenanceLease {
+        _serial: serial,
+        _memory: memory,
+    }
+}
+
+/// Like [`acquire_frozen_lease`], but gives up when another maintenance task
+/// holds the exclusion; callers on the commit path defer instead of waiting.
+fn try_acquire_frozen_lease(shared: &Arc<Shared>, bytes: usize) -> Option<MaintenanceLease> {
+    let serial = shared.maintenance_serial.try_acquire()?;
+    let memory = shared
+        .memory_governor
+        .acquire_unbounded(MemoryPool::Maintenance, bytes);
+    Some(MaintenanceLease {
+        _serial: serial,
+        _memory: memory,
+    })
+}
+
+impl Db {
     pub(crate) fn memory_options(&self) -> MemoryOptions {
         self.shared.opts.memory.clone()
     }
@@ -7808,16 +8084,44 @@ fn shared_get_at(
         .catalog
         .table(table)
         .ok_or_else(|| Error::TableNotFound(table.into()))?;
-    match st.visible_owned(table, id, max_version)? {
-        Some(entry) if !entry.is_tombstone() => {
-            let mut record = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-            if schema.has_implicit_id() {
-                record.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
-            }
-            Ok(Some(record))
-        }
-        _ => Ok(None),
+    let implicit_id = schema.has_implicit_id();
+    let entry = match st.visible_owned(table, id, max_version)? {
+        Some(entry) if !entry.is_tombstone() => entry,
+        _ => return Ok(None),
+    };
+    // Retain only the segment handle the payload lives in and release the
+    // shared state before touching the mapping. Decoding (page faults, one
+    // allocation per column) then runs concurrently with committers waiting
+    // for the write lock, exactly like the batched scan path.
+    let reader = match &entry.kind {
+        VKind::SegPut { segment, .. } => Some(
+            st.readers
+                .get(segment)
+                .cloned()
+                .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?,
+        ),
+        _ => None,
+    };
+    drop(st);
+    let blobs = Some(shared.blobs.as_path());
+    let mut record = match &entry.kind {
+        VKind::MemPut(payload) => decode_record(payload, blobs)?,
+        VKind::SegPut {
+            payload_offset,
+            payload_len,
+            ..
+        } => reader
+            .as_deref()
+            .expect("segment reader captured above")
+            .with_payload(*payload_offset, *payload_len, |bytes| {
+                decode_record(bytes, blobs)
+            })?,
+        VKind::MemTombstone | VKind::SegTombstone => return Ok(None),
+    };
+    if implicit_id {
+        record.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
     }
+    Ok(Some(record))
 }
 
 fn shared_scan_at(shared: &Shared, table: &str, max_version: u64) -> Result<Vec<(String, Record)>> {
@@ -8443,6 +8747,7 @@ fn finish_coordinated_insert_batch(
                     .last()
                     .map(|change| change.id.clone())
                     .expect("prepared table is non-empty");
+                let keys = DerivedIndexKeys::new(&table.name, &table.schema);
                 for change in table.changes {
                     let put = change.operation.as_ref().zip(change.payload.as_ref());
                     let put = put.map(|(record, payload)| (payload, record));
@@ -8454,6 +8759,7 @@ fn finish_coordinated_insert_batch(
                         &table.name,
                         change.id,
                         ApplyRecordState { put, prior: None },
+                        &keys,
                         &mut jobs,
                     );
                     debug_assert!(jobs.is_empty());
@@ -8484,7 +8790,7 @@ fn finish_coordinated_insert_batch(
                 && shared.state.read().unwrap().index.frozen.is_none()
                 && !shared.background_derived.lock().unwrap().running
             {
-                let memory = Db::acquire_maintenance_memory(shared);
+                let memory = acquire_frozen_lease(shared, cs.memtable_bytes as usize);
                 let _ = schedule_frozen_checkpoint(shared, &mut cs, memory)?;
             }
             Ok(())
@@ -8669,7 +8975,7 @@ fn finish_prepared_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Res
             }
             if derived_bytes > 0 || has_frozen_derived {
                 wait_vector_indexing_shared(shared)?;
-                let memory = Db::acquire_maintenance_memory(shared);
+                let memory = acquire_frozen_lease(shared, derived_bytes);
                 if schedule_frozen_derived(shared, memory)? {
                     drop(cs);
                     wait_for_background_derived(shared)?;
@@ -8681,7 +8987,7 @@ fn finish_prepared_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Res
                 wait_for_background_checkpoint(shared)?;
                 continue;
             }
-            let memory = Db::acquire_maintenance_memory(shared);
+            let memory = acquire_frozen_lease(shared, cs.memtable_bytes as usize);
             if schedule_frozen_checkpoint(shared, &mut cs, memory)? {
                 drop(cs);
                 wait_for_background_checkpoint(shared)?;
@@ -8768,6 +9074,7 @@ fn finish_prepared_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Res
                 .last()
                 .map(|change| change.id.clone())
                 .expect("prepared tables are non-empty");
+            let keys = DerivedIndexKeys::new(&table.name, &table.schema);
             for (change, (previous, prior_record)) in table.changes.into_iter().zip(table_previous)
             {
                 if let Some(previous) = &previous {
@@ -8805,6 +9112,7 @@ fn finish_prepared_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Res
                         put,
                         prior: prior_record,
                     },
+                    &keys,
                     &mut jobs,
                 );
                 added += change
@@ -8851,10 +9159,19 @@ fn finish_prepared_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Res
         .memory_governor
         .add_index_delta_bytes(incoming_index_bytes);
     let maintenance_needed = cs.memtable_bytes >= shared.opts.memtable_max_bytes;
+    // Publish derived deltas in the background once the shared delta pool is
+    // half full, but only when they are worth a run: the pool is shared with
+    // the primary memtable, and publishing a few thousand vectors every commit
+    // while the memtable is what fills it would create tiny HNSW runs faster
+    // than background merges can fold them. One sixteenth of the pool is about
+    // the largest run four of which a merge can still rebuild within its half
+    // of the maintenance pool. Hard pool pressure still publishes whatever
+    // exists.
     let derived_schedule_needed = {
         let memory = shared.memory_governor.stats();
         memory.index_delta_bytes >= memory.index_delta_capacity_bytes / 2
-            && shared.state.read().unwrap().derived_delta_memory_bytes() > 0
+            && shared.state.read().unwrap().derived_delta_memory_bytes() as u64
+                >= (memory.index_delta_capacity_bytes / DERIVED_PUBLICATION_MIN_DIVISOR).max(1)
     };
     drop(cs);
 
@@ -8867,10 +9184,8 @@ fn finish_prepared_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Res
         if maintenance_needed || derived_schedule_needed {
             let mut cs = lock_commit_after_group_sync(shared);
             if derived_schedule_needed && !shared.background_derived.lock().unwrap().running {
-                if let Some(memory) = shared.memory_governor.try_acquire(
-                    MemoryPool::Maintenance,
-                    shared.opts.memory.maintenance_pool_bytes,
-                ) {
+                let derived_bytes = shared.state.read().unwrap().derived_delta_memory_bytes();
+                if let Some(memory) = try_acquire_frozen_lease(shared, derived_bytes) {
                     let _ = schedule_frozen_derived(shared, memory)?;
                 }
             }
@@ -8885,7 +9200,7 @@ fn finish_prepared_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Res
                 }
                 let frozen_running = shared.state.read().unwrap().index.frozen.is_some();
                 if !frozen_running {
-                    let memory = Db::acquire_maintenance_memory(shared);
+                    let memory = acquire_frozen_lease(shared, cs.memtable_bytes as usize);
                     let _ = schedule_frozen_checkpoint(shared, &mut cs, memory)?;
                 }
             }
@@ -9253,6 +9568,7 @@ fn validate_foreign_keys(st: &State, staged: &[PreparedTable]) -> Result<()> {
 /// Apply one committed change to the in-memory state, maintaining secondary
 /// and vector indexes (which track the latest committed state only). Async
 /// vector insertions are returned as jobs for the background thread.
+#[allow(clippy::too_many_arguments)]
 fn apply_one_owned(
     st: &mut State,
     version: u64,
@@ -9260,6 +9576,7 @@ fn apply_one_owned(
     table: &str,
     id: String,
     records: ApplyRecordState<'_>,
+    keys: &DerivedIndexKeys,
     jobs: &mut Vec<VecJob>,
 ) {
     let ApplyRecordState { put, prior } = records;
@@ -9279,22 +9596,19 @@ fn apply_one_owned(
     let tdefs = &schema.text_indexes;
     if !defs.is_empty() || !tdefs.is_empty() {
         if let Some(prior) = prior {
-            for def in defs {
+            for (def, key) in defs.iter().zip(&keys.secondary) {
                 if let Some(v) = prior.get(&def.column) {
                     if !v.is_null() {
-                        if let Some(idx) = st
-                            .secondary
-                            .get_mut(&(table.to_owned(), def.column.clone()))
-                        {
+                        if let Some(idx) = st.secondary.get_mut(key) {
                             let key = index_key(v);
                             idx.remove(&key, id_ref);
                         }
                     }
                 }
             }
-            for tdef in tdefs {
+            for (tdef, key) in tdefs.iter().zip(&keys.text) {
                 if let Some(Value::Text(old)) = prior.get(&tdef.column) {
-                    if let Some(tidx) = st.text.get_mut(&(table.to_owned(), tdef.column.clone())) {
+                    if let Some(tidx) = st.text.get_mut(key) {
                         tidx.remove(id_ref, old);
                     }
                 }
@@ -9306,21 +9620,18 @@ fn apply_one_owned(
         None => VKind::MemTombstone,
     };
     if let Some((_, rec)) = put {
-        for def in defs {
+        for (def, key) in defs.iter().zip(&keys.secondary) {
             if let Some(v) = rec.get(&def.column) {
                 if !v.is_null() {
-                    if let Some(idx) = st
-                        .secondary
-                        .get_mut(&(table.to_owned(), def.column.clone()))
-                    {
+                    if let Some(idx) = st.secondary.get_mut(key) {
                         idx.add(index_key(v), id_ref);
                     }
                 }
             }
         }
-        for tdef in tdefs {
+        for (tdef, key) in tdefs.iter().zip(&keys.text) {
             if let Some(Value::Text(s)) = rec.get(&tdef.column) {
-                if let Some(tidx) = st.text.get_mut(&(table.to_owned(), tdef.column.clone())) {
+                if let Some(tidx) = st.text.get_mut(key) {
                     tidx.add(id_ref, s);
                 }
             }
@@ -9329,17 +9640,18 @@ fn apply_one_owned(
 
     // Vector index maintenance. Inserting tombstones the previous label for
     // the same id; a put without a vector (or a delete) tombstones directly.
-    for vdef in &schema.vector_indexes {
-        let key = (table.to_owned(), vdef.column.clone());
+    // Synchronous indexing borrows the vector from the staged record; only
+    // asynchronous jobs need their own copy.
+    for (vdef, key) in schema.vector_indexes.iter().zip(&keys.vector) {
         let new_vec = put.and_then(|(_, rec)| match rec.get(&vdef.column) {
-            Some(Value::Vector(v)) => Some(v.clone()),
+            Some(Value::Vector(v)) => Some(v),
             _ => None,
         });
         match new_vec {
             Some(v) => match vdef.mode {
                 IndexingMode::Sync => {
-                    if let Some(vidx) = st.vector.get_mut(&key) {
-                        vidx.insert(id_ref, &v);
+                    if let Some(vidx) = st.vector.get_mut(key) {
+                        vidx.insert(id_ref, v);
                     }
                 }
                 IndexingMode::Async => jobs.push(VecJob {
@@ -9347,11 +9659,11 @@ fn apply_one_owned(
                     table: table.to_owned(),
                     column: vdef.column.clone(),
                     id: id_ref.to_owned(),
-                    vector: v,
+                    vector: v.clone(),
                 }),
             },
             None => {
-                if let Some(vidx) = st.vector.get_mut(&key) {
+                if let Some(vidx) = st.vector.get_mut(key) {
                     vidx.remove(id_ref);
                 }
             }
@@ -9527,7 +9839,7 @@ fn background_checkpoint_supported(shared: &Shared) -> bool {
 fn schedule_frozen_checkpoint(
     shared: &Arc<Shared>,
     cs: &mut CommitState,
-    memory: MemoryPermit,
+    memory: MaintenanceLease,
 ) -> Result<bool> {
     if !background_checkpoint_supported(shared) {
         return Ok(false);
@@ -10376,7 +10688,7 @@ fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
 /// Move every mutable derived overlay into an immutable in-memory generation
 /// in O(number of indexes), then let the maintenance worker perform graph/run
 /// serialization without the commit mutex or state write lock.
-fn schedule_frozen_derived(shared: &Arc<Shared>, memory: MemoryPermit) -> Result<bool> {
+fn schedule_frozen_derived(shared: &Arc<Shared>, memory: MaintenanceLease) -> Result<bool> {
     let vector_ready = shared.vector_backlog.load(AtomicOrdering::SeqCst) == 0;
     let mut status = shared.background_derived.lock().unwrap();
     if status.running {
@@ -10803,23 +11115,36 @@ fn flush_frozen_derived_inner(
             "writing vector index {}.{}",
             frozen_job.table, frozen_job.def.column
         );
-        let run = vectors_dir.join(format!("delta-{}.vidx.derived-pending", Ulid::new()));
-        frozen_job.frozen.dump_file(
-            &run,
+        // The run is a durable part of the index from here on: the manifest
+        // published below lets the next open map it instead of re-inserting
+        // every vector of this generation.
+        let file = vidx_run_filename(&shared.dir, &frozen_job.table, &frozen_job.def.column);
+        let run = vectors_dir.join(&file);
+        let pending = vectors_dir.join(format!("{file}.derived-pending"));
+        if let Err(error) = frozen_job.frozen.dump_file(
+            &pending,
             &frozen_job.table,
             &frozen_job.def.column,
             &frozen_job.def,
             frozen_job.generation,
-        )?;
+        ) {
+            let _ = fs::remove_file(&pending);
+            return Err(error);
+        }
+        fs::rename(&pending, &run)?;
         fsync_dir(&vectors_dir)?;
-        let file = File::open(&run)?;
-        let mmap = unsafe { MmapOptions::new().map(&file) }?;
-        let (loaded, version) = VecIdx::load_mmap(
-            mmap,
+        let (loaded, version) = match VecIdx::load_mmap_file(
+            &run,
             &frozen_job.table,
             &frozen_job.def.column,
             &frozen_job.def,
-        )?;
+        ) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let _ = fs::remove_file(&run);
+                return Err(error);
+            }
+        };
         if version != frozen_job.generation {
             let _ = fs::remove_file(&run);
             return Err(Error::Corrupt(
@@ -10831,17 +11156,42 @@ fn flush_frozen_derived_inner(
             frozen_job.table, frozen_job.def.column
         );
         pause_derived_before_publish_for_test(shared);
+        // The manifest is written under the commit mutex so it can never
+        // overtake a compaction rebuild that replaced the whole run set.
         let _cs = shared.commit.lock();
-        let mut state = shared.state.write().unwrap();
         let key = (frozen_job.table.clone(), frozen_job.def.column.clone());
-        let published = state
-            .vector
-            .get_mut(&key)
-            .is_some_and(|index| index.publish_frozen_loaded(&frozen_job.frozen, loaded));
-        drop(state);
-        let _ = fs::remove_file(&run);
-        if !published {
-            continue;
+        let manifest = {
+            let mut state = shared.state.write().unwrap();
+            let published = state
+                .vector
+                .get_mut(&key)
+                .is_some_and(|index| index.publish_frozen_loaded(&frozen_job.frozen, loaded));
+            if !published {
+                None
+            } else {
+                state
+                    .vector
+                    .get_mut(&key)
+                    .filter(|index| index.frozen_delta().is_none())
+                    .map(|index| {
+                        let manifest =
+                            vector_manifest_for(&key.0, &key.1, frozen_job.generation, index);
+                        if manifest.is_some() {
+                            index.durable_generation = Some(frozen_job.generation);
+                        }
+                        manifest
+                    })
+            }
+        };
+        match manifest {
+            None => {
+                let _ = fs::remove_file(&run);
+                continue;
+            }
+            Some(Some(manifest)) => {
+                manifest.publish(&vidx_manifest_path(&shared.dir, &key.0, &key.1))?;
+            }
+            Some(None) => {}
         }
     }
 
@@ -10850,6 +11200,7 @@ fn flush_frozen_derived_inner(
     shared.memory_governor.set_index_delta_bytes(retained);
     maybe_schedule_secondary_compaction(shared);
     maybe_schedule_text_compaction(shared);
+    maybe_schedule_vector_merge(shared);
     Ok(())
 }
 
@@ -11000,35 +11351,24 @@ fn consolidate_derived_indexes(shared: &Arc<Shared>) -> Result<()> {
         .collect();
     for (table, def) in vector_defs {
         let key = (table.clone(), def.column.clone());
-        if st
-            .vector
-            .get(&key)
-            .is_none_or(|index| index.delta_memory_bytes() == 0)
-        {
+        let Some(index) = st.vector.get_mut(&key) else {
             continue;
-        }
-        let path = vidx_path(&shared.dir, &table, &def.column);
-        let has_base = st
-            .vector
-            .get(&key)
-            .expect("vector key collected above")
-            .has_mapped_base();
-        let run = if has_base {
-            vdir.join(format!("delta-{}.vidx.run", Ulid::new()))
-        } else {
-            path.with_extension("vidx.tmp")
         };
-        let flush = st
-            .vector
-            .get_mut(&key)
-            .expect("vector key collected above")
-            .flush_delta_mmap(&run, &table, &def.column, &def, version, has_base);
-        if let Err(error) = flush {
-            let _ = fs::remove_file(&run);
-            return Err(error);
+        if index.delta_memory_bytes() > 0 {
+            // The first durable file of an index is its base; later flushes
+            // add runs. Both stay on disk and are listed in the manifest.
+            let run = if index.has_mapped_base() {
+                vdir.join(vidx_run_filename(&shared.dir, &table, &def.column))
+            } else {
+                vidx_path(&shared.dir, &table, &def.column)
+            };
+            index.flush_delta_mmap(&run, &table, &def.column, &def, version)?;
         }
-        if !has_base {
-            fs::rename(&run, &path)?;
+        // A frozen generation still awaiting publication means the runs do
+        // not yet cover `version`; the previous manifest stays valid as a
+        // prefix and the next open replays the difference.
+        if index.frozen_delta().is_none() {
+            publish_vector_manifest(&shared.dir, &table, &def.column, version, index)?;
         }
     }
     if has_sorted_indexes {
@@ -11196,14 +11536,14 @@ fn rebuild_derived_indexes_after_rewrite(
         let tmp = path.with_extension("vidx.tmp");
         resident.dump_file(&tmp, &table, &def.column, &def, version)?;
         fs::rename(&tmp, &path)?;
-        let file = File::open(&path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file) }?;
-        let (mapped, dump_version) = VecIdx::load_mmap(mmap, &table, &def.column, &def)?;
+        let (mut mapped, dump_version) = VecIdx::load_mmap_file(&path, &table, &def.column, &def)?;
         if dump_version != version {
             return Err(Error::Corrupt(
                 "rewritten vector index has the wrong generation".into(),
             ));
         }
+        publish_vector_manifest(&shared.dir, &table, &def.column, version, &mut mapped)?;
+        cleanup_vector_run_orphans(&shared.dir, &table, &def.column, &mapped);
         rebuilt_vector.insert((table, def.column.clone()), mapped);
     }
     st.vector = rebuilt_vector;
@@ -11474,6 +11814,483 @@ fn vidx_path(dir: &Path, table: &str, column: &str) -> PathBuf {
         .join(format!("{:08x}.vidx", crc32fast::hash(key.as_bytes())))
 }
 
+/// Hash stem shared by every file of one vector index (`<stem>.vidx`,
+/// `<stem>-<ulid>.vidx.run`, `<stem>.vidx.runs`).
+fn vidx_stem(dir: &Path, table: &str, column: &str) -> String {
+    vidx_path(dir, table, column)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("vector path has utf8 stem")
+        .to_owned()
+}
+
+fn vidx_manifest_path(dir: &Path, table: &str, column: &str) -> PathBuf {
+    vidx_path(dir, table, column).with_extension("vidx.runs")
+}
+
+fn vidx_run_filename(dir: &Path, table: &str, column: &str) -> String {
+    format!("{}-{}.vidx.run", vidx_stem(dir, table, column), Ulid::new())
+}
+
+/// Stem of a file inside the vectors directory: the part before the first
+/// `-` or `.`, which is the index hash for every file this module writes.
+fn vidx_file_stem(name: &str) -> &str {
+    name.split(['-', '.']).next().unwrap_or(name)
+}
+
+/// The run manifest describing `index` as complete up to `generation`, or
+/// `None` when the index has no durable runs to describe.
+fn vector_manifest_for(
+    table: &str,
+    column: &str,
+    generation: u64,
+    index: &VecIdx,
+) -> Option<DerivedRunManifest> {
+    let metas = index.mapped_run_metas();
+    if metas.is_empty() || !index.mapped_runs_are_durable() {
+        return None;
+    }
+    Some(DerivedRunManifest::new(
+        DerivedRunKind::Vector,
+        table,
+        column,
+        generation,
+        metas,
+        [0, 0],
+    ))
+}
+
+/// Publish the run set of `index` as complete up to `generation`. Callers
+/// guarantee the mutable overlay and the frozen generation are empty, so the
+/// listed runs hold every vector committed at or before `generation`. An
+/// index without durable runs removes any stale manifest instead.
+fn publish_vector_manifest(
+    dir: &Path,
+    table: &str,
+    column: &str,
+    generation: u64,
+    index: &mut VecIdx,
+) -> Result<()> {
+    let path = vidx_manifest_path(dir, table, column);
+    match vector_manifest_for(table, column, generation, index) {
+        Some(manifest) => {
+            manifest.publish(&path)?;
+            index.durable_generation = Some(generation);
+            Ok(())
+        }
+        None => {
+            index.durable_generation = None;
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
+}
+
+/// Remove `<stem>-*.vidx.run` files of one index that `index` no longer maps.
+/// In-flight `.derived-pending` files of the background publisher are not
+/// touched; they are renamed into runs only after being written completely.
+fn cleanup_vector_run_orphans(dir: &Path, table: &str, column: &str, index: &VecIdx) {
+    let stem = vidx_stem(dir, table, column);
+    let keep: HashSet<&str> = index.mapped_run_files().collect();
+    let Ok(entries) = fs::read_dir(dir.join(VECTORS_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.ends_with(".vidx.run") && vidx_file_stem(name) == stem && !keep.contains(name) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Smallest number of comparably sized runs a background merge folds into one
+/// graph, and the live-size ratio within which runs count as comparable.
+/// Size tiering keeps the total re-insertion work at O(n log n) over an
+/// index's life while bounding the runs a search visits to a few per tier.
+const VECTOR_RUN_MERGE_FANOUT: usize = 4;
+const VECTOR_RUN_MERGE_RATIO: usize = 2;
+
+/// A background derived publication needs at least this share of the
+/// index-delta pool in derived deltas; see the soft trigger in the commit
+/// path. Four runs of this size fit one merge within half the maintenance
+/// pool at the default profile.
+const DERIVED_PUBLICATION_MIN_DIVISOR: u64 = 16;
+
+/// Resident bytes of a rebuilt graph per on-disk byte of the runs it merges,
+/// as measured on 64- and 384-dimensional f32 and int8 graphs (1.03-1.22x
+/// the true footprint). The build itself may grow to 3/2 of the estimate
+/// before it is abandoned.
+const VECTOR_MERGE_ESTIMATE_NUM: usize = 5;
+const VECTOR_MERGE_ESTIMATE_DEN: usize = 4;
+
+/// The share of the maintenance pool one merge may reserve. Leaving the rest
+/// keeps explicit maintenance able to start within one merge, and bounds the
+/// transient overdraft when a frozen heap is accounted alongside a merge.
+fn vector_merge_budget(shared: &Shared) -> usize {
+    shared.opts.memory.maintenance_pool_bytes / 2
+}
+
+fn vector_merge_estimate(run: &MappedRunSummary) -> usize {
+    if run.nodes == 0 {
+        0
+    } else {
+        (run.bytes as usize / run.nodes)
+            .saturating_mul(run.live)
+            .saturating_mul(VECTOR_MERGE_ESTIMATE_NUM)
+            / VECTOR_MERGE_ESTIMATE_DEN
+    }
+}
+
+/// Runs one background merge will rebuild, chosen from `runs` (any order).
+/// Runs are sorted by live vectors and grouped while each stays within
+/// `VECTOR_RUN_MERGE_RATIO` of the group's smallest member; the first group
+/// with at least `VECTOR_RUN_MERGE_FANOUT` members whose merged graph fits
+/// `budget` is returned with its estimate. Runs without live vectors are pure
+/// garbage and merge with anything; runs in `rejected` are never considered.
+fn select_vector_merge_group(
+    runs: &[MappedRunSummary],
+    budget: usize,
+    rejected: &HashSet<String>,
+) -> Option<(Vec<String>, usize)> {
+    let mut order: Vec<&MappedRunSummary> = runs
+        .iter()
+        .filter(|run| !run.file.is_empty() && !rejected.contains(&run.file))
+        .collect();
+    order.sort_by_key(|run| run.live);
+    let mut start = 0;
+    while start < order.len() {
+        let floor = order[start].live.max(1);
+        let mut end = start + 1;
+        while end < order.len() && order[end].live <= floor.saturating_mul(VECTOR_RUN_MERGE_RATIO) {
+            end += 1;
+        }
+        let group = &order[start..end];
+        if group.len() >= VECTOR_RUN_MERGE_FANOUT {
+            let mut chosen = Vec::new();
+            let mut total = 0usize;
+            for run in group {
+                let bytes = vector_merge_estimate(run);
+                if total.saturating_add(bytes) > budget {
+                    break;
+                }
+                total += bytes;
+                chosen.push(run.file.clone());
+            }
+            if chosen.len() >= VECTOR_RUN_MERGE_FANOUT {
+                return Some((chosen, total));
+            }
+        }
+        start = end;
+    }
+    None
+}
+
+/// Everything a background merge needs, captured under one state lock.
+struct VectorMergePlan {
+    key: (String, String),
+    def: VectorIndexDef,
+    /// `(file, live labels)` per selected run.
+    selected: Vec<(String, LiveLabels)>,
+    bytes_read: u64,
+    /// Resident bytes the rebuilt graph is expected to need; reserved from
+    /// the maintenance pool while it is built.
+    estimate_bytes: usize,
+    /// Commit version the live snapshot reflects; the merged run is stamped
+    /// with it, since every vector it holds committed at or before it.
+    snapshot_version: u64,
+}
+
+fn vector_merge_target(
+    state: &State,
+    budget: usize,
+    rejected: &HashSet<String>,
+) -> Option<((String, String), Vec<String>, usize)> {
+    state.vector.iter().find_map(|(key, index)| {
+        if index.durable_generation.is_none() || !index.mapped_runs_are_durable() {
+            return None;
+        }
+        select_vector_merge_group(&index.mapped_run_summaries(), budget, rejected)
+            .map(|(files, estimate)| (key.clone(), files, estimate))
+    })
+}
+
+fn vector_merge_needed(shared: &Shared) -> bool {
+    if shared.opts.read_only {
+        return false;
+    }
+    let rejected = shared.vector_merge_rejected.lock().unwrap();
+    vector_merge_target(
+        &shared.state.read().unwrap(),
+        vector_merge_budget(shared),
+        &rejected,
+    )
+    .is_some()
+}
+
+fn maybe_schedule_vector_merge(shared: &Shared) {
+    if !vector_merge_needed(shared)
+        || shared
+            .vector_merge_scheduled
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    let sent = shared
+        .maintenance_tx
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|sender| sender.send(MaintenanceJob::MergeVectorRuns).is_ok());
+    if !sent {
+        shared
+            .vector_merge_scheduled
+            .store(false, AtomicOrdering::Release);
+    }
+}
+
+fn plan_vector_merge(shared: &Shared) -> Option<VectorMergePlan> {
+    let rejected = shared.vector_merge_rejected.lock().unwrap().clone();
+    let state = shared.state.read().unwrap();
+    let (key, files, estimate_bytes) =
+        vector_merge_target(&state, vector_merge_budget(shared), &rejected)?;
+    let index = state.vector.get(&key)?;
+    let def = state
+        .catalog
+        .table(&key.0)?
+        .vector_indexes
+        .iter()
+        .find(|def| def.column == key.1)?
+        .clone();
+    let live = index.live_labels_of(&files)?;
+    let bytes_read = index
+        .mapped_run_summaries()
+        .iter()
+        .filter(|run| files.contains(&run.file))
+        .map(|run| run.bytes)
+        .sum();
+    Some(VectorMergePlan {
+        key,
+        def,
+        selected: files.into_iter().zip(live).collect(),
+        bytes_read,
+        estimate_bytes,
+        snapshot_version: state.committed_version,
+    })
+}
+
+/// Rebuild the planned runs into one durable graph without holding any lock.
+/// Returns the new run's path and mapping, or `None` when no live vector
+/// remained (the old runs are then simply dropped).
+fn build_vector_merge(
+    shared: &Arc<Shared>,
+    plan: &VectorMergePlan,
+) -> Result<Option<(PathBuf, VecIdx)>> {
+    // Only the memory is reserved, at the planner's estimate: a merge shares
+    // the pool with frozen heaps and never takes the maintenance exclusion,
+    // so commits scheduling a checkpoint or publication do not wait for it.
+    let pool = shared.opts.memory.maintenance_pool_bytes;
+    let reserve = plan.estimate_bytes.clamp(1, pool);
+    let _memory = shared
+        .memory_governor
+        .acquire(MemoryPool::Maintenance, reserve);
+    let hard_limit = (plan.estimate_bytes / 2)
+        .saturating_mul(3)
+        .clamp(reserve, pool);
+    let vectors_dir = shared.dir.join(VECTORS_DIR);
+    let (table, column) = (&plan.key.0, &plan.key.1);
+    let merged = match VecIdx::merge_runs_from_files(
+        &vectors_dir,
+        table,
+        column,
+        &plan.def,
+        &plan.selected,
+        hard_limit,
+    ) {
+        Ok(merged) => merged,
+        Err(error @ Error::MemoryLimit(_)) => {
+            // The estimate was too low for this data. Leave these runs alone
+            // for the rest of the process rather than rebuilding them again.
+            shared
+                .vector_merge_rejected
+                .lock()
+                .unwrap()
+                .extend(plan.selected.iter().map(|(file, _)| file.clone()));
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    if merged.total_len() == 0 {
+        return Ok(None);
+    }
+    let file = vidx_run_filename(&shared.dir, table, column);
+    let path = vectors_dir.join(&file);
+    let tmp = vectors_dir.join(format!("{file}.tmp"));
+    if let Err(error) = merged.dump_file(&tmp, table, column, &plan.def, plan.snapshot_version) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    fs::rename(&tmp, &path)?;
+    fsync_dir(&vectors_dir)?;
+    let (loaded, version) = match VecIdx::load_mmap_file(&path, table, column, &plan.def) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+    };
+    if version != plan.snapshot_version {
+        let _ = fs::remove_file(&path);
+        return Err(Error::Corrupt(
+            "merged vector run has the wrong generation".into(),
+        ));
+    }
+    Ok(Some((path, loaded)))
+}
+
+/// Swap the planned runs for the merged graph and republish the manifest.
+/// Returns `false` when the index's run set changed since the plan.
+fn publish_vector_merge(
+    shared: &Arc<Shared>,
+    plan: &VectorMergePlan,
+    built: Option<(PathBuf, VecIdx)>,
+) -> Result<bool> {
+    let (new_path, merged) = match built {
+        Some((path, merged)) => (Some(path), Some(merged)),
+        None => (None, None),
+    };
+    let files: Vec<String> = plan.selected.iter().map(|(file, _)| file.clone()).collect();
+    let _publication = shared.derived_manifest_publication.lock().unwrap();
+    // Held while the manifest is written, so this replacement can never
+    // overtake a compaction rebuild that replaced the whole run set.
+    let _commit = shared.commit.lock();
+    let manifest = {
+        let mut state = shared.state.write().unwrap();
+        let replaced = state
+            .vector
+            .get_mut(&plan.key)
+            .is_some_and(|index| index.replace_mapped_runs(&files, merged));
+        if !replaced {
+            drop(state);
+            if let Some(path) = new_path {
+                let _ = fs::remove_file(path);
+            }
+            return Ok(false);
+        }
+        state.vector.get(&plan.key).and_then(|index| {
+            index.durable_generation.and_then(|generation| {
+                vector_manifest_for(&plan.key.0, &plan.key.1, generation, index)
+            })
+        })
+    };
+    if let Some(manifest) = manifest {
+        manifest.publish(&vidx_manifest_path(&shared.dir, &plan.key.0, &plan.key.1))?;
+    }
+    let vectors_dir = shared.dir.join(VECTORS_DIR);
+    for file in &files {
+        let _ = fs::remove_file(vectors_dir.join(file));
+    }
+    Ok(true)
+}
+
+/// One background merge: plan under the state lock, rebuild without it,
+/// publish under the commit mutex. `Ok(false)` means nothing was merged.
+fn merge_one_vector_run_group(shared: &Arc<Shared>) -> Result<bool> {
+    let started = Instant::now();
+    let Some(plan) = plan_vector_merge(shared) else {
+        return Ok(false);
+    };
+    let built = build_vector_merge(shared, &plan)?;
+    let bytes_written = built
+        .as_ref()
+        .and_then(|(path, _)| fs::metadata(path).ok())
+        .map_or(0, |metadata| metadata.len());
+    if !publish_vector_merge(shared, &plan, built)? {
+        return Ok(false);
+    }
+    shared
+        .vector_run_merge_count
+        .fetch_add(1, AtomicOrdering::Relaxed);
+    shared.vector_run_merge_nanos.fetch_add(
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        AtomicOrdering::Relaxed,
+    );
+    shared
+        .vector_run_merge_bytes_read
+        .fetch_add(plan.bytes_read, AtomicOrdering::Relaxed);
+    shared
+        .vector_run_merge_bytes_written
+        .fetch_add(bytes_written, AtomicOrdering::Relaxed);
+    Ok(true)
+}
+
+/// Remove every file of a dropped vector index.
+fn remove_vector_index_files(dir: &Path, table: &str, column: &str) {
+    let stem = vidx_stem(dir, table, column);
+    let _ = fs::remove_file(vidx_manifest_path(dir, table, column));
+    let _ = fs::remove_file(vidx_path(dir, table, column));
+    let Ok(entries) = fs::read_dir(dir.join(VECTORS_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.ends_with(".vidx.run") && vidx_file_stem(name) == stem)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Map the durable run set described by the index's manifest. Returns the
+/// assembled index with the generations of its oldest run and of the
+/// manifest, or `None` when anything is missing or inconsistent, in which
+/// case the caller falls back to the legacy base file or a rebuild.
+fn load_vector_run_set(
+    dir: &Path,
+    table: &str,
+    def: &VectorIndexDef,
+    committed_version: u64,
+) -> Option<(VecIdx, u64, u64)> {
+    let manifest = DerivedRunManifest::load_at_most(
+        &vidx_manifest_path(dir, table, &def.column),
+        DerivedRunKind::Vector,
+        table,
+        &def.column,
+        committed_version,
+    )
+    .ok()?;
+    let first = manifest.runs.first()?;
+    let vectors_dir = dir.join(VECTORS_DIR);
+    let mut runs = Vec::with_capacity(manifest.runs.len());
+    let mut previous = 0u64;
+    for meta in &manifest.runs {
+        // A merged run is stamped with the commit version of its snapshot,
+        // which can exceed the manifest generation; only a run from a
+        // rolled-back future is rejected.
+        if meta.generation < previous || meta.generation > committed_version {
+            return None;
+        }
+        previous = meta.generation;
+        let (run, version) =
+            VecIdx::load_mmap_file(&vectors_dir.join(&meta.file), table, &def.column, def).ok()?;
+        if version != meta.generation {
+            return None;
+        }
+        runs.push(run);
+    }
+    let mut index = VecIdx::from_mapped_runs(def, runs);
+    index.durable_generation = Some(manifest.generation);
+    Some((index, first.generation, manifest.generation))
+}
+
 /// On open: load each persisted graph if valid, catching up incrementally
 /// with everything committed after the dump; otherwise rebuild from scratch.
 #[allow(clippy::too_many_arguments)]
@@ -11490,32 +12307,51 @@ fn load_or_build_vector_indexes(
     let mut out: HashMap<(String, String), VecIdx> = HashMap::new();
     for table in &catalog.tables {
         for def in &table.vector_indexes {
-            let loaded = File::open(vidx_path(dir, &table.name, &def.column))
-                .ok()
-                .and_then(|file| {
-                    // SAFETY: the dump is immutable while this process owns the
-                    // database lock; writers publish a different temp inode and
-                    // rename it only after the map has been dropped.
-                    unsafe { MmapOptions::new().map(&file) }.ok()
-                })
-                .and_then(|bytes| {
+            let schema_epoch = table.epoch;
+            // Preferred: the complete durable run set from the manifest.
+            // Fallback: the legacy single base file. Either way, everything
+            // committed after the loaded generation is replayed below.
+            let loaded =
+                load_vector_run_set(dir, &table.name, def, committed_version).or_else(|| {
+                    let path = vidx_path(dir, &table.name, &def.column);
+                    let file = File::open(&path).ok()?;
+                    // SAFETY: the dump is immutable while this process owns
+                    // the database lock; writers publish a different temp
+                    // inode and rename it only after the map has been dropped.
+                    let bytes = unsafe { MmapOptions::new().map(&file) }.ok()?;
                     let is_mmap_format = bytes
                         .get(8..12)
                         .is_some_and(|format| format == 4u32.to_le_bytes());
-                    if is_mmap_format {
-                        VecIdx::load_mmap(bytes, &table.name, &def.column, def).ok()
+                    let (mut vidx, dump_version) = if is_mmap_format {
+                        drop(bytes);
+                        VecIdx::load_mmap_file(&path, &table.name, &def.column, def).ok()?
                     } else {
-                        VecIdx::load_bytes(&bytes, &table.name, &def.column, def).ok()
-                    }
+                        VecIdx::load_bytes(&bytes, &table.name, &def.column, def).ok()?
+                    };
+                    vidx.durable_generation = Some(dump_version);
+                    // A dump "from the future" can exist after a manifest.prev
+                    // rollback; it must be discarded, not caught up.
+                    (dump_version <= committed_version).then_some((
+                        vidx,
+                        dump_version,
+                        dump_version,
+                    ))
                 });
             let vidx = match loaded {
-                // A dump "from the future" can exist after a manifest.prev
-                // rollback; it must be discarded, not caught up.
-                Some((mut vidx, dump_version)) if dump_version <= committed_version => {
+                Some((mut vidx, floor, ceiling)) => {
+                    if !read_only {
+                        cleanup_vector_run_orphans(dir, &table.name, &def.column, &vidx);
+                    }
                     catch_up_vector_index(
                         blobs,
                         &mut vidx,
-                        dump_version,
+                        VectorCatchUp {
+                            floor,
+                            ceiling,
+                            committed_version,
+                            schema_epoch,
+                            read_only,
+                        },
                         &table.name,
                         def,
                         index,
@@ -11525,7 +12361,7 @@ fn load_or_build_vector_indexes(
                     )?;
                     vidx
                 }
-                _ => {
+                None => {
                     let resident = build_one_vector_index(
                         blobs,
                         &table.name,
@@ -11551,15 +12387,21 @@ fn load_or_build_vector_indexes(
                         }
                         fs::rename(&tmp, &path)?;
                         fsync_dir(&dir.join(VECTORS_DIR))?;
-                        let file = File::open(&path)?;
-                        let mmap = unsafe { MmapOptions::new().map(&file) }?;
-                        let (mapped, dump_version) =
-                            VecIdx::load_mmap(mmap, &table.name, &def.column, def)?;
+                        let (mut mapped, dump_version) =
+                            VecIdx::load_mmap_file(&path, &table.name, &def.column, def)?;
                         if dump_version != committed_version {
                             return Err(Error::Corrupt(
                                 "rebuilt vector index has the wrong generation".into(),
                             ));
                         }
+                        publish_vector_manifest(
+                            dir,
+                            &table.name,
+                            &def.column,
+                            committed_version,
+                            &mut mapped,
+                        )?;
+                        cleanup_vector_run_orphans(dir, &table.name, &def.column, &mapped);
                         mapped
                     }
                 }
@@ -11581,13 +12423,28 @@ fn load_or_build_vector_indexes(
     Ok(out)
 }
 
-/// Re-apply everything committed after the dump: changed/deleted records,
-/// and dumped ids whose canonical data was compacted away since.
+/// Where a loaded run set stands relative to the canonical data.
+struct VectorCatchUp {
+    /// Generation of the oldest run: nothing at or below it needs a look.
+    floor: u64,
+    /// Generation the run set covers completely (the manifest generation, or
+    /// the dump version of a legacy base, in which case it equals `floor`).
+    ceiling: u64,
+    /// Version the catch-up brings the index to.
+    committed_version: u64,
+    /// Versions at or below the table epoch belong to a dropped incarnation.
+    schema_epoch: u64,
+    read_only: bool,
+}
+
+/// Re-apply everything committed after the loaded runs: changed/deleted
+/// records, records that lost their vector while the runs were written, and
+/// mapped ids whose canonical data was compacted away since.
 #[allow(clippy::too_many_arguments)]
 fn catch_up_vector_index(
     blobs: &Path,
     vidx: &mut VecIdx,
-    dump_version: u64,
+    bounds: VectorCatchUp,
     table: &str,
     def: &VectorIndexDef,
     index: &PrimaryIdx,
@@ -11595,11 +12452,33 @@ fn catch_up_vector_index(
     dir: &Path,
     budget: usize,
 ) -> Result<()> {
+    let VectorCatchUp {
+        floor,
+        ceiling,
+        committed_version,
+        schema_epoch,
+        read_only,
+    } = bounds;
+    let mut liveness = vidx.begin_liveness();
+    let mut flushed = false;
     index.visit_table(table, None, |id, versions| {
         let Some(last) = versions.last() else {
             return Ok(true);
         };
-        if last.version <= dump_version {
+        if last.version > schema_epoch && !last.is_tombstone() {
+            vidx.mark_alive(id, &mut liveness);
+        }
+        if last.version <= floor {
+            return Ok(true);
+        }
+        if last.version <= ceiling {
+            // Changed while the durable runs were being written. A vector
+            // committed at this version lives in a run at least as new as the
+            // change; otherwise the record lost its vector (or was deleted)
+            // and the copy an older run still holds must go.
+            if !vidx.mapped_holds_since(id, last.version) {
+                vidx.remove(id);
+            }
             return Ok(true);
         }
         if last.is_tombstone() {
@@ -11612,43 +12491,58 @@ fn catch_up_vector_index(
             _ => vidx.remove(id),
         }
         if vidx.delta_memory_bytes() >= budget {
+            // Runs flushed mid-walk are stamped with the version the whole
+            // catch-up reaches: every vector they hold committed at or before
+            // it, which is the invariant `mapped_holds_since` relies on.
             let run = dir
                 .join(VECTORS_DIR)
-                .join(format!("catch-up-{}.vidx.run", Ulid::new()));
-            vidx.flush_delta_mmap(&run, table, &def.column, def, last.version, true)?;
+                .join(vidx_run_filename(dir, table, &def.column));
+            vidx.flush_delta_mmap(&run, table, &def.column, def, committed_version)?;
+            flushed = true;
         }
         Ok(true)
     })?;
-    for id in vidx.ids() {
-        let alive = index
-            .latest(table, &id)?
-            .map(|entry| !entry.is_tombstone())
-            .unwrap_or(false);
-        if !alive {
-            vidx.remove(&id);
-        }
+    vidx.remove_unmarked(&liveness);
+    if flushed && !read_only {
+        // Make the replayed work durable, or the next open repeats it: flush
+        // the remainder so the runs alone cover `committed_version`.
+        let run = dir
+            .join(VECTORS_DIR)
+            .join(vidx_run_filename(dir, table, &def.column));
+        vidx.flush_delta_mmap(&run, table, &def.column, def, committed_version)?;
+        publish_vector_manifest(dir, table, &def.column, committed_version, vidx)?;
+        fsync_dir(&dir.join(VECTORS_DIR))?;
     }
     Ok(())
 }
 
-/// Remove vector dumps that no longer correspond to a cataloged index.
+/// Remove vector files (base, runs, manifests, temporaries) that no longer
+/// correspond to a cataloged index. Files of live indexes are left alone:
+/// their stale runs are pruned by `cleanup_vector_run_orphans` at points
+/// where the mapped set is known.
 fn cleanup_orphan_vidx(dir: &Path, catalog: &Catalog) {
-    let expected: HashSet<PathBuf> = catalog
+    let expected: HashSet<String> = catalog
         .tables
         .iter()
         .flat_map(|t| {
             t.vector_indexes
                 .iter()
-                .map(|d| vidx_path(dir, &t.name, &d.column))
+                .map(|d| vidx_stem(dir, &t.name, &d.column))
         })
         .collect();
     if let Ok(entries) = fs::read_dir(dir.join(VECTORS_DIR)) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            let known = expected.contains(&path);
-            let is_vidx = path.extension().is_some_and(|e| e == "vidx");
-            if !known && (is_vidx || path.extension().is_some_and(|e| e == "tmp")) {
-                let _ = fs::remove_file(&path);
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let managed = name.ends_with(".vidx")
+                || name.ends_with(".vidx.run")
+                || name.ends_with(".vidx.runs");
+            // Temporaries are only written under the commit mutex or before
+            // the workers start, so any that survive here are leftovers.
+            if name.ends_with(".tmp") || (managed && !expected.contains(vidx_file_stem(name))) {
+                let _ = fs::remove_file(entry.path());
             }
         }
     }
@@ -12997,12 +13891,12 @@ mod primary_index_tests {
         db.wait_vector_indexing().unwrap();
 
         let state = db.shared.state.read().unwrap();
-        let ids = state
+        let indexed = state
             .vector
             .get(&("docs".to_owned(), "embedding".to_owned()))
             .unwrap()
-            .ids();
-        assert!(!ids.iter().any(|id| id == "victim"));
+            .contains_id("victim");
+        assert!(!indexed);
     }
 
     #[test]
@@ -13455,5 +14349,237 @@ mod primary_index_tests {
         assert!(!pending_index.exists());
         assert!(!pending_vector.exists());
         assert!(unrelated.exists());
+    }
+
+    fn run_summary(file: &str, live: usize, nodes: usize) -> MappedRunSummary {
+        MappedRunSummary {
+            file: file.to_owned(),
+            bytes: nodes as u64 * 300,
+            nodes,
+            live,
+        }
+    }
+
+    #[test]
+    fn vector_merge_group_selection_is_size_tiered_and_budgeted() {
+        let big = usize::MAX;
+        // Four comparable small runs merge; the large base is left alone.
+        let runs = vec![
+            run_summary("base", 5_000, 5_000),
+            run_summary("a", 100, 120),
+            run_summary("b", 130, 130),
+            run_summary("c", 110, 110),
+            run_summary("d", 190, 200),
+        ];
+        let none = HashSet::new();
+        let (mut chosen, estimate) = select_vector_merge_group(&runs, big, &none).expect("group");
+        chosen.sort();
+        assert_eq!(chosen, vec!["a", "b", "c", "d"]);
+        assert_eq!(estimate, (100 + 130 + 110 + 190) * 300 * 5 / 4);
+
+        // Fewer than the fanout never merges, however small the runs.
+        assert!(select_vector_merge_group(&runs[1..4], big, &none).is_none());
+
+        // Rejected runs are invisible to the planner.
+        let rejected: HashSet<String> = ["a".to_owned()].into_iter().collect();
+        assert!(select_vector_merge_group(&runs, big, &rejected).is_none());
+
+        // A run more than twice the group's smallest member starts a new tier.
+        let tiered = vec![
+            run_summary("a", 100, 100),
+            run_summary("b", 100, 100),
+            run_summary("c", 100, 100),
+            run_summary("d", 250, 250),
+            run_summary("e", 260, 260),
+        ];
+        assert!(select_vector_merge_group(&tiered, big, &none).is_none());
+
+        // The estimate must fit the maintenance budget; a group that does not
+        // fit is trimmed to the smallest members and dropped below the fanout.
+        let budget_for_two = 2 * 100 * 300 * 5 / 4 + 1;
+        assert!(select_vector_merge_group(&runs, budget_for_two, &none).is_none());
+
+        // Runs without live vectors are garbage and merge regardless of size.
+        let garbage = vec![
+            run_summary("a", 0, 900),
+            run_summary("b", 0, 10),
+            run_summary("c", 1, 500),
+            run_summary("d", 2, 5),
+        ];
+        assert_eq!(
+            select_vector_merge_group(&garbage, big, &none).map(|(g, _)| g.len()),
+            Some(4)
+        );
+
+        // Anonymous mappings (no file) can never be merged.
+        let anonymous: Vec<_> = (0..5).map(|_| run_summary("", 10, 10)).collect();
+        assert!(select_vector_merge_group(&anonymous, big, &none).is_none());
+    }
+
+    #[test]
+    fn vector_run_merge_reflects_changes_made_while_it_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("merge.esql");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                Column::new("n", ColumnType::Int64),
+                Column::vector("embedding", 8),
+            ],
+        );
+        let vector_for = |n: usize| -> Vec<f32> {
+            (0..8)
+                .map(|d| ((n * 31 + d * 17) % 100) as f32 / 50.0 - 1.0)
+                .collect()
+        };
+        let insert_batch = |db: &Db, from: usize| {
+            for n in from..from + 40 {
+                let mut record = Record::new();
+                record.insert("id".into(), Value::Text(format!("d{n:03}")));
+                record.insert("n".into(), Value::Int64(n as i64));
+                record.insert("embedding".into(), Value::Vector(vector_for(n)));
+                db.insert("docs", record).unwrap();
+            }
+        };
+        let search = |db: &Db, q: &[f32], k: usize| -> Vec<String> {
+            db.search_vector(
+                "docs",
+                "embedding",
+                q,
+                k,
+                &VectorSearchOptions {
+                    ef_search: Some(400),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect()
+        };
+
+        // Three sessions leave a base plus two runs: below the merge fanout,
+        // so opening schedules nothing.
+        {
+            let db = Db::create(&path).unwrap();
+            db.create_table(schema).unwrap();
+            db.create_vector_index("docs", "embedding", VectorIndexOptions::default())
+                .unwrap();
+            insert_batch(&db, 0);
+        }
+        for from in [40, 80] {
+            let db = Db::open(&path).unwrap();
+            insert_batch(&db, from);
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.maintenance_stats().vector_runs, 3);
+        // Stop the maintenance worker so this test drives the merge itself.
+        *db.shared.maintenance_tx.lock().unwrap() = None;
+        for from in [120, 160] {
+            insert_batch(&db, from);
+            consolidate_derived_indexes(&db.shared).unwrap();
+        }
+        assert_eq!(db.maintenance_stats().vector_runs, 5);
+
+        let plan = plan_vector_merge(&db.shared).expect("five comparable runs merge");
+        assert_eq!(plan.selected.len(), 5);
+        let live_before: usize = plan.selected.iter().map(|(_, live)| live.len()).sum();
+        assert_eq!(live_before, 200);
+
+        // Between the plan and the publication: a delete inside an old run
+        // and an update that moves a vector out of one.
+        assert!(db.delete("docs", "d003").unwrap());
+        let far = vec![7.0; 8];
+        let mut patch = Record::new();
+        patch.insert("embedding".into(), Value::Vector(far.clone()));
+        db.update("docs", "d045", patch).unwrap();
+
+        let built = build_vector_merge(&db.shared, &plan).unwrap();
+        let new_path = built
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .expect("live vectors remain");
+        assert!(new_path.exists());
+        assert!(publish_vector_merge(&db.shared, &plan, built).unwrap());
+
+        let stats = db.maintenance_stats();
+        assert_eq!(stats.vector_runs, 1, "five runs became one");
+        let all = search(&db, &vector_for(1), 200);
+        assert_eq!(all.len(), 199, "one deleted record is gone");
+        assert!(!all.contains(&"d003".to_owned()));
+        assert_eq!(search(&db, &far, 1), vec!["d045".to_owned()]);
+        assert_ne!(search(&db, &vector_for(45), 1)[0], "d045");
+        for (file, _) in &plan.selected {
+            assert!(
+                !path.join(VECTORS_DIR).join(file).exists(),
+                "{file} removed"
+            );
+        }
+        let manifest = DerivedRunManifest::load_at_most(
+            &vidx_manifest_path(&path, "docs", "embedding"),
+            DerivedRunKind::Vector,
+            "docs",
+            "embedding",
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(manifest.runs.len(), 1);
+        assert_eq!(
+            path.join(VECTORS_DIR).join(&manifest.runs[0].file),
+            new_path
+        );
+
+        // A reopen maps the merged run plus the close flush and agrees.
+        let expected = search(&db, &vector_for(7), 10);
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(search(&db, &vector_for(7), 10), expected);
+        assert_eq!(search(&db, &far, 1), vec!["d045".to_owned()]);
+        assert!(!search(&db, &vector_for(1), 200).contains(&"d003".to_owned()));
+        assert_eq!(db.maintenance_stats().vector_runs, 2);
+    }
+
+    #[test]
+    fn frozen_leases_never_wait_for_merge_memory_but_explicit_maintenance_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("lease.esql")).unwrap();
+        let shared = db.shared.clone();
+        let pool = shared.opts.memory.maintenance_pool_bytes;
+
+        // A running merge holds half the pool as plain memory.
+        let merge_memory = shared
+            .memory_governor
+            .acquire(MemoryPool::Maintenance, pool / 2);
+
+        // A frozen heap larger than what is left is accounted immediately.
+        let started = Instant::now();
+        let frozen = acquire_frozen_lease(&shared, pool);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            shared.memory_governor.stats().maintenance_in_use_bytes > pool as u64,
+            "frozen accounting may overdraft the pool while the merge runs"
+        );
+        // The exclusion is held: a second frozen lease has to wait.
+        assert!(try_acquire_frozen_lease(&shared, 1).is_none());
+        drop(frozen);
+        assert!(try_acquire_frozen_lease(&shared, 1).is_some());
+
+        // Explicit maintenance wants the whole pool and waits for the merge.
+        let waiter_shared = shared.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let lease = Db::acquire_maintenance_memory(&waiter_shared);
+            done_tx.send(()).unwrap();
+            drop(lease);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(merge_memory);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiter.join().unwrap();
+        assert_eq!(shared.memory_governor.stats().maintenance_in_use_bytes, 0);
     }
 }

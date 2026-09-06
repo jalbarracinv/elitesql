@@ -25,15 +25,15 @@
 <line class="grid" x1="88" y1="450.0" x2="884" y2="450.0" />
 <text class="tick" x="76" y="454.0" text-anchor="end">0.00 ms</text>
 <line class="grid" x1="88" y1="376.4" x2="884" y2="376.4" />
-<text class="tick" x="76" y="380.4" text-anchor="end">0.07 ms</text>
+<text class="tick" x="76" y="380.4" text-anchor="end">0.06 ms</text>
 <line class="grid" x1="88" y1="302.8" x2="884" y2="302.8" />
-<text class="tick" x="76" y="306.8" text-anchor="end">0.14 ms</text>
+<text class="tick" x="76" y="306.8" text-anchor="end">0.13 ms</text>
 <line class="grid" x1="88" y1="229.2" x2="884" y2="229.2" />
-<text class="tick" x="76" y="233.2" text-anchor="end">0.21 ms</text>
+<text class="tick" x="76" y="233.2" text-anchor="end">0.19 ms</text>
 <line class="grid" x1="88" y1="155.6" x2="884" y2="155.6" />
-<text class="tick" x="76" y="159.6" text-anchor="end">0.28 ms</text>
+<text class="tick" x="76" y="159.6" text-anchor="end">0.26 ms</text>
 <line class="grid" x1="88" y1="82.0" x2="884" y2="82.0" />
-<text class="tick" x="76" y="86.0" text-anchor="end">0.35 ms</text>
+<text class="tick" x="76" y="86.0" text-anchor="end">0.32 ms</text>
 <line class="axis" x1="88" y1="82" x2="88" y2="450" />
 <line class="axis" x1="88" y1="450" x2="884" y2="450" />
 <text class="axis-label" x="486.0" y="502" text-anchor="middle">Concurrent writers</text>
@@ -43,28 +43,28 @@
 <text class="tick" x="486.0" y="475" text-anchor="middle">4</text>
 <text class="tick" x="685.0" y="475" text-anchor="middle">8</text>
 <text class="tick" x="884.0" y="475" text-anchor="middle">16</text>
-<polyline class="series" stroke="#c99700" points="88.0,433.4 287.0,413.4 486.0,360.4 685.0,295.2 884.0,138.1" />
-<circle class="point" fill="#c99700" cx="88.0" cy="433.4" r="5" />
-<text class="value" x="100.0" y="420.4" text-anchor="start">0.02 ms</text>
-<circle class="point" fill="#c99700" cx="287.0" cy="413.4" r="5" />
-<text class="value" x="287.0" y="400.4" text-anchor="middle">0.03 ms</text>
-<circle class="point" fill="#c99700" cx="486.0" cy="360.4" r="5" />
-<text class="value" x="486.0" y="347.4" text-anchor="middle">0.09 ms</text>
-<circle class="point" fill="#c99700" cx="685.0" cy="295.2" r="5" />
-<text class="value" x="685.0" y="282.2" text-anchor="middle">0.15 ms</text>
+<polyline class="series" stroke="#c99700" points="88.0,432.1 287.0,409.8 486.0,356.0 685.0,298.4 884.0,138.1" />
+<circle class="point" fill="#c99700" cx="88.0" cy="432.1" r="5" />
+<text class="value" x="100.0" y="419.1" text-anchor="start">0.02 ms</text>
+<circle class="point" fill="#c99700" cx="287.0" cy="409.8" r="5" />
+<text class="value" x="287.0" y="396.8" text-anchor="middle">0.03 ms</text>
+<circle class="point" fill="#c99700" cx="486.0" cy="356.0" r="5" />
+<text class="value" x="486.0" y="343.0" text-anchor="middle">0.08 ms</text>
+<circle class="point" fill="#c99700" cx="685.0" cy="298.4" r="5" />
+<text class="value" x="685.0" y="285.4" text-anchor="middle">0.13 ms</text>
 <circle class="point" fill="#c99700" cx="884.0" cy="138.1" r="5" />
-<text class="value" x="872.0" y="125.1" text-anchor="end">0.30 ms</text>
-<polyline class="series" stroke="#0969da" points="88.0,397.0 287.0,397.6 486.0,392.0 685.0,387.3 884.0,383.0" />
-<circle class="point" fill="#0969da" cx="88.0" cy="397.0" r="5" />
-<text class="value" x="100.0" y="419.0" text-anchor="start">0.05 ms</text>
-<circle class="point" fill="#0969da" cx="287.0" cy="397.6" r="5" />
-<text class="value" x="287.0" y="419.6" text-anchor="middle">0.05 ms</text>
-<circle class="point" fill="#0969da" cx="486.0" cy="392.0" r="5" />
-<text class="value" x="486.0" y="414.0" text-anchor="middle">0.06 ms</text>
-<circle class="point" fill="#0969da" cx="685.0" cy="387.3" r="5" />
-<text class="value" x="685.0" y="409.3" text-anchor="middle">0.06 ms</text>
-<circle class="point" fill="#0969da" cx="884.0" cy="383.0" r="5" />
-<text class="value" x="872.0" y="405.0" text-anchor="end">0.06 ms</text>
+<text class="value" x="872.0" y="125.1" text-anchor="end">0.27 ms</text>
+<polyline class="series" stroke="#0969da" points="88.0,395.1 287.0,393.6 486.0,387.3 685.0,376.0 884.0,374.0" />
+<circle class="point" fill="#0969da" cx="88.0" cy="395.1" r="5" />
+<text class="value" x="100.0" y="417.1" text-anchor="start">0.05 ms</text>
+<circle class="point" fill="#0969da" cx="287.0" cy="393.6" r="5" />
+<text class="value" x="287.0" y="415.6" text-anchor="middle">0.05 ms</text>
+<circle class="point" fill="#0969da" cx="486.0" cy="387.3" r="5" />
+<text class="value" x="486.0" y="409.3" text-anchor="middle">0.05 ms</text>
+<circle class="point" fill="#0969da" cx="685.0" cy="376.0" r="5" />
+<text class="value" x="685.0" y="398.0" text-anchor="middle">0.06 ms</text>
+<circle class="point" fill="#0969da" cx="884.0" cy="374.0" r="5" />
+<text class="value" x="872.0" y="396.0" text-anchor="end">0.07 ms</text>
 <line x1="694" y1="27" x2="719" y2="27" stroke="#c99700" stroke-width="3" />
 <text class="legend" x="728" y="31">EliteSQL</text>
 <line x1="694" y1="50" x2="719" y2="50" stroke="#0969da" stroke-width="3" />

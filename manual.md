@@ -843,7 +843,7 @@ db.create_vector_index(
 
 - `Sync` makes a vector searchable as soon as the commit returns. `Async` lets the commit return before the vector enters the graph — faster bulk loading, at the cost of a short window where it is not yet searchable. Call `db.wait_vector_indexing()` to close that window (after a bulk load, before searching).
 - `metric` is fixed when the index is created: to change it, drop the index and create it again.
-- The graph is a **derived** structure: it is persisted for fast opens, but always rebuildable from the records — it is rebuilt on compaction, and after a crash if its dump is unusable. Losing it never loses data.
+- The graph is a **derived** structure: it is persisted for fast opens (the base graph plus every immutable run published while the database ran, listed in a small run manifest), but always rebuildable from the records — it is rebuilt on compaction, and after a crash if its files are unusable. Losing it never loses data. The maintenance worker merges comparably sized runs in the background so a long-lived index searches a few runs, not one per publication; `db.wait_for_vector_run_merge()` blocks until the currently eligible merges have published, and `maintenance_stats()` reports `vector_runs`, `vector_run_merges` and `vector_run_metadata_bytes`.
 - `db.drop_vector_index("docs", "embedding")` removes the index and its persisted graph; the column and its vectors stay.
 
 ### From the bindings

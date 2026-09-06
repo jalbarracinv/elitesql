@@ -1,7 +1,7 @@
 //! Phase 2.5: aggregates (COUNT/SUM/AVG/MIN/MAX), GROUP BY and HAVING,
 //! including SQL NULL semantics.
 
-use elitesql_core::{Db, Error, QueryOutput, Value};
+use elitesql_core::{Db, DbOptions, Error, QueryOutput, Record, Value};
 use tempfile::TempDir;
 
 fn seeded() -> (TempDir, Db) {
@@ -279,4 +279,130 @@ fn sum_overflow_is_an_error_not_a_wrap() {
     .unwrap();
     let err = db.query("SELECT sum(n) FROM t").unwrap_err();
     assert!(err.to_string().contains("overflow"), "{err}");
+}
+
+// --- Hash aggregation and its bounded fallback ------------------------------------
+
+/// The same 3,000-row dataset in a database with the given per-query budget.
+/// A budget too small for the group table forces the external sort-merge
+/// fallback, so both strategies can be compared row for row.
+fn grouped_dataset(query_working_bytes: usize) -> (TempDir, Db) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = DbOptions::default();
+    options.memory.query_working_bytes = query_working_bytes;
+    let db = Db::create_with(dir.path().join("agg.esql"), options).unwrap();
+    db.query("CREATE TABLE sales (region text NOT NULL, rep text, amount int64, score float64)")
+        .unwrap();
+    let mut txn = db.begin();
+    for i in 0..3_000usize {
+        let mut record = Record::new();
+        record.insert("region".into(), Value::Text(format!("r{:03}", i % 700)));
+        if i % 11 != 0 {
+            record.insert("rep".into(), Value::Text(format!("p{:02}", i % 37)));
+        }
+        record.insert("amount".into(), Value::Int64(((i * 7_919) % 1_000) as i64));
+        if i % 5 != 0 {
+            record.insert("score".into(), Value::Float64((i % 13) as f64 / 2.0));
+        }
+        txn.insert("sales", record).unwrap();
+    }
+    txn.commit().unwrap();
+    (dir, db)
+}
+
+const GROUPED_QUERIES: [&str; 5] = [
+    "SELECT region, count(*), count(rep), sum(amount), avg(score), min(rep), max(amount) \
+     FROM sales GROUP BY region",
+    "SELECT region, count(distinct rep) AS reps, sum(amount) AS total FROM sales \
+     GROUP BY region HAVING count(*) > 3 ORDER BY reps DESC, region LIMIT 50 OFFSET 5",
+    "SELECT rep, count(*) AS n, avg(amount) FROM sales WHERE amount > 500 GROUP BY rep ORDER BY rep",
+    "SELECT region, rep, count(*) FROM sales GROUP BY region, rep",
+    "SELECT rep FROM sales GROUP BY rep",
+];
+
+#[test]
+fn hash_aggregation_and_sort_fallback_agree_row_for_row() {
+    let (_default_dir, hashed) = grouped_dataset(16 * 1024 * 1024);
+    // 8 KiB cannot hold 700 groups, so every grouped query below abandons
+    // the hash table and re-runs as a spilling sort-merge.
+    let (_tiny_dir, sorted) = grouped_dataset(8 * 1024);
+    for sql in GROUPED_QUERIES {
+        let (hashed_columns, hashed_rows) = rows(hashed.query(sql).unwrap());
+        let (sorted_columns, sorted_rows) = rows(sorted.query(sql).unwrap());
+        assert_eq!(hashed_columns, sorted_columns, "{sql}");
+        assert_eq!(hashed_rows, sorted_rows, "{sql}");
+    }
+}
+
+#[test]
+fn hash_aggregation_counts_match_an_independent_tally() {
+    let (_dir, db) = grouped_dataset(16 * 1024 * 1024);
+    let mut expected: std::collections::BTreeMap<String, (i64, i64)> =
+        std::collections::BTreeMap::new();
+    for i in 0..3_000usize {
+        let entry = expected.entry(format!("r{:03}", i % 700)).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += ((i * 7_919) % 1_000) as i64;
+    }
+    let (_, result) = rows(
+        db.query("SELECT region, count(*), sum(amount) FROM sales GROUP BY region ORDER BY region")
+            .unwrap(),
+    );
+    assert_eq!(result.len(), 700);
+    for (row, (region, (count, total))) in result.iter().zip(&expected) {
+        assert_eq!(row[0], Value::Text(region.clone()));
+        assert_eq!(row[1], Value::Int64(*count));
+        assert_eq!(row[2], Value::Int64(*total));
+    }
+
+    // Groups come out in first-seen order without ORDER BY, like the sort path.
+    let (_, unordered) = rows(
+        db.query("SELECT region FROM sales GROUP BY region LIMIT 3")
+            .unwrap(),
+    );
+    assert_eq!(
+        unordered,
+        vec![
+            vec![Value::Text("r000".into())],
+            vec![Value::Text("r001".into())],
+            vec![Value::Text("r002".into())],
+        ]
+    );
+}
+
+#[test]
+fn count_distinct_per_group_respects_the_budget_fallback() {
+    // COUNT(DISTINCT) keeps one set per group; the tiny budget must still
+    // produce exact counts through the fallback.
+    for budget in [16 * 1024 * 1024, 8 * 1024] {
+        let (_dir, db) = grouped_dataset(budget);
+        let (_, result) = rows(
+            db.query(
+                "SELECT rep, count(distinct region) AS regions, count(distinct amount) AS amounts \
+                 FROM sales GROUP BY rep ORDER BY rep",
+            )
+            .unwrap(),
+        );
+        assert_eq!(result.len(), 38, "37 reps plus the NULL group");
+        for row in &result {
+            let Value::Int64(regions) = row[1] else {
+                panic!("count is an integer");
+            };
+            let Value::Int64(amounts) = row[2] else {
+                panic!("count is an integer");
+            };
+            assert!(regions > 0 && amounts > 0);
+        }
+        // The NULL rep group holds every row where i % 11 == 0 (273 rows).
+        let null_group = result
+            .iter()
+            .find(|row| row[0].is_null())
+            .expect("NULL group present");
+        let (_, null_count) = rows(
+            db.query("SELECT count(*) FROM sales WHERE rep IS NULL")
+                .unwrap(),
+        );
+        assert_eq!(null_count[0][0], Value::Int64(273));
+        assert!(matches!(null_group[1], Value::Int64(n) if n <= 273));
+    }
 }

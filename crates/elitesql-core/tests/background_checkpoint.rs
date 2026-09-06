@@ -45,9 +45,12 @@ fn indexed_frozen_memtable_stays_queryable_while_wal_tail_keeps_growing() {
         initial.commit().unwrap();
 
         let memory = db.global_memory_stats();
-        assert_eq!(
-            memory.maintenance_in_use_bytes, memory.maintenance_capacity_bytes,
-            "the frozen generation owns the bounded maintenance reservation"
+        assert!(
+            memory.maintenance_in_use_bytes >= 3_000 * 1024
+                && memory.maintenance_in_use_bytes <= memory.maintenance_capacity_bytes,
+            "the frozen generation is accounted to the maintenance pool at its own size: {} of {}",
+            memory.maintenance_in_use_bytes,
+            memory.maintenance_capacity_bytes
         );
         assert_eq!(
             db.get("events", "e-00042").unwrap().unwrap()["generation"],

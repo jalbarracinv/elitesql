@@ -106,13 +106,17 @@ impl MemoryGovernor {
         }
     }
 
-    pub(crate) fn try_acquire(
+    /// Account `bytes` that already exist without waiting for room. A frozen
+    /// heap moving out of the index-delta pool is real memory whether or not
+    /// the maintenance pool has capacity left, so blocking here would only
+    /// delay the consolidation that frees it. `used` may exceed the capacity
+    /// until the permit drops; blocking reservations wait for that.
+    pub(crate) fn acquire_unbounded(
         self: &Arc<Self>,
         pool: MemoryPool,
         bytes: usize,
-    ) -> Option<MemoryPermit> {
-        let capacity = self.capacity(pool);
-        debug_assert!(bytes <= capacity, "validated reservation exceeds its pool");
+    ) -> MemoryPermit {
+        let bytes = bytes.min(self.capacity(pool));
         let mut state = self
             .state
             .lock()
@@ -121,16 +125,13 @@ impl MemoryGovernor {
             MemoryPool::Query => &mut state.query,
             MemoryPool::Maintenance => &mut state.maintenance,
         };
-        if target.used.saturating_add(bytes) > capacity {
-            return None;
-        }
-        target.used += bytes;
+        target.used = target.used.saturating_add(bytes);
         target.peak = target.peak.max(target.used);
-        Some(MemoryPermit {
+        MemoryPermit {
             governor: self.clone(),
             pool,
             bytes,
-        })
+        }
     }
 
     pub(crate) fn index_would_exceed(&self, additional: usize) -> bool {
