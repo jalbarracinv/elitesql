@@ -32,8 +32,13 @@ pub(crate) struct Manifest {
     /// Commits above this watermark live in the WAL and are replayed on open.
     pub committed_version: u64,
     pub segments: Vec<SegmentMeta>,
-    /// Active WAL file id. WAL files with a different id are obsolete.
+    /// First WAL needed after the segment watermark.
     pub wal_id: u32,
+    /// Last WAL durably reserved before switching writers. Older manifests
+    /// discover successors by directory enumeration, but new rotations make
+    /// their required extent explicit so a missing final WAL is detectable.
+    #[serde(default)]
+    pub required_wal_id: u32,
     /// Highest durable integer identity allocated per table. A default keeps
     /// manifests written before identity support readable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -59,6 +64,7 @@ impl Manifest {
             committed_version: 0,
             segments: Vec::new(),
             wal_id: 1,
+            required_wal_id: 1,
             identity_high_water: BTreeMap::new(),
             catalog: Some(Catalog::new()),
         }
@@ -96,6 +102,15 @@ impl Manifest {
         }
         if let Some(catalog) = &manifest.catalog {
             catalog.validate()?;
+        }
+        if manifest
+            .identity_high_water
+            .values()
+            .any(|value| *value < 0)
+        {
+            return Err(Error::Corrupt(
+                "manifest contains a negative identity high-water mark".into(),
+            ));
         }
         Ok(manifest)
     }

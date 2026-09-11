@@ -1,0 +1,40 @@
+{
+  "name": "sql-r2",
+  "bench": "sql",
+  "argv": [
+    "/Users/jalbarracin/Code/elitesql/target/release/deps/sql-d6408bc5e812114d",
+    "--bench",
+    "--save-baseline",
+    "refresh-refresh-2026-09-11-sql-r2"
+  ],
+  "criterion_baseline": "refresh-refresh-2026-09-11-sql-r2",
+  "repetition": 2,
+  "before": {
+    "utc": "2026-09-11T10:08:02Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "returncode": 0,
+  "wall_seconds": 78.40259954199428,
+  "after": {
+    "utc": "2026-09-11T10:09:20Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  }
+}

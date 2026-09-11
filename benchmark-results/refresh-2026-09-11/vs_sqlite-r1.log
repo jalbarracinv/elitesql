@@ -1,0 +1,32 @@
+insert_1k_rows/elitesql time:   [11.603 ms 11.758 ms 11.938 ms]
+                        thrpt:  [83.765 Kelem/s 85.050 Kelem/s 86.184 Kelem/s]
+insert_1k_rows/elitesql_single_txn
+                        time:   [2.1643 ms 2.3752 ms 2.5240 ms]
+                        thrpt:  [396.19 Kelem/s 421.01 Kelem/s 462.04 Kelem/s]
+insert_1k_rows/sqlite_autocommit
+                        time:   [8.2223 ms 8.2479 ms 8.2860 ms]
+                        thrpt:  [120.69 Kelem/s 121.24 Kelem/s 121.62 Kelem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+insert_1k_rows/sqlite_single_txn
+                        time:   [623.53 µs 627.34 µs 631.76 µs]
+                        thrpt:  [1.5829 Melem/s 1.5940 Melem/s 1.6038 Melem/s]
+insert_1k_rows/elitesql_single_txn_steady
+                        time:   [747.96 µs 864.74 µs 929.02 µs]
+                        thrpt:  [1.0764 Melem/s 1.1564 Melem/s 1.3370 Melem/s]
+insert_1k_rows/elitesql_single_txn_explicit_steady
+                        time:   [880.50 µs 1.0247 ms 1.1194 ms]
+                        thrpt:  [893.32 Kelem/s 975.88 Kelem/s 1.1357 Melem/s]
+insert_1k_rows/sqlite_single_txn_steady
+                        time:   [709.78 µs 726.90 µs 751.91 µs]
+                        thrpt:  [1.3299 Melem/s 1.3757 Melem/s 1.4089 Melem/s]
+
+get_by_id/elitesql      time:   [326.15 ns 326.59 ns 327.08 ns]
+Found 3 outliers among 30 measurements (10.00%)
+  2 (6.67%) low mild
+  1 (3.33%) high severe
+get_by_id/sqlite        time:   [1.4057 µs 1.4249 µs 1.4451 µs]
+Found 5 outliers among 30 measurements (16.67%)
+  3 (10.00%) high mild
+  2 (6.67%) high severe
+

@@ -1,3 +1,11 @@
+mod commit;
+mod maintenance;
+mod reads;
+use commit::*;
+use maintenance::*;
+pub(crate) use reads::json_heap_bytes;
+use reads::*;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -134,6 +142,8 @@ pub struct MemoryOptions {
     /// governor admits only as many simultaneous reservations as fit in
     /// `query_pool_bytes`.
     pub query_working_bytes: usize,
+    /// Maximum wait for a query memory reservation before returning MemoryLimit.
+    pub query_admission_timeout_ms: u64,
     /// Maximum retained estimate for WAL/primary and derived-index deltas.
     /// Crossing the threshold consolidates mutable state into mmap bases.
     pub index_delta_pool_bytes: usize,
@@ -160,6 +170,7 @@ impl MemoryOptions {
             total_memory_bytes: 512 * 1024 * 1024,
             query_pool_bytes: 64 * 1024 * 1024,
             query_working_bytes: 16 * 1024 * 1024,
+            query_admission_timeout_ms: 5_000,
             index_delta_pool_bytes: 192 * 1024 * 1024,
             maintenance_pool_bytes: 192 * 1024 * 1024,
             reserved_memory_bytes: 8 * 1024 * 1024,
@@ -234,6 +245,7 @@ impl Default for MemoryOptions {
             total_memory_bytes: 384 * 1024 * 1024,
             query_pool_bytes: 64 * 1024 * 1024,
             query_working_bytes: 16 * 1024 * 1024,
+            query_admission_timeout_ms: 5_000,
             index_delta_pool_bytes: 128 * 1024 * 1024,
             maintenance_pool_bytes: 128 * 1024 * 1024,
             reserved_memory_bytes: 8 * 1024 * 1024,
@@ -372,10 +384,25 @@ pub struct MaintenanceStats {
     pub commit_prepare_time: Duration,
     /// Conflict/constraint validation performed while serialization is held.
     pub commit_locked_prepare_time: Duration,
+    /// Transaction preparation excluding record/WAL encoding and validation.
+    /// Together with the other `commit_phase_*` counters this is an
+    /// intentionally non-overlapping decomposition of commit work.
+    pub commit_phase_prepare_time: Duration,
+    /// Canonical row-payload encoding performed before WAL publication.
+    pub commit_phase_record_encode_time: Duration,
+    /// WAL frame construction and version/CRC patching, excluding append.
+    pub commit_phase_wal_encode_time: Duration,
+    /// Conflict, schema, uniqueness, foreign-key and identity validation.
+    pub commit_phase_validation_time: Duration,
     /// WAL encoding and append time (including the configured durability sync).
     pub commit_wal_time: Duration,
     /// Version patching and WAL append, excluding group-sync wait.
     pub commit_wal_append_time: Duration,
+    /// Logical bytes appended to WAL files by successful commit writes.
+    pub wal_appended_bytes: u64,
+    /// Per-commit wait for its required durability barrier. Unlike
+    /// `wal_sync_time`, followers waiting on a group barrier are represented.
+    pub commit_phase_sync_wait_time: Duration,
     /// Physical WAL sync calls. In Safe/Balanced modes this may be lower than
     /// `commits` because concurrent commits share one group sync.
     pub wal_syncs: u64,
@@ -401,6 +428,8 @@ pub struct MaintenanceStats {
     pub point_read_throttles: u64,
     /// In-memory publication to primary and derived mutable indexes.
     pub commit_apply_time: Duration,
+    /// Time spent waiting for or scheduling maintenance from the commit path.
+    pub commit_phase_maintenance_wait_time: Duration,
     pub checkpoints: u64,
     pub checkpoint_time: Duration,
     pub automatic_compactions: u64,
@@ -453,9 +482,53 @@ pub struct MaintenanceStats {
 
 /// Where one committed record version lives.
 #[derive(Debug, Clone)]
+struct MemPayload {
+    /// All canonical row payloads produced by one transaction. Sharing this
+    /// allocation removes one heap buffer and one Arc allocation per row.
+    bytes: Arc<Vec<u8>>,
+    start: u32,
+    len: u32,
+}
+
+impl MemPayload {
+    fn whole(bytes: Arc<Vec<u8>>) -> Self {
+        Self {
+            len: u32::try_from(bytes.len()).expect("record payload is bounded by the WAL format"),
+            bytes,
+            start: 0,
+        }
+    }
+
+    fn from_range(bytes: Arc<Vec<u8>>, range: (u32, u32)) -> Self {
+        Self {
+            bytes,
+            start: range.0,
+            len: range.1,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        let start = self.start as usize;
+        &self.bytes[start..start + self.len as usize]
+    }
+
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
+impl Deref for MemPayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+#[derive(Debug, Clone)]
 enum VKind {
     /// Committed via WAL, not yet checkpointed into a segment.
-    MemPut(Arc<Vec<u8>>),
+    MemPut(MemPayload),
     SegPut {
         segment: u32,
         payload_offset: u64,
@@ -483,14 +556,129 @@ impl VersionEntry {
 struct PrimaryIdx {
     generation: u64,
     runs: Vec<PrimaryRun>,
-    delta: HashMap<String, BTreeMap<String, Vec<VersionEntry>>>,
+    delta: PrimaryDelta,
     /// Immutable resident generation currently being written by the
     /// background checkpoint thread. Readers merge it with the new active
     /// delta until canonical publication replaces it with an mmap run.
     frozen: Option<FrozenPrimary>,
 }
 
-type PrimaryDelta = HashMap<String, BTreeMap<String, Vec<VersionEntry>>>;
+type VersionList = Vec<VersionEntry>;
+type PrimaryDelta = HashMap<String, PrimaryTableDelta>;
+
+/// An append-oriented in-memory primary run. Monotonic ids stay contiguous;
+/// the first out-of-order id converts once to the fully general tree.
+#[derive(Default)]
+struct PrimaryTableDelta {
+    monotonic: Vec<(String, VersionList)>,
+    general: Option<BTreeMap<String, VersionList>>,
+}
+
+impl PrimaryTableDelta {
+    fn get(&self, id: &str) -> Option<&VersionList> {
+        if let Some(general) = &self.general {
+            return general.get(id);
+        }
+        self.monotonic
+            .binary_search_by(|(candidate, _)| candidate.as_str().cmp(id))
+            .ok()
+            .map(|index| &self.monotonic[index].1)
+    }
+
+    fn get_mut(&mut self, id: &str) -> Option<&mut VersionList> {
+        if let Some(general) = &mut self.general {
+            return general.get_mut(id);
+        }
+        self.monotonic
+            .binary_search_by(|(candidate, _)| candidate.as_str().cmp(id))
+            .ok()
+            .map(|index| &mut self.monotonic[index].1)
+    }
+
+    fn make_general(&mut self) -> &mut BTreeMap<String, VersionList> {
+        if self.general.is_none() {
+            self.general = Some(self.monotonic.drain(..).collect());
+        }
+        self.general
+            .as_mut()
+            .expect("general primary delta initialized")
+    }
+
+    fn push(&mut self, id: String, entry: VersionEntry) {
+        if let Some(general) = &mut self.general {
+            general.entry(id).or_default().push(entry);
+            return;
+        }
+        match self
+            .monotonic
+            .last_mut()
+            .map(|(last, versions)| (last.as_str().cmp(id.as_str()), versions))
+        {
+            None => self.monotonic.push((id, vec![entry])),
+            Some((std::cmp::Ordering::Less, _)) => {
+                self.monotonic.push((id, vec![entry]));
+            }
+            Some((std::cmp::Ordering::Equal, versions)) => versions.push(entry),
+            Some((std::cmp::Ordering::Greater, _)) => {
+                self.make_general().entry(id).or_default().push(entry);
+            }
+        }
+    }
+
+    fn merge_versions(&mut self, id: String, versions: &VersionList) {
+        if self.get(&id).is_none() {
+            for version in versions {
+                self.push(id.clone(), version.clone());
+            }
+            return;
+        }
+        let merged = self.get_mut(&id).expect("checked above");
+        merged.extend(versions.iter().cloned());
+        merged.sort_unstable_by_key(|entry| entry.version);
+        merged.dedup_by_key(|entry| entry.version);
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = (&String, &VersionList)> + '_> {
+        match &self.general {
+            Some(general) => Box::new(general.iter()),
+            None => Box::new(self.monotonic.iter().map(|(id, versions)| (id, versions))),
+        }
+    }
+
+    fn keys(&self) -> Box<dyn Iterator<Item = &String> + '_> {
+        Box::new(self.iter().map(|(id, _)| id))
+    }
+
+    fn values(&self) -> Box<dyn Iterator<Item = &VersionList> + '_> {
+        Box::new(self.iter().map(|(_, versions)| versions))
+    }
+
+    fn contains_key(&self, id: &str) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn range_after<'a>(
+        &'a self,
+        after: Option<&str>,
+    ) -> Box<dyn Iterator<Item = (&'a String, &'a VersionList)> + 'a> {
+        if let Some(general) = &self.general {
+            use std::ops::Bound::{Excluded, Unbounded};
+            return match after {
+                Some(after) => Box::new(general.range::<str, _>((Excluded(after), Unbounded))),
+                None => Box::new(general.iter()),
+            };
+        }
+        let start = after.map_or(0, |after| {
+            self.monotonic
+                .partition_point(|(id, _)| id.as_str() <= after)
+        });
+        Box::new(
+            self.monotonic[start..]
+                .iter()
+                .map(|(id, versions)| (id, versions)),
+        )
+    }
+}
 
 struct FrozenPrimary {
     version: u64,
@@ -512,7 +700,7 @@ impl PrimaryIdx {
         }
     }
 
-    fn resident(delta: HashMap<String, BTreeMap<String, Vec<VersionEntry>>>) -> Self {
+    fn resident(delta: PrimaryDelta) -> Self {
         Self {
             generation: 0,
             runs: Vec::new(),
@@ -563,10 +751,10 @@ impl PrimaryIdx {
 
     fn push(&mut self, table: &str, id: String, entry: VersionEntry) {
         if let Some(ids) = self.delta.get_mut(table) {
-            ids.entry(id).or_default().push(entry);
+            ids.push(id, entry);
         } else {
-            let mut ids = BTreeMap::new();
-            ids.insert(id, vec![entry]);
+            let mut ids = PrimaryTableDelta::default();
+            ids.push(id, entry);
             self.delta.insert(table.to_owned(), ids);
         }
     }
@@ -671,8 +859,6 @@ impl PrimaryIdx {
         after_id: Option<&str>,
         mut visit: impl FnMut(&str, &[VersionEntry]) -> Result<bool>,
     ) -> Result<()> {
-        use std::ops::Bound::{Excluded, Unbounded};
-
         let prefix = primary_table_prefix(table);
         let after_key = after_id.map(|after| primary_key(table, after));
         let mut cursors: Vec<_> = self
@@ -695,16 +881,10 @@ impl PrimaryIdx {
             .as_ref()
             .and_then(|frozen| frozen.delta.get(table))
         {
-            deltas.push(match after_id {
-                Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)),
-                None => ids.range::<str, _>((Unbounded, Unbounded)),
-            });
+            deltas.push(ids.range_after(after_id));
         }
         if let Some(ids) = self.delta.get(table) {
-            deltas.push(match after_id {
-                Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)),
-                None => ids.range::<str, _>((Unbounded, Unbounded)),
-            });
+            deltas.push(ids.range_after(after_id));
         }
         let mut delta_heads: Vec<_> = deltas.iter_mut().map(Iterator::next).collect();
 
@@ -713,7 +893,15 @@ impl PrimaryIdx {
         // scan performs no heap allocation per visited record.
         let mut next_id = String::new();
         let mut versions: Vec<VersionEntry> = Vec::new();
+        let control = crate::QueryControl::current();
+        let mut visited = 0usize;
         loop {
+            if visited.is_multiple_of(256) {
+                if let Some(control) = &control {
+                    control.check()?;
+                }
+            }
+            visited = visited.wrapping_add(1);
             let run_id = heads
                 .iter()
                 .filter_map(|head| head.as_ref().map(|(id, _)| id.as_str()))
@@ -1657,6 +1845,43 @@ impl SecIdx {
         Ok(self.ids_batch(key, None, usize::MAX)?.into_iter().collect())
     }
 
+    fn contains_pair(&self, key: &[u8], id: &str) -> Result<bool> {
+        if self.removed.get(key).is_some_and(|ids| ids.contains(id)) {
+            return Ok(false);
+        }
+        if self.delta.get(key).is_some_and(|ids| ids.contains(id)) {
+            return Ok(true);
+        }
+        let mut newest = None;
+        let pair = secondary_pair_key(key, id);
+        for run in &self.runs {
+            run.index.visit_key(&pair, |encoded| {
+                let operation = decode_secondary_operation(encoded)?;
+                if newest.is_none_or(|current| operation > current) {
+                    newest = Some(operation);
+                }
+                Ok(true)
+            })?;
+        }
+        if let Some(frozen) = &self.frozen {
+            for (map, op) in [
+                (&frozen.delta, SECONDARY_ADD),
+                (&frozen.removed, SECONDARY_DELETE),
+            ] {
+                if map.get(key).is_some_and(|ids| ids.contains(id)) {
+                    let operation = (frozen.generation, op);
+                    if newest.is_none_or(|current| {
+                        operation.0 > current.0
+                            || (op == SECONDARY_DELETE && operation.0 == current.0)
+                    }) {
+                        newest = Some(operation);
+                    }
+                }
+            }
+        }
+        Ok(newest.is_some_and(|(_, op)| op == SECONDARY_ADD))
+    }
+
     /// Merge one cursor per immutable run plus the bounded mutable overlay.
     /// Versioned tombstones make the result independent of level order.
     fn ids_batch(&self, key: &[u8], after: Option<&str>, limit: usize) -> Result<Vec<String>> {
@@ -2567,9 +2792,16 @@ struct Shared {
     commit_lock_hold_nanos: AtomicU64,
     commit_prepare_nanos: AtomicU64,
     commit_locked_prepare_nanos: AtomicU64,
+    commit_phase_prepare_nanos: AtomicU64,
+    commit_phase_record_encode_nanos: AtomicU64,
+    commit_phase_wal_encode_nanos: AtomicU64,
+    commit_phase_validation_nanos: AtomicU64,
     commit_wal_nanos: AtomicU64,
     commit_wal_append_nanos: AtomicU64,
+    wal_appended_bytes: AtomicU64,
+    commit_phase_sync_wait_nanos: AtomicU64,
     commit_apply_nanos: AtomicU64,
+    commit_phase_maintenance_wait_nanos: AtomicU64,
     /// Committers currently queued for the serialization mutex. A group
     /// leader only opens a coalescing window when contention already exists,
     /// preserving single-writer latency.
@@ -2788,6 +3020,29 @@ pub struct Txn {
     /// per row during large transactions.
     staged: Vec<(String, StagedTable)>,
     staged_bytes: usize,
+    statement_savepoint: Option<StatementSavepoint>,
+}
+
+struct StatementSavepoint {
+    tables: Vec<StatementTableUndo>,
+    staged_bytes: usize,
+    undo_bytes: usize,
+}
+
+struct StatementTableUndo {
+    next_position: usize,
+    operations: HashMap<String, Option<StagedOperation>>,
+}
+
+struct StatementGuard<'a> {
+    txn: &'a mut Txn,
+    success: bool,
+}
+
+impl Drop for StatementGuard<'_> {
+    fn drop(&mut self) {
+        self.txn.finish_statement(self.success);
+    }
 }
 
 struct StagedTable {
@@ -2797,10 +3052,146 @@ struct StagedTable {
     /// not need to reacquire the shared state lock per row. Commit validation
     /// still catches a concurrent writer that inserts the same ID.
     snapshot_high_id: Option<String>,
-    operations: HashMap<String, StagedOperation>,
+    operations: StagedOperations,
     next_position: usize,
 }
 
+/// Keeps the common append-only transaction in a compact ordered vector.
+/// The first out-of-order insertion converts once to the general hash-map
+/// representation required by updates, deletes and statement rollback.
+#[derive(Default)]
+struct StagedOperations {
+    monotonic: Vec<(String, StagedOperation)>,
+    general: Option<HashMap<String, StagedOperation>>,
+}
+
+impl StagedOperations {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn len(&self) -> usize {
+        self.general
+            .as_ref()
+            .map_or(self.monotonic.len(), HashMap::len)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&self, id: &str) -> Option<&StagedOperation> {
+        if let Some(general) = &self.general {
+            return general.get(id);
+        }
+        if self
+            .monotonic
+            .last()
+            .is_none_or(|(last, _)| last.as_str() < id)
+        {
+            return None;
+        }
+        self.monotonic
+            .binary_search_by(|(candidate, _)| candidate.as_str().cmp(id))
+            .ok()
+            .map(|index| &self.monotonic[index].1)
+    }
+
+    fn get_mut(&mut self, id: &str) -> Option<&mut StagedOperation> {
+        if let Some(general) = &mut self.general {
+            return general.get_mut(id);
+        }
+        if self
+            .monotonic
+            .last()
+            .is_none_or(|(last, _)| last.as_str() < id)
+        {
+            return None;
+        }
+        self.monotonic
+            .binary_search_by(|(candidate, _)| candidate.as_str().cmp(id))
+            .ok()
+            .map(|index| &mut self.monotonic[index].1)
+    }
+
+    fn make_general(&mut self) -> &mut HashMap<String, StagedOperation> {
+        if self.general.is_none() {
+            self.general = Some(self.monotonic.drain(..).collect());
+        }
+        self.general.as_mut().expect("general staging initialized")
+    }
+
+    fn insert(&mut self, id: String, operation: StagedOperation) -> Option<StagedOperation> {
+        if let Some(general) = &mut self.general {
+            return general.insert(id, operation);
+        }
+        match self
+            .monotonic
+            .last()
+            .map(|(last, _)| last.as_str().cmp(id.as_str()))
+        {
+            None | Some(std::cmp::Ordering::Less) => {
+                self.monotonic.push((id, operation));
+                None
+            }
+            Some(std::cmp::Ordering::Equal) => Some(std::mem::replace(
+                &mut self.monotonic.last_mut().unwrap().1,
+                operation,
+            )),
+            Some(std::cmp::Ordering::Greater) => self.make_general().insert(id, operation),
+        }
+    }
+
+    fn remove(&mut self, id: &str) -> Option<StagedOperation> {
+        if let Some(general) = &mut self.general {
+            return general.remove(id);
+        }
+        let index = self
+            .monotonic
+            .binary_search_by(|(candidate, _)| candidate.as_str().cmp(id))
+            .ok()?;
+        Some(self.monotonic.remove(index).1)
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = (&String, &StagedOperation)> + '_> {
+        match &self.general {
+            Some(general) => Box::new(general.iter()),
+            None => Box::new(self.monotonic.iter().map(|(id, operation)| (id, operation))),
+        }
+    }
+
+    fn values(&self) -> Box<dyn Iterator<Item = &StagedOperation> + '_> {
+        Box::new(self.iter().map(|(_, operation)| operation))
+    }
+
+    fn into_ordered(self) -> Vec<(String, Option<Record>)> {
+        if let Some(general) = self.general {
+            let operation_count = general.len();
+            let mut ordered: Vec<Option<(String, Option<Record>)>> =
+                std::iter::repeat_with(|| None)
+                    .take(operation_count)
+                    .collect();
+            for (id, operation) in general {
+                ordered[operation.position] = Some((id, operation.operation));
+            }
+            let mut ordered = ordered
+                .into_iter()
+                .map(|entry| entry.expect("staged positions are contiguous"))
+                .collect::<Vec<_>>();
+            if !ordered.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+                ordered.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            }
+            ordered
+        } else {
+            self.monotonic
+                .into_iter()
+                .map(|(id, operation)| (id, operation.operation))
+                .collect()
+        }
+    }
+}
+
+#[derive(Clone)]
 struct StagedOperation {
     /// Original insertion order. Monotonic batches can be reconstructed in
     /// linear time at commit instead of sorting every row by primary key.
@@ -2820,22 +3211,27 @@ struct PreparedTable {
 struct PreparedChange {
     id: String,
     operation: Option<Record>,
-    payload: Option<Arc<Vec<u8>>>,
+    /// `(offset, length)` into `PreparedCommit::payload_arena`.
+    payload: Option<(u32, u32)>,
 }
 
 struct PreparedCommit {
     snap_version: u64,
     staged: Vec<PreparedTable>,
+    payload_arena: Arc<Vec<u8>>,
     preencoded_wal: Option<Vec<u8>>,
     optimistic_prior_records: Vec<Vec<Option<(u64, Record)>>>,
     incoming_index_bytes: usize,
     outside_prepare_time: Duration,
+    phase_prepare_time: Duration,
+    record_encode_time: Duration,
+    wal_encode_time: Duration,
     commit_started: Instant,
     _pending_blobs: PendingBlobPublications,
 }
 
 struct ApplyRecordState<'a> {
-    put: Option<(&'a Arc<Vec<u8>>, &'a Record)>,
+    put: Option<(&'a MemPayload, &'a Record)>,
     prior: Option<Record>,
 }
 
@@ -3413,9 +3809,16 @@ impl Db {
             commit_lock_hold_nanos: AtomicU64::new(0),
             commit_prepare_nanos: AtomicU64::new(0),
             commit_locked_prepare_nanos: AtomicU64::new(0),
+            commit_phase_prepare_nanos: AtomicU64::new(0),
+            commit_phase_record_encode_nanos: AtomicU64::new(0),
+            commit_phase_wal_encode_nanos: AtomicU64::new(0),
+            commit_phase_validation_nanos: AtomicU64::new(0),
             commit_wal_nanos: AtomicU64::new(0),
             commit_wal_append_nanos: AtomicU64::new(0),
+            wal_appended_bytes: AtomicU64::new(0),
+            commit_phase_sync_wait_nanos: AtomicU64::new(0),
             commit_apply_nanos: AtomicU64::new(0),
+            commit_phase_maintenance_wait_nanos: AtomicU64::new(0),
             commit_waiters: AtomicU64::new(0),
             wal_sync_count: AtomicU64::new(0),
             wal_sync_nanos: AtomicU64::new(0),
@@ -3537,6 +3940,12 @@ impl Db {
         }
         let lock_file = acquire_lock(&dir, ro)?;
         let (mut manifest, used_prev) = Manifest::load(&dir)?;
+        crate::wal::validate_wal_chain(
+            &dir,
+            manifest.wal_id,
+            manifest.required_wal_id,
+            manifest.committed_version,
+        )?;
         let catalog = match manifest.catalog.clone() {
             Some(catalog) => catalog,
             None => Catalog::load(&dir.join(CATALOG_FILE))?,
@@ -3607,7 +4016,7 @@ impl Db {
 
         // Load segments listed in the manifest. Read-only mode exposes the
         // valid prefix of a damaged segment instead of refusing to open.
-        let mut index: HashMap<String, BTreeMap<String, Vec<VersionEntry>>> = HashMap::new();
+        let mut index: PrimaryDelta = HashMap::new();
         let primary_path = primary_index_path(&dir);
         let primary_tmp = primary_path.with_extension("pidx.tmp");
         let temp_dir = opts
@@ -3695,9 +4104,7 @@ impl Db {
                         index
                             .entry(entry.table)
                             .or_default()
-                            .entry(entry.id)
-                            .or_default()
-                            .push(version);
+                            .push(entry.id, version);
                     }
                     Ok(())
                 })?
@@ -3743,12 +4150,9 @@ impl Db {
                             opts.memory.index_delta_pool_bytes
                         )));
                     }
-                    index
-                        .entry(entry.table)
-                        .or_default()
-                        .entry(entry.id)
-                        .or_default()
-                        .push(VersionEntry {
+                    index.entry(entry.table).or_default().push(
+                        entry.id,
+                        VersionEntry {
                             version: entry.version,
                             kind: if entry.tombstone {
                                 VKind::SegTombstone
@@ -3759,7 +4163,8 @@ impl Db {
                                     payload_len: entry.payload_len,
                                 }
                             },
-                        });
+                        },
+                    );
                     Ok(())
                 })?;
             }
@@ -3860,7 +4265,7 @@ impl Db {
                     let kind = match ch.payload {
                         Some(payload) => {
                             memtable_bytes += payload.len() as u64;
-                            VKind::MemPut(Arc::new(payload))
+                            VKind::MemPut(MemPayload::whole(Arc::new(payload)))
                         }
                         None => VKind::MemTombstone,
                     };
@@ -4027,9 +4432,16 @@ impl Db {
             commit_lock_hold_nanos: AtomicU64::new(0),
             commit_prepare_nanos: AtomicU64::new(0),
             commit_locked_prepare_nanos: AtomicU64::new(0),
+            commit_phase_prepare_nanos: AtomicU64::new(0),
+            commit_phase_record_encode_nanos: AtomicU64::new(0),
+            commit_phase_wal_encode_nanos: AtomicU64::new(0),
+            commit_phase_validation_nanos: AtomicU64::new(0),
             commit_wal_nanos: AtomicU64::new(0),
             commit_wal_append_nanos: AtomicU64::new(0),
+            wal_appended_bytes: AtomicU64::new(0),
+            commit_phase_sync_wait_nanos: AtomicU64::new(0),
             commit_apply_nanos: AtomicU64::new(0),
+            commit_phase_maintenance_wait_nanos: AtomicU64::new(0),
             commit_waiters: AtomicU64::new(0),
             wal_sync_count: AtomicU64::new(0),
             wal_sync_nanos: AtomicU64::new(0),
@@ -4800,6 +5212,11 @@ impl Db {
             });
         }
         if kind == IndexKind::Secondary {
+            if schema.column(column).is_some_and(|column| column.identity) {
+                return Err(Error::SchemaViolation(format!(
+                    "cannot drop unique index on {table}.{column}: required by an identity/primary key"
+                )));
+            }
             if schema
                 .foreign_keys
                 .iter()
@@ -4886,6 +5303,11 @@ impl Db {
                     column.name
                 )));
             }
+            if column.identity && schema.columns.iter().any(|column| column.identity) {
+                return Err(Error::SchemaViolation(format!(
+                    "table '{table}' can have at most one identity column"
+                )));
+            }
         }
         if column.default.is_none() {
             // Keep writers excluded from the emptiness check through catalog
@@ -4911,9 +5333,21 @@ impl Db {
                     column.name
                 )));
             }
+            let identity_key = column
+                .identity
+                .then(|| (table.to_owned(), column.name.clone()));
+            if column.identity {
+                schema.indexes.push(IndexDef {
+                    column: column.name.clone(),
+                    unique: true,
+                });
+            }
             schema.columns.push(column);
             let publication_error =
                 publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next)?;
+            if let Some(key) = identity_key {
+                st.secondary.insert(key, SecIdx::resident(HashMap::new()));
+            }
             return publication_error.map_or(Ok(()), Err);
         }
         let not_null = !column.nullable;
@@ -5300,7 +5734,7 @@ impl Db {
         top_k: usize,
         filter: Option<&Record>,
     ) -> Result<Vec<TextHit>> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         self.search_text_inner(table, column, query, top_k, filter)
     }
 
@@ -5385,7 +5819,7 @@ impl Db {
     /// Reciprocal Rank Fusion (RRF, k=60). At least one modality is
     /// required; both columns must be indexed.
     pub fn search_hybrid(&self, table: &str, query: &HybridQuery<'_>) -> Result<Vec<HybridHit>> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         if query.text.is_none() && query.vector.is_none() {
             return Err(Error::InvalidArgument(
                 "hybrid search needs a text query, a vector, or both".into(),
@@ -5452,7 +5886,7 @@ impl Db {
         top_k: usize,
         opts: &VectorSearchOptions,
     ) -> Result<Vec<VectorHit>> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         self.search_vector_inner(table, column, query, top_k, opts)
     }
 
@@ -5608,7 +6042,7 @@ impl Db {
     /// bounded number of times on optimistic conflict. Multi-row INSERTs are
     /// a single atomic commit.
     pub fn query(&self, sql: &str) -> Result<crate::sql::QueryOutput> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         crate::sql::execute(self, sql)
     }
 
@@ -5616,7 +6050,7 @@ impl Db {
     /// typed and are bound after parsing; they are never interpolated into the
     /// SQL string.
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<crate::sql::QueryOutput> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         crate::sql::execute_positional(self, sql, params)
     }
 
@@ -5626,7 +6060,7 @@ impl Db {
         sql: &str,
         params: &Record,
     ) -> Result<crate::sql::QueryOutput> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         crate::sql::execute_named(self, sql, params)
     }
 
@@ -5636,7 +6070,7 @@ impl Db {
         params: &[Value],
         max_rows: usize,
     ) -> Result<crate::sql::QueryOutput> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         crate::sql::execute_positional_bounded(self, sql, params, max_rows)
     }
 
@@ -5646,7 +6080,7 @@ impl Db {
         params: &Record,
         max_rows: usize,
     ) -> Result<crate::sql::QueryOutput> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         crate::sql::execute_named_bounded(self, sql, params, max_rows)
     }
 
@@ -5687,6 +6121,7 @@ impl Db {
             started_at: Instant::now(),
             staged: Vec::new(),
             staged_bytes: 0,
+            statement_savepoint: None,
         }
     }
 
@@ -5700,6 +6135,196 @@ impl Db {
             version,
             shared: self.shared.clone(),
         }
+    }
+
+    pub(crate) fn snapshot_with_identities(&self) -> (Snapshot, BTreeMap<String, i64>) {
+        let mut snaps = self.shared.snapshots.lock().unwrap();
+        let state = self.shared.state.read().unwrap();
+        let version = state.committed_version;
+        *snaps.entry(version).or_insert(0) += 1;
+        (
+            Snapshot {
+                version,
+                shared: self.shared.clone(),
+            },
+            identity_manifest(&state),
+        )
+    }
+
+    pub(crate) fn secondary_contains(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+        id: &str,
+    ) -> Result<bool> {
+        let state = self.shared.state.read().unwrap();
+        match state.secondary.get(&(table.into(), column.into())) {
+            Some(index) => index.contains_pair(&index_key(value), id),
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) fn primary_version(&self, table: &str, id: &str) -> Result<Option<u64>> {
+        Ok(self
+            .shared
+            .state
+            .read()
+            .unwrap()
+            .latest_owned(table, id)?
+            .filter(|entry| !entry.is_tombstone())
+            .map(|entry| entry.version))
+    }
+
+    pub(crate) fn visit_secondary_entries(
+        &self,
+        mut visit: impl FnMut(&str, &str, &[u8], &str) -> Result<()>,
+    ) -> Result<()> {
+        let state = self.shared.state.read().unwrap();
+        for ((table, column), index) in &state.secondary {
+            for run in &index.runs {
+                run.index.scan(|pair, _| {
+                    if pair == SECONDARY_FORMAT_KEY {
+                        return Ok(());
+                    }
+                    let (key, id) = secondary_pair_parts(pair)?;
+                    if index.contains_pair(key, id)? {
+                        visit(table, column, key, id)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            for map in std::iter::once(&index.delta)
+                .chain(index.frozen.as_ref().map(|frozen| &frozen.delta))
+            {
+                for (key, ids) in map {
+                    for id in ids {
+                        if index.contains_pair(key, id)? {
+                            visit(table, column, key, id)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Install copy constraints only after every batch is present. The target
+    /// is private until its final rename; invalid copies are never published.
+    pub(crate) fn restore_foreign_keys(&self, schemas: &[TableSchema]) -> Result<()> {
+        let _ddl = self.acquire_ddl_guard();
+        let mut catalog = self.shared.state.read().unwrap().catalog.clone();
+        for schema in schemas {
+            let target = catalog
+                .tables
+                .iter_mut()
+                .find(|table| table.name == schema.name)
+                .ok_or_else(|| Error::TableNotFound(schema.name.clone()))?;
+            target.foreign_keys = schema.foreign_keys.clone();
+        }
+        catalog.validate()?;
+        let snapshot = self.snapshot();
+        for schema in &catalog.tables {
+            if schema.foreign_keys.is_empty() {
+                continue;
+            }
+            let mut cursor = None;
+            loop {
+                let rows = self.scan_batch_at(&snapshot, &schema.name, cursor.as_deref(), 256)?;
+                if rows.is_empty() {
+                    break;
+                }
+                for (id, record) in &rows {
+                    for foreign_key in &schema.foreign_keys {
+                        let value = record.get(&foreign_key.column).unwrap_or(&Value::Null);
+                        if value.is_null() {
+                            continue;
+                        }
+                        let target = catalog
+                            .table(&foreign_key.referenced_table)
+                            .expect("validated catalog");
+                        let exists = if target.has_implicit_id()
+                            && foreign_key.referenced_column == ID_COLUMN
+                        {
+                            match value {
+                                Value::Text(id) => self.get(&target.name, id)?.is_some(),
+                                _ => false,
+                            }
+                        } else {
+                            !self
+                                .find_eq_batch(
+                                    &foreign_key.referenced_table,
+                                    &foreign_key.referenced_column,
+                                    value,
+                                    None,
+                                    1,
+                                )?
+                                .is_empty()
+                        };
+                        if !exists {
+                            return Err(Error::SchemaViolation(format!(
+                                "copy contains orphan {}.{} at physical id {id}",
+                                schema.name, foreign_key.column
+                            )));
+                        }
+                    }
+                }
+                cursor = rows.last().map(|(id, _)| id.clone());
+            }
+        }
+        let mut commit = lock_commit_for_maintenance(&self.shared)?;
+        let mut state = self.shared.state.write().unwrap();
+        if let Some(error) =
+            publish_catalog_generation_locked(&self.shared, &mut commit, &mut state, catalog)?
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Persist recovered sequence metadata even when there are no live rows
+    /// and checkpoint has nothing to flush. Used only on private copy targets.
+    pub(crate) fn restore_identity_high_water(
+        &self,
+        recovered: &BTreeMap<String, i64>,
+    ) -> Result<()> {
+        if self.shared.opts.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let _ddl = self.acquire_ddl_guard();
+        let _commit = lock_commit_for_maintenance(&self.shared)?;
+        let mut state = self.shared.state.write().unwrap();
+        let (mut manifest, _) = Manifest::load(&self.shared.dir)?;
+        for (table, value) in recovered {
+            if *value < 0
+                || !state
+                    .catalog
+                    .table(table)
+                    .is_some_and(|schema| schema.columns.iter().any(|column| column.identity))
+            {
+                return Err(Error::Corrupt(format!(
+                    "invalid recovered identity sequence for '{table}'"
+                )));
+            }
+            let high = manifest
+                .identity_high_water
+                .entry(table.clone())
+                .or_default();
+            *high = (*high)
+                .max(*value)
+                .max(*state.identity_high_water.get(table).unwrap_or(&0));
+        }
+        let outcome = manifest.publish(&self.shared.dir)?;
+        for (table, value) in manifest.identity_high_water {
+            let high = state.identity_high_water.entry(table).or_default();
+            *high = (*high).max(value);
+        }
+        if let Some(error) =
+            publication_sync_error(&self.shared, "recovered identities manifest", outcome)
+        {
+            return Err(error);
+        }
+        Ok(())
     }
 
     // --- auto-commit convenience ops ----------------------------------------
@@ -5956,6 +6581,7 @@ impl Db {
             committed_version: version,
             segments: new_segments.clone(),
             wal_id: cs.wal().id,
+            required_wal_id: cs.wal().id,
             identity_high_water,
             catalog: Some(self.shared.state.read().unwrap().catalog.clone()),
         })
@@ -5976,8 +6602,10 @@ impl Db {
             let mut st = self.shared.state.write().unwrap();
             st.committed_version = version;
             st.segments = new_segments;
-            st.readers
-                .insert(next_segment_id, Arc::new(SegmentReader::new(segment_reader)));
+            st.readers.insert(
+                next_segment_id,
+                Arc::new(SegmentReader::new(segment_reader)),
+            );
             st.next_segment_id = next_segment_id.saturating_add(1);
             st.index.generation = generation;
             st.index.runs.push(PrimaryRun {
@@ -6005,6 +6633,7 @@ impl Db {
                     committed_version: version,
                     segments: self.shared.state.read().unwrap().segments.clone(),
                     wal_id: cs.wal().id,
+                    required_wal_id: cs.wal().id,
                     identity_high_water: identity_manifest(&self.shared.state.read().unwrap()),
                     catalog: Some(self.shared.state.read().unwrap().catalog.clone()),
                 },
@@ -6077,7 +6706,7 @@ impl Db {
 
     /// All visible records of a table, ordered by id.
     pub fn scan(&self, table: &str) -> Result<Vec<(String, Record)>> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         self.scan_unbudgeted(table)
     }
 
@@ -6095,14 +6724,14 @@ impl Db {
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Record)>> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         let snapshot = self.snapshot();
         shared_scan_batch_at(&self.shared, table, snapshot.version, after_id, limit)
     }
 
     /// All records of a table as of a snapshot, ordered by id.
     pub fn scan_at(&self, snapshot: &Snapshot, table: &str) -> Result<Vec<(String, Record)>> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         self.validate_snapshot_owner(snapshot)?;
         shared_scan_at(&self.shared, table, snapshot.version)
     }
@@ -6116,8 +6745,47 @@ impl Db {
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Record)>> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         self.scan_batch_at_unbudgeted(snapshot, table, after_id, limit)
+    }
+
+    /// Snapshot scan bounded by both row count and estimated decoded bytes.
+    /// A row too large for the requested budget returns MemoryLimit; callers
+    /// can retry from the same exclusive physical key with a larger budget.
+    pub fn scan_batch_at_bytes(
+        &self,
+        snapshot: &Snapshot,
+        table: &str,
+        after_id: Option<&str>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<(String, Record)>> {
+        let _memory = self.acquire_query_memory()?;
+        self.scan_batch_at_bytes_unbudgeted(snapshot, table, after_id, limit, max_bytes)
+    }
+
+    pub(crate) fn scan_batch_at_bytes_unbudgeted(
+        &self,
+        snapshot: &Snapshot,
+        table: &str,
+        after_id: Option<&str>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<(String, Record)>> {
+        self.validate_snapshot_owner(snapshot)?;
+        if max_bytes == 0 || max_bytes > self.shared.opts.memory.query_working_bytes {
+            return Err(Error::InvalidArgument(
+                "scan byte budget must be positive and fit query_working_bytes".into(),
+            ));
+        }
+        shared_scan_batch_at_bytes(
+            &self.shared,
+            table,
+            snapshot.version,
+            after_id,
+            limit,
+            Some(max_bytes),
+        )
     }
 
     pub(crate) fn scan_batch_at_unbudgeted(
@@ -6149,7 +6817,7 @@ impl Db {
         column: &str,
         value: &Value,
     ) -> Result<Vec<(String, Record)>> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         self.find_eq_unbudgeted(table, column, value)
     }
 
@@ -6241,7 +6909,7 @@ impl Db {
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Record)>> {
-        let _memory = self.acquire_query_memory();
+        let _memory = self.acquire_query_memory()?;
         self.find_eq_batch_unbudgeted(table, column, value, after_id, limit)
     }
 
@@ -6252,6 +6920,38 @@ impl Db {
         value: &Value,
         after_id: Option<&str>,
         limit: usize,
+    ) -> Result<Vec<(String, Record)>> {
+        self.find_eq_batch_version(table, column, value, after_id, limit, None)
+    }
+
+    pub(crate) fn find_eq_batch_at_unbudgeted(
+        &self,
+        snapshot: &Snapshot,
+        table: &str,
+        column: &str,
+        value: &Value,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Record)>> {
+        self.validate_snapshot_owner(snapshot)?;
+        self.find_eq_batch_version(
+            table,
+            column,
+            value,
+            after_id,
+            limit,
+            Some(snapshot.version),
+        )
+    }
+
+    fn find_eq_batch_version(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+        after_id: Option<&str>,
+        limit: usize,
+        version: Option<u64>,
     ) -> Result<Vec<(String, Record)>> {
         let st = self.shared.state.read().unwrap();
         let schema = st
@@ -6268,7 +6968,13 @@ impl Db {
         // usually yield a few rows, so the output grows on demand instead of
         // reserving a full batch of `(String, Record)` slots per call.
         let mut out = Vec::new();
-        if let Some(index) = st.secondary.get(&(table.to_owned(), column.to_owned())) {
+        let byte_budget = version.map(|_| (self.shared.opts.memory.query_working_bytes / 2).max(1));
+        let mut retained_bytes = 0usize;
+        if let Some(index) = st
+            .secondary
+            .get(&(table.to_owned(), column.to_owned()))
+            .filter(|_| version.is_none_or(|version| version == st.committed_version))
+        {
             let ids = index.ids_batch(&index_key(value), after_id, limit)?;
             if ids.is_empty() {
                 return Ok(out);
@@ -6284,6 +6990,9 @@ impl Db {
                 record
                     .entry(ID_COLUMN.into())
                     .or_insert_with(|| Value::Text(id.clone()));
+                if !record_fits_batch(&record, &id, byte_budget, &mut retained_bytes)? {
+                    break;
+                }
                 out.push((id, record));
             }
             return Ok(out);
@@ -6294,11 +7003,10 @@ impl Db {
         // column probe instead of a full record materialization.
         let predicate = encoded_eq_predicate(&st, table, column, value);
         st.index.visit_table(table, after_id, |id, versions| {
-            let Some(entry) = versions
-                .iter()
-                .rev()
-                .find(|entry| entry.version > schema.epoch)
-            else {
+            let Some(entry) = versions.iter().rev().find(|entry| {
+                entry.version > schema.epoch
+                    && version.is_none_or(|version| entry.version <= version)
+            }) else {
                 return Ok(true);
             };
             if entry.is_tombstone() {
@@ -6318,6 +7026,9 @@ impl Db {
             record
                 .entry(ID_COLUMN.into())
                 .or_insert_with(|| Value::Text(id.to_owned()));
+            if !record_fits_batch(&record, id, byte_budget, &mut retained_bytes)? {
+                return Ok(false);
+            }
             out.push((id.to_owned(), record));
             if out.len() == limit {
                 return Ok(false);
@@ -6411,12 +7122,38 @@ impl Db {
                     .commit_locked_prepare_nanos
                     .load(AtomicOrdering::Relaxed),
             ),
+            commit_phase_prepare_time: Duration::from_nanos(
+                self.shared
+                    .commit_phase_prepare_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
+            commit_phase_record_encode_time: Duration::from_nanos(
+                self.shared
+                    .commit_phase_record_encode_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
+            commit_phase_wal_encode_time: Duration::from_nanos(
+                self.shared
+                    .commit_phase_wal_encode_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
+            commit_phase_validation_time: Duration::from_nanos(
+                self.shared
+                    .commit_phase_validation_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
             commit_wal_time: Duration::from_nanos(
                 self.shared.commit_wal_nanos.load(AtomicOrdering::Relaxed),
             ),
             commit_wal_append_time: Duration::from_nanos(
                 self.shared
                     .commit_wal_append_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
+            wal_appended_bytes: self.shared.wal_appended_bytes.load(AtomicOrdering::Relaxed),
+            commit_phase_sync_wait_time: Duration::from_nanos(
+                self.shared
+                    .commit_phase_sync_wait_nanos
                     .load(AtomicOrdering::Relaxed),
             ),
             wal_syncs: self.shared.wal_sync_count.load(AtomicOrdering::Relaxed),
@@ -6460,6 +7197,11 @@ impl Db {
                 .load(AtomicOrdering::Relaxed),
             commit_apply_time: Duration::from_nanos(
                 self.shared.commit_apply_nanos.load(AtomicOrdering::Relaxed),
+            ),
+            commit_phase_maintenance_wait_time: Duration::from_nanos(
+                self.shared
+                    .commit_phase_maintenance_wait_nanos
+                    .load(AtomicOrdering::Relaxed),
             ),
             checkpoints: self.shared.checkpoint_count.load(AtomicOrdering::Relaxed),
             checkpoint_time: Duration::from_nanos(
@@ -6733,10 +7475,12 @@ impl Db {
         self.shared.memory_governor.stats()
     }
 
-    pub(crate) fn acquire_query_memory(&self) -> MemoryPermit {
-        self.shared.memory_governor.acquire(
+    pub(crate) fn acquire_query_memory(&self) -> Result<MemoryPermit> {
+        crate::query_control::check_current()?;
+        self.shared.memory_governor.acquire_timeout(
             MemoryPool::Query,
             self.shared.opts.memory.query_working_bytes,
+            Duration::from_millis(self.shared.opts.memory.query_admission_timeout_ms),
         )
     }
 
@@ -6781,7 +7525,8 @@ fn try_acquire_frozen_lease(shared: &Arc<Shared>, bytes: usize) -> Option<Mainte
 }
 
 impl Db {
-    pub(crate) fn memory_options(&self) -> MemoryOptions {
+    /// Effective working-memory and admission limits for this database.
+    pub fn memory_options(&self) -> MemoryOptions {
         self.shared.opts.memory.clone()
     }
 
@@ -6992,10 +7737,7 @@ impl Db {
                 id: seg_id,
                 len: segment_position,
             });
-            new_readers.insert(
-                seg_id,
-                Arc::new(SegmentReader::new(File::open(&seg_path)?)),
-            );
+            new_readers.insert(seg_id, Arc::new(SegmentReader::new(File::open(&seg_path)?)));
         }
         fsync_dir(&shared.dir.join(SEGMENTS_DIR))?;
 
@@ -7039,6 +7781,7 @@ impl Db {
             committed_version,
             segments: new_segments.clone(),
             wal_id: cs.wal().id,
+            required_wal_id: cs.wal().id,
             identity_high_water: identity_high_water.clone(),
             catalog: Some(new_catalog.clone()),
         }
@@ -7107,6 +7850,7 @@ impl Db {
                     committed_version,
                     segments: shared.state.read().unwrap().segments.clone(),
                     wal_id: cs.wal().id,
+                    required_wal_id: cs.wal().id,
                     identity_high_water: identity_manifest(&shared.state.read().unwrap()),
                     catalog: Some(shared.state.read().unwrap().catalog.clone()),
                 },
@@ -7140,6 +7884,60 @@ impl Db {
 }
 
 impl Txn {
+    /// Retain only the original operations touched by this statement. Errors
+    /// and unwinding restore its writes without discarding earlier statements.
+    pub(crate) fn with_statement_savepoint<T>(
+        &mut self,
+        execute: impl FnOnce(&mut Txn) -> Result<T>,
+    ) -> Result<T> {
+        if self.statement_savepoint.is_some() {
+            return Err(Error::InvalidArgument("nested statement savepoint".into()));
+        }
+        self.statement_savepoint = Some(StatementSavepoint {
+            tables: self
+                .staged
+                .iter()
+                .map(|(_, table)| StatementTableUndo {
+                    next_position: table.next_position,
+                    operations: HashMap::new(),
+                })
+                .collect(),
+            staged_bytes: self.staged_bytes,
+            undo_bytes: 0,
+        });
+        let mut guard = StatementGuard {
+            txn: self,
+            success: false,
+        };
+        let result = execute(&mut *guard.txn);
+        guard.success = result.is_ok();
+        result
+    }
+
+    fn finish_statement(&mut self, success: bool) {
+        let Some(savepoint) = self.statement_savepoint.take() else {
+            return;
+        };
+        if success {
+            return;
+        }
+        self.staged.truncate(savepoint.tables.len());
+        for ((_, table), undo) in self.staged.iter_mut().zip(savepoint.tables) {
+            for (id, original) in undo.operations {
+                match original {
+                    Some(operation) => {
+                        table.operations.insert(id, operation);
+                    }
+                    None => {
+                        table.operations.remove(&id);
+                    }
+                }
+            }
+            table.next_position = undo.next_position;
+        }
+        self.staged_bytes = savepoint.staged_bytes;
+    }
+
     fn stage(&mut self, table: &str, id: String, operation: Option<Record>) -> Result<()> {
         let table_index = self
             .staged
@@ -7157,10 +7955,47 @@ impl Txn {
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes);
         let limit = self.shared.opts.memory.index_delta_pool_bytes;
-        if projected > limit {
+        let save_original = self
+            .statement_savepoint
+            .as_ref()
+            .and_then(|savepoint| savepoint.tables.get(table_index))
+            .is_some_and(|undo| !undo.operations.contains_key(&id));
+        let extra_undo_bytes = if save_original {
+            id.len()
+                .saturating_add(64)
+                .saturating_add(old_bytes)
+                .saturating_add(
+                    self.staged[table_index]
+                        .1
+                        .operations
+                        .get(&id)
+                        .filter(|old| old.deleted_record.is_some())
+                        .map_or(0, |old| {
+                            staged_operation_bytes(table, &id, &old.deleted_record)
+                        }),
+                )
+        } else {
+            0
+        };
+        let retained_undo = self
+            .statement_savepoint
+            .as_ref()
+            .map_or(0, |s| s.undo_bytes);
+        let required = projected
+            .saturating_add(retained_undo)
+            .saturating_add(extra_undo_bytes);
+        if required > limit {
             return Err(Error::MemoryLimit(format!(
-                "transaction staging needs an estimated {projected} bytes, but memory.index_delta_pool_bytes is {limit}; commit smaller batches"
+                "transaction staging and statement rollback need an estimated {required} bytes, but memory.index_delta_pool_bytes is {limit}; commit smaller batches"
             )));
+        }
+        if save_original {
+            let original = self.staged[table_index].1.operations.get(&id).cloned();
+            let savepoint = self.statement_savepoint.as_mut().expect("savepoint exists");
+            savepoint.tables[table_index]
+                .operations
+                .insert(id.clone(), original);
+            savepoint.undo_bytes = savepoint.undo_bytes.saturating_add(extra_undo_bytes);
         }
         let staged_table = &mut self.staged[table_index].1;
         if let Some(existing) = staged_table.operations.get_mut(&id) {
@@ -7208,7 +8043,7 @@ impl Txn {
                     StagedTable {
                         schema,
                         snapshot_high_id,
-                        operations: HashMap::new(),
+                        operations: StagedOperations::new(),
                         next_position: 0,
                     },
                 ));
@@ -7298,7 +8133,7 @@ impl Txn {
                 .into_iter()
                 .collect();
         if let Some((_, staged)) = self.staged.iter().find(|(name, _)| name == table) {
-            for (id, operation) in &staged.operations {
+            for (id, operation) in staged.operations.iter() {
                 match &operation.operation {
                     Some(record) => {
                         let mut record = record.clone();
@@ -7317,6 +8152,26 @@ impl Txn {
     }
 
     pub fn insert(&mut self, table: &str, record: Record) -> Result<String> {
+        self.insert_record(table, record, None)
+    }
+
+    /// Canonical copies preserve the physical key separately from a declared
+    /// SQL column named `id`. All normal schema and uniqueness checks apply.
+    pub(crate) fn insert_restored(
+        &mut self,
+        table: &str,
+        id: &str,
+        record: Record,
+    ) -> Result<String> {
+        self.insert_record(table, record, Some(id))
+    }
+
+    fn insert_record(
+        &mut self,
+        table: &str,
+        record: Record,
+        restored_id: Option<&str>,
+    ) -> Result<String> {
         let mut record = record;
         self.schema(table)?;
         let table_index = self
@@ -7325,35 +8180,60 @@ impl Txn {
             .position(|(name, _)| name == table)
             .expect("schema was cached above");
         let schema = &self.staged[table_index].1.schema;
-        let id = match (schema.has_implicit_id(), record.get(ID_COLUMN)) {
-            (false, _) | (true, None) => {
-                let mut previous = self.shared.last_generated_id.lock().unwrap();
-                let candidate = Ulid::new();
-                let next = if candidate > *previous {
-                    candidate
-                } else {
-                    previous.increment().ok_or_else(|| {
-                        Error::InvalidArgument("cannot generate id: ULID overflow".into())
-                    })?
-                };
-                *previous = next;
-                next.to_string()
+        let id = if let Some(id) = restored_id {
+            if id.is_empty() {
+                return Err(Error::Corrupt(
+                    "restored physical id must not be empty".into(),
+                ));
             }
-            (true, Some(Value::Text(s))) if !s.is_empty() => {
-                validate_short_string("record id", s)?;
-                if let Ok(explicit) = Ulid::from_string(s) {
-                    let mut previous = self.shared.last_generated_id.lock().unwrap();
-                    if explicit > *previous {
-                        *previous = explicit;
-                    }
+            validate_short_string("record id", id)?;
+            if schema.has_implicit_id() {
+                if record
+                    .get(ID_COLUMN)
+                    .is_some_and(|value| value != &Value::Text(id.into()))
+                {
+                    return Err(Error::Corrupt(
+                        "restored implicit id differs from physical key".into(),
+                    ));
                 }
-                s.clone()
+                record.insert(ID_COLUMN.into(), Value::Text(id.into()));
             }
-            (true, Some(Value::Text(_))) => {
-                return Err(Error::InvalidArgument("id must not be empty".into()))
+            if let Ok(explicit) = Ulid::from_string(id) {
+                let mut previous = self.shared.last_generated_id.lock().unwrap();
+                *previous = (*previous).max(explicit);
             }
-            (true, Some(_)) => {
-                return Err(Error::SchemaViolation("id must be a text value".into()))
+            id.to_owned()
+        } else {
+            match (schema.has_implicit_id(), record.get(ID_COLUMN)) {
+                (false, _) | (true, None) => {
+                    let mut previous = self.shared.last_generated_id.lock().unwrap();
+                    let candidate = Ulid::new();
+                    let next = if candidate > *previous {
+                        candidate
+                    } else {
+                        previous.increment().ok_or_else(|| {
+                            Error::InvalidArgument("cannot generate id: ULID overflow".into())
+                        })?
+                    };
+                    *previous = next;
+                    next.to_string()
+                }
+                (true, Some(Value::Text(s))) if !s.is_empty() => {
+                    validate_short_string("record id", s)?;
+                    if let Ok(explicit) = Ulid::from_string(s) {
+                        let mut previous = self.shared.last_generated_id.lock().unwrap();
+                        if explicit > *previous {
+                            *previous = explicit;
+                        }
+                    }
+                    s.clone()
+                }
+                (true, Some(Value::Text(_))) => {
+                    return Err(Error::InvalidArgument("id must not be empty".into()))
+                }
+                (true, Some(_)) => {
+                    return Err(Error::SchemaViolation("id must be a text value".into()))
+                }
             }
         };
         let identity_name = schema
@@ -7400,9 +8280,7 @@ impl Txn {
                         .state
                         .read()
                         .unwrap()
-                        .visible_owned(table, &id, self.snapshot.version)
-                        .ok()
-                        .flatten()
+                        .visible_owned(table, &id, self.snapshot.version)?
                         .is_some_and(|entry| !entry.is_tombstone())
                 }
             }
@@ -7415,6 +8293,87 @@ impl Txn {
         }
         self.stage(table, id.clone(), Some(normalized))?;
         Ok(id)
+    }
+
+    /// INSERT IGNORE's insert-only transaction keeps a bounded set of keys
+    /// accepted earlier in the same statement. Concurrent uniqueness changes
+    /// are still validated at commit; its caller retries the entire statement.
+    pub(crate) fn insert_if_unique(
+        &mut self,
+        table: &str,
+        record: Record,
+        accepted: &mut HashSet<(String, Vec<u8>)>,
+    ) -> Result<Option<String>> {
+        let result = self.with_statement_savepoint(|txn| {
+            let id = txn.insert(table, record)?;
+            let staged = &txn
+                .staged
+                .iter()
+                .find(|(name, _)| name == table)
+                .expect("insert cached the table")
+                .1;
+            let record = staged
+                .operations
+                .get(&id)
+                .expect("insert staged the id")
+                .operation
+                .as_ref()
+                .expect("insert staged a put");
+            let mut keys = Vec::new();
+            {
+                let state = txn.shared.state.read().unwrap();
+                if state.catalog.table(table) != Some(&staged.schema) {
+                    return Err(Error::Conflict(format!(
+                        "schema for {table} changed during INSERT IGNORE"
+                    )));
+                }
+                for def in staged.schema.indexes.iter().filter(|def| def.unique) {
+                    let Some(value) = record.get(&def.column).filter(|value| !value.is_null())
+                    else {
+                        continue;
+                    };
+                    let key = (def.column.clone(), index_key(value));
+                    if accepted.contains(&key)
+                        || state
+                            .secondary
+                            .get(&(table.to_owned(), def.column.clone()))
+                            .map(|index| index.ids(&key.1))
+                            .transpose()?
+                            .is_some_and(|ids| !ids.is_empty())
+                    {
+                        return Err(Error::UniqueViolation {
+                            table: table.into(),
+                            column: def.column.clone(),
+                        });
+                    }
+                    keys.push(key);
+                }
+            }
+            let key_bytes = keys.iter().fold(0usize, |bytes, (column, key)| {
+                bytes
+                    .saturating_add(column.len())
+                    .saturating_add(key.len())
+                    .saturating_add(96)
+            });
+            let projected = txn.staged_bytes.saturating_add(key_bytes);
+            let undo_bytes = txn.statement_savepoint.as_ref().map_or(0, |s| s.undo_bytes);
+            if projected.saturating_add(undo_bytes) > txn.shared.opts.memory.index_delta_pool_bytes
+            {
+                return Err(Error::MemoryLimit(
+                    "INSERT IGNORE uniqueness tracking exceeds transaction memory budget".into(),
+                ));
+            }
+            txn.staged_bytes = projected;
+            Ok((id, keys))
+        });
+        match result {
+            Ok((id, keys)) => {
+                accepted.extend(keys);
+                Ok(Some(id))
+            }
+            Err(Error::UniqueViolation { .. } | Error::DuplicateId { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn update(&mut self, table: &str, id: &str, patch: Record) -> Result<()> {
@@ -7496,7 +8455,13 @@ impl Txn {
     /// Validate optimistically and publish all staged writes as one atomic
     /// commit. Returns the commit version, or `Error::Conflict` if any
     /// touched record changed after this transaction began.
-    pub fn commit(mut self) -> Result<u64> {
+    pub fn commit(self) -> Result<u64> {
+        // Cancellation may stop query/staging work, but must never interrupt
+        // publication after it has crossed the durable commit boundary.
+        crate::QueryControl::without(|| self.commit_uncontrolled())
+    }
+
+    fn commit_uncontrolled(mut self) -> Result<u64> {
         self.expand_delete_cascades()?;
         commit_staged(&self.shared, self.snapshot.version, self.staged)
     }
@@ -7512,7 +8477,7 @@ impl Txn {
         let mut queue = VecDeque::new();
         let mut visited = HashSet::new();
         for (table, staged) in &self.staged {
-            for (id, operation) in &staged.operations {
+            for (id, operation) in staged.operations.iter() {
                 if operation.operation.is_none() {
                     if let Some(record) = &operation.deleted_record {
                         queue.push_back((table.clone(), id.clone(), record.clone(), 0usize));
@@ -7611,6 +8576,7 @@ fn staged_operation_bytes(table: &str, id: &str, operation: &Option<Record>) -> 
                         Value::Text(text) => text.len() + 24,
                         Value::Blob(blob) => blob.len() + 24,
                         Value::Vector(vector) => vector.len() * std::mem::size_of::<f32>() + 24,
+                        Value::Json(value) => json_heap_bytes(value),
                         _ => std::mem::size_of::<Value>(),
                     }
             })
@@ -8072,1499 +9038,6 @@ fn read_payload_name<'p>(payload: &'p [u8], pos: &mut usize) -> Result<&'p str> 
     Ok(name)
 }
 
-fn shared_get_at(
-    shared: &Shared,
-    table: &str,
-    id: &str,
-    max_version: u64,
-) -> Result<Option<Record>> {
-    let _admission = PointReadAdmission::enter(shared);
-    let st = shared.state.read().unwrap();
-    let schema = st
-        .catalog
-        .table(table)
-        .ok_or_else(|| Error::TableNotFound(table.into()))?;
-    let implicit_id = schema.has_implicit_id();
-    let entry = match st.visible_owned(table, id, max_version)? {
-        Some(entry) if !entry.is_tombstone() => entry,
-        _ => return Ok(None),
-    };
-    // Retain only the segment handle the payload lives in and release the
-    // shared state before touching the mapping. Decoding (page faults, one
-    // allocation per column) then runs concurrently with committers waiting
-    // for the write lock, exactly like the batched scan path.
-    let reader = match &entry.kind {
-        VKind::SegPut { segment, .. } => Some(
-            st.readers
-                .get(segment)
-                .cloned()
-                .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?,
-        ),
-        _ => None,
-    };
-    drop(st);
-    let blobs = Some(shared.blobs.as_path());
-    let mut record = match &entry.kind {
-        VKind::MemPut(payload) => decode_record(payload, blobs)?,
-        VKind::SegPut {
-            payload_offset,
-            payload_len,
-            ..
-        } => reader
-            .as_deref()
-            .expect("segment reader captured above")
-            .with_payload(*payload_offset, *payload_len, |bytes| {
-                decode_record(bytes, blobs)
-            })?,
-        VKind::MemTombstone | VKind::SegTombstone => return Ok(None),
-    };
-    if implicit_id {
-        record.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
-    }
-    Ok(Some(record))
-}
-
-fn shared_scan_at(shared: &Shared, table: &str, max_version: u64) -> Result<Vec<(String, Record)>> {
-    let mut out = Vec::new();
-    let mut after_id = None;
-    let batch_rows = shared.opts.memory.scan_batch_rows.max(1);
-    loop {
-        let batch =
-            shared_scan_batch_at(shared, table, max_version, after_id.as_deref(), batch_rows)?;
-        let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
-            break;
-        };
-        let complete = batch.len() < batch_rows;
-        out.extend(batch);
-        after_id = Some(last_id);
-        if complete {
-            break;
-        }
-    }
-    Ok(out)
-}
-
-fn shared_scan_batch_at(
-    shared: &Shared,
-    table: &str,
-    max_version: u64,
-    after_id: Option<&str>,
-    limit: usize,
-) -> Result<Vec<(String, Record)>> {
-    let st = shared.state.read().unwrap();
-    let schema = st
-        .catalog
-        .table(table)
-        .ok_or_else(|| Error::TableNotFound(table.into()))?;
-    let epoch = schema.epoch;
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let implicit_id = schema.has_implicit_id();
-    let blobs = st.blobs.clone();
-    let mut prepared = Vec::with_capacity(limit);
-    st.index.visit_table(table, after_id, |id, versions| {
-        let Some(entry) = versions
-            .iter()
-            .rev()
-            .find(|entry| entry.version <= max_version && entry.version > epoch)
-        else {
-            return Ok(true);
-        };
-        if entry.is_tombstone() {
-            return Ok(true);
-        }
-        prepared.push((id.to_owned(), entry.kind.clone()));
-        if prepared.len() == limit {
-            return Ok(false);
-        }
-        Ok(true)
-    })?;
-    let mut readers = SegmentReaders::new();
-    for (_, kind) in &prepared {
-        if let VKind::SegPut { segment, .. } = kind {
-            let reader = st
-                .readers
-                .get(segment)
-                .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
-            readers.entry(*segment).or_insert_with(|| reader.clone());
-        }
-    }
-    drop(st);
-
-    let mut out = Vec::with_capacity(prepared.len());
-    for (id, kind) in prepared {
-        let mut record = read_record_kind(&blobs, &readers, &kind)?;
-        if implicit_id {
-            record.insert(ID_COLUMN.into(), Value::Text(id.clone()));
-        }
-        out.push((id, record));
-    }
-    Ok(out)
-}
-
-/// The optimistic commit path. Serialized by the commit mutex; readers are
-/// only blocked during the short in-memory apply at the end.
-fn finish_or_wait_wal_sync(
-    shared: &Arc<Shared>,
-    group: Arc<WalSyncGroup>,
-    leader: bool,
-) -> WalGroupResult {
-    if !leader {
-        return group.wait();
-    }
-
-    // Only a contended writer opens the coalescing window. Uncontended Safe
-    // commits retain their original one-sync latency.
-    if shared.commit_waiters.load(AtomicOrdering::Acquire) > 0
-        && shared.opts.safe_group_commit_delay_us > 0
-    {
-        let coalesce_started = Instant::now();
-        std::thread::sleep(Duration::from_micros(
-            shared.opts.safe_group_commit_delay_us,
-        ));
-        shared.wal_group_coalesce_nanos.fetch_add(
-            elapsed_nanos(coalesce_started.elapsed()),
-            AtomicOrdering::Relaxed,
-        );
-    }
-
-    let leader_lock_started = Instant::now();
-    let mut cs = shared.commit.lock();
-    shared.wal_group_leader_lock_wait_nanos.fetch_add(
-        elapsed_nanos(leader_lock_started.elapsed()),
-        AtomicOrdering::Relaxed,
-    );
-    debug_assert!(
-        cs.wal_sync_group
-            .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(active, &group)),
-        "the elected WAL sync group stays active until its leader completes"
-    );
-    let sync_started = Instant::now();
-    let outcome = cs.wal().sync_data();
-    let sync_time = sync_started.elapsed();
-    cs.wal_sync_group = None;
-    let commits = group.commits.load(AtomicOrdering::Acquire);
-    let bytes = group.bytes.load(AtomicOrdering::Acquire);
-    record_wal_sync(shared, sync_time, commits, bytes);
-    drop(cs);
-
-    let result = match outcome {
-        WalAppendOutcome::Complete => Ok(()),
-        WalAppendOutcome::SyncFailed(error) => Err(error.to_string()),
-    };
-    group.complete(result.clone());
-    result
-}
-
-fn elapsed_nanos(duration: Duration) -> u64 {
-    duration.as_nanos().min(u64::MAX as u128) as u64
-}
-
-fn record_wal_sync(shared: &Shared, elapsed: Duration, commits: u64, bytes: u64) {
-    shared.wal_sync_count.fetch_add(1, AtomicOrdering::Relaxed);
-    shared
-        .wal_sync_nanos
-        .fetch_add(elapsed_nanos(elapsed), AtomicOrdering::Relaxed);
-    shared
-        .wal_synced_bytes
-        .fetch_add(bytes, AtomicOrdering::Relaxed);
-    shared
-        .wal_sync_max_group_commits
-        .fetch_max(commits, AtomicOrdering::Relaxed);
-    shared
-        .wal_sync_max_group_bytes
-        .fetch_max(bytes, AtomicOrdering::Relaxed);
-    if commits > 1 {
-        shared
-            .grouped_commit_count
-            .fetch_add(commits, AtomicOrdering::Relaxed);
-    }
-}
-
-fn lock_commit_for_transaction(shared: &Shared) -> TimedCommitGuard<'_> {
-    TimedCommitGuard {
-        guard: Some(shared.commit.lock()),
-        started: Instant::now(),
-        total_nanos: &shared.commit_lock_hold_nanos,
-        waiters: &shared.commit_waiters,
-        // Safe group commit benefits from allowing the current CPU to append
-        // several queued records before the elected leader fsyncs them. Fast
-        // and Balanced need fair handoff to bound mutex-tail latency instead.
-        fair_handoff: shared.opts.durability != Durability::Safe,
-    }
-}
-
-fn commit_staged(
-    shared: &Arc<Shared>,
-    snap_version: u64,
-    staged_tables: Vec<(String, StagedTable)>,
-) -> Result<u64> {
-    if shared.opts.read_only {
-        return Err(Error::ReadOnly);
-    }
-    ensure_canonical_writable(shared)?;
-    if staged_tables
-        .iter()
-        .all(|(_, staged_table)| staged_table.operations.is_empty())
-    {
-        return Ok(shared.state.read().unwrap().committed_version);
-    }
-    let _active_state_writer = ActiveStateWriter::enter(shared);
-    let prepared = prepare_commit(shared, snap_version, staged_tables);
-    let prepared = prepared?;
-    if is_coordinated_insert_candidate(&prepared) {
-        coordinate_commit(shared, prepared)
-    } else {
-        finish_prepared_commit(shared, prepared)
-    }
-}
-
-fn is_coordinated_insert_candidate(prepared: &PreparedCommit) -> bool {
-    prepared.preencoded_wal.is_some()
-        && prepared.staged.iter().all(|table| {
-            table.schema.indexes.is_empty()
-                && table.schema.text_indexes.is_empty()
-                && table.schema.vector_indexes.is_empty()
-                && table.schema.foreign_keys.is_empty()
-                && !table.schema.columns.iter().any(|column| column.identity)
-                && table
-                    .changes
-                    .iter()
-                    .all(|change| change.operation.is_some())
-        })
-}
-
-fn prepare_commit(
-    shared: &Arc<Shared>,
-    snap_version: u64,
-    staged_tables: Vec<(String, StagedTable)>,
-) -> Result<PreparedCommit> {
-    let commit_started = Instant::now();
-    let prepare_started = Instant::now();
-    let mut blob_sink = BlobSink::new(&shared.dir, shared.opts.external_blob_threshold);
-    let mut staged = Vec::with_capacity(staged_tables.len());
-    for (name, staged_table) in staged_tables {
-        if staged_table.operations.is_empty() {
-            continue;
-        }
-        let operation_count = staged_table.operations.len();
-        let mut ordered: Vec<Option<(String, Option<Record>)>> = std::iter::repeat_with(|| None)
-            .take(operation_count)
-            .collect();
-        for (id, operation) in staged_table.operations {
-            ordered[operation.position] = Some((id, operation.operation));
-        }
-        let mut ordered: Vec<_> = ordered
-            .into_iter()
-            .map(|entry| entry.expect("staged positions are contiguous"))
-            .collect();
-        if !ordered.windows(2).all(|pair| pair[0].0 < pair[1].0) {
-            ordered.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        }
-        let mut changes = Vec::with_capacity(operation_count);
-        for (id, operation) in ordered {
-            let payload = match &operation {
-                Some(record) => Some(Arc::new(encode_record_ordered(
-                    &staged_table.schema,
-                    record,
-                    Some(&mut blob_sink),
-                )?)),
-                None => None,
-            };
-            changes.push(PreparedChange {
-                id,
-                operation,
-                payload,
-            });
-        }
-        staged.push(PreparedTable {
-            name,
-            schema: staged_table.schema,
-            changes,
-        });
-    }
-    staged.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-    // Most transactions do not advance an identity sequence. Encode their
-    // potentially large payloads before taking the global commit mutex, then
-    // patch the final version and CRC once conflict validation assigns it.
-    // Identity high-water marks are read under the mutex and therefore keep
-    // the legacy encoding path below.
-    let preencoded_wal = if staged
-        .iter()
-        .all(|table| !table.schema.columns.iter().any(|column| column.identity))
-    {
-        let wal_changes: Vec<(&str, &str, Option<&[u8]>)> = staged
-            .iter()
-            .flat_map(|table| {
-                table.changes.iter().map(|change| {
-                    (
-                        table.name.as_str(),
-                        change.id.as_str(),
-                        change.payload.as_deref().map(|payload| payload.as_slice()),
-                    )
-                })
-            })
-            .collect();
-        Some(encode_commit(0, &wal_changes, &[])?)
-    } else {
-        None
-    };
-    // Blob files are already individually synced. Publish their names and
-    // sync the blob directory before contending for the commit mutex; the
-    // pending set makes concurrent compaction GC treat them as referenced
-    // until either this commit applies or aborts.
-    let pending_blobs = PendingBlobPublications::new(shared.clone(), &blob_sink);
-    blob_sink.publish()?;
-    #[cfg(test)]
-    {
-        shared
-            .blob_test_reached_publish
-            .store(true, AtomicOrdering::Release);
-        while shared
-            .blob_test_pause_after_publish
-            .load(AtomicOrdering::Acquire)
-        {
-            std::thread::yield_now();
-        }
-    }
-    // Decode prior indexed records optimistically while writers still prepare
-    // in parallel. Commit validation below re-reads each latest version under
-    // the serialization mutex; a cached record is used only when its version
-    // still matches, so concurrent updates remain conflicts and checkpoint
-    // representation changes remain safe.
-    let has_derived_indexes = staged.iter().any(|table| {
-        !table.schema.indexes.is_empty()
-            || !table.schema.text_indexes.is_empty()
-            || !table.schema.vector_indexes.is_empty()
-    });
-    let (incoming_index_bytes, optimistic_prior_records) = if has_derived_indexes {
-        let state = shared.state.read().unwrap();
-        let incoming_index_bytes = estimate_staged_index_bytes(&state, &staged)?;
-        let records = staged
-            .iter()
-            .map(|table| {
-                table
-                    .changes
-                    .iter()
-                    .map(|change| {
-                        if table.schema.indexes.is_empty() && table.schema.text_indexes.is_empty() {
-                            return Ok(None);
-                        }
-                        let previous = if state.id_is_above_high_watermark(&table.name, &change.id)
-                        {
-                            None
-                        } else {
-                            state.latest_owned(&table.name, &change.id)?
-                        };
-                        match previous {
-                            Some(entry) if !entry.is_tombstone() => Ok(Some((
-                                entry.version,
-                                read_record_kind(&state.blobs, &state.readers, &entry.kind)?,
-                            ))),
-                            _ => Ok(None),
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?;
-        (incoming_index_bytes, records)
-    } else {
-        let bytes = staged
-            .iter()
-            .flat_map(|table| &table.changes)
-            .map(|change| {
-                change
-                    .id
-                    .len()
-                    .saturating_add(change.payload.as_ref().map_or(0, |value| value.len()))
-                    .saturating_add(144)
-            })
-            .fold(0usize, usize::saturating_add);
-        let records = staged
-            .iter()
-            .map(|table| vec![None; table.changes.len()])
-            .collect();
-        (bytes, records)
-    };
-    if incoming_index_bytes > shared.memory_governor.index_capacity() {
-        return Err(Error::MemoryLimit(format!(
-            "transaction needs an estimated {incoming_index_bytes} index-delta bytes, but the pool is {} bytes; split the transaction or raise memory.index_delta_pool_bytes",
-            shared.memory_governor.index_capacity()
-        )));
-    }
-    let outside_prepare_time = prepare_started.elapsed();
-
-    Ok(PreparedCommit {
-        snap_version,
-        staged,
-        preencoded_wal,
-        optimistic_prior_records,
-        incoming_index_bytes,
-        outside_prepare_time,
-        commit_started,
-        _pending_blobs: pending_blobs,
-    })
-}
-
-fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Result<u64> {
-    let request = Arc::new(CoordinatedCommit::new(prepared));
-    let mut leader = {
-        let mut coordinator = shared.commit_coordinator.lock().unwrap();
-        coordinator.queue.push_back(request.clone());
-        if coordinator.active {
-            false
-        } else {
-            coordinator.active = true;
-            true
-        }
-    };
-
-    loop {
-        if leader {
-            if should_coalesce_safe_batch(shared) {
-                let coalesce_started = Instant::now();
-                std::thread::sleep(Duration::from_micros(
-                    shared.opts.safe_group_commit_delay_us,
-                ));
-                shared.wal_group_coalesce_nanos.fetch_add(
-                    elapsed_nanos(coalesce_started.elapsed()),
-                    AtomicOrdering::Relaxed,
-                );
-            }
-            let batch = {
-                let mut coordinator = shared.commit_coordinator.lock().unwrap();
-                let take = coordinator.queue.len().min(COMMIT_COORDINATOR_MAX_BATCH);
-                coordinator.queue.drain(..take).collect::<Vec<_>>()
-            };
-            process_coordinated_batch(shared, batch);
-            let mut coordinator = shared.commit_coordinator.lock().unwrap();
-            if let Some(next) = coordinator.queue.front() {
-                next.promote_to_leader();
-            } else {
-                coordinator.active = false;
-            }
-        }
-        if let Some(result) = request.take_result() {
-            return result;
-        }
-        match request.wait_for_result_or_lead() {
-            Some(result) => return result,
-            None => leader = true,
-        }
-    }
-}
-
-fn should_coalesce_safe_batch(shared: &Shared) -> bool {
-    if shared.opts.durability != Durability::Safe || shared.opts.safe_group_commit_delay_us == 0 {
-        return false;
-    }
-    if shared.active_state_writers.load(AtomicOrdering::Acquire) > 1 {
-        // Preserve a short contention memory across the tiny gap between two
-        // writers finishing one batch and staging the next. Without it, a
-        // two-writer workload can alternate just cleanly enough for each new
-        // leader to misclassify the stream as single-writer.
-        shared
-            .safe_coalesce_budget
-            .store(8, AtomicOrdering::Release);
-        return true;
-    }
-    shared
-        .safe_coalesce_budget
-        .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |budget| {
-            budget.checked_sub(1)
-        })
-        .is_ok()
-}
-
-fn process_coordinated_batch(shared: &Arc<Shared>, batch: Vec<Arc<CoordinatedCommit>>) {
-    let mut prepared = batch
-        .iter()
-        .map(|request| {
-            request
-                .prepared
-                .lock()
-                .unwrap()
-                .take()
-                .expect("coordinated commit is processed once")
-        })
-        .collect::<Vec<_>>();
-    let queue_wait = batch
-        .iter()
-        .map(|request| request.queued_at.elapsed())
-        .fold(Duration::ZERO, Duration::saturating_add);
-    if let Some(results) = finish_coordinated_insert_batch(shared, &mut prepared, queue_wait) {
-        debug_assert_eq!(batch.len(), results.len());
-        for (request, result) in batch.into_iter().zip(results) {
-            request.complete(result);
-        }
-        return;
-    }
-    for (request, prepared) in batch.into_iter().zip(prepared) {
-        request.complete(finish_prepared_commit(shared, prepared));
-    }
-}
-
-/// Coordinated path for disjoint inserts into unconstrained tables.
-/// Validation still happens under the serialization mutex, every transaction
-/// receives its own version and WAL frame, and readers see the complete batch
-/// only after the vectored append and one state publication finish. `Safe`
-/// batches issue one strict durability barrier before any member returns.
-fn finish_coordinated_insert_batch(
-    shared: &Arc<Shared>,
-    prepared: &mut [PreparedCommit],
-    queue_wait: Duration,
-) -> Option<Vec<Result<u64>>> {
-    if prepared.len() < 2 {
-        return None;
-    }
-    debug_assert!(prepared.iter().all(is_coordinated_insert_candidate));
-    if shared
-        .background_checkpoint
-        .lock()
-        .unwrap()
-        .last_error
-        .is_some()
-    {
-        return None;
-    }
-    let incoming_bytes = prepared.iter().try_fold(0usize, |total, commit| {
-        total.checked_add(commit.incoming_index_bytes)
-    })?;
-    if shared.memory_governor.index_would_exceed(incoming_bytes) {
-        return None;
-    }
-
-    let lock_started = Instant::now();
-    shared.commit_waiters.fetch_add(1, AtomicOrdering::AcqRel);
-    let mut cs = lock_commit_for_transaction(shared);
-    shared.commit_waiters.fetch_sub(1, AtomicOrdering::AcqRel);
-    let lock_wait = lock_started.elapsed().saturating_add(queue_wait);
-    let locked_prepare_started = Instant::now();
-    let mut ids = HashSet::new();
-    let start_version = {
-        let state = shared.state.read().unwrap();
-        for commit in prepared.iter() {
-            for table in &commit.staged {
-                if state.catalog.table(&table.name) != Some(&table.schema) {
-                    return None;
-                }
-                for change in &table.changes {
-                    if !ids.insert((table.name.clone(), change.id.clone())) {
-                        return None;
-                    }
-                    let previous = if state.id_is_above_high_watermark(&table.name, &change.id) {
-                        None
-                    } else {
-                        match state.latest_owned(&table.name, &change.id) {
-                            Ok(previous) => previous,
-                            Err(_) => return None,
-                        }
-                    };
-                    // Updates/reinserts need prior-record and derived-index
-                    // handling from the general path.
-                    if previous.is_some() {
-                        return None;
-                    }
-                }
-            }
-        }
-        state.committed_version
-    };
-    let batch_len = u64::try_from(prepared.len()).expect("coordinator batch length fits u64");
-    let Some(end_version) = start_version.checked_add(batch_len) else {
-        return Some(
-            (0..prepared.len())
-                .map(|_| {
-                    Err(Error::InvalidArgument(
-                        "commit version space is exhausted".into(),
-                    ))
-                })
-                .collect(),
-        );
-    };
-    let versions = ((start_version + 1)..=end_version).collect::<Vec<_>>();
-    let locked_prepare_time = locked_prepare_started.elapsed();
-
-    let wal_started = Instant::now();
-    for (commit, version) in prepared.iter_mut().zip(&versions) {
-        set_encoded_commit_version(
-            commit
-                .preencoded_wal
-                .as_mut()
-                .expect("insert batch has preencoded WAL"),
-            *version,
-        );
-    }
-    let wal_append_started = Instant::now();
-    let records = prepared
-        .iter()
-        .map(|commit| {
-            commit
-                .preencoded_wal
-                .as_deref()
-                .expect("insert batch has preencoded WAL")
-        })
-        .collect::<Vec<_>>();
-    let synced_bytes = records.iter().fold(0u64, |total, record| {
-        total.saturating_add(record.len() as u64)
-    });
-    if let Err(error) = cs.wal().append_commits_unflushed(&records) {
-        drop(cs);
-        let message = error.to_string();
-        return Some(
-            versions
-                .into_iter()
-                .map(|_| {
-                    Err(Error::Io(std::io::Error::other(format!(
-                        "coordinated WAL append failed: {message}"
-                    ))))
-                })
-                .collect(),
-        );
-    }
-    let wal_append_time = wal_append_started.elapsed();
-    let sync_due = cs.wal().sync_due(
-        shared.opts.durability,
-        shared.opts.balanced_sync_interval_ms,
-    );
-    let sync_outcome = sync_due.then(|| {
-        let sync_started = Instant::now();
-        let outcome = cs.wal().sync_data();
-        record_wal_sync(shared, sync_started.elapsed(), batch_len, synced_bytes);
-        outcome
-    });
-
-    let apply_started = Instant::now();
-    let mut added = 0u64;
-    {
-        let mut state = shared.state.write().unwrap();
-        for (commit, version) in prepared.iter_mut().zip(&versions) {
-            for table in std::mem::take(&mut commit.staged) {
-                let high_id = table
-                    .changes
-                    .last()
-                    .map(|change| change.id.clone())
-                    .expect("prepared table is non-empty");
-                let keys = DerivedIndexKeys::new(&table.name, &table.schema);
-                for change in table.changes {
-                    let put = change.operation.as_ref().zip(change.payload.as_ref());
-                    let put = put.map(|(record, payload)| (payload, record));
-                    let mut jobs = Vec::new();
-                    apply_one_owned(
-                        &mut state,
-                        *version,
-                        &table.schema,
-                        &table.name,
-                        change.id,
-                        ApplyRecordState { put, prior: None },
-                        &keys,
-                        &mut jobs,
-                    );
-                    debug_assert!(jobs.is_empty());
-                    added = added.saturating_add(
-                        change
-                            .payload
-                            .as_deref()
-                            .map_or(0, |payload| payload.len() as u64)
-                            + 32,
-                    );
-                }
-                state.record_high_id(&table.name, &high_id);
-            }
-            state.committed_version = *version;
-        }
-    }
-    let apply_time = apply_started.elapsed();
-    cs.memtable_bytes = cs.memtable_bytes.saturating_add(added);
-    shared.memory_governor.add_index_delta_bytes(incoming_bytes);
-    let maintenance_needed = cs.memtable_bytes >= shared.opts.memtable_max_bytes;
-    drop(cs);
-    let wal_time = wal_started.elapsed();
-
-    if maintenance_needed {
-        let result = (|| -> Result<()> {
-            let mut cs = lock_commit_after_group_sync(shared);
-            if cs.memtable_bytes >= shared.opts.memtable_max_bytes
-                && shared.state.read().unwrap().index.frozen.is_none()
-                && !shared.background_derived.lock().unwrap().running
-            {
-                let memory = acquire_frozen_lease(shared, cs.memtable_bytes as usize);
-                let _ = schedule_frozen_checkpoint(shared, &mut cs, memory)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            let mut status = shared.background_checkpoint.lock().unwrap();
-            status.commit_unknown = matches!(&error, Error::CommitUnknown(_));
-            status.last_error = Some(format!("post-commit maintenance failed: {error}"));
-        }
-    }
-
-    let elapsed_nanos = |duration: Duration| duration.as_nanos().min(u64::MAX as u128) as u64;
-    let count = prepared.len() as u64;
-    shared
-        .commit_count
-        .fetch_add(count, AtomicOrdering::Relaxed);
-    let total_commit_nanos = prepared.iter().fold(0u64, |total, commit| {
-        total.saturating_add(elapsed_nanos(commit.commit_started.elapsed()))
-    });
-    shared
-        .commit_nanos
-        .fetch_add(total_commit_nanos, AtomicOrdering::Relaxed);
-    shared
-        .commit_lock_wait_nanos
-        .fetch_add(elapsed_nanos(lock_wait), AtomicOrdering::Relaxed);
-    let outside_prepare = prepared
-        .iter()
-        .map(|commit| commit.outside_prepare_time)
-        .fold(Duration::ZERO, Duration::saturating_add);
-    shared.commit_prepare_nanos.fetch_add(
-        elapsed_nanos(outside_prepare.saturating_add(locked_prepare_time)),
-        AtomicOrdering::Relaxed,
-    );
-    shared
-        .commit_locked_prepare_nanos
-        .fetch_add(elapsed_nanos(locked_prepare_time), AtomicOrdering::Relaxed);
-    shared.commit_wal_nanos.fetch_add(
-        elapsed_nanos(wal_time).saturating_mul(count),
-        AtomicOrdering::Relaxed,
-    );
-    shared
-        .commit_wal_append_nanos
-        .fetch_add(elapsed_nanos(wal_append_time), AtomicOrdering::Relaxed);
-    shared
-        .commit_apply_nanos
-        .fetch_add(elapsed_nanos(apply_time), AtomicOrdering::Relaxed);
-    shared
-        .coordinated_batch_count
-        .fetch_add(1, AtomicOrdering::Relaxed);
-    shared
-        .coordinated_commit_count
-        .fetch_add(count, AtomicOrdering::Relaxed);
-
-    let sync_error = match sync_outcome {
-        Some(WalAppendOutcome::SyncFailed(error)) => Some(error.to_string()),
-        _ => None,
-    };
-    Some(
-        versions
-            .into_iter()
-            .map(|version| match &sync_error {
-                Some(error) => Err(Error::CommitUnknown(format!(
-                    "version {version} was published, but syncing its coordinated WAL batch failed: {error}"
-                ))),
-                None => Ok(version),
-            })
-            .collect(),
-    )
-}
-
-fn finish_prepared_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Result<u64> {
-    let PreparedCommit {
-        snap_version,
-        staged,
-        preencoded_wal,
-        optimistic_prior_records,
-        incoming_index_bytes,
-        outside_prepare_time,
-        commit_started,
-        _pending_blobs,
-    } = prepared;
-
-    let mut lock_wait = Duration::ZERO;
-    let mut locked_prepare_time = Duration::ZERO;
-    let (mut cs, previous_entries, commit_version, incoming_index_bytes, identity_high_water) = loop {
-        let lock_started = Instant::now();
-        shared.commit_waiters.fetch_add(1, AtomicOrdering::AcqRel);
-        let mut cs = lock_commit_for_transaction(shared);
-        shared.commit_waiters.fetch_sub(1, AtomicOrdering::AcqRel);
-        lock_wait = lock_wait.saturating_add(lock_started.elapsed());
-        // Surface asynchronous I/O failure before this transaction reaches
-        // its WAL durability point; reporting it after apply would make the
-        // commit outcome ambiguous to the caller.
-        take_background_checkpoint_error(shared)?;
-        let locked_prepare_started = Instant::now();
-        let mut previous_entries: Vec<Vec<(Option<VersionEntry>, Option<Record>)>> =
-            Vec::with_capacity(staged.len());
-        let (commit_version, identity_high_water) = {
-            let st = shared.state.read().unwrap();
-            for (table_index, table) in staged.iter().enumerate() {
-                if st.catalog.table(&table.name) != Some(&table.schema) {
-                    return Err(Error::Conflict(format!(
-                        "schema for {} changed while the transaction was preparing",
-                        table.name
-                    )));
-                }
-                let mut table_previous = Vec::with_capacity(table.changes.len());
-                for (change_index, change) in table.changes.iter().enumerate() {
-                    // Write-write conflict: someone committed a change to this
-                    // record after our snapshot.
-                    let previous = if st.id_is_above_high_watermark(&table.name, &change.id) {
-                        None
-                    } else {
-                        st.latest_owned(&table.name, &change.id)?
-                    };
-                    if let Some(last) = &previous {
-                        if last.version > snap_version {
-                            return Err(Error::Conflict(format!(
-                                "{}/{} changed after this transaction began",
-                                table.name, change.id
-                            )));
-                        }
-                    }
-                    // Complete every fallible read before the WAL durability
-                    // point. Applying the already-committed change below must
-                    // only mutate memory and cannot return a late error after
-                    // partially publishing a transaction.
-                    let prior_record = match &previous {
-                        Some(entry)
-                            if !entry.is_tombstone()
-                                && (!table.schema.indexes.is_empty()
-                                    || !table.schema.text_indexes.is_empty()) =>
-                        {
-                            match &optimistic_prior_records[table_index][change_index] {
-                                Some((version, record)) if *version == entry.version => {
-                                    Some(record.clone())
-                                }
-                                _ => Some(read_record_kind(&st.blobs, &st.readers, &entry.kind)?),
-                            }
-                        }
-                        _ => None,
-                    };
-                    table_previous.push((previous, prior_record));
-                }
-                previous_entries.push(table_previous);
-            }
-            validate_unique(&st, &staged)?;
-            validate_foreign_keys(&st, &staged)?;
-            let identity_high_water: Vec<(String, i64)> = staged
-                .iter()
-                .filter(|table| table.schema.columns.iter().any(|column| column.identity))
-                .filter_map(|table| {
-                    st.identity_high_water
-                        .get(&table.name)
-                        .map(|value| (table.name.clone(), *value))
-                })
-                .collect();
-            (st.committed_version + 1, identity_high_water)
-        };
-        locked_prepare_time = locked_prepare_time.saturating_add(locked_prepare_started.elapsed());
-        if shared
-            .memory_governor
-            .index_would_exceed(incoming_index_bytes)
-        {
-            if let Some(group) = cs.wal_sync_group.clone() {
-                drop(cs);
-                let _ = group.wait();
-                continue;
-            }
-            let (derived_bytes, has_frozen_derived) = {
-                let state = shared.state.read().unwrap();
-                (
-                    state.derived_delta_memory_bytes(),
-                    state.has_frozen_derived(),
-                )
-            };
-            let derived_running = shared.background_derived.lock().unwrap().running;
-            if derived_running {
-                drop(cs);
-                wait_for_background_derived(shared)?;
-                continue;
-            }
-            if derived_bytes > 0 || has_frozen_derived {
-                wait_vector_indexing_shared(shared)?;
-                let memory = acquire_frozen_lease(shared, derived_bytes);
-                if schedule_frozen_derived(shared, memory)? {
-                    drop(cs);
-                    wait_for_background_derived(shared)?;
-                    continue;
-                }
-            }
-            if shared.state.read().unwrap().index.frozen.is_some() {
-                drop(cs);
-                wait_for_background_checkpoint(shared)?;
-                continue;
-            }
-            let memory = acquire_frozen_lease(shared, cs.memtable_bytes as usize);
-            if schedule_frozen_checkpoint(shared, &mut cs, memory)? {
-                drop(cs);
-                wait_for_background_checkpoint(shared)?;
-                continue;
-            }
-            if shared
-                .memory_governor
-                .index_would_exceed(incoming_index_bytes)
-            {
-                return Err(Error::MemoryLimit(
-                    "index tombstones still fill the delta pool after consolidation; compact the database or raise memory.index_delta_pool_bytes"
-                        .into(),
-                ));
-            }
-        }
-        break (
-            cs,
-            previous_entries,
-            commit_version,
-            incoming_index_bytes,
-            identity_high_water,
-        );
-    };
-    let prepare_time = outside_prepare_time.saturating_add(locked_prepare_time);
-    // Durability point: the WAL record is the commit.
-    let wal_started = Instant::now();
-    let mut bytes = match preencoded_wal {
-        Some(bytes) => bytes,
-        None => {
-            let wal_changes: Vec<(&str, &str, Option<&[u8]>)> = staged
-                .iter()
-                .flat_map(|table| {
-                    table.changes.iter().map(|change| {
-                        (
-                            table.name.as_str(),
-                            change.id.as_str(),
-                            change.payload.as_deref().map(|payload| payload.as_slice()),
-                        )
-                    })
-                })
-                .collect();
-            let identity_wal: Vec<(&str, i64)> = identity_high_water
-                .iter()
-                .map(|(table, value)| (table.as_str(), *value))
-                .collect();
-            encode_commit(commit_version, &wal_changes, &identity_wal)?
-        }
-    };
-    let wal_append_started = Instant::now();
-    set_encoded_commit_version(&mut bytes, commit_version);
-    cs.wal().append_commit_unflushed(&bytes)?;
-    let sync_due = cs.wal().sync_due(
-        shared.opts.durability,
-        shared.opts.balanced_sync_interval_ms,
-    );
-    let sync_group = if sync_due {
-        match cs.wal_sync_group.as_ref() {
-            Some(group) => {
-                group.join(bytes.len() as u64);
-                Some((group.clone(), false))
-            }
-            None => {
-                let group = Arc::new(WalSyncGroup::new(bytes.len() as u64));
-                cs.wal_sync_group = Some(group.clone());
-                Some((group, true))
-            }
-        }
-    } else {
-        None
-    };
-    let wal_append_time = wal_append_started.elapsed();
-
-    // Publish atomically to readers.
-    let apply_started = Instant::now();
-    let mut added = 0u64;
-    let mut obsolete_operations = 0u64;
-    let mut obsolete_bytes = 0u64;
-    let mut jobs: Vec<VecJob> = Vec::new();
-    {
-        let mut st = shared.state.write().unwrap();
-        for (table, table_previous) in staged.into_iter().zip(previous_entries) {
-            let high_id = table
-                .changes
-                .last()
-                .map(|change| change.id.clone())
-                .expect("prepared tables are non-empty");
-            let keys = DerivedIndexKeys::new(&table.name, &table.schema);
-            for (change, (previous, prior_record)) in table.changes.into_iter().zip(table_previous)
-            {
-                if let Some(previous) = &previous {
-                    // An update, delete, or reinsert supersedes one previously
-                    // visible record version. Count rows, not SQL statements.
-                    obsolete_operations += 1;
-                    obsolete_bytes = obsolete_bytes.saturating_add(obsolete_entry_bytes_estimate(
-                        &table.name,
-                        &change.id,
-                        previous,
-                    ));
-                } else if change.operation.is_none() {
-                    // Insert-then-delete inside one transaction leaves only a
-                    // tombstone, which compaction can discard completely.
-                    obsolete_operations += 1;
-                }
-                if let Some(VersionEntry {
-                    kind: VKind::SegPut { segment, .. },
-                    ..
-                }) = &previous
-                {
-                    st.superseded_segments.insert(*segment);
-                }
-                let put = match (&change.operation, &change.payload) {
-                    (Some(record), Some(payload)) => Some((payload, record)),
-                    _ => None,
-                };
-                apply_one_owned(
-                    &mut st,
-                    commit_version,
-                    &table.schema,
-                    &table.name,
-                    change.id,
-                    ApplyRecordState {
-                        put,
-                        prior: prior_record,
-                    },
-                    &keys,
-                    &mut jobs,
-                );
-                added += change
-                    .payload
-                    .as_deref()
-                    .map_or(0, |payload| payload.len() as u64)
-                    + 32;
-            }
-            st.record_high_id(&table.name, &high_id);
-        }
-        st.committed_version = commit_version;
-    }
-    let apply_time = apply_started.elapsed();
-    if obsolete_operations > 0 {
-        let mut auto = shared.auto_compaction_state.lock().unwrap();
-        auto.debt_operations = auto.debt_operations.saturating_add(obsolete_operations);
-        auto.estimated_reclaimable_bytes = auto
-            .estimated_reclaimable_bytes
-            .saturating_add(obsolete_bytes);
-    }
-    if !jobs.is_empty() {
-        let tx = shared.vector_tx.lock().unwrap();
-        if let Some(tx) = tx.as_ref() {
-            shared
-                .vector_backlog
-                .fetch_add(jobs.len() as u64, AtomicOrdering::SeqCst);
-            for job in jobs {
-                if tx.send(job).is_err() {
-                    *shared
-                        .vector_worker_error
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner()) = Some(
-                        "vector indexing worker stopped before accepting committed work".into(),
-                    );
-                    // Keep the backlog charged: the vector is committed but
-                    // not searchable. A waiter must report the dead worker,
-                    // not claim that indexing completed successfully.
-                }
-            }
-        }
-    }
-    cs.memtable_bytes += added;
-    shared
-        .memory_governor
-        .add_index_delta_bytes(incoming_index_bytes);
-    let maintenance_needed = cs.memtable_bytes >= shared.opts.memtable_max_bytes;
-    // Publish derived deltas in the background once the shared delta pool is
-    // half full, but only when they are worth a run: the pool is shared with
-    // the primary memtable, and publishing a few thousand vectors every commit
-    // while the memtable is what fills it would create tiny HNSW runs faster
-    // than background merges can fold them. One sixteenth of the pool is about
-    // the largest run four of which a merge can still rebuild within its half
-    // of the maintenance pool. Hard pool pressure still publishes whatever
-    // exists.
-    let derived_schedule_needed = {
-        let memory = shared.memory_governor.stats();
-        memory.index_delta_bytes >= memory.index_delta_capacity_bytes / 2
-            && shared.state.read().unwrap().derived_delta_memory_bytes() as u64
-                >= (memory.index_delta_capacity_bytes / DERIVED_PUBLICATION_MIN_DIVISOR).max(1)
-    };
-    drop(cs);
-
-    let wal_result = sync_group.map_or(Ok(()), |(group, leader)| {
-        finish_or_wait_wal_sync(shared, group, leader)
-    });
-    let wal_time = wal_started.elapsed();
-
-    let maintenance_result = (|| -> Result<()> {
-        if maintenance_needed || derived_schedule_needed {
-            let mut cs = lock_commit_after_group_sync(shared);
-            if derived_schedule_needed && !shared.background_derived.lock().unwrap().running {
-                let derived_bytes = shared.state.read().unwrap().derived_delta_memory_bytes();
-                if let Some(memory) = try_acquire_frozen_lease(shared, derived_bytes) {
-                    let _ = schedule_frozen_derived(shared, memory)?;
-                }
-            }
-            if cs.memtable_bytes >= shared.opts.memtable_max_bytes {
-                // The derived worker owns the sole maintenance reservation
-                // and needs this mutex for its final publication. Defer the
-                // soft-threshold primary checkpoint instead of waiting for
-                // that reservation while holding the mutex. A later commit
-                // schedules it; hard index pressure waits outside the mutex.
-                if shared.background_derived.lock().unwrap().running {
-                    return Ok(());
-                }
-                let frozen_running = shared.state.read().unwrap().index.frozen.is_some();
-                if !frozen_running {
-                    let memory = acquire_frozen_lease(shared, cs.memtable_bytes as usize);
-                    let _ = schedule_frozen_checkpoint(shared, &mut cs, memory)?;
-                }
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = maintenance_result {
-        // The transaction is already in the WAL and visible. Never turn a
-        // post-commit checkpoint failure into an apparent transaction
-        // failure that callers might retry. Defer it to the next write before
-        // that write reaches its own durability point.
-        let mut status = shared.background_checkpoint.lock().unwrap();
-        status.commit_unknown = matches!(&error, Error::CommitUnknown(_));
-        status.last_error = Some(format!("post-commit maintenance failed: {error}"));
-    }
-    let elapsed_nanos = |duration: Duration| duration.as_nanos().min(u64::MAX as u128) as u64;
-    shared.commit_count.fetch_add(1, AtomicOrdering::Relaxed);
-    shared.commit_nanos.fetch_add(
-        elapsed_nanos(commit_started.elapsed()),
-        AtomicOrdering::Relaxed,
-    );
-    shared
-        .commit_lock_wait_nanos
-        .fetch_add(elapsed_nanos(lock_wait), AtomicOrdering::Relaxed);
-    shared
-        .commit_prepare_nanos
-        .fetch_add(elapsed_nanos(prepare_time), AtomicOrdering::Relaxed);
-    shared
-        .commit_locked_prepare_nanos
-        .fetch_add(elapsed_nanos(locked_prepare_time), AtomicOrdering::Relaxed);
-    shared
-        .commit_wal_nanos
-        .fetch_add(elapsed_nanos(wal_time), AtomicOrdering::Relaxed);
-    shared
-        .commit_wal_append_nanos
-        .fetch_add(elapsed_nanos(wal_append_time), AtomicOrdering::Relaxed);
-    shared
-        .commit_apply_nanos
-        .fetch_add(elapsed_nanos(apply_time), AtomicOrdering::Relaxed);
-    match wal_result {
-        Ok(()) => Ok(commit_version),
-        Err(error) => Err(Error::CommitUnknown(format!(
-            "version {commit_version} was published, but syncing its WAL group failed: {error}"
-        ))),
-    }
-}
-
-fn estimate_staged_index_bytes(st: &State, staged: &[PreparedTable]) -> Result<usize> {
-    let mut bytes = 0usize;
-    for table in staged {
-        for change in &table.changes {
-            bytes = bytes
-                .saturating_add(change.id.len())
-                .saturating_add(change.payload.as_ref().map_or(0, |value| value.len()))
-                // Matches PrimaryIdx::delta_memory_bytes (96 bytes for the
-                // B-tree key/value slot plus 40 for VersionEntry/Arc), with a
-                // small conservative margin. The outer table key is amortized
-                // across all rows in the transaction.
-                .saturating_add(144);
-            // Updates can create both a tombstone for the old derived entry
-            // and a new entry. Charge both sides conservatively before WAL.
-            bytes = bytes.saturating_add(
-                table
-                    .schema
-                    .indexes
-                    .len()
-                    .saturating_mul(change.id.len().saturating_mul(2).saturating_add(320)),
-            );
-            if table.schema.text_indexes.is_empty() && table.schema.vector_indexes.is_empty() {
-                continue;
-            }
-            let mut charge_record = |record: &Record| {
-                for def in &table.schema.text_indexes {
-                    if let Some(Value::Text(text)) = record.get(&def.column) {
-                        for token in crate::text::tokenize(text) {
-                            bytes = bytes
-                                .saturating_add(token.len())
-                                .saturating_add(change.id.len())
-                                .saturating_add(112);
-                        }
-                    }
-                }
-                for def in &table.schema.vector_indexes {
-                    if let Some(Value::Vector(vector)) = record.get(&def.column) {
-                        let scalar = if def.quantized { 1 } else { 4 };
-                        bytes = bytes
-                            .saturating_add(vector.len().saturating_mul(scalar))
-                            .saturating_add(def.m.saturating_mul(16))
-                            .saturating_add(change.id.len())
-                            .saturating_add(192);
-                    }
-                }
-            };
-            if let Some(record) = &change.operation {
-                charge_record(record);
-            }
-            if let Some(previous) = st.latest_owned(&table.name, &change.id)? {
-                if !previous.is_tombstone() {
-                    let record = read_record_kind(&st.blobs, &st.readers, &previous.kind)?;
-                    charge_record(&record);
-                }
-            }
-        }
-    }
-    Ok(bytes)
-}
-
-fn validate_unique(st: &State, staged: &[PreparedTable]) -> Result<()> {
-    if !st
-        .catalog
-        .tables
-        .iter()
-        .any(|schema| schema.indexes.iter().any(|index| index.unique))
-    {
-        return Ok(());
-    }
-    let mut staged_new: HashMap<(String, String, Vec<u8>), String> = HashMap::new();
-    let staged_keys: HashSet<_> = staged
-        .iter()
-        .flat_map(|table| {
-            table
-                .changes
-                .iter()
-                .map(|change| (table.name.as_str(), change.id.as_str()))
-        })
-        .collect();
-    for table in staged {
-        for change in &table.changes {
-            let Some(record) = &change.operation else {
-                continue;
-            };
-            for def in &table.schema.indexes {
-                if !def.unique {
-                    continue;
-                }
-                let Some(value) = record.get(&def.column) else {
-                    continue;
-                };
-                if value.is_null() {
-                    continue;
-                }
-                let key = index_key(value);
-                if let Some(previous) = staged_new.insert(
-                    (table.name.clone(), def.column.clone(), key.clone()),
-                    change.id.clone(),
-                ) {
-                    if previous != change.id {
-                        return Err(Error::UniqueViolation {
-                            table: table.name.clone(),
-                            column: def.column.clone(),
-                        });
-                    }
-                }
-                if let Some(index) = st.secondary.get(&(table.name.clone(), def.column.clone())) {
-                    for holder in index.ids(&key)? {
-                        // A holder also written by this transaction is judged
-                        // by its staged value (covered by staged_new above).
-                        if holder != change.id
-                            && !staged_keys.contains(&(table.name.as_str(), holder.as_str()))
-                        {
-                            return Err(Error::UniqueViolation {
-                                table: table.name.clone(),
-                                column: def.column.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn prepared_change<'a>(
-    staged: &'a [PreparedTable],
-    table: &str,
-    id: &str,
-) -> Option<&'a PreparedChange> {
-    let table = staged.iter().find(|candidate| candidate.name == table)?;
-    table
-        .changes
-        .binary_search_by(|change| change.id.as_str().cmp(id))
-        .ok()
-        .map(|index| &table.changes[index])
-}
-
-/// Read one row from the state that would exist after `staged` is applied.
-/// The commit mutex is held by the caller, so this view cannot move beneath
-/// validation.
-fn final_record(
-    st: &State,
-    staged: &[PreparedTable],
-    table: &str,
-    id: &str,
-) -> Result<Option<Record>> {
-    let schema = st
-        .catalog
-        .table(table)
-        .ok_or_else(|| Error::TableNotFound(table.into()))?;
-    if let Some(change) = prepared_change(staged, table, id) {
-        return Ok(change.operation.as_ref().map(|record| {
-            let mut record = record.clone();
-            if schema.has_implicit_id() {
-                record.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
-            }
-            record
-        }));
-    }
-    match st.latest_owned(table, id)? {
-        Some(entry) if entry.version > schema.epoch && !entry.is_tombstone() => {
-            let mut record = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-            if schema.has_implicit_id() {
-                record.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
-            }
-            Ok(Some(record))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn final_ids_matching(
-    st: &State,
-    staged: &[PreparedTable],
-    table: &str,
-    column: &str,
-    value: &Value,
-) -> Result<BTreeSet<String>> {
-    let mut candidates = BTreeSet::new();
-    let schema = st
-        .catalog
-        .table(table)
-        .ok_or_else(|| Error::TableNotFound(table.into()))?;
-    if column == ID_COLUMN && schema.has_implicit_id() {
-        if let Value::Text(id) = value {
-            candidates.insert(id.clone());
-        }
-    } else if let Some(index) = st.secondary.get(&(table.to_owned(), column.to_owned())) {
-        candidates.extend(index.ids(&index_key(value))?);
-    } else {
-        // Catalog validation normally guarantees an index for every FK side.
-        // Keep the fallback for old catalogs and recovery tooling.
-        st.index.visit_table(table, None, |id, _versions| {
-            candidates.insert(id.to_owned());
-            Ok(true)
-        })?;
-    }
-    if let Some(prepared) = staged.iter().find(|candidate| candidate.name == table) {
-        candidates.extend(prepared.changes.iter().map(|change| change.id.clone()));
-    }
-    let mut matching = BTreeSet::new();
-    for id in candidates {
-        if let Some(record) = final_record(st, staged, table, &id)? {
-            if record.get(column) == Some(value) {
-                matching.insert(id);
-            }
-        }
-    }
-    Ok(matching)
-}
-
-fn validate_foreign_keys(st: &State, staged: &[PreparedTable]) -> Result<()> {
-    if !st
-        .catalog
-        .tables
-        .iter()
-        .any(|schema| !schema.foreign_keys.is_empty())
-    {
-        return Ok(());
-    }
-
-    // Every new final child value must resolve to a parent in the same final
-    // view. This permits parent+child insertion in one transaction.
-    for table in staged {
-        for change in &table.changes {
-            let Some(record) = &change.operation else {
-                continue;
-            };
-            for foreign_key in &table.schema.foreign_keys {
-                let Some(value) = record.get(&foreign_key.column) else {
-                    continue;
-                };
-                if value.is_null() {
-                    continue;
-                }
-                if final_ids_matching(
-                    st,
-                    staged,
-                    &foreign_key.referenced_table,
-                    &foreign_key.referenced_column,
-                    value,
-                )?
-                .is_empty()
-                {
-                    return Err(Error::SchemaViolation(format!(
-                        "foreign key violation: {}.{} has no matching {}.{}",
-                        table.name,
-                        foreign_key.column,
-                        foreign_key.referenced_table,
-                        foreign_key.referenced_column
-                    )));
-                }
-            }
-        }
-    }
-
-    // Removing a referenced row is legal only if the final view has no
-    // children. A CASCADE miss means a child committed after the deleting
-    // transaction's snapshot; return Conflict so the normal retry path can
-    // rescan and delete it atomically.
-    for parent in staged {
-        for change in &parent.changes {
-            if change.operation.is_some() {
-                continue;
-            }
-            let Some(previous) = st.latest_owned(&parent.name, &change.id)? else {
-                continue;
-            };
-            if previous.is_tombstone() || previous.version <= parent.schema.epoch {
-                continue;
-            }
-            let mut old_record = read_record_kind(&st.blobs, &st.readers, &previous.kind)?;
-            if parent.schema.has_implicit_id() {
-                old_record.insert(ID_COLUMN.into(), Value::Text(change.id.clone()));
-            }
-            for child_schema in &st.catalog.tables {
-                for foreign_key in child_schema
-                    .foreign_keys
-                    .iter()
-                    .filter(|foreign_key| foreign_key.referenced_table == parent.name)
-                {
-                    let Some(old_value) = old_record.get(&foreign_key.referenced_column) else {
-                        continue;
-                    };
-                    let children = final_ids_matching(
-                        st,
-                        staged,
-                        &child_schema.name,
-                        &foreign_key.column,
-                        old_value,
-                    )?;
-                    if children.is_empty() {
-                        continue;
-                    }
-                    match foreign_key.on_delete {
-                        ReferentialAction::Restrict => {
-                            return Err(Error::SchemaViolation(format!(
-                                "cannot delete {}.{}: referenced by {}.{}",
-                                parent.name, change.id, child_schema.name, foreign_key.column
-                            )))
-                        }
-                        ReferentialAction::Cascade => {
-                            return Err(Error::Conflict(format!(
-                                "cascade for {}/{} must be retried after concurrent child change",
-                                parent.name, change.id
-                            )))
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Apply one committed change to the in-memory state, maintaining secondary
 /// and vector indexes (which track the latest committed state only). Async
 /// vector insertions are returned as jobs for the background thread.
@@ -9670,1886 +9143,6 @@ fn apply_one_owned(
         }
     }
     st.index.push(table, id, VersionEntry { version, kind });
-}
-
-/// Drain committed in-memory data into a new segment, publish a new manifest
-/// referencing it, and rotate the WAL. Runs under the commit mutex.
-fn checkpoint_measured(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
-    let started = Instant::now();
-    // Derived overlays have their own frozen background pipeline. Canonical
-    // checkpoint latency must not include serializing secondary/text/vector
-    // indexes under the commit mutex.
-    let result = checkpoint_locked(shared, cs);
-    if result.is_ok() {
-        let nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        shared
-            .checkpoint_count
-            .fetch_add(1, AtomicOrdering::Relaxed);
-        shared
-            .checkpoint_nanos
-            .fetch_add(nanos, AtomicOrdering::Relaxed);
-    }
-    result
-}
-
-fn wait_for_background_checkpoint(shared: &Arc<Shared>) -> Result<()> {
-    let mut status = shared.background_checkpoint.lock().unwrap();
-    while status.running {
-        status = shared
-            .background_checkpoint_done
-            .wait(status)
-            .unwrap_or_else(|poison| poison.into_inner());
-    }
-    if let Some(message) = status.last_error.take() {
-        if std::mem::take(&mut status.commit_unknown) {
-            return Err(Error::CommitUnknown(message));
-        }
-        return Err(Error::Io(std::io::Error::other(format!(
-            "background checkpoint failed: {message}"
-        ))));
-    }
-    Ok(())
-}
-
-fn take_background_checkpoint_error(shared: &Shared) -> Result<()> {
-    let mut status = shared.background_checkpoint.lock().unwrap();
-    if !status.running {
-        if let Some(message) = status.last_error.take() {
-            if std::mem::take(&mut status.commit_unknown) {
-                return Err(Error::CommitUnknown(message));
-            }
-            return Err(Error::Io(std::io::Error::other(format!(
-                "background checkpoint failed: {message}"
-            ))));
-        }
-    }
-    Ok(())
-}
-
-fn lock_commit_for_maintenance<'a>(shared: &'a Arc<Shared>) -> Result<CommitGuard<'a>> {
-    ensure_canonical_writable(shared)?;
-    loop {
-        wait_for_background_checkpoint(shared)?;
-        wait_for_background_derived(shared)?;
-        let guard = lock_commit_after_group_sync(shared);
-        let derived_running = shared.background_derived.lock().unwrap().running;
-        if shared.state.read().unwrap().index.frozen.is_none() && !derived_running {
-            return Ok(guard);
-        }
-        drop(guard);
-    }
-}
-
-fn wait_vector_indexing_shared(shared: &Shared) -> Result<()> {
-    while shared.vector_backlog.load(AtomicOrdering::SeqCst) > 0 {
-        if !shared.vector_worker_alive.load(AtomicOrdering::Acquire) {
-            let message = shared
-                .vector_worker_error
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .clone()
-                .unwrap_or_else(|| "vector indexing worker stopped with pending work".into());
-            return Err(Error::Io(std::io::Error::other(message)));
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    Ok(())
-}
-
-/// WAL rotation must never overtake a group whose callers still depend on the
-/// current generation's sync result. Ordinary run-manifest publication may
-/// use the raw mutex because it does not replace the WAL.
-fn lock_commit_after_group_sync(shared: &Arc<Shared>) -> CommitGuard<'_> {
-    loop {
-        let guard = shared.commit.lock();
-        let Some(group) = guard.wal_sync_group.clone() else {
-            return guard;
-        };
-        drop(guard);
-        let _ = group.wait();
-    }
-}
-
-fn ensure_canonical_writable(shared: &Shared) -> Result<()> {
-    if let Some(message) = shared.canonical_error.lock().unwrap().as_ref() {
-        return Err(Error::CommitUnknown(format!(
-            "database writes are fenced until reopen after an uncertain canonical publication: {message}"
-        )));
-    }
-    Ok(())
-}
-
-fn publication_sync_error(
-    shared: &Shared,
-    operation: &str,
-    outcome: PublishOutcome,
-) -> Option<Error> {
-    let PublishOutcome::SyncFailed(error) = outcome else {
-        return None;
-    };
-    let message =
-        format!("{operation} was renamed into place, but syncing its directory failed: {error}");
-    *shared.canonical_error.lock().unwrap() = Some(message.clone());
-    Some(Error::CommitUnknown(message))
-}
-
-/// Publish a catalog-only generation while the caller holds commit + state.
-/// `catalog.json` is a compatibility mirror; the manifest-embedded catalog is
-/// the canonical schema paired with its exact segment/WAL generation.
-fn publish_catalog_generation_locked(
-    shared: &Arc<Shared>,
-    _cs: &mut CommitState,
-    state: &mut State,
-    next: Catalog,
-) -> Result<Option<Error>> {
-    // Writing the mirror first is safe: if canonical publication does not
-    // happen, current engines ignore the ahead mirror in favor of the embedded
-    // catalog in the old manifest.
-    next.save(&shared.dir.join(CATALOG_FILE))?;
-    let (current, _) = Manifest::load(&shared.dir)?;
-    let outcome = Manifest {
-        format_version: FORMAT_VERSION,
-        committed_version: current.committed_version,
-        segments: current.segments,
-        wal_id: current.wal_id,
-        identity_high_water: current.identity_high_water,
-        catalog: Some(next.clone()),
-    }
-    .publish(&shared.dir)?;
-    state.catalog = next;
-    Ok(publication_sync_error(shared, "catalog manifest", outcome))
-}
-
-fn fence_writes(shared: &Shared, message: impl Into<String>) {
-    *shared.canonical_error.lock().unwrap() = Some(message.into());
-}
-
-fn background_checkpoint_supported(shared: &Shared) -> bool {
-    // Canonical primary data can be frozen independently of disposable
-    // secondary/text/vector overlays. Async vector jobs are the only exception:
-    // their charged payloads have not reached the overlay yet, so freezing until
-    // they drain keeps memory accounting and index publication ordered.
-    shared.vector_backlog.load(AtomicOrdering::SeqCst) == 0
-}
-
-/// Freeze the active primary delta in O(1), transfer its memory charge to the
-/// maintenance pool, and enqueue its durable flush. The caller holds the
-/// commit mutex, so the WAL boundary and MVCC version describe exactly the
-/// frozen generation.
-fn schedule_frozen_checkpoint(
-    shared: &Arc<Shared>,
-    cs: &mut CommitState,
-    memory: MaintenanceLease,
-) -> Result<bool> {
-    if !background_checkpoint_supported(shared) {
-        return Ok(false);
-    }
-    let mut status = shared.background_checkpoint.lock().unwrap();
-    if status.running {
-        return Ok(false);
-    }
-    debug_assert!(status.last_error.is_none(), "checked before WAL commit");
-    status.commit_unknown = false;
-    let (job, retained_index_bytes) = {
-        let mut state = shared.state.write().unwrap();
-        if state.index.frozen.is_some() || state.index.delta.is_empty() {
-            return Ok(false);
-        }
-        let frozen = Arc::new(std::mem::take(&mut state.index.delta));
-        let job = FrozenCheckpointJob {
-            frozen: frozen.clone(),
-            version: state.committed_version,
-            segments: state.segments.clone(),
-            next_segment_id: state.next_segment_id,
-            catalog: state.catalog.clone(),
-            identity_high_water: identity_manifest(&state),
-            first_primary_run: state.index.runs.is_empty(),
-            wal_id: cs.wal().id,
-            wal_cutoff: cs.wal().len,
-            memory: Some(memory),
-        };
-        state.index.frozen = Some(FrozenPrimary {
-            version: job.version,
-            delta: frozen,
-        });
-        let retained = state.index_delta_memory_bytes();
-        (job, retained)
-    };
-    cs.memtable_bytes = 0;
-    // Only the primary delta moved to the maintenance-owned frozen generation;
-    // derived overlays remain live and must stay charged to their pool.
-    shared
-        .memory_governor
-        .set_index_delta_bytes(retained_index_bytes);
-    status.running = true;
-    let sent = shared
-        .checkpoint_tx
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|sender| sender.send(job).is_ok());
-    if !sent {
-        status.running = false;
-        drop(status);
-        thaw_frozen_checkpoint_locked(shared);
-        return Ok(false);
-    }
-    shared.memory_governor.record_index_consolidation();
-    Ok(true)
-}
-
-fn thaw_frozen_checkpoint(shared: &Arc<Shared>) {
-    let _commit = shared.commit.lock();
-    thaw_frozen_checkpoint_locked(shared);
-}
-
-fn thaw_frozen_checkpoint_locked(shared: &Arc<Shared>) {
-    let mut state = shared.state.write().unwrap();
-    let Some(frozen) = state.index.frozen.take() else {
-        return;
-    };
-    for (table, ids) in frozen.delta.iter() {
-        let active = state.index.delta.entry(table.clone()).or_default();
-        for (id, versions) in ids {
-            let merged = active.entry(id.clone()).or_default();
-            merged.extend(versions.iter().cloned());
-            merged.sort_unstable_by_key(|entry| entry.version);
-            merged.dedup_by_key(|entry| entry.version);
-        }
-    }
-    let retained = state.index_delta_memory_bytes();
-    drop(state);
-    shared.memory_governor.set_index_delta_bytes(retained);
-}
-
-fn flush_frozen_checkpoint(shared: &Arc<Shared>, mut job: FrozenCheckpointJob) -> Result<()> {
-    let started = Instant::now();
-    let result = flush_frozen_checkpoint_inner(shared, &job);
-    if result.is_err() {
-        // Publication did not complete. Return the frozen generation to the
-        // active pool; the original WAL still contains every commit.
-        drop(job.memory.take());
-        thaw_frozen_checkpoint(shared);
-    } else {
-        shared.checkpoint_nanos.fetch_add(
-            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            AtomicOrdering::Relaxed,
-        );
-    }
-    result
-}
-
-fn flush_frozen_checkpoint_inner(shared: &Arc<Shared>, job: &FrozenCheckpointJob) -> Result<()> {
-    struct ReservedWalFiles {
-        bridge: PathBuf,
-        active: PathBuf,
-        armed: bool,
-    }
-
-    impl Drop for ReservedWalFiles {
-        fn drop(&mut self) {
-            if self.armed {
-                let _ = fs::remove_file(&self.active);
-                let _ = fs::remove_file(&self.bridge);
-            }
-        }
-    }
-
-    struct MemEntry {
-        table_index: usize,
-        id_start: usize,
-        id_len: usize,
-        version: u64,
-        payload: Option<Arc<Vec<u8>>>,
-    }
-
-    let mem_count = job
-        .frozen
-        .values()
-        .flat_map(|ids| ids.values())
-        .map(Vec::len)
-        .sum();
-    let id_bytes = job
-        .frozen
-        .values()
-        .flat_map(|ids| ids.keys())
-        .map(String::len)
-        .sum();
-    let mut mem = Vec::with_capacity(mem_count);
-    let mut mem_tables = Vec::with_capacity(job.frozen.len());
-    let mut mem_ids = Vec::with_capacity(id_bytes);
-    let mut new_segment_superseded = false;
-    let mut delta_tables: Vec<_> = job.frozen.iter().collect();
-    delta_tables.sort_unstable_by_key(|(table, _)| primary_table_prefix(table));
-    for (table, ids) in delta_tables {
-        let table_index = mem_tables.len();
-        mem_tables.push(table.clone());
-        for (id, versions) in ids {
-            if versions.len() > 1 {
-                new_segment_superseded = true;
-            }
-            let id_start = mem_ids.len();
-            mem_ids.extend_from_slice(id.as_bytes());
-            for version in versions {
-                let payload = match &version.kind {
-                    VKind::MemPut(payload) => Some(payload.clone()),
-                    VKind::MemTombstone => None,
-                    _ => continue,
-                };
-                mem.push(MemEntry {
-                    table_index,
-                    id_start,
-                    id_len: id.len(),
-                    version: version.version,
-                    payload,
-                });
-            }
-        }
-    }
-    if mem.is_empty() {
-        return Ok(());
-    }
-
-    let seg_id = job.next_segment_id;
-    let seg_path = shared
-        .dir
-        .join(SEGMENTS_DIR)
-        .join(segment_file_name(seg_id));
-    let mut locs = vec![(0, 0); mem.len()];
-    let mut segment_order: Vec<usize> = (0..mem.len()).collect();
-    segment_order.sort_unstable_by_key(|index| mem[*index].version);
-    let raw = File::create(&seg_path)?;
-    let writer_bytes = shared
-        .opts
-        .memory
-        .maintenance_pool_bytes
-        .clamp(1, 1024 * 1024);
-    let mut writer = BufWriter::with_capacity(writer_bytes, raw);
-    let mut position = 0u64;
-    let mut encoded = Vec::new();
-    for index in segment_order {
-        let entry = &mem[index];
-        let table = &mem_tables[entry.table_index];
-        let id = std::str::from_utf8(&mem_ids[entry.id_start..entry.id_start + entry.id_len])
-            .expect("copied from a String");
-        let payload_rel = encode_entry_into(
-            &mut encoded,
-            entry.version,
-            table,
-            id,
-            entry.payload.as_deref().map(Vec::as_slice),
-        )?;
-        locs[index] = (
-            position + payload_rel,
-            entry
-                .payload
-                .as_ref()
-                .map_or(0, |payload| payload.len() as u32),
-        );
-        writer.write_all(&encoded)?;
-        position = position.saturating_add(encoded.len() as u64);
-    }
-    writer.flush()?;
-    let segment_file = writer
-        .into_inner()
-        .map_err(|error| Error::Io(error.into_error()))?;
-    segment_file.sync_all()?;
-    fsync_dir(&shared.dir.join(SEGMENTS_DIR))?;
-
-    let mut new_segments = job.segments.clone();
-    new_segments.push(SegmentMeta {
-        id: seg_id,
-        len: position,
-    });
-    let generation = primary_generation(job.version, &new_segments, &job.catalog);
-    let indexes_dir = shared.dir.join(INDEXES_DIR);
-    // Protect the prepared run from another publisher's orphan cleanup. This
-    // mutex never serializes ordinary commits, and primary compaction releases
-    // its maintenance memory before acquiring it, preserving lock order.
-    let _publication = shared.primary_manifest_publication.lock().unwrap();
-    let file = if job.first_primary_run {
-        "primary.pidx".to_owned()
-    } else {
-        format!("primary-L0-{}.pidx.run", Ulid::new())
-    };
-    let level = if job.first_primary_run {
-        PRIMARY_BASE_LEVEL
-    } else {
-        0
-    };
-    let primary_path = indexes_dir.join(&file);
-    let primary_tmp = primary_path.with_extension("run.tmp");
-    let mut primary_writer = PagedWriter::create(&primary_tmp, generation, None)?;
-    let mut key = Vec::new();
-    let mut value = Vec::with_capacity(25);
-    let write_result = (|| -> Result<()> {
-        for (entry, (payload_offset, payload_len)) in mem.iter().zip(&locs) {
-            let table = &mem_tables[entry.table_index];
-            let epoch = job.catalog.table(table).map_or(0, |schema| schema.epoch);
-            if entry.version <= epoch {
-                continue;
-            }
-            let id = std::str::from_utf8(&mem_ids[entry.id_start..entry.id_start + entry.id_len])
-                .expect("copied from a String");
-            encode_primary_key_into(table, id, &mut key);
-            let kind = if entry.payload.is_some() {
-                VKind::SegPut {
-                    segment: seg_id,
-                    payload_offset: *payload_offset,
-                    payload_len: *payload_len,
-                }
-            } else {
-                VKind::SegTombstone
-            };
-            encode_primary_entry_into(
-                &VersionEntry {
-                    version: entry.version,
-                    kind,
-                },
-                &mut value,
-            )?;
-            primary_writer.add(&key, &value)?;
-        }
-        primary_writer.finish()
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&primary_tmp);
-        return Err(error);
-    }
-    fs::rename(&primary_tmp, &primary_path)?;
-    fsync_dir(&indexes_dir)?;
-    let primary_bytes = fs::metadata(&primary_path)?.len();
-    let primary_meta = PrimaryRunMeta {
-        file,
-        level,
-        bytes: primary_bytes,
-        generation,
-    };
-    let primary_index = Arc::new(PagedIndex::open(&primary_path)?);
-    let segment_reader = File::open(&seg_path)?;
-
-    // Two durable empty successor WALs form a recovery bridge before the
-    // active writer is switched: a crash sees either the old manifest + old
-    // WAL + successors, or the new manifest + copied tail + active successor.
-    let bridge_wal_id = job
-        .wal_id
-        .checked_add(1)
-        .ok_or_else(|| Error::Corrupt("WAL id exhausted during checkpoint".into()))?;
-    let active_wal_id = job
-        .wal_id
-        .checked_add(2)
-        .ok_or_else(|| Error::Corrupt("WAL id exhausted during checkpoint".into()))?;
-    let wal_dir = shared.dir.join(WAL_DIR);
-    let bridge_path = wal_path(&shared.dir, bridge_wal_id);
-    let active_path = wal_path(&shared.dir, active_wal_id);
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&bridge_path)?
-        .sync_all()?;
-    if let Err(error) = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&active_path)
-        .and_then(|file| file.sync_all())
-    {
-        let _ = fs::remove_file(&bridge_path);
-        return Err(error.into());
-    }
-    let mut reserved_wals = ReservedWalFiles {
-        bridge: bridge_path.clone(),
-        active: active_path.clone(),
-        armed: true,
-    };
-    fsync_dir(&wal_dir)?;
-    let active_wal = WalWriter::open(&shared.dir, active_wal_id)?;
-
-    // The mutex is held only for validation and the in-memory writer swap.
-    // All WAL copying and manifest fsyncs happen after it is released.
-    let (mut old_wal, tail_len, mut new_primary_runs) = {
-        let mut cs = lock_commit_after_group_sync(shared);
-        if cs.wal().id != job.wal_id || cs.wal().len < job.wal_cutoff {
-            return Err(Error::Corrupt(
-                "background checkpoint observed an unexpected WAL generation".into(),
-            ));
-        }
-        let state = shared.state.read().unwrap();
-        let still_frozen = state.index.frozen.as_ref().is_some_and(|frozen| {
-            frozen.version == job.version && Arc::ptr_eq(&frozen.delta, &job.frozen)
-        });
-        if !still_frozen {
-            return Err(Error::Corrupt(
-                "background checkpoint lost its frozen generation".into(),
-            ));
-        }
-        let runs = state.index.run_metas();
-        drop(state);
-        let tail_len = cs.wal().len - job.wal_cutoff;
-        let old_wal = cs
-            .wal
-            .replace(active_wal)
-            .expect("writable checkpoint has an active WAL");
-        (old_wal, tail_len, runs)
-    };
-    // From this point forward the active writer may contain acknowledged
-    // commits. Neither successor may be removed on an error; recovery follows
-    // the consecutive WAL chain from the still-current manifest.
-    reserved_wals.armed = false;
-
-    if let WalAppendOutcome::SyncFailed(error) = old_wal.sync_data() {
-        let _commit = shared.commit.lock();
-        thaw_frozen_checkpoint_locked(shared);
-        return Err(error.into());
-    }
-
-    // Build the bridge through a temporary inode. Recovery can safely cross
-    // the durable empty placeholder while this copy is incomplete; the full
-    // duplicate tail appears atomically only after it has been synced.
-    let bridge_tmp = wal_dir.join(format!("{bridge_wal_id:06}.wal.bridge.tmp"));
-    let mut source = File::open(wal_path(&shared.dir, job.wal_id))?;
-    source.seek(SeekFrom::Start(job.wal_cutoff))?;
-    let mut raw_tail = source.take(tail_len);
-    let target = File::create(&bridge_tmp)?;
-    let mut target = BufWriter::with_capacity(writer_bytes, target);
-    let copied = std::io::copy(&mut raw_tail, &mut target)?;
-    if copied != tail_len {
-        return Err(Error::Corrupt(
-            "background checkpoint could not copy the complete WAL tail".into(),
-        ));
-    }
-    target.flush()?;
-    let target = target
-        .into_inner()
-        .map_err(|error| Error::Io(error.into_error()))?;
-    target.sync_all()?;
-    fs::rename(&bridge_tmp, &bridge_path)?;
-    fsync_dir(&wal_dir)?;
-
-    #[cfg(test)]
-    {
-        shared
-            .primary_test_reached_manifest
-            .store(true, AtomicOrdering::Release);
-        while shared
-            .primary_test_pause_before_manifest
-            .load(AtomicOrdering::Acquire)
-        {
-            std::thread::yield_now();
-        }
-    }
-
-    new_primary_runs.push(primary_meta.clone());
-    let primary_publish_error = PrimaryRunManifest::new(generation, new_primary_runs)
-        .publish(&indexes_dir)
-        .err();
-    let published_manifest = Manifest {
-        format_version: FORMAT_VERSION,
-        committed_version: job.version,
-        segments: new_segments.clone(),
-        wal_id: bridge_wal_id,
-        identity_high_water: job.identity_high_water.clone(),
-        catalog: Some(job.catalog.clone()),
-    };
-    #[cfg(test)]
-    if shared
-        .primary_test_fail_before_manifest_rename
-        .swap(false, AtomicOrdering::AcqRel)
-    {
-        return Err(Error::Io(std::io::Error::other(
-            "injected primary manifest rename failure",
-        )));
-    }
-    let manifest_outcome = match published_manifest.publish(&shared.dir) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let _commit = shared.commit.lock();
-            thaw_frozen_checkpoint_locked(shared);
-            return Err(error);
-        }
-    };
-    #[cfg(test)]
-    let manifest_outcome = if shared
-        .primary_test_fail_after_manifest_rename
-        .swap(false, AtomicOrdering::AcqRel)
-    {
-        PublishOutcome::SyncFailed(std::io::Error::other(
-            "injected primary manifest directory sync failure",
-        ))
-    } else {
-        manifest_outcome
-    };
-
-    let retained = {
-        let _commit = shared.commit.lock();
-        let mut state = shared.state.write().unwrap();
-        let still_frozen = state.index.frozen.as_ref().is_some_and(|frozen| {
-            frozen.version == job.version && Arc::ptr_eq(&frozen.delta, &job.frozen)
-        });
-        if !still_frozen {
-            return Err(Error::Corrupt(
-                "background checkpoint lost its frozen generation before adoption".into(),
-            ));
-        }
-        if !new_segment_superseded {
-            new_segment_superseded = state.index.delta.iter().any(|(table, ids)| {
-                job.frozen
-                    .get(table)
-                    .is_some_and(|frozen_ids| ids.keys().any(|id| frozen_ids.contains_key(id)))
-            });
-        }
-        state
-            .readers
-            .insert(seg_id, Arc::new(SegmentReader::new(segment_reader)));
-        state.segments = new_segments;
-        state.next_segment_id = seg_id + 1;
-        if new_segment_superseded {
-            state.superseded_segments.insert(seg_id);
-        }
-        state.index.frozen = None;
-        state.index.generation = generation;
-        state.index.runs.push(PrimaryRun {
-            meta: primary_meta,
-            index: primary_index,
-        });
-        state.index_delta_memory_bytes()
-    };
-
-    let publication_error =
-        publication_sync_error(shared, "background checkpoint manifest", manifest_outcome);
-    if publication_error.is_none() {
-        cleanup_orphans(
-            &shared.dir,
-            &Manifest {
-                format_version: FORMAT_VERSION,
-                committed_version: job.version,
-                segments: shared.state.read().unwrap().segments.clone(),
-                wal_id: bridge_wal_id,
-                identity_high_water: job.identity_high_water.clone(),
-                catalog: Some(job.catalog.clone()),
-            },
-        )?;
-    }
-    shared
-        .primary_checkpoint_bytes_written
-        .fetch_add(primary_bytes, AtomicOrdering::Relaxed);
-    shared.memory_governor.set_index_delta_bytes(retained);
-    shared
-        .checkpoint_count
-        .fetch_add(1, AtomicOrdering::Relaxed);
-    if let Some(error) = primary_publish_error {
-        record_maintenance_error(
-            shared,
-            format!("primary run manifest will be rebuilt on reopen: {error}"),
-        );
-        shared
-            .index_maintenance_failures
-            .fetch_add(1, AtomicOrdering::Relaxed);
-    }
-    cleanup_primary_run_orphans(&shared.dir);
-    maybe_schedule_primary_compaction(shared);
-    refresh_compaction_debt_if_needed(shared);
-    maybe_schedule_auto_compaction(shared);
-    publication_error.map_or(Ok(()), Err)
-}
-
-fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> Result<()> {
-    if shared.opts.read_only {
-        return Err(Error::ReadOnly);
-    }
-    struct MemEntry {
-        table_index: usize,
-        id_start: usize,
-        id_len: usize,
-        version: u64,
-        payload: Option<Arc<Vec<u8>>>,
-    }
-    let (
-        mem,
-        mem_tables,
-        mem_ids,
-        segments,
-        committed_version,
-        next_segment_id,
-        new_segment_superseded,
-        catalog,
-        identity_high_water,
-        old_primary_runs,
-        first_primary_run,
-    ) = {
-        let st = shared.state.read().unwrap();
-        let mem_count = st
-            .index
-            .delta
-            .values()
-            .flat_map(|ids| ids.values())
-            .flat_map(|versions| versions.iter())
-            .filter(|version| matches!(&version.kind, VKind::MemPut(_) | VKind::MemTombstone))
-            .count();
-        let id_bytes = st
-            .index
-            .delta
-            .values()
-            .flat_map(|ids| ids.iter())
-            .filter(|(_, versions)| {
-                versions
-                    .iter()
-                    .any(|version| matches!(&version.kind, VKind::MemPut(_) | VKind::MemTombstone))
-            })
-            .map(|(id, _)| id.len())
-            .sum();
-        let mut mem: Vec<MemEntry> = Vec::with_capacity(mem_count);
-        let mut mem_tables = Vec::with_capacity(st.index.delta.len());
-        let mut mem_ids = Vec::with_capacity(id_bytes);
-        let mut new_segment_superseded = false;
-        let mut delta_tables: Vec<_> = st.index.delta.iter().collect();
-        delta_tables.sort_unstable_by_key(|(table, _)| primary_table_prefix(table));
-        for (table, ids) in delta_tables {
-            let table_index = mem_tables.len();
-            mem_tables.push(table.clone());
-            for (id, versions) in ids {
-                let resident_versions = versions.iter().filter(|version| {
-                    matches!(&version.kind, VKind::MemPut(_) | VKind::MemTombstone)
-                });
-                let resident_count = resident_versions.clone().count();
-                if resident_count > 1 {
-                    new_segment_superseded = true;
-                }
-                if resident_count == 0 {
-                    continue;
-                }
-                let id_start = mem_ids.len();
-                mem_ids.extend_from_slice(id.as_bytes());
-                for v in resident_versions {
-                    match &v.kind {
-                        VKind::MemPut(p) => mem.push(MemEntry {
-                            table_index,
-                            id_start,
-                            id_len: id.len(),
-                            version: v.version,
-                            payload: Some(p.clone()),
-                        }),
-                        VKind::MemTombstone => mem.push(MemEntry {
-                            table_index,
-                            id_start,
-                            id_len: id.len(),
-                            version: v.version,
-                            payload: None,
-                        }),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        (
-            mem,
-            mem_tables,
-            mem_ids,
-            st.segments.clone(),
-            st.committed_version,
-            st.next_segment_id,
-            new_segment_superseded,
-            st.catalog.clone(),
-            identity_manifest(&st),
-            st.index.run_metas(),
-            st.index.runs.is_empty(),
-        )
-    };
-    if mem.is_empty() && cs.wal().len == 0 {
-        return Ok(());
-    }
-    let mut new_segments = segments;
-    let mut written: Option<(u32, Vec<(u64, u32)>)> = None;
-    if !mem.is_empty() {
-        let seg_id = next_segment_id;
-        let mut locs = vec![(0, 0); mem.len()];
-        let mut segment_order: Vec<usize> = (0..mem.len()).collect();
-        segment_order.sort_unstable_by_key(|index| mem[*index].version);
-        let seg_path = shared
-            .dir
-            .join(SEGMENTS_DIR)
-            .join(segment_file_name(seg_id));
-        let raw = File::create(&seg_path)?;
-        let writer_bytes = shared
-            .opts
-            .memory
-            .maintenance_pool_bytes
-            .clamp(1, 1024 * 1024);
-        let mut writer = BufWriter::with_capacity(writer_bytes, raw);
-        let mut position = 0u64;
-        let mut entry = Vec::new();
-        for index in segment_order {
-            let m = &mem[index];
-            let table = &mem_tables[m.table_index];
-            let id = std::str::from_utf8(&mem_ids[m.id_start..m.id_start + m.id_len])
-                .expect("copied from a String");
-            let payload_rel = encode_entry_into(
-                &mut entry,
-                m.version,
-                table,
-                id,
-                m.payload.as_ref().map(|p| p.as_slice()),
-            )?;
-            locs[index] = (
-                position + payload_rel,
-                m.payload.as_ref().map_or(0, |p| p.len() as u32),
-            );
-            writer.write_all(&entry)?;
-            position = position.saturating_add(entry.len() as u64);
-        }
-        writer.flush()?;
-        let f = writer
-            .into_inner()
-            .map_err(|error| Error::Io(error.into_error()))?;
-        f.sync_all()?;
-        fsync_dir(&shared.dir.join(SEGMENTS_DIR))?;
-        new_segments.push(SegmentMeta {
-            id: seg_id,
-            len: position,
-        });
-        written = Some((seg_id, locs));
-    }
-
-    // The compact snapshot is already in primary-key order. Build the
-    // disposable primary run directly from it and the segment offsets instead
-    // of writing those offsets back into every B-tree entry only to scan and
-    // clear the same delta immediately afterward.
-    let generation = primary_generation(committed_version, &new_segments, &catalog);
-    let prepared_primary = if let Some((seg_id, locs)) = &written {
-        let indexes_dir = shared.dir.join(INDEXES_DIR);
-        let file = if first_primary_run {
-            "primary.pidx".to_owned()
-        } else {
-            format!("primary-L0-{}.pidx.run", Ulid::new())
-        };
-        let level = if first_primary_run {
-            PRIMARY_BASE_LEVEL
-        } else {
-            0
-        };
-        let path = indexes_dir.join(&file);
-        let tmp = path.with_extension("run.tmp");
-        let mut writer = PagedWriter::create(&tmp, generation, None)?;
-        let mut key = Vec::new();
-        let mut value = Vec::with_capacity(25);
-        let mut entries = 0usize;
-        let write_result = (|| -> Result<()> {
-            for (m, (payload_offset, payload_len)) in mem.iter().zip(locs) {
-                let table = &mem_tables[m.table_index];
-                let epoch = catalog.table(table).map_or(0, |schema| schema.epoch);
-                if m.version <= epoch {
-                    continue;
-                }
-                let id = std::str::from_utf8(&mem_ids[m.id_start..m.id_start + m.id_len])
-                    .expect("copied from a String");
-                encode_primary_key_into(table, id, &mut key);
-                let kind = match m.payload {
-                    Some(_) => VKind::SegPut {
-                        segment: *seg_id,
-                        payload_offset: *payload_offset,
-                        payload_len: *payload_len,
-                    },
-                    None => VKind::SegTombstone,
-                };
-                encode_primary_entry_into(
-                    &VersionEntry {
-                        version: m.version,
-                        kind,
-                    },
-                    &mut value,
-                )?;
-                writer.add(&key, &value)?;
-                entries += 1;
-            }
-            writer.finish()
-        })();
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
-        }
-        if entries == 0 {
-            let _ = fs::remove_file(&tmp);
-            None
-        } else {
-            fs::rename(&tmp, &path)?;
-            fsync_dir(&indexes_dir)?;
-            let bytes = fs::metadata(&path)?.len();
-            let meta = PrimaryRunMeta {
-                file,
-                level,
-                bytes,
-                generation,
-            };
-            let index = Arc::new(PagedIndex::open(&path)?);
-            Some((meta, index))
-        }
-    } else {
-        None
-    };
-    let mut prepared_segment_reader = match &written {
-        Some((seg_id, _)) => Some(File::open(
-            shared
-                .dir
-                .join(SEGMENTS_DIR)
-                .join(segment_file_name(*seg_id)),
-        )?),
-        None => None,
-    };
-
-    // Create the new WAL before the manifest that references it, so the
-    // manifest never points at a missing file.
-    let new_wal_id = cs.wal().id + 1;
-    File::create(wal_path(&shared.dir, new_wal_id))?.sync_all()?;
-    fsync_dir(&shared.dir.join(WAL_DIR))?;
-    let next_wal = WalWriter::open(&shared.dir, new_wal_id)?;
-    let manifest_outcome = Manifest {
-        format_version: FORMAT_VERSION,
-        committed_version,
-        segments: new_segments.clone(),
-        wal_id: new_wal_id,
-        identity_high_water,
-        catalog: Some(catalog.clone()),
-    }
-    .publish(&shared.dir)?;
-
-    // Canonical publication has succeeded. Switch to the new WAL before any
-    // disposable index work so a failed run-manifest publication cannot leave
-    // future commits appending to an unlinked old WAL inode.
-    cs.wal = Some(next_wal);
-
-    {
-        let mut st = shared.state.write().unwrap();
-        if let Some((seg_id, _)) = &written {
-            st.readers.insert(
-                *seg_id,
-                Arc::new(SegmentReader::new(
-                    prepared_segment_reader
-                        .take()
-                        .expect("reader prepared before canonical publication"),
-                )),
-            );
-            st.next_segment_id = seg_id + 1;
-            if new_segment_superseded {
-                st.superseded_segments.insert(*seg_id);
-            }
-        }
-        st.segments = new_segments;
-    }
-
-    let mut new_primary_runs = old_primary_runs;
-    if let Some((meta, _)) = &prepared_primary {
-        new_primary_runs.push(meta.clone());
-    }
-    let primary_publish_error = PrimaryRunManifest::new(generation, new_primary_runs)
-        .publish(&shared.dir.join(INDEXES_DIR))
-        .err();
-
-    {
-        let mut st = shared.state.write().unwrap();
-        st.index.delta.clear();
-        st.index.generation = generation;
-        if let Some((meta, index)) = prepared_primary {
-            shared
-                .primary_checkpoint_bytes_written
-                .fetch_add(meta.bytes, AtomicOrdering::Relaxed);
-            st.index.runs.push(PrimaryRun { meta, index });
-        }
-    }
-    cs.memtable_bytes = 0;
-    let publication_error = publication_sync_error(shared, "checkpoint manifest", manifest_outcome);
-    if let Some(error) = primary_publish_error {
-        if publication_error.is_none() {
-            fence_writes(
-                shared,
-                format!("checkpoint published but primary index publication failed: {error}"),
-            );
-        }
-        return Err(publication_error.unwrap_or(error));
-    }
-    cleanup_primary_run_orphans(&shared.dir);
-    maybe_schedule_primary_compaction(shared);
-    let retained = shared.state.read().unwrap().index_delta_memory_bytes();
-    shared.memory_governor.set_index_delta_bytes(retained);
-    if publication_error.is_none() {
-        cleanup_orphans(
-            &shared.dir,
-            &Manifest {
-                format_version: FORMAT_VERSION,
-                committed_version,
-                segments: shared.state.read().unwrap().segments.clone(),
-                wal_id: new_wal_id,
-                identity_high_water: identity_manifest(&shared.state.read().unwrap()),
-                catalog: Some(shared.state.read().unwrap().catalog.clone()),
-            },
-        )?;
-    }
-    publication_error.map_or(Ok(()), Err)
-}
-
-/// Move every mutable derived overlay into an immutable in-memory generation
-/// in O(number of indexes), then let the maintenance worker perform graph/run
-/// serialization without the commit mutex or state write lock.
-fn schedule_frozen_derived(shared: &Arc<Shared>, memory: MaintenanceLease) -> Result<bool> {
-    let vector_ready = shared.vector_backlog.load(AtomicOrdering::SeqCst) == 0;
-    let mut status = shared.background_derived.lock().unwrap();
-    if status.running {
-        return Ok(false);
-    }
-    status.last_error = None;
-
-    let (secondary, text, vector, retained) = {
-        let mut state = shared.state.write().unwrap();
-        let version = state.committed_version;
-        let mut secondary = Vec::new();
-        for (key, index) in &mut state.secondary {
-            let frozen = index.frozen.clone().or_else(|| index.freeze_delta(version));
-            if let Some(frozen) = frozen {
-                secondary.push(FrozenSecondaryJob {
-                    key: key.clone(),
-                    frozen,
-                });
-            }
-        }
-        let mut text = Vec::new();
-        for (key, index) in &mut state.text {
-            let frozen = index
-                .frozen_delta()
-                .or_else(|| index.freeze_delta_background(version));
-            if let Some(frozen) = frozen {
-                text.push(FrozenTextJob {
-                    key: key.clone(),
-                    frozen,
-                });
-            }
-        }
-        let definitions: HashMap<(String, String), VectorIndexDef> = state
-            .catalog
-            .tables
-            .iter()
-            .flat_map(|table| {
-                table
-                    .vector_indexes
-                    .iter()
-                    .cloned()
-                    .map(|def| ((table.name.clone(), def.column.clone()), def))
-            })
-            .collect();
-        let mut vector = Vec::new();
-        for (key, index) in &mut state.vector {
-            let frozen = index.frozen_delta().or_else(|| {
-                vector_ready
-                    .then(|| index.freeze_delta_background(version))
-                    .flatten()
-            });
-            if let (Some(frozen), Some(generation), Some(def)) =
-                (frozen, index.frozen_generation(), definitions.get(key))
-            {
-                vector.push(FrozenVectorJob {
-                    table: key.0.clone(),
-                    def: def.clone(),
-                    frozen,
-                    generation,
-                });
-            }
-        }
-        let retained = state.index_delta_memory_bytes();
-        (secondary, text, vector, retained)
-    };
-
-    if secondary.is_empty() && text.is_empty() && vector.is_empty() {
-        return Ok(false);
-    }
-    shared.memory_governor.set_index_delta_bytes(retained);
-    let job = DerivedCheckpointJob {
-        secondary,
-        text,
-        vector,
-        memory: Some(memory),
-    };
-    status.running = true;
-    let sent = shared
-        .derived_tx
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|sender| sender.send(job).is_ok());
-    if !sent {
-        status.running = false;
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "derived-index maintenance worker is unavailable",
-        )));
-    }
-    shared.memory_governor.record_index_consolidation();
-    Ok(true)
-}
-
-fn wait_for_background_derived(shared: &Arc<Shared>) -> Result<()> {
-    let mut status = shared.background_derived.lock().unwrap();
-    while status.running {
-        status = shared.background_derived_done.wait(status).unwrap();
-    }
-    if let Some(message) = status.last_error.take() {
-        return Err(Error::Io(std::io::Error::other(format!(
-            "background derived-index publication failed: {message}"
-        ))));
-    }
-    Ok(())
-}
-
-fn flush_frozen_derived(shared: &Arc<Shared>, job: DerivedCheckpointJob) -> Result<()> {
-    let mut stage = "initializing derived-index publication".to_owned();
-    flush_frozen_derived_inner(shared, job, &mut stage)
-        .map_err(|error| Error::Io(std::io::Error::other(format!("{stage}: {error}"))))
-}
-
-#[cfg(test)]
-fn pause_derived_before_publish_for_test(shared: &Shared) {
-    shared
-        .derived_test_reached_publish
-        .store(true, AtomicOrdering::Release);
-    while shared
-        .derived_test_pause_before_publish
-        .load(AtomicOrdering::Acquire)
-    {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-#[cfg(not(test))]
-fn pause_derived_before_publish_for_test(_shared: &Shared) {}
-
-fn publish_background_derived_manifest(
-    _shared: &Shared,
-    manifest: PreparedDerivedRunManifest,
-) -> Result<PublishOutcome> {
-    #[cfg(test)]
-    if _shared
-        .derived_test_fail_before_manifest_rename
-        .swap(false, AtomicOrdering::AcqRel)
-    {
-        return Err(Error::Io(std::io::Error::other(
-            "injected derived manifest rename failure",
-        )));
-    }
-    let outcome = manifest.publish()?;
-    #[cfg(test)]
-    let outcome = if _shared
-        .derived_test_fail_after_manifest_rename
-        .swap(false, AtomicOrdering::AcqRel)
-    {
-        PublishOutcome::SyncFailed(std::io::Error::other(
-            "injected derived manifest directory sync failure",
-        ))
-    } else {
-        outcome
-    };
-    Ok(outcome)
-}
-
-fn flush_frozen_derived_inner(
-    shared: &Arc<Shared>,
-    mut job: DerivedCheckpointJob,
-    stage: &mut String,
-) -> Result<()> {
-    let _publication = shared.derived_manifest_publication.lock().unwrap();
-    let indexes_dir = shared.dir.join(INDEXES_DIR);
-    let vectors_dir = shared.dir.join(VECTORS_DIR);
-    fs::create_dir_all(&indexes_dir)?;
-    fs::create_dir_all(&vectors_dir)?;
-    let temp_dir = shared
-        .opts
-        .memory
-        .spill_directory
-        .clone()
-        .unwrap_or_else(|| indexes_dir.join("tmp"));
-    fs::create_dir_all(&temp_dir)?;
-    let budget = shared.opts.memory.maintenance_pool_bytes;
-
-    for frozen_job in &job.secondary {
-        *stage = format!(
-            "writing secondary index {}.{}",
-            frozen_job.key.0, frozen_job.key.1
-        );
-        let file = sidx_run_filename(&shared.dir, &frozen_job.key.0, &frozen_job.key.1, 0);
-        let path = indexes_dir.join(&file);
-        let prepared = path.with_file_name(format!("{file}.derived-pending"));
-        let tmp = path.with_file_name(format!("{file}.derived-pending.tmp"));
-        let generation = frozen_job.frozen.generation;
-        let mut writer = ExternalPagedWriter::new(&tmp, &temp_dir, generation, budget)?;
-        writer.add(SECONDARY_FORMAT_KEY, SECONDARY_FORMAT_VALUE)?;
-        for (value, ids) in &frozen_job.frozen.delta {
-            for id in ids {
-                writer.add(
-                    &secondary_pair_key(value, id),
-                    &secondary_operation(generation, SECONDARY_ADD),
-                )?;
-            }
-        }
-        for (value, ids) in &frozen_job.frozen.removed {
-            for id in ids {
-                writer.add(
-                    &secondary_pair_key(value, id),
-                    &secondary_operation(generation, SECONDARY_DELETE),
-                )?;
-            }
-        }
-        if let Err(error) = writer.finish() {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
-        }
-        fs::rename(&tmp, &prepared).map_err(|error| {
-            Error::Io(std::io::Error::new(
-                error.kind(),
-                format!(
-                    "publishing frozen secondary run {} -> {} failed: {error}",
-                    tmp.display(),
-                    prepared.display()
-                ),
-            ))
-        })?;
-        fsync_dir(&indexes_dir)?;
-        let mapped = Arc::new(PagedIndex::open(&prepared)?);
-        validate_secondary_run(&mapped)?;
-        *stage = format!(
-            "publishing secondary index {}.{}",
-            frozen_job.key.0, frozen_job.key.1
-        );
-        let bytes = fs::metadata(&prepared)?.len();
-        let (meta, manifest) = {
-            let _commit = shared.commit.lock();
-            let state = shared.state.read().unwrap();
-            let Some(index) = state.secondary.get(&frozen_job.key) else {
-                drop(state);
-                let _ = fs::remove_file(&prepared);
-                continue;
-            };
-            if !index.frozen_matches(&frozen_job.frozen) {
-                drop(state);
-                let _ = fs::remove_file(&prepared);
-                continue;
-            }
-            let meta = DerivedRunMeta {
-                file,
-                level: if index.runs.is_empty() {
-                    DERIVED_BASE_LEVEL
-                } else {
-                    0
-                },
-                bytes,
-                generation,
-            };
-            let mut metas = index.run_metas();
-            metas.push(meta.clone());
-            let manifest = DerivedRunManifest::new(
-                DerivedRunKind::Secondary,
-                &frozen_job.key.0,
-                &frozen_job.key.1,
-                generation,
-                metas,
-                [0, 0],
-            );
-            (meta, manifest)
-        };
-        *stage = format!(
-            "preparing secondary run manifest {}.{}",
-            frozen_job.key.0, frozen_job.key.1
-        );
-        let manifest = manifest.prepare(&sidx_manifest_path(
-            &shared.dir,
-            &frozen_job.key.0,
-            &frozen_job.key.1,
-        ))?;
-        pause_derived_before_publish_for_test(shared);
-        fs::rename(&prepared, &path)?;
-        fsync_dir(&indexes_dir)?;
-        let manifest_outcome = match publish_background_derived_manifest(shared, manifest) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let _ = fs::remove_file(&path);
-                return Err(error);
-            }
-        };
-        {
-            let _commit = shared.commit.lock();
-            let mut state = shared.state.write().unwrap();
-            let index = state.secondary.get_mut(&frozen_job.key).ok_or_else(|| {
-                Error::Corrupt("secondary index disappeared during background publication".into())
-            })?;
-            if !index.frozen_matches(&frozen_job.frozen) {
-                return Err(Error::Corrupt(
-                    "secondary frozen generation changed during background publication".into(),
-                ));
-            }
-            index.runs.push(SecRun {
-                meta: meta.clone(),
-                index: mapped,
-            });
-            index.generation = generation;
-            index.clear_frozen(&frozen_job.frozen);
-        }
-        shared
-            .secondary_checkpoint_bytes_written
-            .fetch_add(meta.bytes, AtomicOrdering::Relaxed);
-        if let PublishOutcome::SyncFailed(error) = manifest_outcome {
-            return Err(error.into());
-        }
-    }
-
-    for frozen_job in &job.text {
-        *stage = format!(
-            "writing text index {}.{}",
-            frozen_job.key.0, frozen_job.key.1
-        );
-        let file = tidx_run_filename(&shared.dir, &frozen_job.key.0, &frozen_job.key.1, 0);
-        let path = indexes_dir.join(&file);
-        let prepared = path.with_file_name(format!("{file}.derived-pending"));
-        let tmp = path.with_file_name(format!("{file}.derived-pending.tmp"));
-        if let Err(error) =
-            TextIdx::write_frozen_delta_paged(&frozen_job.frozen, &tmp, &temp_dir, budget)
-        {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
-        }
-        fs::rename(&tmp, &prepared).map_err(|error| {
-            Error::Io(std::io::Error::new(
-                error.kind(),
-                format!(
-                    "publishing frozen text run {} -> {} failed: {error}",
-                    tmp.display(),
-                    prepared.display()
-                ),
-            ))
-        })?;
-        fsync_dir(&indexes_dir)?;
-        let mapped = Arc::new(PagedIndex::open(&prepared)?);
-        validate_text_run(&mapped)?;
-        *stage = format!(
-            "publishing text index {}.{}",
-            frozen_job.key.0, frozen_job.key.1
-        );
-        let generation = frozen_job.frozen.generation;
-        let bytes = fs::metadata(&prepared)?.len();
-        let (meta, manifest) = {
-            let _commit = shared.commit.lock();
-            let state = shared.state.read().unwrap();
-            let Some(index) = state.text.get(&frozen_job.key) else {
-                drop(state);
-                let _ = fs::remove_file(&prepared);
-                continue;
-            };
-            if !index.frozen_matches(&frozen_job.frozen) {
-                drop(state);
-                let _ = fs::remove_file(&prepared);
-                continue;
-            }
-            let meta = DerivedRunMeta {
-                file,
-                level: if index.runs.is_empty() {
-                    DERIVED_BASE_LEVEL
-                } else {
-                    0
-                },
-                bytes,
-                generation,
-            };
-            let mut metas = index.run_metas();
-            metas.push(meta.clone());
-            let (doc_count, total_len) = index.frozen_doc_stats();
-            let manifest = DerivedRunManifest::new(
-                DerivedRunKind::Text,
-                &frozen_job.key.0,
-                &frozen_job.key.1,
-                generation,
-                metas,
-                [doc_count, total_len],
-            );
-            (meta, manifest)
-        };
-        *stage = format!(
-            "preparing text run manifest {}.{}",
-            frozen_job.key.0, frozen_job.key.1
-        );
-        let manifest = manifest.prepare(&tidx_manifest_path(
-            &shared.dir,
-            &frozen_job.key.0,
-            &frozen_job.key.1,
-        ))?;
-        pause_derived_before_publish_for_test(shared);
-        fs::rename(&prepared, &path)?;
-        fsync_dir(&indexes_dir)?;
-        let manifest_outcome = match publish_background_derived_manifest(shared, manifest) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let _ = fs::remove_file(&path);
-                return Err(error);
-            }
-        };
-        {
-            let _commit = shared.commit.lock();
-            let mut state = shared.state.write().unwrap();
-            let index = state.text.get_mut(&frozen_job.key).ok_or_else(|| {
-                Error::Corrupt("text index disappeared during background publication".into())
-            })?;
-            if !index.frozen_matches(&frozen_job.frozen) {
-                return Err(Error::Corrupt(
-                    "text frozen generation changed during background publication".into(),
-                ));
-            }
-            index.runs.push(TextRun {
-                meta: meta.clone(),
-                index: mapped,
-            });
-            index.generation = generation;
-            index.clear_frozen(&frozen_job.frozen);
-        }
-        shared
-            .text_checkpoint_bytes_written
-            .fetch_add(meta.bytes, AtomicOrdering::Relaxed);
-        if let PublishOutcome::SyncFailed(error) = manifest_outcome {
-            return Err(error.into());
-        }
-    }
-
-    for frozen_job in &job.vector {
-        *stage = format!(
-            "writing vector index {}.{}",
-            frozen_job.table, frozen_job.def.column
-        );
-        // The run is a durable part of the index from here on: the manifest
-        // published below lets the next open map it instead of re-inserting
-        // every vector of this generation.
-        let file = vidx_run_filename(&shared.dir, &frozen_job.table, &frozen_job.def.column);
-        let run = vectors_dir.join(&file);
-        let pending = vectors_dir.join(format!("{file}.derived-pending"));
-        if let Err(error) = frozen_job.frozen.dump_file(
-            &pending,
-            &frozen_job.table,
-            &frozen_job.def.column,
-            &frozen_job.def,
-            frozen_job.generation,
-        ) {
-            let _ = fs::remove_file(&pending);
-            return Err(error);
-        }
-        fs::rename(&pending, &run)?;
-        fsync_dir(&vectors_dir)?;
-        let (loaded, version) = match VecIdx::load_mmap_file(
-            &run,
-            &frozen_job.table,
-            &frozen_job.def.column,
-            &frozen_job.def,
-        ) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                let _ = fs::remove_file(&run);
-                return Err(error);
-            }
-        };
-        if version != frozen_job.generation {
-            let _ = fs::remove_file(&run);
-            return Err(Error::Corrupt(
-                "background vector run has the wrong generation".into(),
-            ));
-        }
-        *stage = format!(
-            "publishing vector index {}.{}",
-            frozen_job.table, frozen_job.def.column
-        );
-        pause_derived_before_publish_for_test(shared);
-        // The manifest is written under the commit mutex so it can never
-        // overtake a compaction rebuild that replaced the whole run set.
-        let _cs = shared.commit.lock();
-        let key = (frozen_job.table.clone(), frozen_job.def.column.clone());
-        let manifest = {
-            let mut state = shared.state.write().unwrap();
-            let published = state
-                .vector
-                .get_mut(&key)
-                .is_some_and(|index| index.publish_frozen_loaded(&frozen_job.frozen, loaded));
-            if !published {
-                None
-            } else {
-                state
-                    .vector
-                    .get_mut(&key)
-                    .filter(|index| index.frozen_delta().is_none())
-                    .map(|index| {
-                        let manifest =
-                            vector_manifest_for(&key.0, &key.1, frozen_job.generation, index);
-                        if manifest.is_some() {
-                            index.durable_generation = Some(frozen_job.generation);
-                        }
-                        manifest
-                    })
-            }
-        };
-        match manifest {
-            None => {
-                let _ = fs::remove_file(&run);
-                continue;
-            }
-            Some(Some(manifest)) => {
-                manifest.publish(&vidx_manifest_path(&shared.dir, &key.0, &key.1))?;
-            }
-            Some(None) => {}
-        }
-    }
-
-    drop(job.memory.take());
-    let retained = shared.state.read().unwrap().index_delta_memory_bytes();
-    shared.memory_governor.set_index_delta_bytes(retained);
-    maybe_schedule_secondary_compaction(shared);
-    maybe_schedule_text_compaction(shared);
-    maybe_schedule_vector_merge(shared);
-    Ok(())
-}
-
-fn consolidate_derived_indexes(shared: &Arc<Shared>) -> Result<()> {
-    if shared.opts.read_only {
-        return Ok(());
-    }
-    let idir = shared.dir.join(INDEXES_DIR);
-    let vdir = shared.dir.join(VECTORS_DIR);
-    fs::create_dir_all(&idir)?;
-    fs::create_dir_all(&vdir)?;
-    let temp_dir = shared
-        .opts
-        .memory
-        .spill_directory
-        .clone()
-        .unwrap_or_else(|| idir.join("tmp"));
-    let budget = shared.opts.memory.maintenance_pool_bytes;
-    let mut st = shared.state.write().unwrap();
-    let version = st.committed_version;
-    let has_sorted_indexes = !st.secondary.is_empty() || !st.text.is_empty();
-    let has_vector_indexes = !st.vector.is_empty();
-    let mut secondary_written = 0u64;
-    let mut text_written = 0u64;
-
-    let secondary_keys: Vec<_> = st.secondary.keys().cloned().collect();
-    for key in secondary_keys {
-        let index = st
-            .secondary
-            .get_mut(&key)
-            .expect("secondary key collected above");
-        if index.delta.is_empty() && index.removed.is_empty() {
-            index.generation = version;
-            publish_secondary_manifest(&shared.dir, &key.0, &key.1, version, index)?;
-            continue;
-        }
-        let first = index.runs.is_empty();
-        let file = if first {
-            sidx_path(&shared.dir, &key.0, &key.1)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("secondary path has utf8 filename")
-                .to_owned()
-        } else {
-            sidx_run_filename(&shared.dir, &key.0, &key.1, 0)
-        };
-        let path = idir.join(&file);
-        let tmp = path.with_file_name(format!("{file}.tmp"));
-        let mut writer = ExternalPagedWriter::new(&tmp, &temp_dir, version, budget)?;
-        writer.add(SECONDARY_FORMAT_KEY, SECONDARY_FORMAT_VALUE)?;
-        for (value, ids) in &index.delta {
-            for id in ids {
-                writer.add(
-                    &secondary_pair_key(value, id),
-                    &secondary_operation(version, SECONDARY_ADD),
-                )?;
-            }
-        }
-        for (value, ids) in &index.removed {
-            for id in ids {
-                writer.add(
-                    &secondary_pair_key(value, id),
-                    &secondary_operation(version, SECONDARY_DELETE),
-                )?;
-            }
-        }
-        if let Err(error) = writer.finish() {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
-        }
-        fs::rename(&tmp, &path)?;
-        let meta = DerivedRunMeta {
-            file,
-            level: if first { DERIVED_BASE_LEVEL } else { 0 },
-            bytes: fs::metadata(&path)?.len(),
-            generation: version,
-        };
-        secondary_written = secondary_written.saturating_add(meta.bytes);
-        let mapped = Arc::new(PagedIndex::open(&path)?);
-        validate_secondary_run(&mapped)?;
-        index.runs.push(SecRun {
-            meta,
-            index: mapped,
-        });
-        index.generation = version;
-        index.delta.clear();
-        index.removed.clear();
-        publish_secondary_manifest(&shared.dir, &key.0, &key.1, version, index)?;
-    }
-
-    let text_keys: Vec<_> = st.text.keys().cloned().collect();
-    for key in text_keys {
-        let index = st.text.get_mut(&key).expect("text key collected above");
-        if index.delta_memory_bytes() == 0 {
-            index.generation = version;
-            publish_text_manifest(&shared.dir, &key.0, &key.1, version, index)?;
-            continue;
-        }
-        let first = index.runs.is_empty();
-        let file = if first {
-            tidx_path(&shared.dir, &key.0, &key.1)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("text path has utf8 filename")
-                .to_owned()
-        } else {
-            tidx_run_filename(&shared.dir, &key.0, &key.1, 0)
-        };
-        let path = idir.join(&file);
-        let tmp = path.with_file_name(format!("{file}.tmp"));
-        if let Err(error) = index.write_delta_paged(&tmp, &temp_dir, version, budget) {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
-        }
-        fs::rename(&tmp, &path)?;
-        let meta = DerivedRunMeta {
-            file,
-            level: if first { DERIVED_BASE_LEVEL } else { 0 },
-            bytes: fs::metadata(&path)?.len(),
-            generation: version,
-        };
-        text_written = text_written.saturating_add(meta.bytes);
-        let mapped = Arc::new(PagedIndex::open(&path)?);
-        validate_text_run(&mapped)?;
-        index.runs.push(TextRun {
-            meta,
-            index: mapped,
-        });
-        index.freeze_delta(version);
-        publish_text_manifest(&shared.dir, &key.0, &key.1, version, index)?;
-    }
-
-    // Freeze each mutable HNSW overlay independently. Existing mmap graphs are
-    // not rebuilt: searches merge the immutable runs, while canonical
-    // segments remain the restart source of truth for ephemeral overlays.
-    let vector_defs: Vec<(String, VectorIndexDef)> = st
-        .catalog
-        .tables
-        .iter()
-        .flat_map(|table| {
-            table
-                .vector_indexes
-                .iter()
-                .cloned()
-                .map(|def| (table.name.clone(), def))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    for (table, def) in vector_defs {
-        let key = (table.clone(), def.column.clone());
-        let Some(index) = st.vector.get_mut(&key) else {
-            continue;
-        };
-        if index.delta_memory_bytes() > 0 {
-            // The first durable file of an index is its base; later flushes
-            // add runs. Both stay on disk and are listed in the manifest.
-            let run = if index.has_mapped_base() {
-                vdir.join(vidx_run_filename(&shared.dir, &table, &def.column))
-            } else {
-                vidx_path(&shared.dir, &table, &def.column)
-            };
-            index.flush_delta_mmap(&run, &table, &def.column, &def, version)?;
-        }
-        // A frozen generation still awaiting publication means the runs do
-        // not yet cover `version`; the previous manifest stays valid as a
-        // prefix and the next open replays the difference.
-        if index.frozen_delta().is_none() {
-            publish_vector_manifest(&shared.dir, &table, &def.column, version, index)?;
-        }
-    }
-    if has_sorted_indexes {
-        fsync_dir(&idir)?;
-    }
-    if has_vector_indexes {
-        fsync_dir(&vdir)?;
-    }
-    drop(st);
-    shared
-        .secondary_checkpoint_bytes_written
-        .fetch_add(secondary_written, AtomicOrdering::Relaxed);
-    shared
-        .text_checkpoint_bytes_written
-        .fetch_add(text_written, AtomicOrdering::Relaxed);
-    maybe_schedule_secondary_compaction(shared);
-    maybe_schedule_text_compaction(shared);
-    Ok(())
-}
-
-/// Rebuild derived indexes after canonical segment rewriting without ever
-/// retaining all rebuilt structures at once. Sorted indexes stream directly
-/// to paged files; each HNSW graph must fit the maintenance pool, is persisted,
-/// and is remapped before the next graph begins.
-fn rebuild_derived_indexes_after_rewrite(
-    shared: &Arc<Shared>,
-    rebuild_secondary: bool,
-) -> Result<()> {
-    let idir = shared.dir.join(INDEXES_DIR);
-    let vdir = shared.dir.join(VECTORS_DIR);
-    fs::create_dir_all(&idir)?;
-    fs::create_dir_all(&vdir)?;
-    let temp_dir = shared
-        .opts
-        .memory
-        .spill_directory
-        .clone()
-        .unwrap_or_else(|| idir.join("tmp"));
-    let budget = shared.opts.memory.maintenance_pool_bytes;
-    let mut st = shared.state.write().unwrap();
-    let version = st.committed_version;
-
-    if rebuild_secondary {
-        let definitions: Vec<_> = st
-            .catalog
-            .tables
-            .iter()
-            .flat_map(|table| {
-                table
-                    .indexes
-                    .iter()
-                    .map(|def| (table.name.clone(), def.column.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let mut rebuilt = HashMap::new();
-        for (table, column) in definitions {
-            let path = sidx_path(&shared.dir, &table, &column);
-            let tmp = path.with_extension("sidx.tmp");
-            write_secondary_from_canonical(
-                &tmp,
-                &temp_dir,
-                version,
-                budget,
-                &st.blobs,
-                &table,
-                &column,
-                &st.index,
-                &st.readers,
-            )?;
-            fs::rename(&tmp, &path)?;
-            let meta = DerivedRunMeta {
-                file: path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .expect("secondary path has utf8 filename")
-                    .to_owned(),
-                level: DERIVED_BASE_LEVEL,
-                bytes: fs::metadata(&path)?.len(),
-                generation: version,
-            };
-            let index = SecIdx::paged_runs(
-                version,
-                vec![SecRun {
-                    meta,
-                    index: Arc::new(PagedIndex::open(&path)?),
-                }],
-            )?;
-            publish_secondary_manifest(&shared.dir, &table, &column, version, &index)?;
-            rebuilt.insert((table, column), index);
-        }
-        st.secondary = rebuilt;
-    }
-
-    let text_definitions: Vec<_> = st
-        .catalog
-        .tables
-        .iter()
-        .flat_map(|table| {
-            table
-                .text_indexes
-                .iter()
-                .map(|def| (table.name.clone(), def.column.clone()))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    let mut rebuilt_text = HashMap::new();
-    for (table, column) in text_definitions {
-        let path = tidx_path(&shared.dir, &table, &column);
-        let tmp = path.with_extension("tidx.tmp");
-        let (doc_count, total_len) = write_text_from_canonical(
-            &tmp,
-            &temp_dir,
-            version,
-            budget,
-            &st.blobs,
-            &table,
-            &column,
-            &st.index,
-            &st.readers,
-        )?;
-        fs::rename(&tmp, &path)?;
-        let meta = DerivedRunMeta {
-            file: path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("text path has utf8 filename")
-                .to_owned(),
-            level: DERIVED_BASE_LEVEL,
-            bytes: fs::metadata(&path)?.len(),
-            generation: version,
-        };
-        let index = TextIdx::paged_runs(
-            version,
-            vec![TextRun {
-                meta,
-                index: Arc::new(PagedIndex::open(&path)?),
-            }],
-            doc_count,
-            total_len,
-        )?;
-        publish_text_manifest(&shared.dir, &table, &column, version, &index)?;
-        rebuilt_text.insert((table, column), index);
-    }
-    st.text = rebuilt_text;
-
-    let vector_definitions: Vec<_> = st
-        .catalog
-        .tables
-        .iter()
-        .flat_map(|table| {
-            table
-                .vector_indexes
-                .iter()
-                .cloned()
-                .map(|def| (table.name.clone(), def))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    let mut rebuilt_vector = HashMap::new();
-    for (table, def) in vector_definitions {
-        let resident =
-            build_one_vector_index(&st.blobs, &table, &def, &st.index, &st.readers, budget)?;
-        let path = vidx_path(&shared.dir, &table, &def.column);
-        let tmp = path.with_extension("vidx.tmp");
-        resident.dump_file(&tmp, &table, &def.column, &def, version)?;
-        fs::rename(&tmp, &path)?;
-        let (mut mapped, dump_version) = VecIdx::load_mmap_file(&path, &table, &def.column, &def)?;
-        if dump_version != version {
-            return Err(Error::Corrupt(
-                "rewritten vector index has the wrong generation".into(),
-            ));
-        }
-        publish_vector_manifest(&shared.dir, &table, &def.column, version, &mut mapped)?;
-        cleanup_vector_run_orphans(&shared.dir, &table, &def.column, &mapped);
-        rebuilt_vector.insert((table, def.column.clone()), mapped);
-    }
-    st.vector = rebuilt_vector;
-    fsync_dir(&idir)?;
-    fsync_dir(&vdir)?;
-    Ok(())
 }
 
 fn sidx_path(dir: &Path, table: &str, column: &str) -> PathBuf {
@@ -12908,7 +10501,7 @@ fn find_eq_streaming(
     ];
     for (position, ids) in resident_tables.into_iter().enumerate() {
         let Some(ids) = ids else { continue };
-        for (id, versions) in ids {
+        for (id, versions) in ids.iter() {
             if position == 0 {
                 seen_active.insert(id.as_str());
             } else if seen_active.contains(id.as_str()) {
@@ -13194,7 +10787,7 @@ fn check_value(col: &crate::schema::Column, value: &Value) -> Result<()> {
 /// Validate an insert against the schema, normalizing the caller's map in
 /// place: unknown columns rejected, missing columns become Null (or error
 /// when NOT NULL). No rebuild — the caller's allocations are reused.
-fn normalize_record(schema: &TableSchema, mut record: Record) -> Result<Record> {
+pub(crate) fn normalize_record(schema: &TableSchema, mut record: Record) -> Result<Record> {
     // In the traditional schema `id` is only a transport field for the
     // physical ULID and is not encoded in the payload.  A declared `id`
     // (for example `id int AUTO_INCREMENT PRIMARY KEY`) is an ordinary
@@ -13328,12 +10921,23 @@ impl Drop for BlobSink {
 pub(crate) fn encode_record_ordered(
     schema: &TableSchema,
     record: &Record,
-    mut sink: Option<&mut BlobSink>,
+    sink: Option<&mut BlobSink>,
 ) -> Result<Vec<u8>> {
     // Size the payload up front: the encoding is a fixed function of the
     // column names and values, so one exact reservation replaces the chain of
     // doubling reallocations that otherwise dominates encoding time.
     let mut buf = Vec::with_capacity(encoded_record_len_hint(schema, record));
+    encode_record_ordered_into(&mut buf, schema, record, sink)?;
+    Ok(buf)
+}
+
+/// Append one canonical record to a transaction-owned payload arena.
+pub(crate) fn encode_record_ordered_into(
+    buf: &mut Vec<u8>,
+    schema: &TableSchema,
+    record: &Record,
+    mut sink: Option<&mut BlobSink>,
+) -> Result<()> {
     let column_count = u16::try_from(schema.columns.len())
         .map_err(|_| Error::InvalidArgument("record has more than 65535 stored columns".into()))?;
     buf.extend_from_slice(&column_count.to_le_bytes());
@@ -13346,13 +10950,13 @@ pub(crate) fn encode_record_ordered(
         let value = record.get(&col.name).unwrap_or(&Value::Null);
         match (value, sink.as_deref_mut()) {
             (Value::Blob(content), Some(sink)) => match sink.maybe_externalize(content)? {
-                Some((name, crc)) => encode_blob_ref(&mut buf, &name, content.len() as u64, crc)?,
-                None => encode_value(&mut buf, value),
+                Some((name, crc)) => encode_blob_ref(buf, &name, content.len() as u64, crc)?,
+                None => encode_value(buf, value),
             },
-            _ => encode_value(&mut buf, value),
+            _ => encode_value(buf, value),
         }
     }
-    Ok(buf)
+    Ok(())
 }
 
 /// Encoded size of a record in schema order, or a generous estimate when a
@@ -13394,7 +10998,20 @@ pub(crate) fn decode_record(buf: &[u8], blobs: Option<&Path>) -> Result<Record> 
             .map_err(|_| Error::Corrupt("invalid utf8 in column name".into()))?
             .to_owned();
         let value = decode_value(buf, &mut pos, blobs)?;
-        record.insert(name, value);
+        match record.entry(name) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                return Err(Error::Corrupt(format!(
+                    "duplicate column '{}' in record payload",
+                    entry.key()
+                )));
+            }
+        }
+    }
+    if pos != buf.len() {
+        return Err(Error::Corrupt("trailing bytes in record payload".into()));
     }
     Ok(record)
 }
@@ -13418,6 +11035,22 @@ pub(crate) fn scan_payload_blob_refs(buf: &[u8], out: &mut Vec<BlobRef>) -> Resu
 #[cfg(test)]
 mod primary_index_tests {
     use super::*;
+
+    #[test]
+    fn record_decoder_rejects_duplicate_fields_and_trailing_bytes() {
+        let mut duplicate = 2u16.to_le_bytes().to_vec();
+        for n in [1, 2] {
+            duplicate.extend_from_slice(&1u16.to_le_bytes());
+            duplicate.push(b'n');
+            encode_value(&mut duplicate, &Value::Int64(n));
+        }
+        assert!(
+            matches!(decode_record(&duplicate, None), Err(Error::Corrupt(message)) if message.contains("duplicate column"))
+        );
+        assert!(
+            matches!(decode_record(&[0, 0, 42], None), Err(Error::Corrupt(message)) if message.contains("trailing bytes"))
+        );
+    }
 
     #[test]
     fn point_read_admission_is_inactive_without_writers_and_bounds_mixed_readers() {
@@ -13482,20 +11115,21 @@ mod primary_index_tests {
     fn paged_primary_roundtrips_many_ids_and_versions() {
         let dir = tempfile::tempdir().unwrap();
         let mut resident = HashMap::new();
-        let mut ids = BTreeMap::new();
+        let mut ids = PrimaryTableDelta::default();
         for id in 0..200u32 {
-            let mut versions = Vec::new();
             for version in 1..=5u64 {
-                versions.push(VersionEntry {
-                    version: version * 1000 + id as u64,
-                    kind: VKind::SegPut {
-                        segment: 7,
-                        payload_offset: version * 10,
-                        payload_len: id,
+                ids.push(
+                    format!("{id:026}"),
+                    VersionEntry {
+                        version: version * 1000 + id as u64,
+                        kind: VKind::SegPut {
+                            segment: 7,
+                            payload_offset: version * 10,
+                            payload_len: id,
+                        },
                     },
-                });
+                );
             }
-            ids.insert(format!("{id:026}"), versions);
         }
         resident.insert("docs".to_owned(), ids);
         let path = dir.path().join("primary.pidx");

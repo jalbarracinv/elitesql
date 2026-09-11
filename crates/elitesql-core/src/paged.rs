@@ -16,8 +16,10 @@ use crate::error::{Error, Result};
 const MAGIC: &[u8; 8] = b"ESQLPAGE";
 const DIRECTORY_MAGIC_V1: &[u8; 4] = b"DIR1";
 const DIRECTORY_MAGIC_V2: &[u8; 4] = b"DIR2";
+const DIRECTORY_MAGIC_V3: &[u8; 4] = b"DIR3";
 const FORMAT_V1: u32 = 1;
-const FORMAT: u32 = 2;
+const FORMAT_V2: u32 = 2;
+const FORMAT: u32 = 3;
 const HEADER_LEN: usize = 48;
 const DEFAULT_PAGE_SIZE: usize = 4096;
 const WRITER_BUFFER_SIZE: usize = 1024 * 1024;
@@ -68,7 +70,7 @@ impl PagedIndex {
             return Err(Error::Corrupt("paged index: bad header".into()));
         }
         let format = read_u32(&mmap, 8)?;
-        if format != FORMAT_V1 && format != FORMAT {
+        if !matches!(format, FORMAT_V1 | FORMAT_V2 | FORMAT) {
             return Err(Error::Corrupt("paged index: unsupported format".into()));
         }
         let header_crc = read_u32(&mmap, 44)?;
@@ -84,15 +86,25 @@ impl PagedIndex {
         let directory_offset = usize::try_from(read_u64(&mmap, 32)?)
             .map_err(|_| Error::Corrupt("paged index: directory overflow".into()))?;
         let directory_count = read_u32(&mmap, 40)? as usize;
-        let directory_magic = if format == FORMAT_V1 {
-            DIRECTORY_MAGIC_V1
-        } else {
-            DIRECTORY_MAGIC_V2
+        let directory_magic = match format {
+            FORMAT_V1 => DIRECTORY_MAGIC_V1,
+            FORMAT_V2 => DIRECTORY_MAGIC_V2,
+            _ => DIRECTORY_MAGIC_V3,
         };
         if mmap.get(directory_offset..directory_offset.saturating_add(4)) != Some(directory_magic) {
             return Err(Error::Corrupt("paged index: bad directory".into()));
         }
         let mut pos = directory_offset + 4;
+        let footer_len = if format == FORMAT { 4 } else { 0 };
+        let directory_end = mmap
+            .len()
+            .checked_sub(footer_len)
+            .ok_or_else(|| Error::Corrupt("paged index: missing metadata checksum".into()))?;
+        if pos > directory_end || directory_count > (directory_end - pos) / 8 {
+            return Err(Error::Corrupt(
+                "paged index: invalid directory count".into(),
+            ));
+        }
         let mut pages = Vec::with_capacity(directory_count);
         if format == FORMAT_V1 {
             for _ in 0..directory_count {
@@ -154,10 +166,38 @@ impl PagedIndex {
                 pages.push(directory_entry);
             }
         }
-        if pos != mmap.len() {
+        if pos != directory_end {
             return Err(Error::Corrupt(
                 "paged index: trailing directory bytes".into(),
             ));
+        }
+        // Metadata controls which pages are skipped, so it must be trusted
+        // BEFORE any lookup can return absence. Payload CRCs alone cannot
+        // detect a damaged lower/upper bound that bypasses the payload.
+        let mut metadata_crc = crc32fast::Hasher::new();
+        let mut expected_offset = HEADER_LEN;
+        for &directory_entry in &pages {
+            let page = page_view(&mmap, format, directory_entry);
+            if page.offset != expected_offset {
+                return Err(Error::Corrupt("paged index: noncontiguous pages".into()));
+            }
+            expected_offset = page
+                .payload_offset
+                .checked_add(page.payload_len)
+                .filter(|end| *end <= directory_offset)
+                .ok_or_else(|| Error::Corrupt("paged index: invalid page extent".into()))?;
+            metadata_crc.update(&mmap[page.offset..page.payload_offset]);
+        }
+        if expected_offset != directory_offset {
+            return Err(Error::Corrupt("paged index: missing page data".into()));
+        }
+        if format == FORMAT {
+            metadata_crc.update(&mmap[directory_offset..directory_end]);
+            if metadata_crc.finalize() != read_u32(&mmap, directory_end)? {
+                return Err(Error::Corrupt(
+                    "paged index: navigation metadata crc mismatch".into(),
+                ));
+            }
         }
         for pair in pages.windows(2) {
             if page_view(&mmap, format, pair[0]).first_key
@@ -167,13 +207,64 @@ impl PagedIndex {
             }
         }
         let _ = mmap.advise(Advice::Random);
-        Ok(Self {
+        let index = Self {
             mmap,
             pages,
             format,
             dump_version,
             entry_count,
-        })
+        };
+        if format != FORMAT {
+            index.validate_legacy_navigation()?;
+        }
+        Ok(index)
+    }
+
+    /// Older runs have no checksum over their navigation keys. Verify each
+    /// boundary against checksummed entries rather than silently trusting it.
+    fn validate_legacy_navigation(&self) -> Result<()> {
+        let mut count = 0u64;
+        let mut previous: Option<(&[u8], &[u8])> = None;
+        for &directory_entry in &self.pages {
+            let page = self.page(directory_entry);
+            let payload = &self.mmap[page.payload_offset..page.payload_offset + page.payload_len];
+            if crc32fast::hash(payload) != read_u32(&self.mmap, page.offset + 4)? {
+                return Err(Error::Corrupt(
+                    "paged index: legacy page crc mismatch".into(),
+                ));
+            }
+            let mut pos = 0;
+            let mut first = None;
+            let mut last = None;
+            while pos < payload.len() {
+                let key_len = read_u32_at(payload, &mut pos)? as usize;
+                let value_len = read_u32_at(payload, &mut pos)? as usize;
+                let key = take(payload, &mut pos, key_len)?;
+                let value = take(payload, &mut pos, value_len)?;
+                if previous.is_some_and(|previous| previous > (key, value)) {
+                    return Err(Error::Corrupt(
+                        "paged index: unsorted legacy entries".into(),
+                    ));
+                }
+                first.get_or_insert(key);
+                last = Some(key);
+                previous = Some((key, value));
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Corrupt("paged index: entry count overflow".into()))?;
+            }
+            if first != Some(page.first_key) || last != Some(page.last_key) {
+                return Err(Error::Corrupt(
+                    "paged index: legacy navigation disagrees with entries".into(),
+                ));
+            }
+        }
+        if count != self.entry_count {
+            return Err(Error::Corrupt(
+                "paged index: incorrect legacy entry count".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn dump_version(&self) -> u64 {
@@ -454,6 +545,7 @@ pub(crate) struct PagedWriter {
     pages: Vec<u64>,
     dump_version: u64,
     entry_count: u64,
+    metadata_crc: crc32fast::Hasher,
 }
 
 /// Memory-bounded external sorter feeding a [`PagedWriter`]. Input entries may
@@ -795,6 +887,7 @@ impl PagedWriter {
             pages: Vec::new(),
             dump_version,
             entry_count: 0,
+            metadata_crc: crc32fast::Hasher::new(),
         })
     }
 
@@ -862,6 +955,8 @@ impl PagedWriter {
                 .ok_or_else(|| Error::Corrupt("paged index: truncated page".into()))?;
             let output_offset = self.file.stream_position()?;
             self.file.write_all(raw)?;
+            self.metadata_crc
+                .update(&index.mmap[page.offset..page.payload_offset]);
             self.pages.push(output_offset);
         }
         self.entry_count = self.entry_count.saturating_add(index.entry_count);
@@ -877,10 +972,14 @@ impl PagedWriter {
     pub(crate) fn finish(mut self) -> Result<()> {
         self.flush_page()?;
         let directory_offset = self.file.stream_position()?;
-        self.file.write_all(DIRECTORY_MAGIC_V2)?;
+        self.file.write_all(DIRECTORY_MAGIC_V3)?;
+        self.metadata_crc.update(DIRECTORY_MAGIC_V3);
         for offset in &self.pages {
             self.file.write_all(&offset.to_le_bytes())?;
+            self.metadata_crc.update(&offset.to_le_bytes());
         }
+        self.file
+            .write_all(&self.metadata_crc.clone().finalize().to_le_bytes())?;
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(MAGIC);
         header.extend_from_slice(&FORMAT.to_le_bytes());
@@ -907,17 +1006,18 @@ impl PagedWriter {
             return Ok(());
         }
         let offset = self.file.stream_position()? as usize;
-        self.file
-            .write_all(&(self.page.len() as u32).to_le_bytes())?;
-        self.file
-            .write_all(&crc32fast::hash(&self.page).to_le_bytes())?;
         let first_key = self.page_first.as_ref().expect("non-empty page");
-        self.file
-            .write_all(&(first_key.len() as u32).to_le_bytes())?;
-        self.file
-            .write_all(&(self.page_last.len() as u32).to_le_bytes())?;
+        let mut metadata = [0u8; 16];
+        metadata[..4].copy_from_slice(&(self.page.len() as u32).to_le_bytes());
+        metadata[4..8].copy_from_slice(&crc32fast::hash(&self.page).to_le_bytes());
+        metadata[8..12].copy_from_slice(&(first_key.len() as u32).to_le_bytes());
+        metadata[12..].copy_from_slice(&(self.page_last.len() as u32).to_le_bytes());
+        self.file.write_all(&metadata)?;
         self.file.write_all(first_key)?;
         self.file.write_all(&self.page_last)?;
+        self.metadata_crc.update(&metadata);
+        self.metadata_crc.update(first_key);
+        self.metadata_crc.update(&self.page_last);
         self.file.write_all(&self.page)?;
         self.pages.push(offset as u64);
         self.page.clear();
@@ -980,6 +1080,64 @@ mod tests {
             })
             .unwrap();
         values
+    }
+
+    #[test]
+    fn every_navigation_metadata_byte_is_checked_before_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.page");
+        let mut writer = PagedWriter::create(&path, 1, Some(256)).unwrap();
+        for i in 0..100 {
+            writer
+                .add(format!("key-{i:03}").as_bytes(), b"value")
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let index = PagedIndex::open(&path).unwrap();
+        let directory = read_u64(&original, 32).unwrap() as usize;
+        let mut offsets: Vec<usize> = (0..HEADER_LEN).collect();
+        for &entry in &index.pages {
+            let page = index.page(entry);
+            offsets.extend(page.offset..page.payload_offset);
+        }
+        offsets.extend(directory..original.len());
+        drop(index);
+        for offset in offsets {
+            let mut bytes = original.clone();
+            bytes[offset] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+            assert!(
+                PagedIndex::open(&path).is_err(),
+                "metadata offset {offset} was trusted"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_v2_boundaries_must_match_checksummed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.page");
+        let mut writer = PagedWriter::create(&path, 1, Some(256)).unwrap();
+        for key in [b"r1", b"r2", b"r3"] {
+            writer.add(key, b"v").unwrap();
+        }
+        writer.finish().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        // V2 has the same page layout but no navigation checksum footer.
+        let directory = read_u64(&bytes, 32).unwrap() as usize;
+        bytes[8..12].copy_from_slice(&FORMAT_V2.to_le_bytes());
+        let header_crc = crc32fast::hash(&bytes[..44]);
+        bytes[44..48].copy_from_slice(&header_crc.to_le_bytes());
+        bytes[directory..directory + 4].copy_from_slice(DIRECTORY_MAGIC_V2);
+        bytes.truncate(bytes.len() - 4);
+        std::fs::write(&path, &bytes).unwrap();
+        let index = PagedIndex::open(&path).unwrap();
+        assert_eq!(collect_values(&index, b"r1"), vec![b"v".to_vec()]);
+        drop(index);
+        bytes[HEADER_LEN + 17] ^= 2;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(PagedIndex::open(&path), Err(Error::Corrupt(_))));
     }
 
     #[test]

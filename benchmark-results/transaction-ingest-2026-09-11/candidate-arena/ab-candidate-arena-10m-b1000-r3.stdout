@@ -1,0 +1,35 @@
+EliteSQL vs SQLite scalable benchmark
+  EliteSQL:     0.0.1
+  SQLite:       3.45.0 (rusqlite bundled)
+  rows:         10000000
+  batch size:   1000
+  point reads:  1000 (warm cache, plus 1000 untimed warmups)
+  full scans:   1 (unindexed score lookup)
+  durability:   EliteSQL fast <-> SQLite WAL + synchronous=OFF 
+  engines:      EliteSQL only
+  EliteSQL load: batched transactions
+  load timing:  ingest wall, final checkpoint, maintenance drain and worker time separated
+
+EliteSQL
+  EliteSQL: loaded 1000000/10000000 rows (10%)
+  EliteSQL: loaded 2000000/10000000 rows (20%)
+  EliteSQL: loaded 3000000/10000000 rows (30%)
+  EliteSQL: loaded 4000000/10000000 rows (40%)
+  EliteSQL: loaded 5000000/10000000 rows (50%)
+  EliteSQL: loaded 6000000/10000000 rows (60%)
+  EliteSQL: loaded 7000000/10000000 rows (70%)
+  EliteSQL: loaded 8000000/10000000 rows (80%)
+  EliteSQL: loaded 9000000/10000000 rows (90%)
+  EliteSQL: loaded 10000000/10000000 rows (100%)
+  load phases: 1.358 s record construction + 1.881 s staging + 4.986 s commit/bulk calls (automatic primary flushes may overlap)
+  commit internals: 4.954 s total (10000), 0.540 s lock wait, 1.057 s prepare, 3.350 s WAL, 1.806 s apply, 0.000 s other/admission wait
+  exclusive commit phases: 0.106 s prepare + 0.545 s record encode + 0.102 s validation + 0.455 s WAL encode + 1.391 s WAL append + 0.000 s sync wait + 1.806 s MVCC apply + 0.000 s maintenance wait
+  primary LSM: 11 runs, 1 promotions (0.473 s worker time), 533.29 MiB checkpoint runs, 331.33 MiB read + 331.33 MiB written by promotions
+  logical memory: 384 MiB configured; query peak 16.00/64 MiB, index-delta peak 111.01/128 MiB, maintenance peak 128.00/128 MiB (26 consolidations)
+
+Result
+engine     ingest wall    final cp       drain  total load       rows/s      point read    full scan
+EliteSQL       8.226 s     0.124 s     0.000 s     8.350 s      1197615     1.677 us/op      1.397 s
+           checkpoint work: 4.185 s (26), promotion work: 0.473 s (1), disk: 2248.85 MiB
+
+CSV: /Users/jalbarracin/Code/elitesql/crates/elitesql-core/../../benchmark-results/transaction-ingest-2026-09-11/candidate-arena/ab-candidate-arena-10m-b1000-r3.csv

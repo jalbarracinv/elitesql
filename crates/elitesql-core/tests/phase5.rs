@@ -432,6 +432,7 @@ fn big_blobs_go_out_of_line_and_roundtrip() {
         db.get("files", &big_id).unwrap().unwrap()["data"],
         Value::Blob(big)
     );
+    drop(db);
     let report = check(dir.path().join("b.esql")).unwrap();
     assert!(report.is_ok(), "{:?}", report.errors);
 }

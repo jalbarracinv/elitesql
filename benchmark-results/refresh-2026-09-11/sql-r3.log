@@ -1,0 +1,22 @@
+sql_1m/point_by_unique_index
+                        time:   [4.0991 µs 4.1133 µs 4.1396 µs]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+sql_1m/point_by_unique_index_bound
+                        time:   [3.4651 µs 3.4697 µs 3.4772 µs]
+sql_1m/indexed_join_100_of_1m
+                        time:   [158.92 µs 159.18 µs 159.54 µs]
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+sql_1m/indexed_join_100_of_1m_bound
+                        time:   [153.95 µs 156.09 µs 158.58 µs]
+sql_1m/full_scan_filter_1m
+                        time:   [301.76 µs 302.30 µs 302.74 µs]
+sql_1m/group_by_997_groups_1m
+                        time:   [308.53 ms 308.75 ms 308.98 ms]
+sql_1m/group_by_10k_groups_1m
+                        time:   [330.97 ms 331.59 ms 332.33 ms]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high mild
+

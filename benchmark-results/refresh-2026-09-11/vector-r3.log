@@ -1,0 +1,22 @@
+ANN construction: m=16, ef_construction=200
+ANN indexed ingest: 9.231743834s
+ANN layout: monolithic=false, checkpoints=0, derived_publications=1
+recall@10 (N=100000, dim=64, ef_search=64): 0.9520
+recall@10 (N=100000, dim=64, ef_search=128): 0.9940
+recall@10 (N=100000, dim=64, ef_search=256): 0.9980
+recall@10 (N=100000, dim=64, ef_search=512): 1.0000
+vector_100k/search_top10_ef64
+                        time:   [192.05 µs 193.63 µs 195.45 µs]
+vector_100k/search_top10_ef128
+                        time:   [336.25 µs 342.38 µs 351.11 µs]
+vector_100k/search_top10_ef256
+                        time:   [614.79 µs 635.34 µs 653.45 µs]
+Found 4 outliers among 30 measurements (13.33%)
+  1 (3.33%) high mild
+  3 (10.00%) high severe
+vector_100k/search_top10_ef512
+                        time:   [1.0618 ms 1.0835 ms 1.1117 ms]
+Found 3 outliers among 30 measurements (10.00%)
+  3 (10.00%) high mild
+
+open with persisted graph (N=100000, dim=64): 100.198292ms

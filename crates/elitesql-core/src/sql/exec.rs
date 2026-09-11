@@ -18,13 +18,24 @@
 //! `exec_update` — and retry on optimistic conflict with jittered backoff
 //! until `WRITE_RETRY_BUDGET` runs out.
 
+#[path = "planner.rs"]
+mod planner;
+use planner::*;
+#[path = "sort.rs"]
+mod sort;
+use sort::*;
+#[path = "values.rs"]
+mod values;
+use values::*;
+
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::collate::Collation;
@@ -68,10 +79,11 @@ pub enum QueryOutput {
 /// Blocking operators continue to use [`Db::query`] and its bounded spill
 /// machinery until their cursor form is available.
 pub struct QueryCursor<'db> {
-    _memory: MemoryPermit,
+    _memory: Option<MemoryPermit>,
     db: &'db Db,
     snapshot: Snapshot,
     table: String,
+    driver: TableDriver,
     batch_rows: usize,
     after_id: Option<String>,
     batch: std::vec::IntoIter<(String, Record)>,
@@ -81,9 +93,17 @@ pub struct QueryCursor<'db> {
     offset_remaining: usize,
     limit_remaining: Option<usize>,
     done: bool,
+    control: crate::QueryControl,
 }
 
 impl QueryCursor<'_> {
+    pub fn control(&self) -> crate::QueryControl {
+        self.control.clone()
+    }
+
+    pub fn set_control(&mut self, control: crate::QueryControl) {
+        self.control = control;
+    }
     /// Output column names, available before consuming the first row.
     pub fn columns(&self) -> &[String] {
         &self.columns
@@ -108,8 +128,28 @@ impl Iterator for QueryCursor<'_> {
     type Item = Result<Vec<Value>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let control = self.control.clone();
+        match control.run(|| Ok(self.next_controlled())) {
+            Ok(next) => next,
+            Err(error) => {
+                self.done = true;
+                self.batch = Vec::new().into_iter();
+                self._memory.take();
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl QueryCursor<'_> {
+    fn next_controlled(&mut self) -> Option<Result<Vec<Value>>> {
         if self.done || self.limit_remaining == Some(0) {
             self.done = true;
+            self.batch = Vec::new().into_iter();
+            self._memory.take();
             return None;
         }
         loop {
@@ -133,6 +173,15 @@ impl Iterator for QueryCursor<'_> {
                 return Some(Ok(project_row(&row, &self.extract)));
             }
 
+            self.batch = Vec::new().into_iter();
+            self._memory.take();
+            let mut memory = match self.db.acquire_query_memory() {
+                Ok(memory) => memory,
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            };
             // Without predicates every scanned row is emitted, so the last
             // batch only needs what OFFSET and LIMIT still allow.
             let fetch = match self.limit_remaining {
@@ -142,12 +191,34 @@ impl Iterator for QueryCursor<'_> {
                     .max(1),
                 _ => self.batch_rows,
             };
-            let next_batch = match self.db.scan_batch_at_unbudgeted(
-                &self.snapshot,
-                &self.table,
-                self.after_id.as_deref(),
-                fetch,
-            ) {
+            let batch = match &self.driver {
+                TableDriver::Empty => Ok(Vec::new()),
+                TableDriver::Id(id) if self.after_id.is_none() => self
+                    .db
+                    .get_at_unbudgeted(&self.snapshot, &self.table, id)
+                    .map(|record| {
+                        record
+                            .map(|record| vec![(id.clone(), record)])
+                            .unwrap_or_default()
+                    }),
+                TableDriver::Id(_) => Ok(Vec::new()),
+                TableDriver::Equality(column, value) => self.db.find_eq_batch_at_unbudgeted(
+                    &self.snapshot,
+                    &self.table,
+                    column,
+                    value,
+                    self.after_id.as_deref(),
+                    fetch,
+                ),
+                TableDriver::Scan => self.db.scan_batch_at_bytes_unbudgeted(
+                    &self.snapshot,
+                    &self.table,
+                    self.after_id.as_deref(),
+                    fetch,
+                    (self.db.memory_options().query_working_bytes / 2).max(1),
+                ),
+            };
+            let next_batch = match batch {
                 Ok(batch) => batch,
                 Err(error) => {
                     self.done = true;
@@ -158,6 +229,17 @@ impl Iterator for QueryCursor<'_> {
                 self.done = true;
                 return None;
             };
+            let bytes = next_batch
+                .iter()
+                .map(|(id, record)| id.capacity() + record_heap_bytes(record))
+                .sum::<usize>()
+                .saturating_add(next_batch.capacity() * size_of::<(String, Record)>());
+            if bytes > self.db.memory_options().query_working_bytes {
+                self.done = true;
+                return Some(Err(Error::MemoryLimit("cursor batch exceeds query working memory; lower scan_batch_rows or raise query_working_bytes".into())));
+            }
+            memory.shrink_to(bytes);
+            self._memory = Some(memory);
             self.after_id = Some(last_id);
             self.batch = next_batch.into_iter();
         }
@@ -448,6 +530,22 @@ fn execute_txn_statement(
     statement: Statement,
     statement_timestamp: i64,
 ) -> Result<QueryOutput> {
+    if matches!(
+        &statement,
+        Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. }
+    ) {
+        return txn.with_statement_savepoint(|txn| {
+            execute_txn_statement_inner(txn, statement, statement_timestamp)
+        });
+    }
+    execute_txn_statement_inner(txn, statement, statement_timestamp)
+}
+
+fn execute_txn_statement_inner(
+    txn: &mut Txn,
+    statement: Statement,
+    statement_timestamp: i64,
+) -> Result<QueryOutput> {
     match statement {
         Statement::Insert {
             table,
@@ -514,7 +612,7 @@ fn execute_cursor_with<'db>(
     sql: &str,
     params: SuppliedParams<'_>,
 ) -> Result<QueryCursor<'db>> {
-    let memory_permit = db.acquire_query_memory();
+    let _memory_permit = db.acquire_query_memory()?;
     let statement_timestamp = current_timestamp_micros()?;
     let mut statement = parser::parse_cached(sql)?;
     bind_statement(&mut statement, params, statement_timestamp)?;
@@ -566,10 +664,11 @@ fn execute_cursor_with<'db>(
         .scan_batch_rows
         .min((memory.query_working_bytes / 1024).max(1));
     Ok(QueryCursor {
-        _memory: memory_permit,
+        _memory: None,
         db,
         snapshot: db.snapshot(),
         table: stmt.from.name,
+        driver: table_driver(&tables[0], 0, &predicates),
         batch_rows,
         after_id: None,
         batch: Vec::new().into_iter(),
@@ -579,6 +678,7 @@ fn execute_cursor_with<'db>(
         offset_remaining: limit_to_usize(stmt.offset.as_ref()).unwrap_or(0),
         limit_remaining: limit_to_usize(stmt.limit.as_ref()),
         done: false,
+        control: crate::QueryControl::current().unwrap_or_default(),
     })
 }
 
@@ -839,241 +939,6 @@ fn column_def_to_column(c: ColumnDef) -> Result<crate::schema::Column> {
         col = col.identity();
     }
     Ok(col)
-}
-
-// --- literals ------------------------------------------------------------------
-
-/// Schema-aware coercion for INSERT/UPDATE SET values.
-fn literal_to_value(lit: &Literal, ty: ColumnType, col: &str) -> Result<Value> {
-    if let Literal::Bound(value) = lit {
-        return bound_value_for_column(value, ty, col);
-    }
-    let out = match (lit, ty) {
-        (Literal::Null, _) => Value::Null,
-        (Literal::Bool(b), ColumnType::Bool) => Value::Bool(*b),
-        (Literal::Int(n), ColumnType::Int64) => Value::Int64(*n),
-        (Literal::Int(n), ColumnType::Float64) => Value::Float64(*n as f64),
-        (Literal::Int(n), ColumnType::Timestamp) => Value::Timestamp(*n),
-        (Literal::Float(f), ColumnType::Float64) => Value::Float64(*f),
-        (Literal::Str(s), ColumnType::Text) => Value::Text(s.clone()),
-        (Literal::Str(s), ColumnType::Json) => {
-            let j = serde_json::from_str(s)
-                .map_err(|e| Error::Sql(format!("invalid json literal for '{col}': {e}")))?;
-            Value::Json(j)
-        }
-        (Literal::Str(s), ColumnType::Vector) => {
-            let v: Vec<f32> = serde_json::from_str(s).map_err(|e| {
-                Error::Sql(format!(
-                    "invalid vector literal for '{col}' (expected a JSON array of numbers): {e}"
-                ))
-            })?;
-            Value::Vector(v)
-        }
-        (Literal::Str(s), ColumnType::Timestamp) => Value::parse_timestamp(s).ok_or_else(|| {
-            Error::Sql(format!(
-                "invalid timestamp literal for '{col}': expected 'YYYY-MM-DD HH:MM:SS[.ffffff]' (UTC)"
-            ))
-        })?,
-        (Literal::Str(s), ColumnType::Date) => Value::parse_date(s).ok_or_else(|| {
-            Error::Sql(format!("invalid date literal for '{col}': expected 'YYYY-MM-DD' with a real date"))
-        })?,
-        (Literal::Str(s), ColumnType::Time) => Value::parse_time(s).ok_or_else(|| {
-            Error::Sql(format!("invalid time literal for '{col}': expected 'HH:MM:SS[.ffffff]'"))
-        })?,
-        (Literal::Int(n), ColumnType::Date) => {
-            let d = i32::try_from(*n).map_err(|_| {
-                Error::Sql(format!("date literal out of range for '{col}'"))
-            })?;
-            Value::Date(d)
-        }
-        (Literal::Int(n), ColumnType::Time) => {
-            if !(0..86_400_000_000).contains(n) {
-                return Err(Error::Sql(format!(
-                    "time literal out of range for '{col}': 0..86400000000 microseconds"
-                )));
-            }
-            Value::Time(*n)
-        }
-        (Literal::Blob(b), ColumnType::Blob) => Value::Blob(b.clone()),
-        (
-            Literal::PositionalParam
-            | Literal::NamedParam(_)
-            | Literal::Bound(_)
-            | Literal::CurrentTimestamp,
-            _,
-        ) => {
-            unreachable!("parameters are bound before execution")
-        }
-        _ => {
-            return Err(Error::Sql(format!(
-                "literal {lit:?} is not valid for column '{col}' of type {ty}"
-            )))
-        }
-    };
-    Ok(out)
-}
-
-fn bound_value_for_column(value: &Value, ty: ColumnType, col: &str) -> Result<Value> {
-    if value.is_null() || value.matches(ty) {
-        return Ok(value.clone());
-    }
-    let converted = match (value, ty) {
-        (Value::Int64(value), ColumnType::Float64) => Some(Value::Float64(*value as f64)),
-        (Value::Int64(value), ColumnType::Timestamp) => Some(Value::Timestamp(*value)),
-        (Value::Int64(value), ColumnType::Date) => {
-            Some(Value::Date(i32::try_from(*value).map_err(|_| {
-                Error::Sql(format!("date parameter out of range for '{col}'"))
-            })?))
-        }
-        (Value::Int64(value), ColumnType::Time) if (0..86_400_000_000).contains(value) => {
-            Some(Value::Time(*value))
-        }
-        (Value::Text(value), ColumnType::Timestamp) => Value::parse_timestamp(value),
-        (Value::Text(value), ColumnType::Date) => Value::parse_date(value),
-        (Value::Text(value), ColumnType::Time) => Value::parse_time(value),
-        (Value::Text(value), ColumnType::Json) => {
-            Some(Value::Json(serde_json::Value::String(value.clone())))
-        }
-        (Value::Bool(value), ColumnType::Json) => Some(Value::Json((*value).into())),
-        (Value::Int64(value), ColumnType::Json) => Some(Value::Json((*value).into())),
-        (Value::Float64(value), ColumnType::Json) => {
-            serde_json::Number::from_f64(*value).map(|number| Value::Json(number.into()))
-        }
-        (Value::Json(serde_json::Value::Array(values)), ColumnType::Vector) => {
-            let mut vector = Vec::with_capacity(values.len());
-            for component in values {
-                let Some(component) = component.as_f64() else {
-                    return Err(Error::Sql(format!(
-                        "vector parameter for '{col}' contains a non-numeric component"
-                    )));
-                };
-                if !component.is_finite()
-                    || component < f32::MIN as f64
-                    || component > f32::MAX as f64
-                {
-                    return Err(Error::Sql(format!(
-                        "vector parameter for '{col}' contains a component outside finite float32"
-                    )));
-                }
-                vector.push(component as f32);
-            }
-            Some(Value::Vector(vector))
-        }
-        _ => None,
-    };
-    converted.ok_or_else(|| {
-        Error::Sql(format!(
-            "parameter value {value:?} is not valid for column '{col}' of type {ty}"
-        ))
-    })
-}
-
-/// Context-free conversion for WHERE comparisons.
-fn literal_to_plain_value(lit: &Literal) -> Value {
-    match lit {
-        Literal::Null => Value::Null,
-        Literal::Bool(b) => Value::Bool(*b),
-        Literal::Int(n) => Value::Int64(*n),
-        Literal::Float(f) => Value::Float64(*f),
-        Literal::Str(s) => Value::Text(s.clone()),
-        Literal::Blob(b) => Value::Blob(b.clone()),
-        Literal::Bound(value) => value.clone(),
-        Literal::PositionalParam | Literal::NamedParam(_) | Literal::CurrentTimestamp => {
-            unreachable!("parameters are bound before expression resolution")
-        }
-    }
-}
-
-// --- value comparison ------------------------------------------------------------
-
-fn numeric(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int64(n) => Some(*n as f64),
-        Value::Float64(f) => Some(*f),
-        Value::Timestamp(t) => Some(*t as f64),
-        _ => None,
-    }
-}
-
-/// Strict ordering for WHERE comparisons; None = not comparable.
-/// Text literals coerce against date/time columns ('2026-08-07', '09:30:00')
-/// so natural predicates work without a cast syntax.
-fn cmp_vals(a: &Value, b: &Value) -> Option<Ordering> {
-    match (a, b) {
-        (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)),
-        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
-        (Value::Blob(x), Value::Blob(y)) => Some(x.cmp(y)),
-        (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
-        (Value::Time(x), Value::Time(y)) => Some(x.cmp(y)),
-        (Value::Date(x), Value::Text(s)) => match Value::parse_date(s) {
-            Some(Value::Date(y)) => Some(x.cmp(&y)),
-            _ => None,
-        },
-        (Value::Text(s), Value::Date(y)) => match Value::parse_date(s) {
-            Some(Value::Date(x)) => Some(x.cmp(y)),
-            _ => None,
-        },
-        (Value::Time(x), Value::Text(s)) => match Value::parse_time(s) {
-            Some(Value::Time(y)) => Some(x.cmp(&y)),
-            _ => None,
-        },
-        (Value::Text(s), Value::Time(y)) => match Value::parse_time(s) {
-            Some(Value::Time(x)) => Some(x.cmp(y)),
-            _ => None,
-        },
-        (Value::Timestamp(x), Value::Text(s)) => match Value::parse_timestamp(s) {
-            Some(Value::Timestamp(y)) => Some(x.cmp(&y)),
-            _ => None,
-        },
-        (Value::Text(s), Value::Timestamp(y)) => match Value::parse_timestamp(s) {
-            Some(Value::Timestamp(x)) => Some(x.cmp(y)),
-            _ => None,
-        },
-        _ => match (numeric(a), numeric(b)) {
-            (Some(x), Some(y)) => Some(x.total_cmp(&y)),
-            _ => None,
-        },
-    }
-}
-
-fn eq_vals(a: &Value, b: &Value) -> Option<bool> {
-    if let (Value::Json(x), Value::Json(y)) = (a, b) {
-        return Some(x == y);
-    }
-    cmp_vals(a, b).map(|o| o == Ordering::Equal)
-}
-
-/// Total order for ORDER BY: never fails, NULLs first, then by type family.
-fn sort_cmp(a: &Value, b: &Value, collation: Collation) -> Ordering {
-    fn rank(v: &Value) -> u8 {
-        match v {
-            Value::Null => 0,
-            Value::Bool(_) => 1,
-            Value::Int64(_) | Value::Float64(_) | Value::Timestamp(_) => 2,
-            Value::Text(_) => 3,
-            Value::Blob(_) => 4,
-            Value::Json(_) => 5,
-            Value::Vector(_) => 6,
-            Value::Date(_) => 7,
-            Value::Time(_) => 8,
-        }
-    }
-    let (ra, rb) = (rank(a), rank(b));
-    if ra != rb {
-        return ra.cmp(&rb);
-    }
-    match (a, b) {
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        (Value::Text(x), Value::Text(y)) => collation.compare(x, y),
-        (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
-        (Value::Json(x), Value::Json(y)) => x.to_string().cmp(&y.to_string()),
-        (Value::Date(x), Value::Date(y)) => x.cmp(y),
-        (Value::Time(x), Value::Time(y)) => x.cmp(y),
-        _ => numeric(a)
-            .zip(numeric(b))
-            .map(|(x, y)| x.total_cmp(&y))
-            .unwrap_or(Ordering::Equal),
-    }
 }
 
 // --- resolved expressions -----------------------------------------------------
@@ -1434,7 +1299,15 @@ fn single_table_of(e: &RExpr) -> Option<usize> {
 fn coerce_for_lookup(v: &Value, ty: ColumnType) -> Option<Value> {
     match (v, ty) {
         (Value::Int64(n), ColumnType::Timestamp) => Some(Value::Timestamp(*n)),
-        (Value::Int64(n), ColumnType::Float64) => Some(Value::Float64(*n as f64)),
+        (Value::Int64(n) | Value::Timestamp(n), ColumnType::Float64) => {
+            let float = *n as f64;
+            (compare_integer_float(*n, float) == Ordering::Equal).then_some(Value::Float64(float))
+        }
+        (Value::Float64(float), ColumnType::Int64) => exact_float_integer(*float).map(Value::Int64),
+        (Value::Float64(float), ColumnType::Timestamp) => {
+            exact_float_integer(*float).map(Value::Timestamp)
+        }
+        (Value::Timestamp(n), ColumnType::Int64) => Some(Value::Int64(*n)),
         (Value::Text(s), ColumnType::Date) => Value::parse_date(s),
         (Value::Text(s), ColumnType::Time) => Value::parse_time(s),
         (Value::Text(s), ColumnType::Timestamp) => Value::parse_timestamp(s),
@@ -1513,6 +1386,9 @@ fn join_key(v: &Value) -> Option<Vec<u8>> {
     // as join keys only when exactly equal in value.
     let norm = match v {
         Value::Timestamp(t) => Value::Int64(*t),
+        Value::Float64(float) => exact_float_integer(*float)
+            .map(Value::Int64)
+            .unwrap_or_else(|| v.clone()),
         other => other.clone(),
     };
     let mut buf = Vec::new();
@@ -1560,7 +1436,7 @@ fn value_heap_bytes(value: &Value) -> usize {
             Value::Text(s) => s.capacity(),
             Value::Blob(b) => b.capacity(),
             Value::Vector(v) => v.capacity() * size_of::<f32>(),
-            Value::Json(v) => v.to_string().len(),
+            Value::Json(v) => crate::db::json_heap_bytes(v),
             _ => 0,
         }
 }
@@ -1584,231 +1460,6 @@ impl Drop for SpillFiles {
             let _ = fs::remove_file(path);
         }
     }
-}
-
-struct SpillSorter<'a> {
-    db: &'a Db,
-    budget: usize,
-    keep: Option<usize>,
-    specs: Vec<SortSpec>,
-    buffer: Vec<SortedOutputRow>,
-    buffer_bytes: usize,
-    spill_dir: PathBuf,
-    runs: SpillFiles,
-}
-
-impl<'a> SpillSorter<'a> {
-    fn new(db: &'a Db, specs: Vec<SortSpec>, keep: Option<usize>) -> Result<Self> {
-        let memory = db.memory_options();
-        let spill_dir = memory
-            .spill_directory
-            .unwrap_or_else(|| std::env::temp_dir().join("elitesql-query-spill"));
-        Ok(Self {
-            db,
-            budget: memory.query_working_bytes,
-            keep,
-            specs,
-            buffer: Vec::new(),
-            buffer_bytes: 0,
-            spill_dir,
-            runs: SpillFiles(Vec::new()),
-        })
-    }
-
-    fn push(&mut self, row: SortedOutputRow) -> Result<()> {
-        let bytes = sorted_row_bytes(&row);
-        // One oversized row is allowed through by itself: the operator never
-        // creates a second full-size copy before flushing it.
-        if !self.buffer.is_empty() && self.buffer_bytes.saturating_add(bytes) > self.budget {
-            self.flush_run()?;
-        }
-        self.buffer_bytes = self.buffer_bytes.saturating_add(bytes);
-        self.buffer.push(row);
-        self.db.record_query_buffer(self.buffer_bytes);
-        if self.buffer_bytes >= self.budget {
-            self.flush_run()?;
-        }
-        Ok(())
-    }
-
-    fn sort_and_prune(&mut self) {
-        self.buffer
-            .sort_by(|a, b| compare_sorted_rows(a, b, &self.specs));
-        if let Some(keep) = self.keep {
-            self.buffer.truncate(keep);
-        }
-    }
-
-    fn flush_run(&mut self) -> Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        self.sort_and_prune();
-        fs::create_dir_all(&self.spill_dir)?;
-        let path = self.spill_dir.join(format!("query-{}.run", Ulid::new()));
-        let file = File::create(&path)?;
-        let mut writer = BufWriter::new(file);
-        for row in &self.buffer {
-            write_sorted_row(&mut writer, row)?;
-        }
-        writer.flush()?;
-        let bytes = writer.get_ref().metadata()?.len();
-        self.db.record_query_spill(bytes);
-        self.runs.0.push(path);
-        self.buffer.clear();
-        self.buffer_bytes = 0;
-        Ok(())
-    }
-
-    fn finish(mut self, offset: usize, limit: Option<usize>) -> Result<Vec<Vec<Value>>> {
-        let mut out = Vec::with_capacity(limit.unwrap_or(0).min(4096));
-        self.for_each_sorted(offset, limit, |row| {
-            out.push(row.values);
-            Ok(())
-        })?;
-        Ok(out)
-    }
-
-    fn for_each_sorted(
-        &mut self,
-        offset: usize,
-        limit: Option<usize>,
-        mut visit: impl FnMut(SortedOutputRow) -> Result<()>,
-    ) -> Result<()> {
-        if self.runs.0.is_empty() {
-            self.sort_and_prune();
-            let take = limit.unwrap_or(usize::MAX);
-            for row in self.buffer.drain(..).skip(offset).take(take) {
-                visit(row)?;
-            }
-            return Ok(());
-        }
-        self.flush_run()?;
-
-        let mut readers: Vec<SpillRunReader> = self
-            .runs
-            .0
-            .iter()
-            .map(SpillRunReader::open)
-            .collect::<Result<_>>()?;
-        let mut heads: Vec<Option<SortedOutputRow>> = readers
-            .iter_mut()
-            .map(SpillRunReader::next_row)
-            .collect::<Result<_>>()?;
-        let take = limit.unwrap_or(usize::MAX);
-        let stop = offset.saturating_add(take);
-        let mut seen = 0usize;
-        while seen < stop {
-            let next = heads
-                .iter()
-                .enumerate()
-                .filter_map(|(i, row)| row.as_ref().map(|r| (i, r)))
-                .min_by(|(_, a), (_, b)| compare_sorted_rows(a, b, &self.specs))
-                .map(|(i, _)| i);
-            let Some(run) = next else { break };
-            let row = heads[run].take().expect("selected run has a row");
-            if seen >= offset {
-                visit(row)?;
-            }
-            seen += 1;
-            heads[run] = readers[run].next_row()?;
-        }
-        Ok(())
-    }
-}
-
-struct SpillRunReader {
-    reader: BufReader<File>,
-}
-
-impl SpillRunReader {
-    fn open(path: &PathBuf) -> Result<Self> {
-        Ok(Self {
-            reader: BufReader::new(File::open(path)?),
-        })
-    }
-
-    fn next_row(&mut self) -> Result<Option<SortedOutputRow>> {
-        let mut len_bytes = [0u8; 4];
-        let mut read = 0usize;
-        while read < len_bytes.len() {
-            let n = self.reader.read(&mut len_bytes[read..])?;
-            if n == 0 {
-                if read == 0 {
-                    return Ok(None);
-                }
-                return Err(Error::Corrupt("truncated query spill frame".into()));
-            }
-            read += n;
-        }
-        let len = u32::from_le_bytes(len_bytes) as usize;
-        let mut body = vec![0u8; len];
-        self.reader.read_exact(&mut body)?;
-        decode_sorted_row(&body).map(Some)
-    }
-}
-
-fn write_sorted_row(writer: &mut impl Write, row: &SortedOutputRow) -> Result<()> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&row.sequence.to_le_bytes());
-    body.extend_from_slice(&(row.keys.len() as u32).to_le_bytes());
-    for value in &row.keys {
-        encode_value(&mut body, value);
-    }
-    body.extend_from_slice(&(row.values.len() as u32).to_le_bytes());
-    for value in &row.values {
-        encode_value(&mut body, value);
-    }
-    let len = u32::try_from(body.len())
-        .map_err(|_| Error::Sql("one query row is too large to spill".into()))?;
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(&body)?;
-    Ok(())
-}
-
-fn decode_sorted_row(body: &[u8]) -> Result<SortedOutputRow> {
-    let mut pos = 0usize;
-    let sequence = read_spill_u64(body, &mut pos)?;
-    let key_count = read_spill_u32(body, &mut pos)? as usize;
-    let mut keys = Vec::with_capacity(key_count);
-    for _ in 0..key_count {
-        keys.push(decode_value(body, &mut pos, None)?);
-    }
-    let value_count = read_spill_u32(body, &mut pos)? as usize;
-    let mut values = Vec::with_capacity(value_count);
-    for _ in 0..value_count {
-        values.push(decode_value(body, &mut pos, None)?);
-    }
-    if pos != body.len() {
-        return Err(Error::Corrupt(
-            "query spill frame has trailing bytes".into(),
-        ));
-    }
-    Ok(SortedOutputRow {
-        keys,
-        values,
-        sequence,
-    })
-}
-
-fn read_spill_u32(buf: &[u8], pos: &mut usize) -> Result<u32> {
-    let bytes: [u8; 4] = buf
-        .get(*pos..pos.saturating_add(4))
-        .ok_or_else(|| Error::Corrupt("truncated query spill frame".into()))?
-        .try_into()
-        .expect("four bytes");
-    *pos += 4;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_spill_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
-    let bytes: [u8; 8] = buf
-        .get(*pos..pos.saturating_add(8))
-        .ok_or_else(|| Error::Corrupt("truncated query spill frame".into()))?
-        .try_into()
-        .expect("eight bytes");
-    *pos += 8;
-    Ok(u64::from_le_bytes(bytes))
 }
 
 fn record_heap_bytes(record: &Record) -> usize {
@@ -2014,82 +1665,6 @@ fn project_row(row: &ExecRow, extract: &[(usize, String)]) -> Vec<Value> {
         .iter()
         .map(|(ti, col)| col_value(row, *ti, col))
         .collect()
-}
-
-/// How a table's rows are produced. This is the whole access-path decision:
-/// every read path (batched SELECT, joins, UPDATE/DELETE) and `EXPLAIN` derive
-/// it from `table_driver`, so what EXPLAIN prints is what the executor runs.
-enum TableDriver {
-    /// The predicate cannot match any row, so nothing is read at all.
-    Empty,
-    Id(String),
-    Equality(String, Value),
-    Scan,
-}
-
-fn table_driver(table: &TableCtx, ti: usize, predicates: &[RExpr]) -> TableDriver {
-    table_driver_at(table, ti, predicates).0
-}
-
-/// `table_driver` plus the index of the predicate that drove the choice.
-/// Execution re-checks every predicate anyway, so only `EXPLAIN` needs it — to
-/// avoid echoing the driving predicate as a redundant filter line.
-fn table_driver_at(
-    table: &TableCtx,
-    ti: usize,
-    predicates: &[RExpr],
-) -> (TableDriver, Option<usize>) {
-    for (position, predicate) in predicates.iter().enumerate() {
-        let RExpr::Cmp {
-            left,
-            op: CmpOp::Eq,
-            right,
-        } = predicate
-        else {
-            continue;
-        };
-        let (column, value) = match (left, right) {
-            (RVal::Col(index, column), RVal::Val(value)) if *index == ti => (column, value),
-            (RVal::Val(value), RVal::Col(index, column)) if *index == ti => (column, value),
-            _ => continue,
-        };
-        // `col = NULL` is never true, so no access path can produce a row.
-        // Answering without touching the table is both faster and what makes
-        // the plan honest about it.
-        if value.is_null() {
-            return (TableDriver::Empty, Some(position));
-        }
-        if column == ID_COLUMN && table.schema.has_implicit_id() {
-            return match value {
-                Value::Text(id) => (TableDriver::Id(id.clone()), Some(position)),
-                _ => (TableDriver::Empty, Some(position)),
-            };
-        }
-        let ty = table.schema.column(column).expect("resolved column").ty;
-        if let Some(value) = coerce_for_lookup(value, ty) {
-            return (TableDriver::Equality(column.clone(), value), Some(position));
-        }
-    }
-    (TableDriver::Scan, None)
-}
-
-fn has_secondary_index(table: &TableCtx, column: &str) -> bool {
-    table.schema.indexes.iter().any(|d| d.column == column)
-}
-
-/// True when `column` on `table` can be probed directly instead of scanned.
-fn column_is_probeable(table: &TableCtx, column: &str) -> bool {
-    (column == ID_COLUMN && table.schema.has_implicit_id()) || has_secondary_index(table, column)
-}
-
-/// The join-strategy decision, shared by the executor and `EXPLAIN`.
-///
-/// Index nested-loop is preferred at every cardinality: unlike the hash path
-/// it does not materialize the complete right table and its hash map. The
-/// optimizer may later add a cost-based crossover constrained by memory.
-/// RIGHT JOIN always takes the hash path, which is what preserves its side.
-fn join_uses_index_loop(kind: JoinKind, new_table: &TableCtx, new_col: &str) -> bool {
-    kind != JoinKind::Right && column_is_probeable(new_table, new_col)
 }
 
 fn driven_batch(
@@ -2687,376 +2262,6 @@ fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
         columns,
         rows: out_rows,
     })
-}
-
-// --- EXPLAIN ------------------------------------------------------------------
-//
-// EXPLAIN re-derives the plan from the same functions the executor obeys
-// (`resolve_query`, `table_driver`, `join_uses_index_loop`, `aggregate_plan`)
-// and never runs the query. Planning carries no estimates, so every line is a
-// statement about what will happen, not a prediction.
-
-/// Long text values are elided: a plan line must stay readable in a terminal.
-const EXPLAIN_TEXT_LIMIT: usize = 32;
-
-fn explain_value(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".into(),
-        Value::Bool(v) => v.to_string(),
-        Value::Int64(v) => v.to_string(),
-        Value::Float64(v) => v.to_string(),
-        Value::Text(v) if v.chars().count() > EXPLAIN_TEXT_LIMIT => {
-            let head: String = v.chars().take(EXPLAIN_TEXT_LIMIT).collect();
-            format!("'{head}...'")
-        }
-        Value::Text(v) => format!("'{v}'"),
-        Value::Blob(v) => format!("blob[{} bytes]", v.len()),
-        Value::Timestamp(v) => format!("timestamp({v})"),
-        Value::Date(v) => format!("date({v})"),
-        Value::Time(v) => format!("time({v})"),
-        Value::Json(_) => "json".into(),
-        Value::Vector(v) => format!("vector[{}]", v.len()),
-    }
-}
-
-fn explain_col(tables: &[TableCtx], col: &(usize, String)) -> String {
-    format!("{}.{}", tables[col.0].label, col.1)
-}
-
-fn explain_op(op: CmpOp) -> &'static str {
-    match op {
-        CmpOp::Eq => "=",
-        CmpOp::Neq => "<>",
-        CmpOp::Lt => "<",
-        CmpOp::Le => "<=",
-        CmpOp::Gt => ">",
-        CmpOp::Ge => ">=",
-    }
-}
-
-fn explain_rval(tables: &[TableCtx], aggs: &[String], value: &RVal) -> String {
-    match value {
-        RVal::Col(ti, column) => format!("{}.{column}", tables[*ti].label),
-        RVal::Val(v) => explain_value(v),
-        RVal::Agg(index) => aggs
-            .get(*index)
-            .cloned()
-            .unwrap_or_else(|| format!("agg#{index}")),
-    }
-}
-
-fn explain_expr(tables: &[TableCtx], aggs: &[String], expr: &RExpr) -> String {
-    match expr {
-        RExpr::Cmp { left, op, right } => format!(
-            "{} {} {}",
-            explain_rval(tables, aggs, left),
-            explain_op(*op),
-            explain_rval(tables, aggs, right)
-        ),
-        RExpr::IsNull { col, negated } => format!(
-            "{} IS {}NULL",
-            explain_col(tables, col),
-            if *negated { "NOT " } else { "" }
-        ),
-        RExpr::InList { col, list, negated } => format!(
-            "{} {}IN ({})",
-            explain_col(tables, col),
-            if *negated { "NOT " } else { "" },
-            list.iter()
-                .map(explain_value)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        RExpr::And(a, b) => format!(
-            "({} AND {})",
-            explain_expr(tables, aggs, a),
-            explain_expr(tables, aggs, b)
-        ),
-        RExpr::Or(a, b) => format!(
-            "({} OR {})",
-            explain_expr(tables, aggs, a),
-            explain_expr(tables, aggs, b)
-        ),
-        RExpr::Not(inner) => format!("NOT {}", explain_expr(tables, aggs, inner)),
-    }
-}
-
-/// Accumulates plan lines; `depth` is rendered as indentation so the result is
-/// a single text column that reads as a tree.
-struct PlanBuilder {
-    rows: Vec<Vec<Value>>,
-}
-
-impl PlanBuilder {
-    fn new() -> Self {
-        PlanBuilder { rows: Vec::new() }
-    }
-
-    fn line(&mut self, depth: usize, text: impl AsRef<str>) {
-        let mut out = "  ".repeat(depth);
-        out.push_str(text.as_ref());
-        self.rows.push(vec![Value::Text(out)]);
-    }
-
-    fn filters(&mut self, depth: usize, tables: &[TableCtx], conjuncts: &[RExpr]) {
-        for conjunct in conjuncts {
-            self.line(
-                depth,
-                format!("filter: {}", explain_expr(tables, &[], conjunct)),
-            );
-        }
-    }
-
-    fn finish(self) -> QueryOutput {
-        QueryOutput::Rows {
-            columns: vec!["plan".into()],
-            rows: self.rows,
-        }
-    }
-}
-
-/// The access path `table_driver` picked, named after the mechanism the storage
-/// layer will actually use.
-fn explain_access(
-    plan: &mut PlanBuilder,
-    depth: usize,
-    tables: &[TableCtx],
-    ti: usize,
-    pushed: &[RExpr],
-) {
-    let table = &tables[ti];
-    let label = &table.label;
-    let (driver, driving) = table_driver_at(table, ti, pushed);
-    let empty = matches!(driver, TableDriver::Empty);
-    let line = match driver {
-        TableDriver::Empty => {
-            format!("NO ACCESS {label}  (equality on NULL matches no row)")
-        }
-        TableDriver::Id(id) => format!("POINT LOOKUP {label}.id = '{id}'"),
-        TableDriver::Equality(column, value) if has_secondary_index(table, &column) => {
-            format!("INDEX LOOKUP {label}.{column} = {}", explain_value(&value))
-        }
-        // Without a secondary index find_eq walks the primary directory and
-        // filters, which costs a full scan however selective the predicate is.
-        TableDriver::Equality(column, value) => format!(
-            "SCAN {label}  (equality {column} = {}, no index)",
-            explain_value(&value)
-        ),
-        TableDriver::Scan => format!("SCAN {label}"),
-    };
-    plan.line(depth, line);
-    // Nothing is read on the empty path, so nothing is filtered either.
-    if empty {
-        return;
-    }
-    let remaining: Vec<RExpr> = pushed
-        .iter()
-        .enumerate()
-        .filter(|(position, _)| Some(*position) != driving)
-        .map(|(_, predicate)| predicate.clone())
-        .collect();
-    plan.filters(depth + 1, tables, &remaining);
-}
-
-/// Emits the left-deep join tree with the outermost (last) join at the root.
-/// `joins` is how many of `stmt.joins` this subtree covers.
-fn explain_join_tree(
-    plan: &mut PlanBuilder,
-    depth: usize,
-    stmt: &SelectStmt,
-    tables: &[TableCtx],
-    pushdown: &[Vec<RExpr>],
-    joins: usize,
-    streamed: bool,
-) -> Result<()> {
-    let Some(index) = joins.checked_sub(1) else {
-        explain_access(plan, depth, tables, 0, &pushdown[0]);
-        return Ok(());
-    };
-    let join = &stmt.joins[index];
-    let new_ti = index + 1;
-    let left = resolve_col(tables, &join.on.0)?;
-    let right = resolve_col(tables, &join.on.1)?;
-    let (existing, fresh) = if left.0 == new_ti && right.0 < new_ti {
-        (right, left)
-    } else if right.0 == new_ti && left.0 < new_ti {
-        (left, right)
-    } else {
-        return Err(Error::Sql(
-            "ON must join the new table with a previously listed table".into(),
-        ));
-    };
-    let kind = match join.kind {
-        JoinKind::Inner => "INNER",
-        JoinKind::Left => "LEFT",
-        JoinKind::Right => "RIGHT",
-    };
-    let index_loop = join_uses_index_loop(join.kind, &tables[new_ti], &fresh.1);
-    let strategy = if index_loop {
-        "index nested-loop"
-    } else {
-        "grace hash join"
-    };
-    plan.line(depth, format!("JOIN {kind} ({strategy})"));
-    plan.line(
-        depth + 1,
-        format!(
-            "on: {} = {}",
-            explain_col(tables, &existing),
-            explain_col(tables, &fresh)
-        ),
-    );
-    if index_loop && streamed {
-        plan.line(depth + 1, "streamed: no joined rows are materialized");
-    }
-    explain_join_tree(plan, depth + 1, stmt, tables, pushdown, index, streamed)?;
-    if index_loop {
-        let probe = if fresh.1 == ID_COLUMN && tables[new_ti].schema.has_implicit_id() {
-            format!(
-                "POINT LOOKUP {}.id = {}",
-                tables[new_ti].label,
-                explain_col(tables, &existing)
-            )
-        } else {
-            format!(
-                "INDEX PROBE {} = {}",
-                explain_col(tables, &fresh),
-                explain_col(tables, &existing)
-            )
-        };
-        plan.line(depth + 1, probe);
-        plan.filters(depth + 2, tables, &pushdown[new_ti]);
-    } else {
-        explain_access(plan, depth + 1, tables, new_ti, &pushdown[new_ti]);
-    }
-    Ok(())
-}
-
-fn explain_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
-    let ResolvedQuery {
-        tables,
-        pushdown,
-        residual,
-        is_aggregate,
-    } = resolve_query(db, stmt)?;
-
-    // Build the same plans execution builds, so EXPLAIN rejects exactly the
-    // queries that cannot run instead of printing a plan for one of them.
-    let aggregate = if is_aggregate {
-        let plan = aggregate_plan(&tables, stmt)?;
-        aggregate_order_positions(stmt, &plan.headers)?;
-        Some(plan)
-    } else {
-        projection_plan(&tables, &stmt.projection)?;
-        for key in &stmt.order_by {
-            resolve_col(&tables, &key.column)?;
-        }
-        None
-    };
-    let agg_names: Vec<String> = match &aggregate {
-        Some(plan) => plan
-            .specs
-            .iter()
-            .map(|spec| match &spec.arg {
-                Some(col) => format!("{}({})", spec.func.name(), explain_col(&tables, col)),
-                None => format!("{}(*)", spec.func.name()),
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-
-    let mut plan = PlanBuilder::new();
-    let mut depth = 0;
-
-    // Outermost operators first: LIMIT wraps the sort, which wraps grouping.
-    if stmt.limit.is_some() || stmt.offset.is_some() {
-        let mut line = String::from("LIMIT");
-        match limit_to_usize(stmt.limit.as_ref()) {
-            Some(n) => line.push_str(&format!(" {n}")),
-            None => line.push_str(" ALL"),
-        }
-        if let Some(offset) = limit_to_usize(stmt.offset.as_ref()) {
-            line.push_str(&format!(" OFFSET {offset}"));
-        }
-        plan.line(depth, line);
-        depth += 1;
-    }
-    if !stmt.order_by.is_empty() {
-        let keys: Vec<String> = stmt
-            .order_by
-            .iter()
-            .map(|key| {
-                let name = match aggregate {
-                    // Aggregate ORDER BY addresses output columns by name.
-                    Some(_) => key.column.column.clone(),
-                    None => explain_col(&tables, &resolve_col(&tables, &key.column)?),
-                };
-                let direction = if key.desc { "DESC" } else { "ASC" };
-                // Only name the collation when it is not the default, so the
-                // common plan stays quiet.
-                let collation = if key.collation == Collation::default() {
-                    String::new()
-                } else {
-                    format!(" COLLATE {}", key.collation.name())
-                };
-                Ok(format!("{name} {direction}{collation}"))
-            })
-            .collect::<Result<_>>()?;
-        plan.line(depth, format!("SORT {}", keys.join(", ")));
-        plan.line(
-            depth + 1,
-            "external merge sort, spills to disk over the query budget",
-        );
-        depth += 1;
-    }
-    if let Some(aggregate) = &aggregate {
-        let line = if aggregate.group_cols.is_empty() {
-            "AGGREGATE (single group)".to_string()
-        } else {
-            format!(
-                "GROUP BY {}",
-                aggregate
-                    .group_cols
-                    .iter()
-                    .map(|col| explain_col(&tables, col))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        plan.line(depth, line);
-        if !agg_names.is_empty() {
-            plan.line(depth + 1, format!("aggregates: {}", agg_names.join(", ")));
-        }
-        if let Some(having) = &aggregate.having {
-            plan.line(
-                depth + 1,
-                format!("having: {}", explain_expr(&tables, &agg_names, having)),
-            );
-        }
-        depth += 1;
-    }
-
-    // Residual conjuncts span tables, so they are evaluated above the join.
-    for conjunct in &residual {
-        plan.line(
-            depth,
-            format!("filter: {}", explain_expr(&tables, &agg_names, conjunct)),
-        );
-    }
-
-    // The bounded streaming join path only handles a two-table, non-aggregate
-    // SELECT; see exec_select's dispatch.
-    let streamed = tables.len() == 2 && !is_aggregate;
-    explain_join_tree(
-        &mut plan,
-        depth,
-        stmt,
-        &tables,
-        &pushdown,
-        stmt.joins.len(),
-        streamed,
-    )?;
-    Ok(plan.finish())
 }
 
 // --- aggregation --------------------------------------------------------------
@@ -4400,60 +3605,29 @@ fn exec_insert_ignore_unique(
     returning: &[String],
     statement_timestamp: i64,
 ) -> Result<QueryOutput> {
-    let schema = db
-        .table_schema(table)
-        .ok_or_else(|| Error::TableNotFound(table.into()))?;
-    let returning_columns = if returning.len() == 1 && returning[0] == "*" {
-        implicit_id_and_declared_columns(&schema)
-    } else {
-        returning.to_vec()
-    };
-    let identity_column = schema
-        .columns
-        .iter()
-        .find(|column| column.identity)
-        .map(|column| column.name.clone());
-    let mut ids = Vec::new();
-    let mut identity_values = Vec::new();
-    let mut returned_rows = Vec::new();
-    for row in rows {
-        match exec_insert(
-            db,
+    let deadline = Instant::now() + WRITE_RETRY_BUDGET;
+    let mut attempt = 0;
+    loop {
+        let mut txn = db.begin();
+        let result = exec_insert_txn_with_conflicts(
+            &mut txn,
             table,
             columns,
-            std::slice::from_ref(row),
+            rows,
             returning,
             statement_timestamp,
-            false,
-        ) {
-            Ok(QueryOutput::Inserted { ids: inserted }) => ids.extend(inserted),
-            Ok(QueryOutput::InsertedIdentity {
-                ids: inserted,
-                values,
-                ..
-            }) => {
-                ids.extend(inserted);
-                identity_values.extend(values);
+            true,
+        )
+        .and_then(|output| txn.commit().map(|_| output));
+        match result {
+            Err(Error::Conflict(_) | Error::UniqueViolation { .. } | Error::DuplicateId { .. })
+                if Instant::now() < deadline =>
+            {
+                backoff_before_retry(attempt);
+                attempt += 1;
             }
-            Ok(QueryOutput::Rows { rows, .. }) => returned_rows.extend(rows),
-            Ok(other) => unreachable!("INSERT returned {other:?}"),
-            Err(Error::UniqueViolation { .. } | Error::DuplicateId { .. }) => {}
-            Err(error) => return Err(error),
+            result => return result,
         }
-    }
-    if !returning_columns.is_empty() {
-        Ok(QueryOutput::Rows {
-            columns: returning_columns,
-            rows: returned_rows,
-        })
-    } else if let Some(column) = identity_column {
-        Ok(QueryOutput::InsertedIdentity {
-            ids,
-            column,
-            values: identity_values,
-        })
-    } else {
-        Ok(QueryOutput::Inserted { ids })
     }
 }
 
@@ -4465,6 +3639,28 @@ fn exec_insert_txn(
     returning: &[String],
     statement_timestamp: i64,
 ) -> Result<QueryOutput> {
+    exec_insert_txn_with_conflicts(
+        txn,
+        table,
+        columns,
+        rows,
+        returning,
+        statement_timestamp,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exec_insert_txn_with_conflicts(
+    txn: &mut Txn,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Literal>],
+    returning: &[String],
+    statement_timestamp: i64,
+    ignore_unique: bool,
+) -> Result<QueryOutput> {
+    let mut accepted_keys = HashSet::new();
     let schema = txn.table_schema(table)?;
     let inferred_columns;
     let columns = if columns.is_empty() {
@@ -4535,7 +3731,14 @@ fn exec_insert_txn(
                 rec.insert(column.name.clone(), Value::Timestamp(statement_timestamp));
             }
         }
-        let id = txn.insert(table, rec)?;
+        let id = if ignore_unique {
+            let Some(id) = txn.insert_if_unique(table, rec, &mut accepted_keys)? else {
+                continue;
+            };
+            id
+        } else {
+            txn.insert(table, rec)?
+        };
         if !returning_columns.is_empty() || identity_column.is_some() {
             let inserted = txn
                 .get(table, &id)?

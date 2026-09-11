@@ -1,0 +1,11 @@
+{"durability":"fast","phase":"load","rows":20000,"seconds":0.015982083}
+{"allocated_bytes":3226881304,"allocations":32154419,"operations":200,"p50_ns":4886625,"p95_ns":5038209,"p99_ns":6247042,"phase":"cursor_id","rows":20000,"spill_files":0,"spilled_bytes":0}
+{"allocated_bytes":3226853540,"allocations":32153208,"operations":200,"p50_ns":4876458,"p95_ns":4951417,"p99_ns":4969334,"phase":"cursor_index","rows":20000,"spill_files":0,"spilled_bytes":0}
+{"allocated_bytes":3226994824,"allocations":32155807,"operations":200,"p50_ns":5081750,"p95_ns":5141459,"p99_ns":5157292,"phase":"cursor_scan","rows":20000,"spill_files":0,"spilled_bytes":0}
+{"allocated_bytes":3087135444,"allocations":28206007,"operations":200,"p50_ns":4815459,"p95_ns":4943625,"p99_ns":5019167,"phase":"and_index_last","rows":20000,"spill_files":0,"spilled_bytes":0}
+{"allocated_bytes":6775428,"allocations":19408,"operations":200,"p50_ns":4625,"p95_ns":5667,"p99_ns":8583,"phase":"and_index_first","rows":20000,"spill_files":0,"spilled_bytes":0}
+{"allocated_bytes":188837998,"allocations":1810003,"operations":10,"p50_ns":5612833,"p95_ns":5679083,"p99_ns":5679083,"phase":"top_k","rows":20000,"spill_files":40,"spilled_bytes":15200}
+{"allocated_bytes":248101785,"allocations":3208141,"operations":10,"p50_ns":9206250,"p95_ns":9240834,"p99_ns":9240834,"phase":"full_sort","rows":20000,"spill_files":40,"spilled_bytes":7600000}
+{"allocations":9242,"apply_ns":82082,"commit_ns":562912,"debt_operations":0,"durability":"fast","lock_hold_ns":460169,"lock_wait_ns":8166,"locked_prepare_ns":15586,"operations":200,"p50_ns":3000,"p95_ns":5375,"p99_ns":7708,"phase":"commit_plain","prepare_ns":69999,"sync_ns":0,"wal_append_ns":332999,"wal_ns":434206}
+{"allocations":14648,"apply_ns":129414,"commit_ns":707503,"debt_operations":0,"durability":"fast","lock_hold_ns":613042,"lock_wait_ns":8514,"locked_prepare_ns":104917,"operations":200,"p50_ns":3959,"p95_ns":6334,"p99_ns":10083,"phase":"commit_identity","prepare_ns":173924,"sync_ns":0,"wal_append_ns":323627,"wal_ns":498335}
+{"allocations":18048,"apply_ns":138669,"commit_ns":1226210,"debt_operations":0,"durability":"fast","lock_hold_ns":1123748,"lock_wait_ns":9167,"locked_prepare_ns":531834,"operations":200,"p50_ns":6334,"p95_ns":8750,"p99_ns":19792,"phase":"commit_foreign_key","prepare_ns":606835,"sync_ns":0,"wal_append_ns":420663,"wal_ns":581340}

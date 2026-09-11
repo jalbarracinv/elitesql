@@ -35,7 +35,7 @@ use elitesql_core::{jsonio, Db, Error, QueryCursor, QueryOutput, Record, Txn, Va
 use serde_json::{json, Value as J};
 
 /// Protocol-level error code for authentication, outside the engine's range
-/// (`Error::code()` currently returns 1..=17) so clients can tell them apart.
+/// (`Error::code()` currently returns 1..=18) so clients can tell them apart.
 const AUTH_ERROR_CODE: u32 = 20;
 const SIDECAR_TXN_TIMEOUT: Duration = Duration::from_secs(30);
 const SIDECAR_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -313,7 +313,7 @@ fn handle_connection_with_timeouts<S: Stream>(
     loop {
         if reader
             .get_ref()
-            .set_timeouts(txn.as_ref().map(|_| idle_timeout))
+            .set_timeouts((txn.is_some() || cursor.is_some()).then_some(idle_timeout))
             .is_err()
         {
             return;
@@ -341,7 +341,7 @@ fn handle_connection_with_timeouts<S: Stream>(
         }
         let response =
             dispatch_with_txn(&db, &line, &auth, &mut authenticated, &mut txn, &mut cursor);
-        if authenticated && writer.get_ref().set_timeouts(None).is_err() {
+        if authenticated && writer.get_ref().set_timeouts(Some(idle_timeout)).is_err() {
             return;
         }
         let response = bounded_response_bytes(&response);
@@ -436,20 +436,39 @@ fn sidecar_query(db: &Db, sql: &str, params: Option<&J>) -> Result<QueryOutput, 
 fn sidecar_cursor_next(
     active: &mut SidecarCursor<'_>,
     max_rows: usize,
+    byte_budget: usize,
 ) -> Result<(Vec<Vec<Value>>, bool), Error> {
     let mut rows = Vec::with_capacity(max_rows);
-    if let Some(row) = active.pending.take() {
-        rows.push(row);
-    }
-    while rows.len() <= max_rows {
-        match active.cursor.next() {
-            Some(Ok(row)) => rows.push(row),
+    let mut bytes = 2usize; // outer row array
+    loop {
+        let next = active
+            .pending
+            .take()
+            .map(Ok)
+            .or_else(|| active.cursor.next());
+        match next {
+            Some(Ok(row)) => {
+                let encoded = rows_to_json(std::slice::from_ref(&row));
+                let row_bytes = serde_json::to_vec(&encoded[0])
+                    .expect("JSON values serialize")
+                    .len();
+                let next_bytes = bytes
+                    .saturating_add(row_bytes)
+                    .saturating_add(usize::from(!rows.is_empty()));
+                if rows.len() == max_rows || next_bytes > byte_budget {
+                    active.pending = Some(row);
+                    if rows.is_empty() {
+                        return Err(Error::MemoryLimit("one cursor row exceeds the response byte limit; row retained until close or retry".into()));
+                    }
+                    return Ok((rows, false));
+                }
+                bytes = next_bytes;
+                rows.push(row);
+            }
             Some(Err(error)) => return Err(error),
             None => return Ok((rows, true)),
         }
     }
-    active.pending = rows.pop();
-    Ok((rows, false))
 }
 
 fn rows_to_json(rows: &[Vec<Value>]) -> Vec<Vec<J>> {
@@ -600,7 +619,7 @@ fn handle_request<'db>(
         }
         return response;
     }
-    let result = match op {
+    let mut execute = || match op {
         "ping" => Ok(json!("pong")),
         "query" if txn.is_some() => Err(Error::InvalidArgument(
             "an explicit transaction is active; use query_in_txn or commit/rollback".into(),
@@ -649,7 +668,22 @@ fn handle_request<'db>(
             let active = cursor
                 .as_mut()
                 .ok_or_else(|| Error::InvalidArgument("no active streaming cursor".into()))?;
-            let (rows, done) = sidecar_cursor_next(active, requested)?;
+            let mut envelope = json!({"ok": true, "result": {"rows": [], "done": false}});
+            if let Some(id) = &id {
+                envelope
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("id".into(), id.clone());
+            }
+            let overhead = serde_json::to_vec(&envelope)
+                .expect("JSON envelope")
+                .len()
+                .saturating_sub(2);
+            let (rows, done) = sidecar_cursor_next(
+                active,
+                requested,
+                MAX_RESPONSE_BYTES.saturating_sub(overhead),
+            )?;
             if done {
                 cursor.take();
             }
@@ -754,6 +788,24 @@ fn handle_request<'db>(
             "unknown op '{other}'"
         ))),
     };
+    let result = if matches!(op, "query" | "query_open") {
+        request
+            .get("timeout_ms")
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    Error::InvalidArgument("timeout_ms must be an unsigned integer".into())
+                })
+            })
+            .transpose()
+            .and_then(|timeout| {
+                elitesql_core::QueryControl::with_timeout(Duration::from_millis(
+                    timeout.unwrap_or(30_000),
+                ))
+            })
+            .and_then(|control| control.run(execute))
+    } else {
+        execute()
+    };
     let mut response = match result {
         Ok(value) => json!({"ok": true, "result": value}),
         Err(e) => json!({"ok": false, "code": e.code(), "error": e.to_string()}),
@@ -767,6 +819,62 @@ fn handle_request<'db>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_batches_fit_serialized_bytes_without_skipping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("db")).unwrap();
+        db.query("CREATE TABLE docs(body text)").unwrap();
+        for id in ["a", "b", "c"] {
+            let mut row = Record::new();
+            row.insert("id".into(), Value::Text(id.into()));
+            row.insert("body".into(), Value::Text("\\".repeat(2 * 1024 * 1024)));
+            db.insert("docs", row).unwrap();
+        }
+        let mut active = SidecarCursor {
+            cursor: db.query_cursor("SELECT id,body FROM docs").unwrap(),
+            pending: None,
+        };
+        let mut ids = Vec::new();
+        loop {
+            let (rows, done) =
+                sidecar_cursor_next(&mut active, 512, MAX_RESPONSE_BYTES - 128).unwrap();
+            assert_eq!(rows.len(), 1);
+            let envelope = json!({"ok":true,"result":{"rows":rows_to_json(&rows),"done":done}});
+            assert!(serde_json::to_vec(&envelope).unwrap().len() <= MAX_RESPONSE_BYTES);
+            ids.push(rows[0][0].clone());
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            ids,
+            [
+                Value::Text("a".into()),
+                Value::Text("b".into()),
+                Value::Text("c".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn oversized_cursor_row_is_retained_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("db")).unwrap();
+        db.query("CREATE TABLE docs(body text)").unwrap();
+        let mut row = Record::new();
+        row.insert("body".into(), Value::Text("x".repeat(2048)));
+        db.insert("docs", row).unwrap();
+        let mut active = SidecarCursor {
+            cursor: db.query_cursor("SELECT body FROM docs").unwrap(),
+            pending: None,
+        };
+        assert!(sidecar_cursor_next(&mut active, 1, 1024).is_err());
+        assert!(active.pending.is_some());
+        let (rows, done) = sidecar_cursor_next(&mut active, 1, 4096).unwrap();
+        assert_eq!(rows, vec![vec![Value::Text("x".repeat(2048))]]);
+        assert!(done);
+    }
 
     fn socket_call(writer: &mut UnixStream, reader: &mut BufReader<UnixStream>, request: J) -> J {
         writeln!(writer, "{request}").unwrap();
@@ -1049,6 +1157,39 @@ mod tests {
         );
         worker.join().unwrap();
         assert!(db.scan("docs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn sidecar_idle_timeout_releases_a_cursor_and_its_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::create(dir.path().join("idle-cursor")).unwrap());
+        db.query("CREATE TABLE docs(n int)").unwrap();
+        db.query("INSERT INTO docs(n) VALUES(1),(2),(3)").unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let served = db.clone();
+        let worker = std::thread::spawn(move || {
+            handle_connection_with_timeout(served, server, Auth::Trusted, Duration::from_millis(50))
+        });
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        assert_eq!(
+            socket_call(
+                &mut client,
+                &mut reader,
+                json!({"op":"query_open","sql":"SELECT n FROM docs"})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            socket_call(
+                &mut client,
+                &mut reader,
+                json!({"op":"query_next","max_rows":1})
+            )["ok"],
+            true
+        );
+        worker.join().unwrap();
+        assert_eq!(db.global_memory_stats().query_in_use_bytes, 0);
+        assert!(db.query("SELECT n FROM docs").is_ok());
     }
 
     #[test]

@@ -1,0 +1,36 @@
+{
+  "name": "wal-preallocation",
+  "bench": "wal_preallocation",
+  "argv": [
+    "/Users/jalbarracin/Code/elitesql/target/release/deps/wal_preallocation-a5dbc63a2ad88114",
+    "/Users/jalbarracin/Code/elitesql/benchmark-results/refresh-2026-09-11/wal-preallocation.csv"
+  ],
+  "before": {
+    "utc": "2026-09-11T10:05:09Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "returncode": 0,
+  "wall_seconds": 4.070046124979854,
+  "after": {
+    "utc": "2026-09-11T10:05:13Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  }
+}

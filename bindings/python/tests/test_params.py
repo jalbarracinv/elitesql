@@ -118,6 +118,19 @@ class ParameterEncodingTests(unittest.TestCase):
 
 @unittest.skipUnless(LIB_PATH.is_file(), f"build {LIB_PATH} first")
 class EmbeddedParameterTests(unittest.TestCase):
+    def test_full_int64_range_and_identity_metadata_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with EliteSQL(Path(directory) / "integers.esql", lib_path=str(LIB_PATH)) as db:
+                db.query("CREATE TABLE numbers(n int)")
+                values = [-(2 ** 63), -9007199254740993, 9007199254740991, 9007199254740993, 2 ** 63 - 1]
+                for value in values:
+                    db.query("INSERT INTO numbers(n) VALUES(?)", [value])
+                self.assertEqual(db.query("SELECT n FROM numbers")["rows"], [[value] for value in values])
+                db.query("CREATE TABLE ids(id int AUTO_INCREMENT PRIMARY KEY)")
+                result = db.query("INSERT INTO ids(id) VALUES(?)", [9007199254740993])
+                self.assertEqual(result["lastrowid"], 9007199254740993)
+                self.assertEqual(result["identity"]["values"], [9007199254740993])
+
     def test_roundtrip_named_limit_and_injection_payload(self):
         with tempfile.TemporaryDirectory() as directory:
             with EliteSQL(Path(directory) / "params.esql", lib_path=str(LIB_PATH)) as db:

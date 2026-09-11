@@ -1,0 +1,46 @@
+Benchmarking sql_1m/point_by_unique_index
+Benchmarking sql_1m/point_by_unique_index: Warming up for 3.0000 s
+Benchmarking sql_1m/point_by_unique_index: Collecting 10 samples in estimated 5.0000 s (1.2M iterations)
+Benchmarking sql_1m/point_by_unique_index: Analyzing
+Benchmarking sql_1m/point_by_unique_index_bound
+Benchmarking sql_1m/point_by_unique_index_bound: Warming up for 3.0000 s
+Benchmarking sql_1m/point_by_unique_index_bound: Collecting 10 samples in estimated 5.0001 s (1.5M iterations)
+Benchmarking sql_1m/point_by_unique_index_bound: Analyzing
+Benchmarking sql_1m/indexed_join_100_of_1m
+Benchmarking sql_1m/indexed_join_100_of_1m: Warming up for 3.0000 s
+Benchmarking sql_1m/indexed_join_100_of_1m: Collecting 10 samples in estimated 5.0003 s (27k iterations)
+Benchmarking sql_1m/indexed_join_100_of_1m: Analyzing
+Benchmarking sql_1m/indexed_join_100_of_1m_bound
+Benchmarking sql_1m/indexed_join_100_of_1m_bound: Warming up for 3.0000 s
+Benchmarking sql_1m/indexed_join_100_of_1m_bound: Collecting 10 samples in estimated 5.0027 s (31k iterations)
+Benchmarking sql_1m/indexed_join_100_of_1m_bound: Analyzing
+Benchmarking sql_1m/full_scan_filter_1m
+Benchmarking sql_1m/full_scan_filter_1m: Warming up for 3.0000 s
+Benchmarking sql_1m/full_scan_filter_1m: Collecting 10 samples in estimated 5.0063 s (16k iterations)
+Benchmarking sql_1m/full_scan_filter_1m: Analyzing
+Benchmarking sql_1m/group_by_997_groups_1m
+Benchmarking sql_1m/group_by_997_groups_1m: Warming up for 3.0000 s
+Benchmarking sql_1m/group_by_997_groups_1m: Collecting 10 samples in estimated 6.2755 s (20 iterations)
+Benchmarking sql_1m/group_by_997_groups_1m: Analyzing
+Benchmarking sql_1m/group_by_10k_groups_1m
+Benchmarking sql_1m/group_by_10k_groups_1m: Warming up for 3.0000 s
+Benchmarking sql_1m/group_by_10k_groups_1m: Collecting 10 samples in estimated 6.8959 s (20 iterations)
+Benchmarking sql_1m/group_by_10k_groups_1m: Analyzing
+       76.49 real        70.35 user         5.46 sys
+           577994752  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               43745  page reclaims
+                7135  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 726  voluntary context switches
+               46915  involuntary context switches
+       1483020645784  instructions retired
+        325761974324  cycles elapsed
+           310084256  peak memory footprint

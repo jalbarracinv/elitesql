@@ -459,6 +459,18 @@ impl Catalog {
             table.validate().map_err(|error| {
                 Error::Corrupt(format!("invalid catalog table '{}': {error}", table.name))
             })?;
+            for column in table.columns.iter().filter(|column| column.identity) {
+                if !table
+                    .indexes
+                    .iter()
+                    .any(|index| index.column == column.name && index.unique)
+                {
+                    return Err(Error::Corrupt(format!(
+                        "identity {}.{} is missing its unique index",
+                        table.name, column.name
+                    )));
+                }
+            }
             if self.tables[..index]
                 .iter()
                 .any(|previous| previous.name == table.name)
@@ -467,6 +479,41 @@ impl Catalog {
                     "catalog contains duplicate table '{}'",
                     table.name
                 )));
+            }
+            for foreign_key in &table.foreign_keys {
+                let invalid = || {
+                    Error::Corrupt(format!(
+                        "invalid foreign key {}.{} -> {}.{}",
+                        table.name,
+                        foreign_key.column,
+                        foreign_key.referenced_table,
+                        foreign_key.referenced_column
+                    ))
+                };
+                let target = self
+                    .table(&foreign_key.referenced_table)
+                    .ok_or_else(invalid)?;
+                let implicit = target.has_implicit_id() && foreign_key.referenced_column == "id";
+                let target_type = if implicit {
+                    ColumnType::Text
+                } else {
+                    target
+                        .column(&foreign_key.referenced_column)
+                        .ok_or_else(invalid)?
+                        .ty
+                };
+                if table.column(&foreign_key.column).ok_or_else(invalid)?.ty != target_type
+                    || (!implicit
+                        && !target.indexes.iter().any(|index| {
+                            index.column == foreign_key.referenced_column && index.unique
+                        }))
+                    || !table
+                        .indexes
+                        .iter()
+                        .any(|index| index.column == foreign_key.column)
+                {
+                    return Err(invalid());
+                }
             }
         }
         Ok(())

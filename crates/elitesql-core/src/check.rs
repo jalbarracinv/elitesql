@@ -10,6 +10,8 @@ use crate::schema::Catalog;
 use crate::segment::{scan_segment, segment_file_name};
 use crate::wal::{scan_wal, wal_path, WAL_DIR};
 
+mod logical;
+
 /// Result of an offline integrity check. `errors` are integrity violations;
 /// `warnings` are recoverable oddities (torn WAL tail, orphan files) that
 /// open() handles automatically.
@@ -39,6 +41,7 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
         ));
         return Ok(report);
     }
+    let _source_lock = crate::db::acquire_lock(dir, true)?;
 
     let catalog_mirror_error = Catalog::load(&dir.join(CATALOG_FILE)).err();
 
@@ -178,52 +181,46 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
         }
     }
 
-    // WAL: records must checksum; a torn tail is normal after a crash.
-    let wal_file = wal_path(dir, manifest.wal_id);
-    match fs::read(&wal_file) {
-        Ok(data) => {
-            let scan = scan_wal(&data);
-            if !scan.clean {
-                report.warnings.push(format!(
-                    "wal {}: torn tail at offset {} (truncated on next open)",
-                    manifest.wal_id, scan.valid_len
-                ));
+    // Inspect every successor, including the required final WAL. Reuse normal
+    // recovery's preflight so check never blesses a chain open must reject.
+    let wal_ids = match crate::wal::validate_wal_chain(
+        dir,
+        manifest.wal_id,
+        manifest.required_wal_id,
+        manifest.committed_version,
+    ) {
+        Ok(ids) => ids,
+        Err(error) => {
+            report.errors.push(error.to_string());
+            return Ok(report);
+        }
+    };
+    for id in &wal_ids {
+        let data = fs::read(wal_path(dir, *id))?;
+        let scan = scan_wal(&data);
+        if !scan.clean {
+            report.warnings.push(format!(
+                "wal {id}: incomplete final record at offset {} (truncated on next open)",
+                scan.valid_len
+            ));
+        }
+        for rec in scan.records {
+            if rec.version <= manifest.committed_version {
+                continue;
             }
-            let mut last = manifest.committed_version;
-            for rec in &scan.records {
-                let Some(expected) = last.checked_add(1) else {
-                    report
-                        .errors
-                        .push(format!("wal {}: commit version exhausted", manifest.wal_id));
-                    break;
-                };
-                if rec.version != expected {
-                    report.errors.push(format!(
-                        "wal {}: commit version gap (expected {expected}, found {})",
-                        manifest.wal_id, rec.version
-                    ));
-                    break;
-                }
-                last = rec.version;
-                for ch in &rec.changes {
-                    if let Some(p) = &ch.payload {
-                        if let Err(e) =
-                            crate::db::decode_record(p, Some(&dir.join(crate::db::BLOBS_DIR)))
-                        {
-                            report.errors.push(format!(
-                                "wal {}: bad payload for {}/{}: {e}",
-                                manifest.wal_id, ch.table, ch.id
-                            ));
-                        }
+            for ch in rec.changes {
+                if let Some(payload) = ch.payload {
+                    if let Err(error) =
+                        crate::db::decode_record(&payload, Some(&dir.join(crate::db::BLOBS_DIR)))
+                    {
+                        report.errors.push(format!(
+                            "wal {id}: bad payload for {}/{}: {error}",
+                            ch.table, ch.id
+                        ));
                     }
                 }
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.errors.push(format!(
-            "wal {} missing; uncheckpointed commits may be lost",
-            manifest.wal_id
-        )),
-        Err(e) => report.errors.push(format!("wal {}: {e}", manifest.wal_id)),
     }
     if let Ok(dirents) = fs::read_dir(dir.join(WAL_DIR)) {
         for dirent in dirents.flatten() {
@@ -231,7 +228,7 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
             let name = name.to_string_lossy().into_owned();
             if let Some(stem) = name.strip_suffix(".wal") {
                 if let Ok(id) = stem.parse::<u32>() {
-                    if id != manifest.wal_id {
+                    if id < manifest.wal_id {
                         report
                             .warnings
                             .push(format!("obsolete wal {name} (removed on next open)"));
@@ -241,5 +238,17 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
         }
     }
 
+    if report.errors.is_empty() {
+        let catalog = match &manifest.catalog {
+            Some(catalog) => catalog.clone(),
+            None => Catalog::load(&dir.join(CATALOG_FILE))?,
+        };
+        if let Err(error) = logical::check_logical(dir, &manifest, &catalog, &wal_ids, &mut report)
+        {
+            report
+                .errors
+                .push(format!("logical check could not complete: {error}"));
+        }
+    }
     Ok(report)
 }

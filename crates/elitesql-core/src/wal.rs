@@ -31,6 +31,73 @@ pub(crate) fn wal_path(dir: &Path, id: u32) -> PathBuf {
     dir.join(WAL_DIR).join(wal_file_name(id))
 }
 
+/// Preflight the entire recoverable chain before normal open modifies any
+/// canonical file. Only an incomplete final record may be truncated.
+pub(crate) fn validate_wal_chain(
+    dir: &Path,
+    anchor: u32,
+    required: u32,
+    watermark: u64,
+) -> Result<Vec<u32>> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(dir.join(WAL_DIR))? {
+        let entry = entry?;
+        if let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".wal"))
+            .and_then(|name| name.parse::<u32>().ok())
+        {
+            if id >= anchor {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    if ids.first() != Some(&anchor) || ids.last().is_none_or(|id| *id < required.max(anchor)) {
+        return Err(Error::Corrupt(format!(
+            "required wal chain {anchor}..={} is incomplete",
+            required.max(anchor)
+        )));
+    }
+    let mut expected_id = anchor;
+    let mut version = watermark;
+    for (position, id) in ids.iter().copied().enumerate() {
+        if id != expected_id {
+            return Err(Error::Corrupt(format!(
+                "required wal {expected_id} is missing before {id}"
+            )));
+        }
+        expected_id = id.saturating_add(1);
+        let data = std::fs::read(wal_path(dir, id))?;
+        let scan = scan_wal(&data);
+        if let Some(message) = scan.corruption {
+            return Err(Error::Corrupt(format!(
+                "wal {id} at offset {}: {message}",
+                scan.valid_len
+            )));
+        }
+        if !scan.clean && position + 1 != ids.len() {
+            return Err(Error::Corrupt(format!(
+                "wal {id}: incomplete record before a successor WAL"
+            )));
+        }
+        for record in scan.records {
+            if record.version <= version {
+                continue;
+            }
+            if version.checked_add(1) != Some(record.version) {
+                return Err(Error::Corrupt(format!(
+                    "wal {id}: commit version gap after {version}: {}",
+                    record.version
+                )));
+            }
+            version = record.version;
+        }
+    }
+    Ok(ids)
+}
+
 // Commit record layout (all integers little-endian):
 //
 //   u64  commit_version
@@ -131,6 +198,7 @@ pub(crate) struct WalScan {
     pub records: Vec<WalRecord>,
     pub valid_len: u64,
     pub clean: bool,
+    pub corruption: Option<String>,
 }
 
 /// Scan a WAL buffer, stopping at the first torn or corrupt record.
@@ -145,6 +213,7 @@ pub(crate) fn scan_wal(data: &[u8]) -> WalScan {
                 records,
                 valid_len: start as u64,
                 clean: true,
+                corruption: None,
             };
         }
         match parse_record(data, &mut pos, start) {
@@ -157,50 +226,78 @@ pub(crate) fn scan_wal(data: &[u8]) -> WalScan {
                     records,
                     valid_len: start as u64,
                     clean: false,
+                    corruption: Some("WAL versions are not strictly increasing".into()),
                 }
             }
-            Err(_) => {
+            Err(error) => {
                 return WalScan {
                     records,
                     valid_len: start as u64,
                     clean: false,
-                }
+                    corruption: match error {
+                        WalParseError::Incomplete => {
+                            // A damaged length can disguise an interior
+                            // record as an incomplete tail. A later complete
+                            // checksummed record proves this is corruption.
+                            (start.saturating_add(1)..data.len().saturating_sub(15))
+                                .any(|offset| {
+                                    let mut candidate = offset;
+                                    parse_record(data, &mut candidate, offset).is_ok_and(|record| {
+                                        record.version > previous_version.unwrap_or(0)
+                                    })
+                                })
+                                .then(|| "incomplete record precedes a valid WAL record".into())
+                        }
+                        WalParseError::Corrupt(message) => Some(message),
+                    },
+                };
             }
         }
     }
 }
 
-fn parse_record(data: &[u8], pos: &mut usize, start: usize) -> Result<WalRecord> {
-    let version = read_u64(data, pos)?;
-    let count = read_u32(data, pos)? as usize;
+enum WalParseError {
+    Incomplete,
+    Corrupt(String),
+}
+
+fn parse_record(
+    data: &[u8],
+    pos: &mut usize,
+    start: usize,
+) -> std::result::Result<WalRecord, WalParseError> {
+    let version = read_u64(data, pos).map_err(|_| WalParseError::Incomplete)?;
+    let count = read_u32(data, pos).map_err(|_| WalParseError::Incomplete)? as usize;
     // Bounds-checked reads keep a garbage count from allocating; this cap is
     // an extra sanity guard against absurd-but-parseable values.
     if count as u64 > data.len() as u64 {
-        return Err(Error::Corrupt("wal: implausible change count".into()));
+        return Err(WalParseError::Incomplete);
     }
     let mut changes = Vec::with_capacity(count.min(1024));
     let mut identity_high_water = Vec::new();
     for _ in 0..count {
-        let kind = read_u8(data, pos)?;
+        let kind = read_u8(data, pos).map_err(|_| WalParseError::Incomplete)?;
         if kind != KIND_PUT && kind != KIND_TOMBSTONE {
-            return Err(Error::Corrupt(format!("wal: unknown change kind {kind}")));
+            return Err(WalParseError::Corrupt(format!(
+                "wal: unknown change kind {kind}"
+            )));
         }
         let table = read_short_str(data, pos)?;
         let id = read_short_str(data, pos)?;
-        let payload_len = read_u32(data, pos)? as usize;
+        let payload_len = read_u32(data, pos).map_err(|_| WalParseError::Incomplete)? as usize;
         let end = pos
             .checked_add(payload_len)
-            .ok_or_else(|| Error::Corrupt("wal: length overflow".into()))?;
-        let payload_bytes = data
-            .get(*pos..end)
-            .ok_or_else(|| Error::Corrupt("wal: truncated payload".into()))?;
+            .ok_or_else(|| WalParseError::Corrupt("wal: length overflow".into()))?;
+        let payload_bytes = data.get(*pos..end).ok_or(WalParseError::Incomplete)?;
         *pos = end;
         if kind == KIND_TOMBSTONE && payload_len != 0 {
-            return Err(Error::Corrupt("wal: tombstone with payload".into()));
+            return Err(WalParseError::Corrupt("wal: tombstone with payload".into()));
         }
         if table == IDENTITY_META_TABLE {
             if kind != KIND_PUT || payload_len != 8 {
-                return Err(Error::Corrupt("wal: invalid identity metadata".into()));
+                return Err(WalParseError::Corrupt(
+                    "wal: invalid identity metadata".into(),
+                ));
             }
             let value = i64::from_le_bytes(
                 payload_bytes
@@ -208,7 +305,9 @@ fn parse_record(data: &[u8], pos: &mut usize, start: usize) -> Result<WalRecord>
                     .expect("identity payload length checked"),
             );
             if value < 1 {
-                return Err(Error::Corrupt("wal: invalid identity high-water".into()));
+                return Err(WalParseError::Corrupt(
+                    "wal: invalid identity high-water".into(),
+                ));
             }
             identity_high_water.push((id, value));
         } else {
@@ -220,9 +319,9 @@ fn parse_record(data: &[u8], pos: &mut usize, start: usize) -> Result<WalRecord>
         }
     }
     let crc_pos = *pos;
-    let stored_crc = read_u32(data, pos)?;
+    let stored_crc = read_u32(data, pos).map_err(|_| WalParseError::Incomplete)?;
     if crc32fast::hash(&data[start..crc_pos]) != stored_crc {
-        return Err(Error::Corrupt("wal: record crc mismatch".into()));
+        return Err(WalParseError::Corrupt("wal: record crc mismatch".into()));
     }
     Ok(WalRecord {
         version,
@@ -231,18 +330,16 @@ fn parse_record(data: &[u8], pos: &mut usize, start: usize) -> Result<WalRecord>
     })
 }
 
-fn read_short_str(data: &[u8], pos: &mut usize) -> Result<String> {
-    let len = read_u16(data, pos)? as usize;
+fn read_short_str(data: &[u8], pos: &mut usize) -> std::result::Result<String, WalParseError> {
+    let len = read_u16(data, pos).map_err(|_| WalParseError::Incomplete)? as usize;
     let end = pos
         .checked_add(len)
-        .ok_or_else(|| Error::Corrupt("wal: length overflow".into()))?;
-    let slice = data
-        .get(*pos..end)
-        .ok_or_else(|| Error::Corrupt("wal: unexpected end".into()))?;
+        .ok_or_else(|| WalParseError::Corrupt("wal: length overflow".into()))?;
+    let slice = data.get(*pos..end).ok_or(WalParseError::Incomplete)?;
     *pos = end;
     std::str::from_utf8(slice)
         .map(|s| s.to_owned())
-        .map_err(|_| Error::Corrupt("wal: invalid utf8".into()))
+        .map_err(|_| WalParseError::Corrupt("wal: invalid utf8".into()))
 }
 
 pub(crate) struct WalWriter {

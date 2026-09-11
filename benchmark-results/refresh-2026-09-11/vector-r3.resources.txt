@@ -1,0 +1,34 @@
+Benchmarking vector_100k/search_top10_ef64
+Benchmarking vector_100k/search_top10_ef64: Warming up for 3.0000 s
+Benchmarking vector_100k/search_top10_ef64: Collecting 30 samples in estimated 5.0232 s (26k iterations)
+Benchmarking vector_100k/search_top10_ef64: Analyzing
+Benchmarking vector_100k/search_top10_ef128
+Benchmarking vector_100k/search_top10_ef128: Warming up for 3.0000 s
+Benchmarking vector_100k/search_top10_ef128: Collecting 30 samples in estimated 5.0439 s (15k iterations)
+Benchmarking vector_100k/search_top10_ef128: Analyzing
+Benchmarking vector_100k/search_top10_ef256
+Benchmarking vector_100k/search_top10_ef256: Warming up for 3.0000 s
+Benchmarking vector_100k/search_top10_ef256: Collecting 30 samples in estimated 5.1435 s (8370 iterations)
+Benchmarking vector_100k/search_top10_ef256: Analyzing
+Benchmarking vector_100k/search_top10_ef512
+Benchmarking vector_100k/search_top10_ef512: Warming up for 3.0000 s
+Benchmarking vector_100k/search_top10_ef512: Collecting 30 samples in estimated 5.3905 s (4650 iterations)
+Benchmarking vector_100k/search_top10_ef512: Analyzing
+       49.30 real        48.82 user         0.30 sys
+           253149184  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               20368  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 164  voluntary context switches
+               11288  involuntary context switches
+        571710756463  instructions retired
+        211656039314  cycles elapsed
+           145654264  peak memory footprint

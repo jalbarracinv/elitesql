@@ -249,8 +249,15 @@ fn concurrent_writers_remain_consistent_while_auto_compacting() {
     for handle in handles {
         handle.join().unwrap();
     }
+    // Commits can finish before the background checkpoint publishes its
+    // segment and schedules compaction. Drain those commits before waiting
+    // for the compaction queue; waiting on an empty queue is not a barrier
+    // for checkpoints that are still running.
+    db.checkpoint().unwrap();
     db.wait_for_automatic_compaction().unwrap();
-    assert!(db.maintenance_stats().automatic_compactions > 0);
+    let stats = db.maintenance_stats();
+    assert!(stats.automatic_compactions > 0, "{stats:?}");
+    assert_eq!(stats.automatic_compaction_failures, 0, "{stats:?}");
     for worker in 0..4 {
         assert_eq!(
             db.get("docs", &format!("worker-{worker}"))

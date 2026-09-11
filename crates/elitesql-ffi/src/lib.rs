@@ -183,6 +183,14 @@ pub unsafe extern "C" fn elitesql_open(
                     set_memory_usize!(total_memory_bytes);
                     set_memory_usize!(query_pool_bytes);
                     set_memory_usize!(query_working_bytes);
+                    if let Some(value) = memory.get("query_admission_timeout_ms") {
+                        opts.memory.query_admission_timeout_ms =
+                            value.as_u64().ok_or_else(|| {
+                                Error::InvalidArgument(
+                                    "query_admission_timeout_ms must be an unsigned integer".into(),
+                                )
+                            })?;
+                    }
                     set_memory_usize!(index_delta_pool_bytes);
                     set_memory_usize!(maintenance_pool_bytes);
                     set_memory_usize!(reserved_memory_bytes);

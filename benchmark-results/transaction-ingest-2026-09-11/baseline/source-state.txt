@@ -1,0 +1,59 @@
+d7ddbde9fe1e099f05cbbc17b7601c42a3ab0a5c
+ M README.md
+ M benchmark.md
+ M bindings/node/elitesql.d.ts
+ M bindings/node/elitesql.js
+ M bindings/node/package.json
+ M bindings/node/test.js
+ M bindings/python/elitesql.py
+ M bindings/python/tests/test_params.py
+ M crates/elitesql-cli/src/main.rs
+ M crates/elitesql-cli/src/serve.rs
+ M crates/elitesql-core/examples/vector_memory.rs
+ M crates/elitesql-core/src/backup.rs
+ M crates/elitesql-core/src/check.rs
+ M crates/elitesql-core/src/db.rs
+ M crates/elitesql-core/src/distance.rs
+ M crates/elitesql-core/src/error.rs
+ M crates/elitesql-core/src/jsonio.rs
+ M crates/elitesql-core/src/lib.rs
+ M crates/elitesql-core/src/manifest.rs
+ M crates/elitesql-core/src/memory.rs
+ M crates/elitesql-core/src/paged.rs
+ M crates/elitesql-core/src/repair.rs
+ M crates/elitesql-core/src/schema.rs
+ M crates/elitesql-core/src/sql/exec.rs
+ M crates/elitesql-core/src/vector.rs
+ M crates/elitesql-core/src/wal.rs
+ M crates/elitesql-core/tests/auto_compaction.rs
+ M crates/elitesql-core/tests/compaction.rs
+ M crates/elitesql-core/tests/corruption.rs
+ M crates/elitesql-core/tests/ddl.rs
+ M crates/elitesql-core/tests/phase5.rs
+ M crates/elitesql-core/tests/query_memory.rs
+ M crates/elitesql-core/tests/repair_jsonio.rs
+ M crates/elitesql-ffi/include/elitesql.h
+ M crates/elitesql-ffi/src/lib.rs
+ M docs/disk-format.md
+ M manual.md
+?? .github/
+?? benchmark-results/archive/
+?? benchmark-results/refresh-2026-09-11/
+?? benchmark-results/review-2026-09-11/
+?? benchmark-results/transaction-ingest-2026-09-11/
+?? bindings/node/test-integration.js
+?? crates/elitesql-core/examples/audit_performance.rs
+?? crates/elitesql-core/src/check/
+?? crates/elitesql-core/src/db/
+?? crates/elitesql-core/src/query_control.rs
+?? crates/elitesql-core/src/sql/planner.rs
+?? crates/elitesql-core/src/sql/sort.rs
+?? crates/elitesql-core/src/sql/values.rs
+?? crates/elitesql-core/tests/integrity_regressions.rs
+?? crates/elitesql-core/tests/numeric_differential.rs
+?? docs/auditoria-y-plan-2026-09-10.md
+?? docs/implementacion-plan.md
+?? docs/revision-integridad-2026-09-10.md
+?? scripts/acceptance.sh
+?? scripts/refresh-benchmarks.py
+?? scripts/review-benchmark.py

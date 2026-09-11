@@ -22,7 +22,7 @@ app.esql/
 
 `ESQLMANI` (8 bytes) + u32 crc32 of the body + u32 length + JSON body:
 `{format_version, committed_version, segments: [{id, len}], wal_id,
-identity_high_water, catalog}`. Embedding the catalog makes every canonical
+required_wal_id, identity_high_water, catalog}`. Embedding the catalog makes every canonical
 generation self-contained: schema cannot advance independently of its data.
 Publication: write `manifest.tmp` (fsync), rotate `manifest` →
 `manifest.prev`, rename `manifest.tmp` → `manifest`, fsync the directory.
@@ -58,11 +58,19 @@ per change: u8 kind, u16+table, u16+id, u32+payload
 u32  crc32 of the whole record
 ```
 
-Idempotent replay: records at or below the manifest's watermark are skipped;
-a torn tail is truncated. At checkpoint the WAL rotates (id+1) and the old
-file is deleted only after the primary and redundant manifest copies are
-durable. A missing active WAL or a commit-version gap is corruption, never an
-empty WAL to recreate or silently skip.
+Idempotent replay: records at or below the manifest's watermark are skipped.
+Recovery checks the entire WAL chain before modifying canonical files. An
+incomplete final record can be truncated; a checksum error, malformed record,
+version gap, or incomplete record before another valid record is corruption.
+Normal open refuses these cases and preserves the WAL for explicit salvage.
+
+Background checkpoint reserves a bridge WAL (id+1) and a new writer (id+2).
+Before switching writers, it persists `required_wal_id` in both manifest copies.
+The final manifest anchors the bridge and still requires the new writer.
+Thus deleting even an empty required successor is detectable. Older manifests
+default this field to zero and discover consecutive successors by enumeration;
+they cannot prove that an absent last successor existed before this upgrade.
+Obsolete WALs are removed only after canonical publication is durable.
 
 ## Record payload
 
@@ -85,6 +93,27 @@ out-of-line BEFORE the WAL commit that references them:
 `ESQLBLOB` (8) + u32 crc + u64 len + content. Reads are fully validated.
 GC at compaction: chunks not referenced by any surviving payload are deleted
 (including orphans from torn commits).
+
+## Sorted index runs (`indexes/`)
+
+Primary, secondary and text indexes share the disposable `ESQLPAGE` format.
+New runs use version 3, independently of the canonical database format version.
+The 48-byte header contains magic, version, page size, generation, entry count,
+directory offset/count and a CRC over its first 44 bytes.
+
+Each V3 page contains `u32 payload_len`, `u32 payload_crc`, `u32 first_key_len`,
+`u32 last_key_len`, the first/last keys, then sorted key/value entries. The
+directory is `DIR3` followed by one `u64 page_offset` per page and a final
+`u32 navigation_crc`. That checksum covers, in page order, every page header
+and its boundary keys, followed by the directory magic and offsets. Open
+validates it and contiguous page extents before consulting any key range.
+Payload CRCs are checked when a page is read.
+
+V1/V2 runs remain readable, but their unprotected boundaries are checked against
+the actual checksummed entries, their ordering and total count during open.
+A bad primary run is rebuilt from canonical segments before serving writes.
+V3 disjoint-range merges can copy whole pages while updating the navigation
+checksum; the canonical segment and WAL layouts are unchanged by this upgrade.
 
 ## ANN graphs (`vectors/`)
 

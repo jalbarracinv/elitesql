@@ -1,0 +1,32 @@
+Benchmarking sql_1m/point_by_unique_index
+Benchmarking sql_1m/point_by_unique_index: Warming up for 1.0000 s
+Benchmarking sql_1m/point_by_unique_index: Collecting 10 samples in estimated 2.0000 s (468k iterations)
+Benchmarking sql_1m/point_by_unique_index: Analyzing
+Benchmarking sql_1m/point_by_unique_index_bound
+Benchmarking sql_1m/point_by_unique_index_bound: Warming up for 1.0000 s
+Benchmarking sql_1m/point_by_unique_index_bound: Collecting 10 samples in estimated 2.0001 s (567k iterations)
+Benchmarking sql_1m/point_by_unique_index_bound: Analyzing
+Benchmarking sql_1m/indexed_join_100_of_1m
+Benchmarking sql_1m/indexed_join_100_of_1m: Warming up for 1.0000 s
+Benchmarking sql_1m/indexed_join_100_of_1m: Collecting 10 samples in estimated 2.0048 s (12k iterations)
+Benchmarking sql_1m/indexed_join_100_of_1m: Analyzing
+Benchmarking sql_1m/indexed_join_100_of_1m_bound
+Benchmarking sql_1m/indexed_join_100_of_1m_bound: Warming up for 1.0000 s
+Benchmarking sql_1m/indexed_join_100_of_1m_bound: Collecting 10 samples in estimated 2.0068 s (13k iterations)
+Benchmarking sql_1m/indexed_join_100_of_1m_bound: Analyzing
+Benchmarking sql_1m/full_scan_filter_1m
+Benchmarking sql_1m/full_scan_filter_1m: Warming up for 1.0000 s
+Benchmarking sql_1m/full_scan_filter_1m: Collecting 10 samples in estimated 2.0073 s (6490 iterations)
+Benchmarking sql_1m/full_scan_filter_1m: Analyzing
+Benchmarking sql_1m/group_by_997_groups_1m
+Benchmarking sql_1m/group_by_997_groups_1m: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 3.2s.
+Benchmarking sql_1m/group_by_997_groups_1m: Collecting 10 samples in estimated 3.2276 s (10 iterations)
+Benchmarking sql_1m/group_by_997_groups_1m: Analyzing
+Benchmarking sql_1m/group_by_10k_groups_1m
+Benchmarking sql_1m/group_by_10k_groups_1m: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 3.5s.
+Benchmarking sql_1m/group_by_10k_groups_1m: Collecting 10 samples in estimated 3.5144 s (10 iterations)
+Benchmarking sql_1m/group_by_10k_groups_1m: Analyzing

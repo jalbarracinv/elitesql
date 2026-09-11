@@ -14,6 +14,43 @@ fn rows(output: QueryOutput) -> Vec<Vec<Value>> {
 }
 
 #[test]
+fn top_k_keeps_only_the_best_rows_without_spilling_the_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create_with(
+        dir.path().join("topk"),
+        DbOptions {
+            memory: MemoryOptions {
+                query_working_bytes: 4096,
+                ..MemoryOptions::default()
+            },
+            ..DbOptions::default()
+        },
+    )
+    .unwrap();
+    db.query("CREATE TABLE items(n int)").unwrap();
+    let mut txn = db.begin();
+    for n in (0..1000).rev() {
+        let mut row = Record::new();
+        row.insert("n".into(), Value::Int64(n));
+        txn.insert("items", row).unwrap();
+    }
+    txn.commit().unwrap();
+    assert_eq!(
+        rows(
+            db.query("SELECT n FROM items ORDER BY n LIMIT 3 OFFSET 2")
+                .unwrap()
+        ),
+        vec![
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)]
+        ]
+    );
+    assert_eq!(db.query_memory_stats().spill_files, 0);
+    assert!(db.query_memory_stats().peak_buffer_bytes <= 4096);
+}
+
+#[test]
 fn ingest_performance_profile_is_valid_and_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let options = DbOptions::ingest_performance();
@@ -47,6 +84,7 @@ fn order_by_spills_under_a_tiny_budget_and_cleans_up() {
         DbOptions {
             memory: MemoryOptions {
                 query_working_bytes: 512,
+                query_admission_timeout_ms: 5_000,
                 scan_batch_rows: 4,
                 spill_directory: Some(spill_dir.clone()),
                 ..MemoryOptions::default()
@@ -95,6 +133,7 @@ fn cursor_streams_batches_from_one_stable_snapshot() {
         DbOptions {
             memory: MemoryOptions {
                 query_working_bytes: 4 * 1024,
+                query_admission_timeout_ms: 5_000,
                 scan_batch_rows: 3,
                 spill_directory: None,
                 ..MemoryOptions::default()
@@ -137,6 +176,7 @@ fn high_cardinality_group_by_uses_bounded_sorted_runs() {
         DbOptions {
             memory: MemoryOptions {
                 query_working_bytes: 768,
+                query_admission_timeout_ms: 5_000,
                 scan_batch_rows: 5,
                 spill_directory: Some(spill_dir.clone()),
                 ..MemoryOptions::default()
@@ -175,6 +215,7 @@ fn count_distinct_spills_under_the_query_budget() {
         DbOptions {
             memory: MemoryOptions {
                 query_working_bytes: 512,
+                query_admission_timeout_ms: 5_000,
                 scan_batch_rows: 4,
                 spill_directory: Some(spill_dir.clone()),
                 ..MemoryOptions::default()
@@ -214,6 +255,7 @@ fn indexed_join_streams_probes_and_spills_only_the_sort() {
         DbOptions {
             memory: MemoryOptions {
                 query_working_bytes: 640,
+                query_admission_timeout_ms: 5_000,
                 scan_batch_rows: 4,
                 spill_directory: Some(spill_dir.clone()),
                 ..MemoryOptions::default()
@@ -265,6 +307,7 @@ fn unindexed_grace_hash_join_is_bounded_even_for_a_hot_key() {
         DbOptions {
             memory: MemoryOptions {
                 query_working_bytes: 384,
+                query_admission_timeout_ms: 5_000,
                 scan_batch_rows: 3,
                 spill_directory: Some(spill_dir.clone()),
                 ..MemoryOptions::default()
@@ -335,6 +378,7 @@ fn zero_memory_settings_are_rejected() {
         DbOptions {
             memory: MemoryOptions {
                 query_working_bytes: 0,
+                query_admission_timeout_ms: 5_000,
                 ..MemoryOptions::default()
             },
             ..DbOptions::default()
@@ -354,6 +398,7 @@ fn database_query_pool_applies_backpressure_across_threads() {
                     total_memory_bytes: 16 * 1024,
                     query_pool_bytes: 1024,
                     query_working_bytes: 1024,
+                    query_admission_timeout_ms: 5_000,
                     index_delta_pool_bytes: 4 * 1024,
                     maintenance_pool_bytes: 8 * 1024,
                     reserved_memory_bytes: 3 * 1024,
@@ -369,14 +414,21 @@ fn database_query_pool_applies_backpressure_across_threads() {
     db.query("INSERT INTO items (id, n) VALUES ('a', 1), ('b', 2)")
         .unwrap();
 
-    let cursor = db.query_cursor("SELECT id, n FROM items").unwrap();
-    assert_eq!(db.global_memory_stats().query_in_use_bytes, 1024);
+    let mut cursor = db.query_cursor("SELECT id, n FROM items").unwrap();
+    assert_eq!(
+        db.global_memory_stats().query_in_use_bytes,
+        0,
+        "an unopened batch owns no working reservation"
+    );
+    cursor.next().unwrap().unwrap();
+    let retained = db.global_memory_stats().query_in_use_bytes;
+    assert!(retained > 0 && retained <= 1024);
     assert_eq!(
         db.get("items", "a").unwrap().unwrap()["n"],
         Value::Int64(1),
         "a point lookup returns only caller-owned result memory and must not wait for an operator slot"
     );
-    assert_eq!(db.global_memory_stats().query_in_use_bytes, 1024);
+    assert_eq!(db.global_memory_stats().query_in_use_bytes, retained);
 
     let worker_db = db.clone();
     let (tx, rx) = mpsc::channel();
@@ -407,6 +459,7 @@ fn index_delta_pool_consolidates_to_mmap_bases() {
             total_memory_bytes: 32 * 1024,
             query_pool_bytes: 4 * 1024,
             query_working_bytes: 2 * 1024,
+            query_admission_timeout_ms: 5_000,
             index_delta_pool_bytes: 3 * 1024,
             maintenance_pool_bytes: 20 * 1024,
             reserved_memory_bytes: 5 * 1024,
@@ -472,6 +525,7 @@ fn invalid_global_pool_layout_is_rejected() {
                 total_memory_bytes: 1024,
                 query_pool_bytes: 512,
                 query_working_bytes: 256,
+                query_admission_timeout_ms: 5_000,
                 index_delta_pool_bytes: 512,
                 maintenance_pool_bytes: 512,
                 reserved_memory_bytes: 128,
@@ -494,6 +548,7 @@ fn oversized_transaction_is_rejected_before_commit() {
                 total_memory_bytes: 16 * 1024,
                 query_pool_bytes: 2 * 1024,
                 query_working_bytes: 1024,
+                query_admission_timeout_ms: 5_000,
                 index_delta_pool_bytes: 2 * 1024,
                 maintenance_pool_bytes: 8 * 1024,
                 reserved_memory_bytes: 4 * 1024,
@@ -525,6 +580,7 @@ fn vector_deltas_freeze_into_mmap_runs_under_pressure() {
             total_memory_bytes: 32 * 1024,
             query_pool_bytes: 4 * 1024,
             query_working_bytes: 4 * 1024,
+            query_admission_timeout_ms: 5_000,
             index_delta_pool_bytes: 3 * 1024,
             maintenance_pool_bytes: 20 * 1024,
             reserved_memory_bytes: 5 * 1024,
@@ -588,6 +644,7 @@ fn index_creation_and_primary_recovery_spill_with_a_tiny_maintenance_pool() {
             total_memory_bytes: 20 * 1024,
             query_pool_bytes: 4 * 1024,
             query_working_bytes: 2 * 1024,
+            query_admission_timeout_ms: 5_000,
             index_delta_pool_bytes: 4 * 1024,
             maintenance_pool_bytes: 8 * 1024,
             reserved_memory_bytes: 4 * 1024,

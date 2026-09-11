@@ -9,6 +9,7 @@
 //
 // Values: scalars are native; date/time/timestamp arrive as Date objects
 // (dates at UTC midnight), blobs as Buffer, vectors as number arrays.
+// Int64 values outside Number's safe integer range arrive as BigInt.
 
 'use strict';
 
@@ -20,6 +21,8 @@ const US_PER_DAY = 86_400_000_000n;
 function decodeValue(v) {
   if (v && typeof v === 'object' && !Array.isArray(v) && '$t' in v) {
     switch (v.$t) {
+      case 'int64':
+        return BigInt(v.v);
       case 'date':
         return new Date(v.days * 86_400_000);
       case 'time': // milliseconds since midnight as a number
@@ -42,6 +45,13 @@ function decodeValue(v) {
 }
 
 function decodeResult(result) {
+  if (result && result.identity) {
+    return {
+      ...result,
+      identity: { ...result.identity, values: result.identity.values.map(decodeValue) },
+      lastrowid: decodeValue(result.lastrowid),
+    };
+  }
   if (result && Array.isArray(result.rows) && Array.isArray(result.columns)) {
     return {
       ...result,
@@ -114,16 +124,21 @@ class EliteSQLError extends Error {
 }
 EliteSQLError.CONFLICT_RETRY = 9;
 EliteSQLError.COMMIT_UNKNOWN = 17;
+EliteSQLError.QUERY_INTERRUPTED = 18;
 
 class SidecarClient {
   constructor(socket) {
     this._socket = socket;
     this._pending = [];
+    this._pendingBytes = 0;
+    this._closed = false;
+    this._writeQueue = Promise.resolve();
     this._cursorActive = false;
     const rl = readline.createInterface({ input: socket });
     rl.on('line', (line) => {
       const waiter = this._pending.shift();
       if (!waiter) return;
+      this._pendingBytes -= waiter.bytes;
       try {
         const response = JSON.parse(line);
         if (response.ok) waiter.resolve(response.result);
@@ -174,21 +189,49 @@ class SidecarClient {
   }
 
   _failAll(err) {
+    this._closed = true;
     const pending = this._pending;
     this._pending = [];
+    this._pendingBytes = 0;
     for (const waiter of pending) waiter.reject(err);
   }
 
   _call(request) {
+    if (this._closed || this._socket.destroyed) {
+      return Promise.reject(new EliteSQLError(1, 'sidecar connection is closed'));
+    }
     if (this._cursorActive && !['query_open', 'query_next', 'query_close'].includes(request.op)) {
       return Promise.reject(new EliteSQLError(
         8,
         'a streaming cursor owns this connection until it is exhausted or closed',
       ));
     }
+    let payload;
+    try {
+      payload = JSON.stringify(request) + '\n';
+      if (Buffer.byteLength(payload) > 8 * 1024 * 1024) throw new RangeError('sidecar request exceeds the 8 MiB frame limit');
+    } catch (error) { return Promise.reject(error); }
+    const bytes = Buffer.byteLength(payload);
+    if (this._pending.length >= 128 || this._pendingBytes + bytes > 16 * 1024 * 1024) {
+      return Promise.reject(new EliteSQLError(8, 'sidecar request queue is full; await outstanding requests'));
+    }
     return new Promise((resolve, reject) => {
-      this._pending.push({ resolve, reject });
-      this._socket.write(JSON.stringify(request) + '\n');
+      this._pendingBytes += bytes;
+      this._pending.push({ resolve, reject, bytes });
+      this._writeQueue = this._writeQueue.then(async () => {
+        if (this._closed || this._socket.destroyed) throw new EliteSQLError(1, 'sidecar connection is closed');
+        if (!this._socket.write(payload)) {
+          await new Promise((drained, failed) => {
+            const cleanup = () => { this._socket.off('drain', onDrain); this._socket.off('error', onError); this._socket.off('close', onClose); };
+            const onDrain = () => { cleanup(); drained(); };
+            const onError = error => { cleanup(); failed(error); };
+            const onClose = () => onError(new EliteSQLError(1, 'sidecar closed while waiting for drain'));
+            this._socket.once('drain', onDrain);
+            this._socket.once('error', onError);
+            this._socket.once('close', onClose);
+          });
+        }
+      }).catch(error => { this._failAll(error); this._socket.destroy(); });
     });
   }
 
@@ -196,13 +239,17 @@ class SidecarClient {
     return (await this._call({ op: 'ping' })) === 'pong';
   }
 
-  async query(sql, params) {
+  async query(sql, params, { timeoutMs } = {}) {
     const request = { op: 'query', sql };
+    if (timeoutMs !== undefined) {
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new RangeError('timeoutMs must be a nonnegative safe integer');
+      request.timeout_ms = timeoutMs;
+    }
     if (params !== undefined) request.params = encodeParams(params);
     return decodeResult(await this._call(request));
   }
 
-  async stream(sql, params, { batchRows = 512 } = {}) {
+  async stream(sql, params, { batchRows = 512, timeoutMs } = {}) {
     if (!Number.isInteger(batchRows) || batchRows < 1 || batchRows > 4096) {
       throw new RangeError('batchRows must be between 1 and 4096');
     }
@@ -211,6 +258,10 @@ class SidecarClient {
     }
     this._cursorActive = true;
     const request = { op: 'query_open', sql };
+    if (timeoutMs !== undefined) {
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new RangeError('timeoutMs must be a nonnegative safe integer');
+      request.timeout_ms = timeoutMs;
+    }
     if (params !== undefined) request.params = encodeParams(params);
     try {
       const opened = await this._call(request);
@@ -267,6 +318,7 @@ class SidecarClient {
   }
 
   close() {
+    this._failAll(new EliteSQLError(1, 'sidecar client is closed'));
     this._socket.end();
   }
 }
@@ -304,9 +356,13 @@ class SidecarQueryCursor {
   }
 
   async *[Symbol.asyncIterator]() {
-    while (!this.done) {
-      const rows = await this.nextBatch();
-      for (const row of rows) yield row;
+    try {
+      while (!this.done) {
+        const rows = await this.nextBatch();
+        for (const row of rows) yield row;
+      }
+    } finally {
+      await this.close();
     }
   }
 }

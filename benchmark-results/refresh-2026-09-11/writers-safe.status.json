@@ -1,0 +1,51 @@
+{
+  "name": "writers-safe",
+  "bench": "concurrent_writers",
+  "argv": [
+    "/Users/jalbarracin/Code/elitesql/target/release/deps/concurrent_writers-9e9ac4a5191e0170",
+    "--writers",
+    "1,2,4,8,16",
+    "--rows",
+    "40k",
+    "--batch-size",
+    "10",
+    "--repetitions",
+    "3",
+    "--durability",
+    "safe",
+    "--sqlite-sync",
+    "strict",
+    "--safe-group-delay-us",
+    "200",
+    "--csv",
+    "/Users/jalbarracin/Code/elitesql/benchmark-results/refresh-2026-09-11/writers-safe.csv"
+  ],
+  "before": {
+    "utc": "2026-09-11T09:59:15Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "returncode": 0,
+  "wall_seconds": 305.1410090409918,
+  "after": {
+    "utc": "2026-09-11T10:04:20Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  }
+}

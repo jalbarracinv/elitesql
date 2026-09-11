@@ -1,0 +1,54 @@
+Benchmarking insert_1k_rows/elitesql
+Benchmarking insert_1k_rows/elitesql: Warming up for 3.0000 s
+Benchmarking insert_1k_rows/elitesql: Collecting 10 samples in estimated 8.8119 s (110 iterations)
+Benchmarking insert_1k_rows/elitesql: Analyzing
+Benchmarking insert_1k_rows/elitesql_single_txn
+Benchmarking insert_1k_rows/elitesql_single_txn: Warming up for 3.0000 s
+Benchmarking insert_1k_rows/elitesql_single_txn: Collecting 10 samples in estimated 7.9860 s (110 iterations)
+Benchmarking insert_1k_rows/elitesql_single_txn: Analyzing
+Benchmarking insert_1k_rows/sqlite_autocommit
+Benchmarking insert_1k_rows/sqlite_autocommit: Warming up for 3.0000 s
+Benchmarking insert_1k_rows/sqlite_autocommit: Collecting 10 samples in estimated 5.2583 s (550 iterations)
+Benchmarking insert_1k_rows/sqlite_autocommit: Analyzing
+Benchmarking insert_1k_rows/sqlite_single_txn
+Benchmarking insert_1k_rows/sqlite_single_txn: Warming up for 3.0000 s
+Benchmarking insert_1k_rows/sqlite_single_txn: Collecting 10 samples in estimated 5.0697 s (3740 iterations)
+Benchmarking insert_1k_rows/sqlite_single_txn: Analyzing
+Benchmarking insert_1k_rows/elitesql_single_txn_steady
+Benchmarking insert_1k_rows/elitesql_single_txn_steady: Warming up for 3.0000 s
+Benchmarking insert_1k_rows/elitesql_single_txn_steady: Collecting 10 samples in estimated 5.0434 s (3080 iterations)
+Benchmarking insert_1k_rows/elitesql_single_txn_steady: Analyzing
+Benchmarking insert_1k_rows/elitesql_single_txn_explicit_steady
+Benchmarking insert_1k_rows/elitesql_single_txn_explicit_steady: Warming up for 3.0000 s
+Benchmarking insert_1k_rows/elitesql_single_txn_explicit_steady: Collecting 10 samples in estimated 5.0093 s (3410 iterations)
+Benchmarking insert_1k_rows/elitesql_single_txn_explicit_steady: Analyzing
+Benchmarking insert_1k_rows/sqlite_single_txn_steady
+Benchmarking insert_1k_rows/sqlite_single_txn_steady: Warming up for 3.0000 s
+Benchmarking insert_1k_rows/sqlite_single_txn_steady: Collecting 10 samples in estimated 5.0136 s (6270 iterations)
+Benchmarking insert_1k_rows/sqlite_single_txn_steady: Analyzing
+Benchmarking get_by_id/elitesql
+Benchmarking get_by_id/elitesql: Warming up for 3.0000 s
+Benchmarking get_by_id/elitesql: Collecting 30 samples in estimated 5.0001 s (15M iterations)
+Benchmarking get_by_id/elitesql: Analyzing
+Benchmarking get_by_id/sqlite
+Benchmarking get_by_id/sqlite: Warming up for 3.0000 s
+Benchmarking get_by_id/sqlite: Collecting 30 samples in estimated 5.0004 s (3.6M iterations)
+Benchmarking get_by_id/sqlite: Analyzing
+       92.38 real        38.04 user        25.66 sys
+           313098240  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               72385  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+               60350  voluntary context switches
+               61996  involuntary context switches
+       1173050750015  instructions retired
+        257653941697  cycles elapsed
+           119030336  peak memory footprint

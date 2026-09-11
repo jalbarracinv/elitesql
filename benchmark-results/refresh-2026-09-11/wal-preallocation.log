@@ -1,0 +1,11 @@
+growing      run=1 p50=3983.9 us p95=4098.5 us mean=3840.0 us
+preallocated run=1 p50=3991.5 us p95=4069.8 us mean=3939.9 us
+preallocated run=2 p50=3990.4 us p95=4066.9 us mean=3940.1 us
+growing      run=2 p50=3970.9 us p95=4175.2 us mean=3706.6 us
+growing      run=3 p50=3973.0 us p95=4122.0 us mean=3744.8 us
+preallocated run=3 p50=3970.9 us p95=4067.2 us mean=3729.7 us
+preallocated run=4 p50=3937.8 us p95=4107.9 us mean=3689.6 us
+growing      run=4 p50=3971.2 us p95=4089.2 us mean=3742.9 us
+growing      run=5 p50=3972.5 us p95=4071.2 us mean=3703.7 us
+preallocated run=5 p50=3980.2 us p95=4100.7 us mean=3859.2 us
+CSV: /Users/jalbarracin/Code/elitesql/benchmark-results/refresh-2026-09-11/wal-preallocation.csv

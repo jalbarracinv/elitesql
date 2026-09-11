@@ -1,0 +1,25 @@
+EliteSQL vs SQLite scalable benchmark
+  EliteSQL:     0.0.1
+  SQLite:       3.45.0 (rusqlite bundled)
+  rows:         1000000
+  batch size:   10000
+  point reads:  10000 (warm cache, plus 1000 untimed warmups)
+  full scans:   3 (unindexed score lookup)
+  durability:   EliteSQL fast <-> SQLite WAL + synchronous=OFF 
+  engines:      EliteSQL only
+  EliteSQL load: direct sorted bulk
+  load timing:  ingest wall, final checkpoint, maintenance drain and worker time separated
+
+EliteSQL
+  EliteSQL bulk: loaded 1000000/1000000 rows
+  load phases: 0.000 s staging + 0.501 s commit/bulk calls (automatic primary flushes may overlap)
+  commit internals: 0.000 s total (0), 0.000 s lock wait, 0.000 s prepare, 0.000 s WAL, 0.000 s apply, 0.000 s other/admission wait
+  primary LSM: 1 runs, 0 promotions (0.000 s worker time), 53.33 MiB checkpoint runs, 0.00 MiB read + 0.00 MiB written by promotions
+  logical memory: 384 MiB configured; query peak 16.00/64 MiB, index-delta peak 0.00/128 MiB, maintenance peak 128.00/128 MiB (0 consolidations)
+
+Result
+engine     ingest wall    final cp       drain  total load       rows/s      point read    full scan
+EliteBulk      0.501 s     0.000 s     0.000 s     0.501 s      1995600     1.811 us/op      0.017 s
+           checkpoint work: 0.000 s (1), promotion work: 0.000 s (0), disk: 223.93 MiB
+
+CSV: /Users/jalbarracin/Code/elitesql/benchmark-results/refresh-2026-09-11/scale-bulk-1m-r3-elitesql.csv

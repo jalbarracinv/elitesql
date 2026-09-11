@@ -2,7 +2,7 @@
 
 export type QueryResult =
   | { columns: string[]; rows: unknown[][] }
-  | { inserted: string[] }
+  | { inserted: string[]; identity?: { column: string; values: (number | bigint)[] }; lastrowid?: number | bigint | null }
   | { affected: number }
   | { ok: true };
 
@@ -17,17 +17,18 @@ export class EliteSQLError extends Error {
   code: number;
   static CONFLICT_RETRY: number;
   static COMMIT_UNKNOWN: number;
+  static QUERY_INTERRUPTED: number;
 }
 
 export class SidecarClient {
   static connect(socketPath: string): Promise<SidecarClient>;
   static connect(target: { host?: string; port: number; token: string }): Promise<SidecarClient>;
   ping(): Promise<boolean>;
-  query(sql: string, params?: unknown[] | Record<string, unknown>): Promise<QueryResult>;
+  query(sql: string, params?: unknown[] | Record<string, unknown>, opts?: { timeoutMs?: number }): Promise<QueryResult>;
   stream(
     sql: string,
     params?: unknown[] | Record<string, unknown>,
-    opts?: { batchRows?: number },
+    opts?: { batchRows?: number; timeoutMs?: number },
   ): Promise<SidecarQueryCursor>;
   createVectorIndex(
     table: string,

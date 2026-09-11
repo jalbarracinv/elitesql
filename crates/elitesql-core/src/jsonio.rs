@@ -44,6 +44,9 @@ pub fn value_to_json(v: &Value) -> J {
     match v {
         Value::Null => J::Null,
         Value::Bool(b) => json!(b),
+        Value::Int64(n) if !(-9_007_199_254_740_991..=9_007_199_254_740_991).contains(n) => {
+            json!({"$t": "int64", "v": n.to_string()})
+        }
         Value::Int64(n) => json!(n),
         Value::Float64(f) => match serde_json::Number::from_f64(*f) {
             Some(n) => J::Number(n),
@@ -254,8 +257,8 @@ pub fn output_to_json(out: &QueryOutput) -> J {
             values,
         } => json!({
             "inserted": ids,
-            "identity": {"column": column, "values": values},
-            "lastrowid": values.first(),
+            "identity": {"column": column, "values": values.iter().map(|value| value_to_json(&Value::Int64(*value))).collect::<Vec<_>>()},
+            "lastrowid": values.first().map(|value| value_to_json(&Value::Int64(*value))),
         }),
         QueryOutput::Affected(n) => json!({"affected": n}),
         QueryOutput::None => json!({"ok": true}),

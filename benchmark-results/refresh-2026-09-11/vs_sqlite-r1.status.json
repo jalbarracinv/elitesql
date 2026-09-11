@@ -1,0 +1,40 @@
+{
+  "name": "vs_sqlite-r1",
+  "bench": "vs_sqlite",
+  "argv": [
+    "/Users/jalbarracin/Code/elitesql/target/release/deps/vs_sqlite-b99a4b5c15c88d80",
+    "--bench",
+    "--save-baseline",
+    "refresh-refresh-2026-09-11-vs_sqlite-r1"
+  ],
+  "criterion_baseline": "refresh-refresh-2026-09-11-vs_sqlite-r1",
+  "repetition": 1,
+  "before": {
+    "utc": "2026-09-11T10:05:13Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "returncode": 0,
+  "wall_seconds": 92.3933866660227,
+  "after": {
+    "utc": "2026-09-11T10:06:45Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  }
+}

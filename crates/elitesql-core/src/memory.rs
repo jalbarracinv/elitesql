@@ -6,7 +6,9 @@
 //! database budget. Query and maintenance reservations are RAII permits;
 //! retained index deltas are reconciled after every publish/consolidation.
 
+use crate::error::{Error, Result};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MemoryLimits {
@@ -74,14 +76,46 @@ impl MemoryGovernor {
     }
 
     pub(crate) fn acquire(self: &Arc<Self>, pool: MemoryPool, bytes: usize) -> MemoryPermit {
+        self.acquire_with_deadline(pool, bytes, None)
+            .expect("validated maintenance reservation")
+    }
+
+    pub(crate) fn acquire_timeout(
+        self: &Arc<Self>,
+        pool: MemoryPool,
+        bytes: usize,
+        timeout: Duration,
+    ) -> Result<MemoryPermit> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            Error::InvalidArgument("query admission timeout is out of range".into())
+        })?;
+        self.acquire_with_deadline(pool, bytes, Some(deadline))
+    }
+
+    fn acquire_with_deadline(
+        self: &Arc<Self>,
+        pool: MemoryPool,
+        bytes: usize,
+        deadline: Option<Instant>,
+    ) -> Result<MemoryPermit> {
         let capacity = self.capacity(pool);
-        debug_assert!(bytes <= capacity, "validated reservation exceeds its pool");
+        let control = matches!(pool, MemoryPool::Query)
+            .then(crate::QueryControl::current)
+            .flatten();
+        if bytes > capacity {
+            return Err(Error::MemoryLimit(
+                "reservation exceeds its memory pool".into(),
+            ));
+        }
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let mut counted_wait = false;
         loop {
+            if let Some(control) = &control {
+                control.check()?;
+            }
             let target = match pool {
                 MemoryPool::Query => &mut state.query,
                 MemoryPool::Maintenance => &mut state.maintenance,
@@ -89,20 +123,37 @@ impl MemoryGovernor {
             if target.used.saturating_add(bytes) <= capacity {
                 target.used += bytes;
                 target.peak = target.peak.max(target.used);
-                return MemoryPermit {
+                return Ok(MemoryPermit {
                     governor: self.clone(),
                     pool,
                     bytes,
-                };
+                });
             }
             if !counted_wait {
                 target.waits = target.waits.saturating_add(1);
                 counted_wait = true;
             }
-            state = self
-                .available
-                .wait(state)
-                .unwrap_or_else(|poison| poison.into_inner());
+            state = if let Some(deadline) = deadline {
+                let mut remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(Error::MemoryLimit(
+                        "query memory admission timed out".into(),
+                    ));
+                }
+                if let Some(control) = &control {
+                    remaining = remaining
+                        .min(control.remaining().unwrap_or(Duration::from_millis(50)))
+                        .min(Duration::from_millis(50));
+                }
+                self.available
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .0
+            } else {
+                self.available
+                    .wait(state)
+                    .unwrap_or_else(|poison| poison.into_inner())
+            };
         }
     }
 
@@ -116,7 +167,6 @@ impl MemoryGovernor {
         pool: MemoryPool,
         bytes: usize,
     ) -> MemoryPermit {
-        let bytes = bytes.min(self.capacity(pool));
         let mut state = self
             .state
             .lock()
@@ -224,6 +274,14 @@ pub(crate) struct MemoryPermit {
     bytes: usize,
 }
 
+impl MemoryPermit {
+    pub(crate) fn shrink_to(&mut self, bytes: usize) {
+        assert!(bytes <= self.bytes);
+        self.governor.release(self.pool, self.bytes - bytes);
+        self.bytes = bytes;
+    }
+}
+
 impl Drop for MemoryPermit {
     fn drop(&mut self) {
         self.governor.release(self.pool, self.bytes);
@@ -235,6 +293,31 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn admission_expires_and_transferred_memory_is_not_clamped() {
+        let governor = MemoryGovernor::new(MemoryLimits {
+            total: 100,
+            query: 40,
+            index_delta: 20,
+            maintenance: 30,
+            reserve: 10,
+        });
+        let transferred = governor.acquire_unbounded(MemoryPool::Maintenance, 75);
+        assert_eq!(governor.stats().maintenance_in_use_bytes, 75);
+        drop(transferred);
+        assert_eq!(governor.stats().maintenance_in_use_bytes, 0);
+        let held = governor.acquire(MemoryPool::Query, 40);
+        assert!(matches!(
+            governor.acquire_timeout(MemoryPool::Query, 1, Duration::from_millis(20)),
+            Err(Error::MemoryLimit(_))
+        ));
+        assert_eq!(governor.stats().query_in_use_bytes, 40);
+        drop(held);
+        assert!(governor
+            .acquire_timeout(MemoryPool::Query, 40, Duration::ZERO)
+            .is_ok());
+    }
 
     #[test]
     fn query_permits_wait_and_wake() {

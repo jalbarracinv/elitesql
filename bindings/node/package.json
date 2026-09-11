@@ -5,7 +5,8 @@
   "main": "elitesql.js",
   "types": "elitesql.d.ts",
   "scripts": {
-    "test": "node test.js"
+    "test": "node test.js",
+    "test:integration": "node test-integration.js"
   },
   "license": "(MIT OR Apache-2.0)",
   "keywords": ["database", "embedded", "vector-search", "full-text", "elitesql"],

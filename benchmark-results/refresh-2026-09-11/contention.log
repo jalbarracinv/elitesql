@@ -1,0 +1,41 @@
+EliteSQL mixed reader/writer contention matrix
+  workloads=[Insert, Update, Delete, Identity, ForeignKey, Derived] cache=[Warm, Cold] readers=[16] writers=[4] fixture=50000 reads=100000 writes=5000 batch=10 repetitions=3
+  note: cold reopens without warmup; OS page-cache eviction is unsupported on this platform (evict=0/0)
+  insert      warm readers=16 writers=4  run=1 reads=  1628287/s rp99=    97.2 us writes=   81414/s wp50/p95/p99=  210.3/   324.0/   393.1 us throttles=6069 coordinated=450/187 lock=61.1/42.0 us evict=0/0
+  insert      warm readers=16 writers=4  run=2 reads=  2262766/s rp99=    84.5 us writes=  113138/s wp50/p95/p99=  174.8/   304.2/   391.0 us throttles=5312 coordinated=429/165 lock=50.4/36.5 us evict=0/0
+  insert      warm readers=16 writers=4  run=3 reads=  2286625/s rp99=    80.3 us writes=  114331/s wp50/p95/p99=  177.1/   293.7/   332.8 us throttles=6202 coordinated=431/170 lock=51.3/37.6 us evict=0/0
+  insert      cold readers=16 writers=4  run=1 reads=  2499878/s rp99=    74.0 us writes=  124994/s wp50/p95/p99=  162.4/   252.6/   316.4 us throttles=5424 coordinated=446/186 lock=48.2/33.6 us evict=0/0
+  insert      cold readers=16 writers=4  run=2 reads=  2268354/s rp99=    89.4 us writes=  113418/s wp50/p95/p99=  172.1/   327.0/   911.9 us throttles=3578 coordinated=430/148 lock=49.2/40.0 us evict=0/0
+  insert      cold readers=16 writers=4  run=3 reads=  2343988/s rp99=    86.9 us writes=  117199/s wp50/p95/p99=  178.8/   322.1/   408.8 us throttles=5706 coordinated=438/170 lock=55.5/38.7 us evict=0/0
+  update      warm readers=16 writers=4  run=1 reads=  1771917/s rp99=   118.8 us writes=   88596/s wp50/p95/p99=  320.1/   805.1/  1033.5 us throttles=8826 coordinated=0/0 lock=0.2/80.2 us evict=0/0
+  update      warm readers=16 writers=4  run=2 reads=  1748308/s rp99=   127.6 us writes=   87415/s wp50/p95/p99=  331.2/   837.8/  1919.1 us throttles=8199 coordinated=0/0 lock=0.2/80.7 us evict=0/0
+  update      warm readers=16 writers=4  run=3 reads=  1803810/s rp99=   124.5 us writes=   90191/s wp50/p95/p99=  323.3/   773.6/  1066.1 us throttles=8193 coordinated=0/0 lock=0.2/78.1 us evict=0/0
+  update      cold readers=16 writers=4  run=1 reads=  1862160/s rp99=   120.1 us writes=   93108/s wp50/p95/p99=  307.9/   747.2/  1728.7 us throttles=8258 coordinated=0/0 lock=0.2/79.3 us evict=0/0
+  update      cold readers=16 writers=4  run=2 reads=  1877047/s rp99=   119.8 us writes=   93852/s wp50/p95/p99=  305.8/   747.7/  2218.5 us throttles=7678 coordinated=0/0 lock=0.2/72.0 us evict=0/0
+  update      cold readers=16 writers=4  run=3 reads=  1940735/s rp99=   108.2 us writes=   97037/s wp50/p95/p99=  305.9/   596.2/   827.0 us throttles=8967 coordinated=0/0 lock=0.2/70.4 us evict=0/0
+  delete      warm readers=16 writers=4  run=1 reads=  1933024/s rp99=   108.8 us writes=   96651/s wp50/p95/p99=  297.2/   628.8/   950.3 us throttles=8409 coordinated=0/0 lock=113.4/68.8 us evict=0/0
+  delete      warm readers=16 writers=4  run=2 reads=  1904281/s rp99=   115.6 us writes=   95214/s wp50/p95/p99=  316.5/   637.1/   934.0 us throttles=7766 coordinated=0/0 lock=131.1/70.5 us evict=0/0
+  delete      warm readers=16 writers=4  run=3 reads=  1949009/s rp99=   117.5 us writes=   97450/s wp50/p95/p99=  294.3/   655.0/  1149.0 us throttles=6985 coordinated=0/0 lock=112.6/68.5 us evict=0/0
+  delete      cold readers=16 writers=4  run=1 reads=  2021492/s rp99=   102.8 us writes=  101075/s wp50/p95/p99=  292.1/   575.0/   810.5 us throttles=8516 coordinated=0/0 lock=106.1/63.6 us evict=0/0
+  delete      cold readers=16 writers=4  run=2 reads=  1975852/s rp99=   104.7 us writes=   98793/s wp50/p95/p99=  293.6/   578.2/   770.7 us throttles=8799 coordinated=0/0 lock=113.0/66.7 us evict=0/0
+  delete      cold readers=16 writers=4  run=3 reads=  1576091/s rp99=    90.2 us writes=   78805/s wp50/p95/p99=  290.2/   528.5/  3577.0 us throttles=6744 coordinated=0/0 lock=253.9/104.7 us evict=0/0
+  identity    warm readers=16 writers=4  run=1 reads=  1422233/s rp99=   152.3 us writes=   71112/s wp50/p95/p99=  385.6/   658.2/   773.0 us throttles=7153 coordinated=0/0 lock=39.6/66.0 us evict=0/0
+  identity    warm readers=16 writers=4  run=2 reads=  1454870/s rp99=   153.0 us writes=   72743/s wp50/p95/p99=  371.9/   646.8/   745.7 us throttles=6963 coordinated=0/0 lock=34.9/62.5 us evict=0/0
+  identity    warm readers=16 writers=4  run=3 reads=  1438316/s rp99=   151.9 us writes=   71916/s wp50/p95/p99=  372.1/   640.0/   780.5 us throttles=7038 coordinated=0/0 lock=41.6/64.4 us evict=0/0
+  identity    cold readers=16 writers=4  run=1 reads=  1469633/s rp99=   153.2 us writes=   73482/s wp50/p95/p99=  382.0/   645.4/   737.2 us throttles=7913 coordinated=0/0 lock=36.0/72.7 us evict=0/0
+  identity    cold readers=16 writers=4  run=2 reads=  1520575/s rp99=   149.2 us writes=   76029/s wp50/p95/p99=  363.8/   621.9/   753.1 us throttles=6776 coordinated=0/0 lock=39.1/61.3 us evict=0/0
+  identity    cold readers=16 writers=4  run=3 reads=  1529608/s rp99=   140.9 us writes=   76480/s wp50/p95/p99=  353.8/   601.5/   697.2 us throttles=6854 coordinated=0/0 lock=32.7/56.5 us evict=0/0
+  foreign-key warm readers=16 writers=4  run=1 reads=  1749794/s rp99=   109.8 us writes=   87490/s wp50/p95/p99=  358.5/   476.3/   568.3 us throttles=13965 coordinated=0/0 lock=254.3/81.7 us evict=0/0
+  foreign-key warm readers=16 writers=4  run=2 reads=  1741046/s rp99=   111.0 us writes=   87052/s wp50/p95/p99=  356.4/   538.8/   621.1 us throttles=14029 coordinated=0/0 lock=258.0/83.1 us evict=0/0
+  foreign-key warm readers=16 writers=4  run=3 reads=  1750718/s rp99=   108.4 us writes=   87536/s wp50/p95/p99=  341.2/   529.2/   639.5 us throttles=13636 coordinated=0/0 lock=252.9/80.8 us evict=0/0
+  foreign-key cold readers=16 writers=4  run=1 reads=  2016883/s rp99=    91.2 us writes=  100844/s wp50/p95/p99=  327.3/   459.7/   501.8 us throttles=14990 coordinated=0/0 lock=229.3/75.5 us evict=0/0
+  foreign-key cold readers=16 writers=4  run=2 reads=  1959238/s rp99=   101.8 us writes=   97962/s wp50/p95/p99=  350.0/   457.2/   536.4 us throttles=14123 coordinated=0/0 lock=245.7/79.4 us evict=0/0
+  foreign-key cold readers=16 writers=4  run=3 reads=  2047432/s rp99=    87.4 us writes=  102372/s wp50/p95/p99=  313.9/   437.7/   506.0 us throttles=15294 coordinated=0/0 lock=223.3/73.9 us evict=0/0
+  derived     warm readers=16 writers=4  run=1 reads=   921710/s rp99=   287.6 us writes=   46085/s wp50/p95/p99=  700.0/  1180.8/  1355.4 us throttles=9830 coordinated=0/0 lock=496.5/178.5 us evict=0/0
+  derived     warm readers=16 writers=4  run=2 reads=   906677/s rp99=   298.8 us writes=   45334/s wp50/p95/p99=  705.9/  1225.1/  1344.0 us throttles=8237 coordinated=0/0 lock=516.6/179.8 us evict=0/0
+  derived     warm readers=16 writers=4  run=3 reads=   941153/s rp99=   295.7 us writes=   47058/s wp50/p95/p99=  705.5/   994.4/  1195.2 us throttles=8145 coordinated=0/0 lock=499.8/172.0 us evict=0/0
+  derived     cold readers=16 writers=4  run=1 reads=  1093621/s rp99=   242.6 us writes=   54681/s wp50/p95/p99=  603.8/   797.3/   857.2 us throttles=9403 coordinated=0/0 lock=427.5/146.7 us evict=0/0
+  derived     cold readers=16 writers=4  run=2 reads=  1070633/s rp99=   245.0 us writes=   53532/s wp50/p95/p99=  618.7/   822.8/   904.5 us throttles=9748 coordinated=0/0 lock=427.8/150.2 us evict=0/0
+  derived     cold readers=16 writers=4  run=3 reads=  1070650/s rp99=   238.3 us writes=   53532/s wp50/p95/p99=  615.8/   795.2/   866.2 us throttles=9644 coordinated=0/0 lock=427.0/148.1 us evict=0/0
+
+CSV: /Users/jalbarracin/Code/elitesql/benchmark-results/refresh-2026-09-11/contention.csv

@@ -60,7 +60,7 @@ impl Db {
         // logical copy so schemas and rows describe one coherent point while
         // ordinary DML continues through MVCC.
         let _ddl = self.acquire_ddl_guard();
-        let snap = self.snapshot();
+        let (snap, identities) = self.snapshot_with_identities();
         let result = (|| {
             // Fast durability defers fsync to the final checkpoint, which
             // publishes the manifest and syncs everything before the rename.
@@ -72,32 +72,43 @@ impl Db {
                 },
             )?;
             let mut report = BackupReport::default();
+            let schemas: Vec<_> = self
+                .tables()
+                .iter()
+                .filter_map(|table| self.table_schema(table))
+                .collect();
+            for schema in &schemas {
+                let mut loading_schema = schema.clone();
+                loading_schema.foreign_keys.clear();
+                out.create_table(loading_schema)?;
+            }
             for table in self.tables() {
-                let Some(schema) = self.table_schema(&table) else {
-                    continue;
-                };
-                out.create_table(schema)?;
                 report.tables += 1;
                 let mut cursor: Option<String> = None;
                 loop {
-                    let rows =
-                        self.scan_batch_at(&snap, &table, cursor.as_deref(), BACKUP_BATCH)?;
+                    let rows = self.scan_batch_at_bytes(
+                        &snap,
+                        &table,
+                        cursor.as_deref(),
+                        BACKUP_BATCH,
+                        (self.memory_options().query_working_bytes / 2).max(1),
+                    )?;
                     if rows.is_empty() {
                         break;
                     }
                     let mut txn = out.begin();
-                    for (_, record) in &rows {
-                        // The scanned record carries its `id`, so the copy
-                        // keeps the original ids.
-                        txn.insert(&table, record.clone())?;
+                    for (id, record) in &rows {
+                        txn.insert_restored(&table, id, record.clone())?;
                     }
                     txn.commit()?;
                     report.records += rows.len() as u64;
                     cursor = rows.last().map(|(id, _)| id.clone());
                 }
             }
+            out.restore_foreign_keys(&schemas)?;
             out.wait_vector_indexing()?;
             out.checkpoint()?;
+            out.restore_identity_high_water(&identities)?;
             Ok(report)
         })();
 
@@ -183,7 +194,22 @@ pub fn restore(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<RestoreRe
         };
         for table in db.tables() {
             report.tables += 1;
-            report.records += db.scan(&table)?.len() as u64;
+            let mut cursor = None;
+            let snap = db.snapshot();
+            loop {
+                let rows = db.scan_batch_at_bytes(
+                    &snap,
+                    &table,
+                    cursor.as_deref(),
+                    BACKUP_BATCH,
+                    (db.memory_options().query_working_bytes / 2).max(1),
+                )?;
+                if rows.is_empty() {
+                    break;
+                }
+                report.records += rows.len() as u64;
+                cursor = rows.last().map(|(id, _)| id.clone());
+            }
         }
         drop(db);
         Ok(report)

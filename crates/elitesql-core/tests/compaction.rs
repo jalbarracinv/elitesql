@@ -93,6 +93,7 @@ fn compaction_preserves_live_snapshot_versions() {
     // Everything still consistent after reopen.
     let db = Db::open(&path).unwrap();
     assert_eq!(db.scan("docs").unwrap().len(), 50);
+    drop(db);
     let report = check(&path).unwrap();
     assert!(report.is_ok(), "{:?}", report.errors);
 }

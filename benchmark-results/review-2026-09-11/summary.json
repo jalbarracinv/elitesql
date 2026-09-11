@@ -1,0 +1,4658 @@
+{
+  "10k": {
+    "baseline": {
+      "phases": {
+        "load": {
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "seconds": {
+            "median": 0.008422458,
+            "min": 0.007207666,
+            "max": 0.008888625
+          }
+        },
+        "cursor_id": {
+          "allocated_bytes": {
+            "median": 1616345304,
+            "min": 1616345304,
+            "max": 1616345304
+          },
+          "allocations": {
+            "median": 16082419,
+            "min": 16082419,
+            "max": 16082419
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 2397875,
+            "min": 2397667,
+            "max": 2410250
+          },
+          "p95_ns": {
+            "median": 2769459,
+            "min": 2743334,
+            "max": 2790833
+          },
+          "p99_ns": {
+            "median": 3365375,
+            "min": 3336833,
+            "max": 3373542
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_index": {
+          "allocated_bytes": {
+            "median": 1616317312,
+            "min": 1616317312,
+            "max": 1616317312
+          },
+          "allocations": {
+            "median": 16081208,
+            "min": 16081208,
+            "max": 16081208
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 2409084,
+            "min": 2394250,
+            "max": 2411292
+          },
+          "p95_ns": {
+            "median": 2448916,
+            "min": 2444834,
+            "max": 2463375
+          },
+          "p99_ns": {
+            "median": 2464750,
+            "min": 2458000,
+            "max": 2496417
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_scan": {
+          "allocated_bytes": {
+            "median": 1616458368,
+            "min": 1616458368,
+            "max": 1616458368
+          },
+          "allocations": {
+            "median": 16083807,
+            "min": 16083807,
+            "max": 16083807
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 2494208,
+            "min": 2484667,
+            "max": 2505875
+          },
+          "p95_ns": {
+            "median": 2540666,
+            "min": 2535125,
+            "max": 2628917
+          },
+          "p99_ns": {
+            "median": 2557541,
+            "min": 2552916,
+            "max": 4426334
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_last": {
+          "allocated_bytes": {
+            "median": 1548807216,
+            "min": 1548807216,
+            "max": 1548807216
+          },
+          "allocations": {
+            "median": 14110807,
+            "min": 14110807,
+            "max": 14110807
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 2343708,
+            "min": 2309125,
+            "max": 2363333
+          },
+          "p95_ns": {
+            "median": 2391250,
+            "min": 2361000,
+            "max": 2413459
+          },
+          "p99_ns": {
+            "median": 2416625,
+            "min": 2399542,
+            "max": 2471333
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_first": {
+          "allocated_bytes": {
+            "median": 6520216,
+            "min": 6520216,
+            "max": 6520216
+          },
+          "allocations": {
+            "median": 19407,
+            "min": 19407,
+            "max": 19407
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4375,
+            "min": 4375,
+            "max": 4583
+          },
+          "p95_ns": {
+            "median": 6042,
+            "min": 5334,
+            "max": 6625
+          },
+          "p99_ns": {
+            "median": 10833,
+            "min": 9125,
+            "max": 12500
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "top_k": {
+          "allocated_bytes": {
+            "median": 99152218,
+            "min": 99152218,
+            "max": 99152218
+          },
+          "allocations": {
+            "median": 905403,
+            "min": 905403,
+            "max": 905403
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 2786959,
+            "min": 2708791,
+            "max": 2787750
+          },
+          "p95_ns": {
+            "median": 2826833,
+            "min": 2795708,
+            "max": 2855541
+          },
+          "p99_ns": {
+            "median": 2826833,
+            "min": 2795708,
+            "max": 2855541
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 20,
+            "min": 20,
+            "max": 20
+          },
+          "spilled_bytes": {
+            "median": 7600,
+            "min": 7600,
+            "max": 7600
+          }
+        },
+        "full_sort": {
+          "allocated_bytes": {
+            "median": 128777645,
+            "min": 128777645,
+            "max": 128777645
+          },
+          "allocations": {
+            "median": 1604391,
+            "min": 1604391,
+            "max": 1604391
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 4538334,
+            "min": 4517792,
+            "max": 4594792
+          },
+          "p95_ns": {
+            "median": 4631084,
+            "min": 4548417,
+            "max": 4640708
+          },
+          "p99_ns": {
+            "median": 4631084,
+            "min": 4548417,
+            "max": 4640708
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 20,
+            "min": 20,
+            "max": 20
+          },
+          "spilled_bytes": {
+            "median": 3800000,
+            "min": 3800000,
+            "max": 3800000
+          }
+        },
+        "commit_plain": {
+          "allocations": {
+            "median": 9242,
+            "min": 9242,
+            "max": 9242
+          },
+          "apply_ns": {
+            "median": 71248,
+            "min": 69077,
+            "max": 75249
+          },
+          "commit_ns": {
+            "median": 709874,
+            "min": 694719,
+            "max": 757629
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 602497,
+            "min": 592787,
+            "max": 656996
+          },
+          "lock_wait_ns": {
+            "median": 7789,
+            "min": 7748,
+            "max": 7923
+          },
+          "locked_prepare_ns": {
+            "median": 15244,
+            "min": 15089,
+            "max": 16584
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 2958,
+            "min": 2875,
+            "max": 3000
+          },
+          "p95_ns": {
+            "median": 5750,
+            "min": 5583,
+            "max": 6083
+          },
+          "p99_ns": {
+            "median": 8625,
+            "min": 8250,
+            "max": 8875
+          },
+          "prepare_ns": {
+            "median": 67494,
+            "min": 65300,
+            "max": 71335
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 480173,
+            "min": 476039,
+            "max": 542084
+          },
+          "wal_ns": {
+            "median": 575422,
+            "min": 567120,
+            "max": 630789
+          }
+        },
+        "commit_identity": {
+          "allocations": {
+            "median": 14648,
+            "min": 14648,
+            "max": 14648
+          },
+          "apply_ns": {
+            "median": 130487,
+            "min": 117466,
+            "max": 131632
+          },
+          "commit_ns": {
+            "median": 707161,
+            "min": 699791,
+            "max": 709006
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 615166,
+            "min": 599416,
+            "max": 616420
+          },
+          "lock_wait_ns": {
+            "median": 8406,
+            "min": 8206,
+            "max": 8457
+          },
+          "locked_prepare_ns": {
+            "median": 95749,
+            "min": 92180,
+            "max": 105327
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4000,
+            "min": 3875,
+            "max": 4041
+          },
+          "p95_ns": {
+            "median": 6375,
+            "min": 6250,
+            "max": 6667
+          },
+          "p99_ns": {
+            "median": 8750,
+            "min": 7916,
+            "max": 8875
+          },
+          "prepare_ns": {
+            "median": 167303,
+            "min": 161448,
+            "max": 173584
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 329158,
+            "min": 323840,
+            "max": 334374
+          },
+          "wal_ns": {
+            "median": 499958,
+            "min": 497161,
+            "max": 510418
+          }
+        },
+        "commit_foreign_key": {
+          "allocations": {
+            "median": 18048,
+            "min": 18048,
+            "max": 18048
+          },
+          "apply_ns": {
+            "median": 130785,
+            "min": 127373,
+            "max": 138304
+          },
+          "commit_ns": {
+            "median": 1222003,
+            "min": 1162119,
+            "max": 1232588
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 1123449,
+            "min": 1050872,
+            "max": 1132907
+          },
+          "lock_wait_ns": {
+            "median": 8667,
+            "min": 8492,
+            "max": 8952
+          },
+          "locked_prepare_ns": {
+            "median": 516796,
+            "min": 478540,
+            "max": 520592
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 6167,
+            "min": 5833,
+            "max": 6333
+          },
+          "p95_ns": {
+            "median": 8125,
+            "min": 7791,
+            "max": 8750
+          },
+          "p99_ns": {
+            "median": 13042,
+            "min": 9958,
+            "max": 13125
+          },
+          "prepare_ns": {
+            "median": 587871,
+            "min": 563959,
+            "max": 593207
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 440628,
+            "min": 414203,
+            "max": 442244
+          },
+          "wal_ns": {
+            "median": 595459,
+            "min": 562082,
+            "max": 600835
+          }
+        }
+      },
+      "rss_mib": {
+        "median": 13.390625,
+        "min": 12.984375,
+        "max": 13.53125
+      }
+    },
+    "current": {
+      "phases": {
+        "load": {
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "seconds": {
+            "median": 0.0085685,
+            "min": 0.006194,
+            "max": 0.008930375
+          }
+        },
+        "cursor_id": {
+          "allocated_bytes": {
+            "median": 926104,
+            "min": 926104,
+            "max": 926104
+          },
+          "allocations": {
+            "median": 11419,
+            "min": 11419,
+            "max": 11419
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 3750,
+            "min": 3709,
+            "max": 3791
+          },
+          "p95_ns": {
+            "median": 7083,
+            "min": 6916,
+            "max": 7375
+          },
+          "p99_ns": {
+            "median": 9416,
+            "min": 8625,
+            "max": 9500
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_index": {
+          "allocated_bytes": {
+            "median": 6127312,
+            "min": 6127312,
+            "max": 6127312
+          },
+          "allocations": {
+            "median": 14608,
+            "min": 14608,
+            "max": 14608
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 6375,
+            "min": 6375,
+            "max": 6458
+          },
+          "p95_ns": {
+            "median": 7416,
+            "min": 7334,
+            "max": 7584
+          },
+          "p99_ns": {
+            "median": 9709,
+            "min": 8750,
+            "max": 12583
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_scan": {
+          "allocated_bytes": {
+            "median": 1616463168,
+            "min": 1616463168,
+            "max": 1616463168
+          },
+          "allocations": {
+            "median": 16084007,
+            "min": 16084007,
+            "max": 16084007
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 2615458,
+            "min": 2614542,
+            "max": 2625250
+          },
+          "p95_ns": {
+            "median": 3010541,
+            "min": 3000250,
+            "max": 3034500
+          },
+          "p99_ns": {
+            "median": 3746167,
+            "min": 3716292,
+            "max": 3806833
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_last": {
+          "allocated_bytes": {
+            "median": 6524416,
+            "min": 6524416,
+            "max": 6524416
+          },
+          "allocations": {
+            "median": 19807,
+            "min": 19807,
+            "max": 19807
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4584,
+            "min": 4417,
+            "max": 4833
+          },
+          "p95_ns": {
+            "median": 6083,
+            "min": 5167,
+            "max": 6250
+          },
+          "p99_ns": {
+            "median": 8166,
+            "min": 6542,
+            "max": 10125
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_first": {
+          "allocated_bytes": {
+            "median": 6523016,
+            "min": 6523016,
+            "max": 6778000
+          },
+          "allocations": {
+            "median": 19607,
+            "min": 19607,
+            "max": 19608
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4250,
+            "min": 4209,
+            "max": 4250
+          },
+          "p95_ns": {
+            "median": 4959,
+            "min": 4791,
+            "max": 5542
+          },
+          "p99_ns": {
+            "median": 6750,
+            "min": 5417,
+            "max": 8542
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "top_k": {
+          "allocated_bytes": {
+            "median": 84022178,
+            "min": 84022178,
+            "max": 84022178
+          },
+          "allocations": {
+            "median": 904013,
+            "min": 904013,
+            "max": 904013
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 2820375,
+            "min": 2788792,
+            "max": 2880500
+          },
+          "p95_ns": {
+            "median": 2861000,
+            "min": 2847250,
+            "max": 2906917
+          },
+          "p99_ns": {
+            "median": 2861000,
+            "min": 2847250,
+            "max": 2906917
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "full_sort": {
+          "allocated_bytes": {
+            "median": 128780825,
+            "min": 128780825,
+            "max": 128780825
+          },
+          "allocations": {
+            "median": 1604431,
+            "min": 1604431,
+            "max": 1604431
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 4736792,
+            "min": 4668792,
+            "max": 4760625
+          },
+          "p95_ns": {
+            "median": 4804667,
+            "min": 4787125,
+            "max": 4855250
+          },
+          "p99_ns": {
+            "median": 4804667,
+            "min": 4787125,
+            "max": 4855250
+          },
+          "rows": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "spill_files": {
+            "median": 20,
+            "min": 20,
+            "max": 20
+          },
+          "spilled_bytes": {
+            "median": 3800000,
+            "min": 3800000,
+            "max": 3800000
+          }
+        },
+        "commit_plain": {
+          "allocations": {
+            "median": 9242,
+            "min": 9242,
+            "max": 9242
+          },
+          "apply_ns": {
+            "median": 66082,
+            "min": 62078,
+            "max": 91457
+          },
+          "commit_ns": {
+            "median": 680957,
+            "min": 618246,
+            "max": 727294
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 583130,
+            "min": 514664,
+            "max": 624417
+          },
+          "lock_wait_ns": {
+            "median": 7503,
+            "min": 7156,
+            "max": 7624
+          },
+          "locked_prepare_ns": {
+            "median": 14498,
+            "min": 13174,
+            "max": 15164
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 2792,
+            "min": 2709,
+            "max": 3125
+          },
+          "p95_ns": {
+            "median": 5708,
+            "min": 5417,
+            "max": 5833
+          },
+          "p99_ns": {
+            "median": 8667,
+            "min": 8500,
+            "max": 9291
+          },
+          "prepare_ns": {
+            "median": 71449,
+            "min": 62931,
+            "max": 72163
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 480877,
+            "min": 406167,
+            "max": 491416
+          },
+          "wal_ns": {
+            "median": 561091,
+            "min": 489997,
+            "max": 601296
+          }
+        },
+        "commit_identity": {
+          "allocations": {
+            "median": 14648,
+            "min": 14648,
+            "max": 14648
+          },
+          "apply_ns": {
+            "median": 129918,
+            "min": 125170,
+            "max": 146963
+          },
+          "commit_ns": {
+            "median": 726003,
+            "min": 709087,
+            "max": 734581
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 638420,
+            "min": 626503,
+            "max": 647499
+          },
+          "lock_wait_ns": {
+            "median": 8421,
+            "min": 8411,
+            "max": 8717
+          },
+          "locked_prepare_ns": {
+            "median": 98749,
+            "min": 94411,
+            "max": 109576
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 3916,
+            "min": 3875,
+            "max": 4166
+          },
+          "p95_ns": {
+            "median": 6458,
+            "min": 6292,
+            "max": 6708
+          },
+          "p99_ns": {
+            "median": 9125,
+            "min": 8375,
+            "max": 9709
+          },
+          "prepare_ns": {
+            "median": 160423,
+            "min": 151825,
+            "max": 171787
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 342009,
+            "min": 330334,
+            "max": 372752
+          },
+          "wal_ns": {
+            "median": 522251,
+            "min": 519252,
+            "max": 539207
+          }
+        },
+        "commit_foreign_key": {
+          "allocations": {
+            "median": 18048,
+            "min": 18048,
+            "max": 18048
+          },
+          "apply_ns": {
+            "median": 139375,
+            "min": 132335,
+            "max": 142305
+          },
+          "commit_ns": {
+            "median": 1235785,
+            "min": 1218132,
+            "max": 1239456
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 1128210,
+            "min": 1120992,
+            "max": 1136867
+          },
+          "lock_wait_ns": {
+            "median": 9292,
+            "min": 9000,
+            "max": 9372
+          },
+          "locked_prepare_ns": {
+            "median": 519616,
+            "min": 505208,
+            "max": 530122
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 6292,
+            "min": 6292,
+            "max": 6333
+          },
+          "p95_ns": {
+            "median": 8708,
+            "min": 8416,
+            "max": 9083
+          },
+          "p99_ns": {
+            "median": 12334,
+            "min": 10500,
+            "max": 17667
+          },
+          "prepare_ns": {
+            "median": 599538,
+            "min": 577327,
+            "max": 604283
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 433447,
+            "min": 424877,
+            "max": 459876
+          },
+          "wal_ns": {
+            "median": 597155,
+            "min": 579627,
+            "max": 620621
+          }
+        }
+      },
+      "rss_mib": {
+        "median": 13.140625,
+        "min": 13.09375,
+        "max": 13.359375
+      }
+    }
+  },
+  "20k-final": {
+    "baseline": {
+      "phases": {
+        "load": {
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "seconds": {
+            "median": 0.016084458,
+            "min": 0.015658167,
+            "max": 0.016226541
+          }
+        },
+        "cursor_id": {
+          "allocated_bytes": {
+            "median": 3226881304,
+            "min": 3226881304,
+            "max": 3226881304
+          },
+          "allocations": {
+            "median": 32154419,
+            "min": 32154419,
+            "max": 32154419
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4887042,
+            "min": 4828125,
+            "max": 5021125
+          },
+          "p95_ns": {
+            "median": 5093083,
+            "min": 5012791,
+            "max": 5129958
+          },
+          "p99_ns": {
+            "median": 6464167,
+            "min": 6073292,
+            "max": 6784416
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_index": {
+          "allocated_bytes": {
+            "median": 3226853540,
+            "min": 3226853540,
+            "max": 3226853540
+          },
+          "allocations": {
+            "median": 32153208,
+            "min": 32153208,
+            "max": 32153208
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4889042,
+            "min": 4886125,
+            "max": 4984042
+          },
+          "p95_ns": {
+            "median": 4966959,
+            "min": 4938458,
+            "max": 6227083
+          },
+          "p99_ns": {
+            "median": 5000000,
+            "min": 4969750,
+            "max": 6292792
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_scan": {
+          "allocated_bytes": {
+            "median": 3226994824,
+            "min": 3226994824,
+            "max": 3226994824
+          },
+          "allocations": {
+            "median": 32155807,
+            "min": 32155807,
+            "max": 32155807
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 5073625,
+            "min": 5056500,
+            "max": 5167000
+          },
+          "p95_ns": {
+            "median": 5156750,
+            "min": 5117542,
+            "max": 5984666
+          },
+          "p99_ns": {
+            "median": 5220625,
+            "min": 5134667,
+            "max": 6034750
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_last": {
+          "allocated_bytes": {
+            "median": 3087135444,
+            "min": 3087135444,
+            "max": 3087135444
+          },
+          "allocations": {
+            "median": 28206007,
+            "min": 28206007,
+            "max": 28206007
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4770791,
+            "min": 4714541,
+            "max": 4883125
+          },
+          "p95_ns": {
+            "median": 4848083,
+            "min": 4786833,
+            "max": 5730500
+          },
+          "p99_ns": {
+            "median": 4871750,
+            "min": 4814084,
+            "max": 5884292
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_first": {
+          "allocated_bytes": {
+            "median": 6520444,
+            "min": 6520444,
+            "max": 6520444
+          },
+          "allocations": {
+            "median": 19407,
+            "min": 19407,
+            "max": 19407
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4708,
+            "min": 4666,
+            "max": 4917
+          },
+          "p95_ns": {
+            "median": 5458,
+            "min": 5416,
+            "max": 7375
+          },
+          "p99_ns": {
+            "median": 8208,
+            "min": 7250,
+            "max": 12750
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "top_k": {
+          "allocated_bytes": {
+            "median": 188837998,
+            "min": 188837998,
+            "max": 188837998
+          },
+          "allocations": {
+            "median": 1810003,
+            "min": 1810003,
+            "max": 1810003
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 5631792,
+            "min": 5626250,
+            "max": 5678792
+          },
+          "p95_ns": {
+            "median": 5714084,
+            "min": 5707250,
+            "max": 6353000
+          },
+          "p99_ns": {
+            "median": 5714084,
+            "min": 5707250,
+            "max": 6353000
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 40,
+            "min": 40,
+            "max": 40
+          },
+          "spilled_bytes": {
+            "median": 15200,
+            "min": 15200,
+            "max": 15200
+          }
+        },
+        "full_sort": {
+          "allocated_bytes": {
+            "median": 248101785,
+            "min": 248101785,
+            "max": 248101785
+          },
+          "allocations": {
+            "median": 3208141,
+            "min": 3208141,
+            "max": 3208141
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 9189500,
+            "min": 9161292,
+            "max": 9206542
+          },
+          "p95_ns": {
+            "median": 9281958,
+            "min": 9259666,
+            "max": 9811667
+          },
+          "p99_ns": {
+            "median": 9281958,
+            "min": 9259666,
+            "max": 9811667
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 40,
+            "min": 40,
+            "max": 40
+          },
+          "spilled_bytes": {
+            "median": 7600000,
+            "min": 7600000,
+            "max": 7600000
+          }
+        },
+        "commit_plain": {
+          "allocations": {
+            "median": 9242,
+            "min": 9242,
+            "max": 9242
+          },
+          "apply_ns": {
+            "median": 81796,
+            "min": 81578,
+            "max": 85712
+          },
+          "commit_ns": {
+            "median": 683079,
+            "min": 652873,
+            "max": 732040
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 576548,
+            "min": 549448,
+            "max": 623295
+          },
+          "lock_wait_ns": {
+            "median": 7869,
+            "min": 7799,
+            "max": 8420
+          },
+          "locked_prepare_ns": {
+            "median": 15668,
+            "min": 14758,
+            "max": 16079
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 3042,
+            "min": 2958,
+            "max": 3125
+          },
+          "p95_ns": {
+            "median": 5792,
+            "min": 5667,
+            "max": 5834
+          },
+          "p99_ns": {
+            "median": 8041,
+            "min": 7500,
+            "max": 9292
+          },
+          "prepare_ns": {
+            "median": 71747,
+            "min": 69552,
+            "max": 72365
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 448789,
+            "min": 422922,
+            "max": 489997
+          },
+          "wal_ns": {
+            "median": 550342,
+            "min": 523735,
+            "max": 595585
+          }
+        },
+        "commit_identity": {
+          "allocations": {
+            "median": 14648,
+            "min": 14648,
+            "max": 14648
+          },
+          "apply_ns": {
+            "median": 147617,
+            "min": 132615,
+            "max": 152993
+          },
+          "commit_ns": {
+            "median": 757037,
+            "min": 739119,
+            "max": 877796
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 655790,
+            "min": 636251,
+            "max": 770206
+          },
+          "lock_wait_ns": {
+            "median": 8627,
+            "min": 8414,
+            "max": 8678
+          },
+          "locked_prepare_ns": {
+            "median": 100252,
+            "min": 100215,
+            "max": 127629
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4250,
+            "min": 4084,
+            "max": 4500
+          },
+          "p95_ns": {
+            "median": 6667,
+            "min": 6667,
+            "max": 6791
+          },
+          "p99_ns": {
+            "median": 8375,
+            "min": 8250,
+            "max": 10375
+          },
+          "prepare_ns": {
+            "median": 177040,
+            "min": 175302,
+            "max": 209802
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 350291,
+            "min": 347924,
+            "max": 429042
+          },
+          "wal_ns": {
+            "median": 544465,
+            "min": 526461,
+            "max": 631627
+          }
+        },
+        "commit_foreign_key": {
+          "allocations": {
+            "median": 18048,
+            "min": 18048,
+            "max": 18048
+          },
+          "apply_ns": {
+            "median": 138174,
+            "min": 137133,
+            "max": 149079
+          },
+          "commit_ns": {
+            "median": 1213966,
+            "min": 1133794,
+            "max": 1274453
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 1112784,
+            "min": 1032912,
+            "max": 1169084
+          },
+          "lock_wait_ns": {
+            "median": 8707,
+            "min": 8625,
+            "max": 9034
+          },
+          "locked_prepare_ns": {
+            "median": 540047,
+            "min": 511707,
+            "max": 552666
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 6417,
+            "min": 6291,
+            "max": 6542
+          },
+          "p95_ns": {
+            "median": 8875,
+            "min": 8750,
+            "max": 9167
+          },
+          "p99_ns": {
+            "median": 11583,
+            "min": 11375,
+            "max": 12333
+          },
+          "prepare_ns": {
+            "median": 614415,
+            "min": 585370,
+            "max": 630673
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 400547,
+            "min": 351799,
+            "max": 433076
+          },
+          "wal_ns": {
+            "median": 561177,
+            "min": 511166,
+            "max": 604385
+          }
+        }
+      },
+      "rss_mib": {
+        "median": 20.265625,
+        "min": 20.140625,
+        "max": 20.328125
+      }
+    },
+    "current": {
+      "phases": {
+        "load": {
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "seconds": {
+            "median": 0.017890375,
+            "min": 0.01781225,
+            "max": 0.027630667
+          }
+        },
+        "cursor_id": {
+          "allocated_bytes": {
+            "median": 926104,
+            "min": 926104,
+            "max": 926104
+          },
+          "allocations": {
+            "median": 11419,
+            "min": 11419,
+            "max": 11419
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4625,
+            "min": 4375,
+            "max": 4625
+          },
+          "p95_ns": {
+            "median": 7500,
+            "min": 7042,
+            "max": 8625
+          },
+          "p99_ns": {
+            "median": 10250,
+            "min": 9417,
+            "max": 13125
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_index": {
+          "allocated_bytes": {
+            "median": 6127540,
+            "min": 6127540,
+            "max": 6127540
+          },
+          "allocations": {
+            "median": 14608,
+            "min": 14608,
+            "max": 14608
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 6792,
+            "min": 6750,
+            "max": 6792
+          },
+          "p95_ns": {
+            "median": 7666,
+            "min": 7541,
+            "max": 8208
+          },
+          "p99_ns": {
+            "median": 9709,
+            "min": 9000,
+            "max": 9959
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_scan": {
+          "allocated_bytes": {
+            "median": 3226999624,
+            "min": 3226999624,
+            "max": 3226999624
+          },
+          "allocations": {
+            "median": 32156007,
+            "min": 32156007,
+            "max": 32156007
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 5292334,
+            "min": 5283875,
+            "max": 5340792
+          },
+          "p95_ns": {
+            "median": 5533083,
+            "min": 5530666,
+            "max": 5750500
+          },
+          "p99_ns": {
+            "median": 6858250,
+            "min": 6735459,
+            "max": 6915625
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_last": {
+          "allocated_bytes": {
+            "median": 6524644,
+            "min": 6524644,
+            "max": 6524644
+          },
+          "allocations": {
+            "median": 19807,
+            "min": 19807,
+            "max": 19807
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4709,
+            "min": 4625,
+            "max": 5250
+          },
+          "p95_ns": {
+            "median": 6417,
+            "min": 5417,
+            "max": 7250
+          },
+          "p99_ns": {
+            "median": 9542,
+            "min": 7459,
+            "max": 11792
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_first": {
+          "allocated_bytes": {
+            "median": 6523244,
+            "min": 6523244,
+            "max": 6778228
+          },
+          "allocations": {
+            "median": 19607,
+            "min": 19607,
+            "max": 19608
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4459,
+            "min": 4375,
+            "max": 4459
+          },
+          "p95_ns": {
+            "median": 4709,
+            "min": 4709,
+            "max": 5000
+          },
+          "p99_ns": {
+            "median": 6750,
+            "min": 5834,
+            "max": 12000
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "top_k": {
+          "allocated_bytes": {
+            "median": 167748978,
+            "min": 167748978,
+            "max": 167748978
+          },
+          "allocations": {
+            "median": 1807613,
+            "min": 1807613,
+            "max": 1807613
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 5747083,
+            "min": 5724000,
+            "max": 5766959
+          },
+          "p95_ns": {
+            "median": 5907625,
+            "min": 5766792,
+            "max": 8450334
+          },
+          "p99_ns": {
+            "median": 5907625,
+            "min": 5766792,
+            "max": 8450334
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "full_sort": {
+          "allocated_bytes": {
+            "median": 248107085,
+            "min": 248107085,
+            "max": 248107085
+          },
+          "allocations": {
+            "median": 3208201,
+            "min": 3208201,
+            "max": 3208201
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 9572375,
+            "min": 9530875,
+            "max": 9758750
+          },
+          "p95_ns": {
+            "median": 9819958,
+            "min": 9707083,
+            "max": 10135833
+          },
+          "p99_ns": {
+            "median": 9819958,
+            "min": 9707083,
+            "max": 10135833
+          },
+          "rows": {
+            "median": 20000,
+            "min": 20000,
+            "max": 20000
+          },
+          "spill_files": {
+            "median": 40,
+            "min": 40,
+            "max": 40
+          },
+          "spilled_bytes": {
+            "median": 7600000,
+            "min": 7600000,
+            "max": 7600000
+          }
+        },
+        "commit_plain": {
+          "allocations": {
+            "median": 9242,
+            "min": 9242,
+            "max": 9242
+          },
+          "apply_ns": {
+            "median": 82457,
+            "min": 70205,
+            "max": 87039
+          },
+          "commit_ns": {
+            "median": 706838,
+            "min": 686581,
+            "max": 773972
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 604425,
+            "min": 579623,
+            "max": 662747
+          },
+          "lock_wait_ns": {
+            "median": 7969,
+            "min": 7494,
+            "max": 7999
+          },
+          "locked_prepare_ns": {
+            "median": 16493,
+            "min": 15873,
+            "max": 17795
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 3000,
+            "min": 2917,
+            "max": 3000
+          },
+          "p95_ns": {
+            "median": 5583,
+            "min": 5459,
+            "max": 5708
+          },
+          "p99_ns": {
+            "median": 9250,
+            "min": 8833,
+            "max": 9542
+          },
+          "prepare_ns": {
+            "median": 75997,
+            "min": 71917,
+            "max": 79753
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 489118,
+            "min": 448453,
+            "max": 532543
+          },
+          "wal_ns": {
+            "median": 578456,
+            "min": 553126,
+            "max": 634629
+          }
+        },
+        "commit_identity": {
+          "allocations": {
+            "median": 14648,
+            "min": 14648,
+            "max": 14648
+          },
+          "apply_ns": {
+            "median": 129835,
+            "min": 127417,
+            "max": 135918
+          },
+          "commit_ns": {
+            "median": 704779,
+            "min": 692538,
+            "max": 725374
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 613508,
+            "min": 607294,
+            "max": 632620
+          },
+          "lock_wait_ns": {
+            "median": 8706,
+            "min": 8495,
+            "max": 8758
+          },
+          "locked_prepare_ns": {
+            "median": 99330,
+            "min": 97070,
+            "max": 104341
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4042,
+            "min": 4000,
+            "max": 4167
+          },
+          "p95_ns": {
+            "median": 6500,
+            "min": 6291,
+            "max": 6667
+          },
+          "p99_ns": {
+            "median": 8708,
+            "min": 8417,
+            "max": 8916
+          },
+          "prepare_ns": {
+            "median": 165208,
+            "min": 156354,
+            "max": 171549
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 332659,
+            "min": 326869,
+            "max": 338127
+          },
+          "wal_ns": {
+            "median": 503287,
+            "min": 499622,
+            "max": 518077
+          }
+        },
+        "commit_foreign_key": {
+          "allocations": {
+            "median": 18048,
+            "min": 18048,
+            "max": 18048
+          },
+          "apply_ns": {
+            "median": 137752,
+            "min": 129626,
+            "max": 146333
+          },
+          "commit_ns": {
+            "median": 1246456,
+            "min": 1054262,
+            "max": 1260956
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 1144504,
+            "min": 960997,
+            "max": 1159035
+          },
+          "lock_wait_ns": {
+            "median": 9081,
+            "min": 8379,
+            "max": 9247
+          },
+          "locked_prepare_ns": {
+            "median": 535125,
+            "min": 480750,
+            "max": 538165
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 6458,
+            "min": 5917,
+            "max": 6459
+          },
+          "p95_ns": {
+            "median": 8625,
+            "min": 8375,
+            "max": 8792
+          },
+          "p99_ns": {
+            "median": 10750,
+            "min": 10042,
+            "max": 10916
+          },
+          "prepare_ns": {
+            "median": 609496,
+            "min": 547662,
+            "max": 612114
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 440167,
+            "min": 319707,
+            "max": 442120
+          },
+          "wal_ns": {
+            "median": 599957,
+            "min": 469916,
+            "max": 609794
+          }
+        }
+      },
+      "rss_mib": {
+        "median": 20.03125,
+        "min": 20.0,
+        "max": 20.109375
+      }
+    }
+  },
+  "100k": {
+    "baseline": {
+      "phases": {
+        "load": {
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "seconds": {
+            "median": 0.063028042,
+            "min": 0.06288025,
+            "max": 0.06635075
+          }
+        },
+        "cursor_id": {
+          "allocated_bytes": {
+            "median": 2413609796,
+            "min": 2413609796,
+            "max": 2413609796
+          },
+          "allocations": {
+            "median": 24107411,
+            "min": 24107411,
+            "max": 24107411
+          },
+          "operations": {
+            "median": 30,
+            "min": 30,
+            "max": 30
+          },
+          "p50_ns": {
+            "median": 24157875,
+            "min": 23980500,
+            "max": 24270500
+          },
+          "p95_ns": {
+            "median": 24672041,
+            "min": 24235667,
+            "max": 25308917
+          },
+          "p99_ns": {
+            "median": 25174000,
+            "min": 25064667,
+            "max": 25387667
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_index": {
+          "allocated_bytes": {
+            "median": 2413609338,
+            "min": 2413609338,
+            "max": 2413609338
+          },
+          "allocations": {
+            "median": 24107226,
+            "min": 24107226,
+            "max": 24107226
+          },
+          "operations": {
+            "median": 30,
+            "min": 30,
+            "max": 30
+          },
+          "p50_ns": {
+            "median": 24302708,
+            "min": 24046084,
+            "max": 24800792
+          },
+          "p95_ns": {
+            "median": 24710750,
+            "min": 24168959,
+            "max": 25749000
+          },
+          "p99_ns": {
+            "median": 24959917,
+            "min": 24175292,
+            "max": 25832958
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_scan": {
+          "allocated_bytes": {
+            "median": 2413619336,
+            "min": 2413619336,
+            "max": 2413619336
+          },
+          "allocations": {
+            "median": 24107615,
+            "min": 24107615,
+            "max": 24107615
+          },
+          "operations": {
+            "median": 30,
+            "min": 30,
+            "max": 30
+          },
+          "p50_ns": {
+            "median": 25062917,
+            "min": 25020083,
+            "max": 25120750
+          },
+          "p95_ns": {
+            "median": 25379625,
+            "min": 25257750,
+            "max": 25614875
+          },
+          "p99_ns": {
+            "median": 25678292,
+            "min": 25440667,
+            "max": 25741167
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_last": {
+          "allocated_bytes": {
+            "median": 2314845564,
+            "min": 2314845564,
+            "max": 2314845564
+          },
+          "allocations": {
+            "median": 21143315,
+            "min": 21143315,
+            "max": 21143315
+          },
+          "operations": {
+            "median": 30,
+            "min": 30,
+            "max": 30
+          },
+          "p50_ns": {
+            "median": 23852958,
+            "min": 23748667,
+            "max": 23919583
+          },
+          "p95_ns": {
+            "median": 24097125,
+            "min": 24059209,
+            "max": 24285917
+          },
+          "p99_ns": {
+            "median": 24158375,
+            "min": 24107708,
+            "max": 24309083
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_first": {
+          "allocated_bytes": {
+            "median": 984106,
+            "min": 984106,
+            "max": 984106
+          },
+          "allocations": {
+            "median": 2915,
+            "min": 2915,
+            "max": 2915
+          },
+          "operations": {
+            "median": 30,
+            "min": 30,
+            "max": 30
+          },
+          "p50_ns": {
+            "median": 6291,
+            "min": 5625,
+            "max": 7417
+          },
+          "p95_ns": {
+            "median": 8834,
+            "min": 7750,
+            "max": 9625
+          },
+          "p99_ns": {
+            "median": 10250,
+            "min": 8667,
+            "max": 12958
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "top_k": {
+          "allocated_bytes": {
+            "median": 905011578,
+            "min": 905011578,
+            "max": 905011578
+          },
+          "allocations": {
+            "median": 9045173,
+            "min": 9045173,
+            "max": 9045173
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 27483833,
+            "min": 27469750,
+            "max": 27856292
+          },
+          "p95_ns": {
+            "median": 28075958,
+            "min": 27749750,
+            "max": 28322542
+          },
+          "p99_ns": {
+            "median": 28075958,
+            "min": 27749750,
+            "max": 28322542
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 180,
+            "min": 180,
+            "max": 180
+          },
+          "spilled_bytes": {
+            "median": 68400,
+            "min": 68400,
+            "max": 68400
+          }
+        },
+        "full_sort": {
+          "allocated_bytes": {
+            "median": 1185679565,
+            "min": 1185679565,
+            "max": 1185679565
+          },
+          "allocations": {
+            "median": 16037311,
+            "min": 16037311,
+            "max": 16037311
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 47734667,
+            "min": 47386334,
+            "max": 49657875
+          },
+          "p95_ns": {
+            "median": 48382917,
+            "min": 48113875,
+            "max": 50268584
+          },
+          "p99_ns": {
+            "median": 48382917,
+            "min": 48113875,
+            "max": 50268584
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 180,
+            "min": 180,
+            "max": 180
+          },
+          "spilled_bytes": {
+            "median": 38000000,
+            "min": 38000000,
+            "max": 38000000
+          }
+        },
+        "commit_plain": {
+          "allocations": {
+            "median": 9242,
+            "min": 9242,
+            "max": 9242
+          },
+          "apply_ns": {
+            "median": 91244,
+            "min": 88957,
+            "max": 106661
+          },
+          "commit_ns": {
+            "median": 851075,
+            "min": 827257,
+            "max": 950674
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 741128,
+            "min": 714614,
+            "max": 835716
+          },
+          "lock_wait_ns": {
+            "median": 8403,
+            "min": 8162,
+            "max": 8458
+          },
+          "locked_prepare_ns": {
+            "median": 19336,
+            "min": 17052,
+            "max": 21203
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 3292,
+            "min": 3042,
+            "max": 3292
+          },
+          "p95_ns": {
+            "median": 6708,
+            "min": 6083,
+            "max": 7416
+          },
+          "p99_ns": {
+            "median": 13791,
+            "min": 12417,
+            "max": 14292
+          },
+          "prepare_ns": {
+            "median": 77497,
+            "min": 77089,
+            "max": 82206
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 602163,
+            "min": 576085,
+            "max": 675663
+          },
+          "wal_ns": {
+            "median": 711124,
+            "min": 688046,
+            "max": 804506
+          }
+        },
+        "commit_identity": {
+          "allocations": {
+            "median": 14648,
+            "min": 14648,
+            "max": 14648
+          },
+          "apply_ns": {
+            "median": 149085,
+            "min": 140877,
+            "max": 157755
+          },
+          "commit_ns": {
+            "median": 797956,
+            "min": 758700,
+            "max": 844256
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 695120,
+            "min": 658998,
+            "max": 739541
+          },
+          "lock_wait_ns": {
+            "median": 9422,
+            "min": 9256,
+            "max": 9523
+          },
+          "locked_prepare_ns": {
+            "median": 106836,
+            "min": 106204,
+            "max": 114001
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4500,
+            "min": 4291,
+            "max": 4625
+          },
+          "p95_ns": {
+            "median": 7250,
+            "min": 6958,
+            "max": 7291
+          },
+          "p99_ns": {
+            "median": 11250,
+            "min": 9250,
+            "max": 12500
+          },
+          "prepare_ns": {
+            "median": 183509,
+            "min": 179827,
+            "max": 185534
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 370246,
+            "min": 345171,
+            "max": 426964
+          },
+          "wal_ns": {
+            "median": 578378,
+            "min": 533995,
+            "max": 623249
+          }
+        },
+        "commit_foreign_key": {
+          "allocations": {
+            "median": 18048,
+            "min": 18048,
+            "max": 18048
+          },
+          "apply_ns": {
+            "median": 142958,
+            "min": 139216,
+            "max": 143626
+          },
+          "commit_ns": {
+            "median": 1344291,
+            "min": 1272835,
+            "max": 1396447
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 1240667,
+            "min": 1167710,
+            "max": 1290620
+          },
+          "lock_wait_ns": {
+            "median": 9080,
+            "min": 8984,
+            "max": 9340
+          },
+          "locked_prepare_ns": {
+            "median": 559503,
+            "min": 535087,
+            "max": 568494
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 6541,
+            "min": 6541,
+            "max": 7583
+          },
+          "p95_ns": {
+            "median": 9291,
+            "min": 8791,
+            "max": 10000
+          },
+          "p99_ns": {
+            "median": 11417,
+            "min": 10917,
+            "max": 12208
+          },
+          "prepare_ns": {
+            "median": 635582,
+            "min": 610169,
+            "max": 646407
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 528913,
+            "min": 430664,
+            "max": 550039
+          },
+          "wal_ns": {
+            "median": 694962,
+            "min": 597003,
+            "max": 712004
+          }
+        }
+      },
+      "rss_mib": {
+        "median": 69.5,
+        "min": 69.21875,
+        "max": 72.609375
+      }
+    },
+    "current": {
+      "phases": {
+        "load": {
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "seconds": {
+            "median": 0.05496375,
+            "min": 0.054324583,
+            "max": 0.061005417
+          }
+        },
+        "cursor_id": {
+          "allocated_bytes": {
+            "median": 149396,
+            "min": 149396,
+            "max": 149396
+          },
+          "allocations": {
+            "median": 1721,
+            "min": 1721,
+            "max": 1721
+          },
+          "operations": {
+            "median": 30,
+            "min": 30,
+            "max": 30
+          },
+          "p50_ns": {
+            "median": 5292,
+            "min": 5292,
+            "max": 5542
+          },
+          "p95_ns": {
+            "median": 9875,
+            "min": 9792,
+            "max": 10292
+          },
+          "p99_ns": {
+            "median": 10959,
+            "min": 10500,
+            "max": 18834
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_index": {
+          "allocated_bytes": {
+            "median": 933318,
+            "min": 933318,
+            "max": 933318
+          },
+          "allocations": {
+            "median": 2196,
+            "min": 2196,
+            "max": 2196
+          },
+          "operations": {
+            "median": 30,
+            "min": 30,
+            "max": 30
+          },
+          "p50_ns": {
+            "median": 6875,
+            "min": 6375,
+            "max": 7000
+          },
+          "p95_ns": {
+            "median": 9250,
+            "min": 8750,
+            "max": 9666
+          },
+          "p99_ns": {
+            "median": 10666,
+            "min": 10083,
+            "max": 10875
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_scan": {
+          "allocated_bytes": {
+            "median": 2413620056,
+            "min": 2413620056,
+            "max": 2413620056
+          },
+          "allocations": {
+            "median": 24107645,
+            "min": 24107645,
+            "max": 24107645
+          },
+          "operations": {
+            "median": 30,
+            "min": 30,
+            "max": 30
+          },
+          "p50_ns": {
+            "median": 26546667,
+            "min": 26452125,
+            "max": 26603334
+          },
+          "p95_ns": {
+            "median": 27871667,
+            "min": 27496500,
+            "max": 28231292
+          },
+          "p99_ns": {
+            "median": 28260541,
+            "min": 27620875,
+            "max": 28304958
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_last": {
+          "allocated_bytes": {
+            "median": 1042344,
+            "min": 1042344,
+            "max": 1042344
+          },
+          "allocations": {
+            "median": 2975,
+            "min": 2975,
+            "max": 2975
+          },
+          "operations": {
+            "median": 30,
+            "min": 30,
+            "max": 30
+          },
+          "p50_ns": {
+            "median": 6667,
+            "min": 5917,
+            "max": 7917
+          },
+          "p95_ns": {
+            "median": 9708,
+            "min": 8042,
+            "max": 12125
+          },
+          "p99_ns": {
+            "median": 19416,
+            "min": 17959,
+            "max": 20417
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_first": {
+          "allocated_bytes": {
+            "median": 984526,
+            "min": 984526,
+            "max": 984526
+          },
+          "allocations": {
+            "median": 2945,
+            "min": 2945,
+            "max": 2945
+          },
+          "operations": {
+            "median": 30,
+            "min": 30,
+            "max": 30
+          },
+          "p50_ns": {
+            "median": 4458,
+            "min": 4416,
+            "max": 4709
+          },
+          "p95_ns": {
+            "median": 5625,
+            "min": 5125,
+            "max": 5875
+          },
+          "p99_ns": {
+            "median": 5959,
+            "min": 5750,
+            "max": 7166
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "top_k": {
+          "allocated_bytes": {
+            "median": 836538018,
+            "min": 836538018,
+            "max": 836538018
+          },
+          "allocations": {
+            "median": 9035693,
+            "min": 9035693,
+            "max": 9035693
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 28740291,
+            "min": 28528334,
+            "max": 28828916
+          },
+          "p95_ns": {
+            "median": 28879292,
+            "min": 28720375,
+            "max": 29052333
+          },
+          "p99_ns": {
+            "median": 28879292,
+            "min": 28720375,
+            "max": 29052333
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "full_sort": {
+          "allocated_bytes": {
+            "median": 1185708665,
+            "min": 1185708665,
+            "max": 1185708665
+          },
+          "allocations": {
+            "median": 16037511,
+            "min": 16037511,
+            "max": 16037511
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 48673000,
+            "min": 48217833,
+            "max": 48847292
+          },
+          "p95_ns": {
+            "median": 49246417,
+            "min": 48873916,
+            "max": 49375417
+          },
+          "p99_ns": {
+            "median": 49246417,
+            "min": 48873916,
+            "max": 49375417
+          },
+          "rows": {
+            "median": 100000,
+            "min": 100000,
+            "max": 100000
+          },
+          "spill_files": {
+            "median": 180,
+            "min": 180,
+            "max": 180
+          },
+          "spilled_bytes": {
+            "median": 38000000,
+            "min": 38000000,
+            "max": 38000000
+          }
+        },
+        "commit_plain": {
+          "allocations": {
+            "median": 9242,
+            "min": 9242,
+            "max": 9242
+          },
+          "apply_ns": {
+            "median": 95926,
+            "min": 94762,
+            "max": 97176
+          },
+          "commit_ns": {
+            "median": 776380,
+            "min": 683217,
+            "max": 939658
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 668956,
+            "min": 574654,
+            "max": 812163
+          },
+          "lock_wait_ns": {
+            "median": 8003,
+            "min": 7886,
+            "max": 8333
+          },
+          "locked_prepare_ns": {
+            "median": 17703,
+            "min": 15337,
+            "max": 17707
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 3083,
+            "min": 3041,
+            "max": 3084
+          },
+          "p95_ns": {
+            "median": 5708,
+            "min": 5583,
+            "max": 6166
+          },
+          "p99_ns": {
+            "median": 15084,
+            "min": 14500,
+            "max": 15792
+          },
+          "prepare_ns": {
+            "median": 75454,
+            "min": 74791,
+            "max": 93575
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 526869,
+            "min": 432122,
+            "max": 667956
+          },
+          "wal_ns": {
+            "median": 641951,
+            "min": 549565,
+            "max": 783625
+          }
+        },
+        "commit_identity": {
+          "allocations": {
+            "median": 14648,
+            "min": 14648,
+            "max": 14648
+          },
+          "apply_ns": {
+            "median": 135292,
+            "min": 132878,
+            "max": 141292
+          },
+          "commit_ns": {
+            "median": 732081,
+            "min": 722662,
+            "max": 792800
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 637417,
+            "min": 635745,
+            "max": 697083
+          },
+          "lock_wait_ns": {
+            "median": 8751,
+            "min": 8246,
+            "max": 9251
+          },
+          "locked_prepare_ns": {
+            "median": 111836,
+            "min": 103457,
+            "max": 117533
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4167,
+            "min": 4000,
+            "max": 4250
+          },
+          "p95_ns": {
+            "median": 6417,
+            "min": 6334,
+            "max": 6958
+          },
+          "p99_ns": {
+            "median": 8792,
+            "min": 8750,
+            "max": 9625
+          },
+          "prepare_ns": {
+            "median": 172791,
+            "min": 170249,
+            "max": 184664
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 345459,
+            "min": 333872,
+            "max": 381960
+          },
+          "wal_ns": {
+            "median": 523746,
+            "min": 515002,
+            "max": 570118
+          }
+        },
+        "commit_foreign_key": {
+          "allocations": {
+            "median": 18048,
+            "min": 18048,
+            "max": 18048
+          },
+          "apply_ns": {
+            "median": 142918,
+            "min": 142629,
+            "max": 143617
+          },
+          "commit_ns": {
+            "median": 1202878,
+            "min": 1179712,
+            "max": 1312745
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 1099711,
+            "min": 1066825,
+            "max": 1200289
+          },
+          "lock_wait_ns": {
+            "median": 9122,
+            "min": 8868,
+            "max": 9429
+          },
+          "locked_prepare_ns": {
+            "median": 558161,
+            "min": 551210,
+            "max": 585253
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 6666,
+            "min": 6541,
+            "max": 6791
+          },
+          "p95_ns": {
+            "median": 9125,
+            "min": 9042,
+            "max": 9750
+          },
+          "p99_ns": {
+            "median": 11209,
+            "min": 10625,
+            "max": 14292
+          },
+          "prepare_ns": {
+            "median": 636293,
+            "min": 632709,
+            "max": 670008
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 366170,
+            "min": 340408,
+            "max": 438117
+          },
+          "wal_ns": {
+            "median": 530081,
+            "min": 504276,
+            "max": 604377
+          }
+        }
+      },
+      "rss_mib": {
+        "median": 72.3125,
+        "min": 69.5,
+        "max": 72.34375
+      }
+    }
+  },
+  "1m": {
+    "baseline": {
+      "phases": {
+        "load": {
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "seconds": {
+            "median": 0.666678292,
+            "min": 0.66199175,
+            "max": 0.682894417
+          }
+        },
+        "cursor_id": {
+          "allocated_bytes": {
+            "median": 8049142442,
+            "min": 8049142442,
+            "max": 8049142442
+          },
+          "allocations": {
+            "median": 80451207,
+            "min": 80451207,
+            "max": 80451207
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 242640500,
+            "min": 242480875,
+            "max": 245465583
+          },
+          "p95_ns": {
+            "median": 244498250,
+            "min": 244462500,
+            "max": 246661875
+          },
+          "p99_ns": {
+            "median": 244498250,
+            "min": 244462500,
+            "max": 246661875
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_index": {
+          "allocated_bytes": {
+            "median": 8049143768,
+            "min": 8049143768,
+            "max": 8049143768
+          },
+          "allocations": {
+            "median": 80451145,
+            "min": 80451145,
+            "max": 80451145
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 244503042,
+            "min": 242363500,
+            "max": 245039833
+          },
+          "p95_ns": {
+            "median": 246502916,
+            "min": 243310208,
+            "max": 246781875
+          },
+          "p99_ns": {
+            "median": 246502916,
+            "min": 243310208,
+            "max": 246781875
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_scan": {
+          "allocated_bytes": {
+            "median": 8049164438,
+            "min": 8049164438,
+            "max": 8049164438
+          },
+          "allocations": {
+            "median": 80451274,
+            "min": 80451274,
+            "max": 80451274
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 251885500,
+            "min": 251599917,
+            "max": 254087291
+          },
+          "p95_ns": {
+            "median": 254056125,
+            "min": 252785125,
+            "max": 254786250
+          },
+          "p99_ns": {
+            "median": 254056125,
+            "min": 252785125,
+            "max": 254786250
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_last": {
+          "allocated_bytes": {
+            "median": 7722371030,
+            "min": 7722371030,
+            "max": 7722371030
+          },
+          "allocations": {
+            "median": 70568634,
+            "min": 70568634,
+            "max": 70568634
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 239917958,
+            "min": 237734708,
+            "max": 241782792
+          },
+          "p95_ns": {
+            "median": 242657875,
+            "min": 239545459,
+            "max": 244450917
+          },
+          "p99_ns": {
+            "median": 242657875,
+            "min": 239545459,
+            "max": 244450917
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_first": {
+          "allocated_bytes": {
+            "median": 326074,
+            "min": 326074,
+            "max": 326074
+          },
+          "allocations": {
+            "median": 973,
+            "min": 973,
+            "max": 973
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 9209,
+            "min": 8000,
+            "max": 14250
+          },
+          "p95_ns": {
+            "median": 10167,
+            "min": 9333,
+            "max": 24459
+          },
+          "p99_ns": {
+            "median": 10167,
+            "min": 9333,
+            "max": 24459
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "top_k": {
+          "allocated_bytes": {
+            "median": 8970554068,
+            "min": 8970554068,
+            "max": 8970554068
+          },
+          "allocations": {
+            "median": 90539663,
+            "min": 90539663,
+            "max": 90539663
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 278854625,
+            "min": 278431625,
+            "max": 281975000
+          },
+          "p95_ns": {
+            "median": 281030834,
+            "min": 280033959,
+            "max": 286371000
+          },
+          "p99_ns": {
+            "median": 281030834,
+            "min": 280033959,
+            "max": 286371000
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 1760,
+            "min": 1760,
+            "max": 1760
+          },
+          "spilled_bytes": {
+            "median": 668800,
+            "min": 668800,
+            "max": 668800
+          }
+        },
+        "full_sort": {
+          "allocated_bytes": {
+            "median": 11651573135,
+            "min": 11651573135,
+            "max": 11651573135
+          },
+          "allocations": {
+            "median": 160463891,
+            "min": 160463891,
+            "max": 160463891
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 746147000,
+            "min": 742849167,
+            "max": 755814875
+          },
+          "p95_ns": {
+            "median": 756248084,
+            "min": 751059750,
+            "max": 758727291
+          },
+          "p99_ns": {
+            "median": 756248084,
+            "min": 751059750,
+            "max": 758727291
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 1760,
+            "min": 1760,
+            "max": 1760
+          },
+          "spilled_bytes": {
+            "median": 380000000,
+            "min": 380000000,
+            "max": 380000000
+          }
+        },
+        "commit_plain": {
+          "allocations": {
+            "median": 9242,
+            "min": 9242,
+            "max": 9242
+          },
+          "apply_ns": {
+            "median": 136167,
+            "min": 119886,
+            "max": 136547
+          },
+          "commit_ns": {
+            "median": 677920,
+            "min": 638006,
+            "max": 736497
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 568915,
+            "min": 531626,
+            "max": 596717
+          },
+          "lock_wait_ns": {
+            "median": 8509,
+            "min": 8043,
+            "max": 10319
+          },
+          "locked_prepare_ns": {
+            "median": 18745,
+            "min": 15124,
+            "max": 20705
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 3250,
+            "min": 3209,
+            "max": 3958
+          },
+          "p95_ns": {
+            "median": 6791,
+            "min": 5791,
+            "max": 6958
+          },
+          "p99_ns": {
+            "median": 11000,
+            "min": 10541,
+            "max": 11375
+          },
+          "prepare_ns": {
+            "median": 74490,
+            "min": 74419,
+            "max": 97439
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 400282,
+            "min": 344576,
+            "max": 401573
+          },
+          "wal_ns": {
+            "median": 540993,
+            "min": 501578,
+            "max": 560459
+          }
+        },
+        "commit_identity": {
+          "allocations": {
+            "median": 14648,
+            "min": 14648,
+            "max": 14648
+          },
+          "apply_ns": {
+            "median": 139747,
+            "min": 136990,
+            "max": 172001
+          },
+          "commit_ns": {
+            "median": 879125,
+            "min": 819616,
+            "max": 880537
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 761087,
+            "min": 722875,
+            "max": 778668
+          },
+          "lock_wait_ns": {
+            "median": 9591,
+            "min": 8965,
+            "max": 10501
+          },
+          "locked_prepare_ns": {
+            "median": 123588,
+            "min": 106164,
+            "max": 124335
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4625,
+            "min": 4500,
+            "max": 5042
+          },
+          "p95_ns": {
+            "median": 7583,
+            "min": 7000,
+            "max": 7625
+          },
+          "p99_ns": {
+            "median": 9959,
+            "min": 9334,
+            "max": 10167
+          },
+          "prepare_ns": {
+            "median": 196000,
+            "min": 174781,
+            "max": 210297
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 417583,
+            "min": 394257,
+            "max": 455927
+          },
+          "wal_ns": {
+            "median": 621587,
+            "min": 605167,
+            "max": 642923
+          }
+        },
+        "commit_foreign_key": {
+          "allocations": {
+            "median": 18048,
+            "min": 18048,
+            "max": 18048
+          },
+          "apply_ns": {
+            "median": 133495,
+            "min": 132874,
+            "max": 145623
+          },
+          "commit_ns": {
+            "median": 1351500,
+            "min": 1308167,
+            "max": 1430338
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 1235963,
+            "min": 1198999,
+            "max": 1322752
+          },
+          "lock_wait_ns": {
+            "median": 9166,
+            "min": 9089,
+            "max": 9203
+          },
+          "locked_prepare_ns": {
+            "median": 634616,
+            "min": 609243,
+            "max": 655377
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 6833,
+            "min": 6542,
+            "max": 6958
+          },
+          "p95_ns": {
+            "median": 9208,
+            "min": 8958,
+            "max": 9333
+          },
+          "p99_ns": {
+            "median": 12833,
+            "min": 12125,
+            "max": 14750
+          },
+          "prepare_ns": {
+            "median": 721729,
+            "min": 691825,
+            "max": 734627
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 435119,
+            "min": 424247,
+            "max": 488702
+          },
+          "wal_ns": {
+            "median": 591540,
+            "min": 578917,
+            "max": 657165
+          }
+        }
+      },
+      "rss_mib": {
+        "median": 579.890625,
+        "min": 571.4375,
+        "max": 684.890625
+      }
+    },
+    "current": {
+      "phases": {
+        "load": {
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "seconds": {
+            "median": 0.706447667,
+            "min": 0.696328542,
+            "max": 0.722515166
+          }
+        },
+        "cursor_id": {
+          "allocated_bytes": {
+            "median": 46012,
+            "min": 46012,
+            "max": 46012
+          },
+          "allocations": {
+            "median": 577,
+            "min": 577,
+            "max": 577
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 5083,
+            "min": 4792,
+            "max": 5791
+          },
+          "p95_ns": {
+            "median": 9958,
+            "min": 8250,
+            "max": 11083
+          },
+          "p99_ns": {
+            "median": 9958,
+            "min": 8250,
+            "max": 11083
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_index": {
+          "allocated_bytes": {
+            "median": 308798,
+            "min": 308798,
+            "max": 308798
+          },
+          "allocations": {
+            "median": 735,
+            "min": 735,
+            "max": 735
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 7584,
+            "min": 7458,
+            "max": 7708
+          },
+          "p95_ns": {
+            "median": 9417,
+            "min": 9291,
+            "max": 10708
+          },
+          "p99_ns": {
+            "median": 9417,
+            "min": 9291,
+            "max": 10708
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "cursor_scan": {
+          "allocated_bytes": {
+            "median": 8049164678,
+            "min": 8049164678,
+            "max": 8049164678
+          },
+          "allocations": {
+            "median": 80451284,
+            "min": 80451284,
+            "max": 80451284
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 264609667,
+            "min": 261007125,
+            "max": 265907333
+          },
+          "p95_ns": {
+            "median": 267327083,
+            "min": 262272875,
+            "max": 272757875
+          },
+          "p99_ns": {
+            "median": 267327083,
+            "min": 262272875,
+            "max": 272757875
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_last": {
+          "allocated_bytes": {
+            "median": 327820,
+            "min": 327820,
+            "max": 327820
+          },
+          "allocations": {
+            "median": 994,
+            "min": 994,
+            "max": 994
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 8667,
+            "min": 7667,
+            "max": 10666
+          },
+          "p95_ns": {
+            "median": 9667,
+            "min": 9000,
+            "max": 17375
+          },
+          "p99_ns": {
+            "median": 9667,
+            "min": 9000,
+            "max": 17375
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "and_index_first": {
+          "allocated_bytes": {
+            "median": 326214,
+            "min": 326214,
+            "max": 326214
+          },
+          "allocations": {
+            "median": 983,
+            "min": 983,
+            "max": 983
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 5041,
+            "min": 4916,
+            "max": 5167
+          },
+          "p95_ns": {
+            "median": 5833,
+            "min": 5709,
+            "max": 5958
+          },
+          "p99_ns": {
+            "median": 5833,
+            "min": 5709,
+            "max": 5958
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "top_k": {
+          "allocated_bytes": {
+            "median": 8369147648,
+            "min": 8369147648,
+            "max": 8369147648
+          },
+          "allocations": {
+            "median": 90451093,
+            "min": 90451093,
+            "max": 90451093
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 284165584,
+            "min": 282146375,
+            "max": 285136875
+          },
+          "p95_ns": {
+            "median": 286913833,
+            "min": 283341083,
+            "max": 287597250
+          },
+          "p99_ns": {
+            "median": 286913833,
+            "min": 283341083,
+            "max": 287597250
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "spilled_bytes": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "full_sort": {
+          "allocated_bytes": {
+            "median": 13832650615,
+            "min": 13832650615,
+            "max": 13832650615
+          },
+          "allocations": {
+            "median": 230466471,
+            "min": 230466471,
+            "max": 230466471
+          },
+          "operations": {
+            "median": 10,
+            "min": 10,
+            "max": 10
+          },
+          "p50_ns": {
+            "median": 688340417,
+            "min": 687893833,
+            "max": 693079542
+          },
+          "p95_ns": {
+            "median": 699854458,
+            "min": 692098000,
+            "max": 707649667
+          },
+          "p99_ns": {
+            "median": 699854458,
+            "min": 692098000,
+            "max": 707649667
+          },
+          "rows": {
+            "median": 1000000,
+            "min": 1000000,
+            "max": 1000000
+          },
+          "spill_files": {
+            "median": 1820,
+            "min": 1820,
+            "max": 1820
+          },
+          "spilled_bytes": {
+            "median": 760000000,
+            "min": 760000000,
+            "max": 760000000
+          }
+        },
+        "commit_plain": {
+          "allocations": {
+            "median": 9242,
+            "min": 9242,
+            "max": 9242
+          },
+          "apply_ns": {
+            "median": 120713,
+            "min": 105292,
+            "max": 124707
+          },
+          "commit_ns": {
+            "median": 755545,
+            "min": 663541,
+            "max": 773212
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 599496,
+            "min": 551752,
+            "max": 658793
+          },
+          "lock_wait_ns": {
+            "median": 8540,
+            "min": 8088,
+            "max": 9956
+          },
+          "locked_prepare_ns": {
+            "median": 34544,
+            "min": 16548,
+            "max": 41047
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 3333,
+            "min": 3167,
+            "max": 3750
+          },
+          "p95_ns": {
+            "median": 5958,
+            "min": 5916,
+            "max": 6375
+          },
+          "p99_ns": {
+            "median": 12792,
+            "min": 10708,
+            "max": 25458
+          },
+          "prepare_ns": {
+            "median": 96248,
+            "min": 78752,
+            "max": 125133
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 398000,
+            "min": 365668,
+            "max": 505917
+          },
+          "wal_ns": {
+            "median": 546469,
+            "min": 506574,
+            "max": 631339
+          }
+        },
+        "commit_identity": {
+          "allocations": {
+            "median": 14648,
+            "min": 14648,
+            "max": 14648
+          },
+          "apply_ns": {
+            "median": 136662,
+            "min": 131707,
+            "max": 171209
+          },
+          "commit_ns": {
+            "median": 883293,
+            "min": 756209,
+            "max": 898545
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 768119,
+            "min": 664578,
+            "max": 779378
+          },
+          "lock_wait_ns": {
+            "median": 9048,
+            "min": 9026,
+            "max": 10408
+          },
+          "locked_prepare_ns": {
+            "median": 117415,
+            "min": 110326,
+            "max": 125794
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 4250,
+            "min": 4125,
+            "max": 4959
+          },
+          "p95_ns": {
+            "median": 6791,
+            "min": 6417,
+            "max": 7125
+          },
+          "p99_ns": {
+            "median": 9834,
+            "min": 8417,
+            "max": 16083
+          },
+          "prepare_ns": {
+            "median": 186198,
+            "min": 181542,
+            "max": 223753
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 405173,
+            "min": 352751,
+            "max": 482698
+          },
+          "wal_ns": {
+            "median": 630083,
+            "min": 536003,
+            "max": 658947
+          }
+        },
+        "commit_foreign_key": {
+          "allocations": {
+            "median": 18048,
+            "min": 18048,
+            "max": 18048
+          },
+          "apply_ns": {
+            "median": 142996,
+            "min": 136164,
+            "max": 146125
+          },
+          "commit_ns": {
+            "median": 1344759,
+            "min": 1340209,
+            "max": 1366378
+          },
+          "debt_operations": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "lock_hold_ns": {
+            "median": 1241531,
+            "min": 1230738,
+            "max": 1264464
+          },
+          "lock_wait_ns": {
+            "median": 9209,
+            "min": 9083,
+            "max": 9418
+          },
+          "locked_prepare_ns": {
+            "median": 642756,
+            "min": 607792,
+            "max": 688700
+          },
+          "operations": {
+            "median": 200,
+            "min": 200,
+            "max": 200
+          },
+          "p50_ns": {
+            "median": 6958,
+            "min": 6750,
+            "max": 7041
+          },
+          "p95_ns": {
+            "median": 9541,
+            "min": 9000,
+            "max": 9959
+          },
+          "p99_ns": {
+            "median": 13250,
+            "min": 11333,
+            "max": 31583
+          },
+          "prepare_ns": {
+            "median": 716697,
+            "min": 683625,
+            "max": 771531
+          },
+          "sync_ns": {
+            "median": 0,
+            "min": 0,
+            "max": 0
+          },
+          "wal_append_ns": {
+            "median": 453339,
+            "min": 362918,
+            "max": 456422
+          },
+          "wal_ns": {
+            "median": 610246,
+            "min": 530376,
+            "max": 621757
+          }
+        }
+      },
+      "rss_mib": {
+        "median": 601.046875,
+        "min": 585.328125,
+        "max": 614.078125
+      }
+    }
+  }
+}

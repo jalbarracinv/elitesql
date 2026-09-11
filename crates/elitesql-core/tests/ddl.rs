@@ -86,6 +86,7 @@ fn concurrent_catalog_changes_are_serialized_from_validation_to_publish() {
             .count(),
         1
     );
+    drop(db);
     assert_clean(&path_of(&dir));
 }
 
@@ -135,7 +136,9 @@ fn drop_table_is_durable_and_reclaims_space_on_compact() {
     let db = Db::open(&path).unwrap();
     assert_eq!(db.tables(), vec!["keep".to_string()]);
     assert!(matches!(db.scan("users"), Err(Error::TableNotFound(_))));
+    drop(db);
     assert_clean(&path);
+    let db = Db::open(&path).unwrap();
 
     // Compaction is what returns the disk space.
     db.compact().unwrap();
@@ -268,6 +271,7 @@ fn drop_index_stops_enforcing_and_still_answers_queries() {
             .len(),
         2
     );
+    drop(db);
     assert_clean(&path);
 }
 
@@ -344,6 +348,7 @@ fn drop_vector_and_text_indexes() {
     let schema = db.table_schema("docs").unwrap();
     assert!(schema.vector_indexes.is_empty() && schema.text_indexes.is_empty());
     assert_eq!(db.scan("docs").unwrap().len(), 1);
+    drop(db);
     assert_clean(&path);
 }
 
@@ -414,6 +419,7 @@ fn add_column_is_metadata_only_and_reads_null() {
         )[0][0],
         Value::Null
     );
+    drop(db);
     assert_clean(&path);
 }
 
@@ -467,6 +473,7 @@ fn add_column_with_default_backfills_existing_records() {
             .count(),
         1201
     );
+    drop(db);
     assert_clean(&path);
 }
 
@@ -575,7 +582,9 @@ fn drop_column_removes_data_and_its_index() {
     let db = Db::open(&path).unwrap();
     assert_eq!(db.table_schema("users").unwrap().columns.len(), 1);
     assert_eq!(db.get("users", &id).unwrap().unwrap().get("age"), None);
+    drop(db);
     assert_clean(&path);
+    let db = Db::open(&path).unwrap();
     db.query("ALTER TABLE users DROP COLUMN IF EXISTS age")
         .unwrap();
 }
@@ -631,6 +640,7 @@ fn drop_column_keeps_other_columns_including_blobs_and_vectors() {
     let db = Db::open(&path).unwrap();
     let read = db.get("docs", &id).unwrap().unwrap();
     assert_eq!(read["payload"], Value::Blob(big));
+    drop(db);
     assert_clean(&path);
 }
 
@@ -709,7 +719,9 @@ fn rename_table_moves_records_and_indexes() {
         db.get("people", &id).unwrap().unwrap()["age"],
         Value::Int64(30)
     );
+    drop(db);
     assert_clean(&path);
+    let db = Db::open(&path).unwrap();
     // Writes keep working after the reopen, and so does the moved index.
     insert(&db, "people", &[("name", Value::Text("cleo".into()))]);
     assert_eq!(db.scan("people").unwrap().len(), 3);
@@ -777,6 +789,7 @@ fn rename_column_carries_values_and_indexes() {
             .len(),
         1
     );
+    drop(db);
     assert_clean(&path);
 }
 
@@ -846,6 +859,7 @@ fn renames_keep_vector_and_text_search_working() {
         .len(),
         1
     );
+    drop(db);
     assert_clean(&path);
 }
 

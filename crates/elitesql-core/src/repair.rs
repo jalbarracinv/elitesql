@@ -15,7 +15,6 @@ use crate::manifest::fsync_dir;
 use crate::manifest::Manifest;
 use crate::schema::Catalog;
 use crate::segment::scan_segment;
-use crate::value::Value;
 use crate::wal::{scan_wal, WAL_DIR};
 
 type RecordKey = (String, String);
@@ -53,9 +52,13 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
     }
     let partial = partial_path(dst)?;
 
-    let catalog = Manifest::load(src)
-        .ok()
-        .and_then(|(manifest, _)| manifest.catalog)
+    let manifest = Manifest::load(src).ok().map(|(manifest, _)| manifest);
+    let mut identities = manifest
+        .as_ref()
+        .map(|manifest| manifest.identity_high_water.clone())
+        .unwrap_or_default();
+    let catalog = manifest.as_ref()
+        .and_then(|manifest| manifest.catalog.clone())
         .map(Ok)
         .unwrap_or_else(|| Catalog::load(&src.join(CATALOG_FILE)))
         .map_err(|e| {
@@ -63,6 +66,12 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
             "salvage requires a readable catalog.json ({e}); without the schema records cannot be re-typed"
         ))
     })?;
+
+    identities.retain(|table, _| {
+        catalog
+            .table(table)
+            .is_some_and(|schema| schema.columns.iter().any(|column| column.identity))
+    });
 
     // Latest version per (table, id): version + payload (None = tombstone).
     // Entries the catalog does not own are skipped, exactly as `open` skips
@@ -140,6 +149,15 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
             ));
         }
         for rec in scan.records {
+            for (table, value) in rec.identity_high_water {
+                if catalog.table(&table).is_some_and(|schema| {
+                    rec.version > schema.epoch
+                        && schema.columns.iter().any(|column| column.identity)
+                }) {
+                    let high = identities.entry(table).or_default();
+                    *high = (*high).max(value);
+                }
+            }
             for ch in rec.changes {
                 push(ch.table, ch.id, rec.version, ch.payload);
             }
@@ -159,7 +177,9 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
     let rebuilt = (|| -> Result<()> {
         let out = Db::create(&partial)?;
         for table in &catalog.tables {
-            out.create_table(table.clone())?;
+            let mut loading_schema = table.clone();
+            loading_schema.foreign_keys.clear();
+            out.create_table(loading_schema)?;
             report.tables.push(table.name.clone());
         }
 
@@ -170,7 +190,7 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
                 report.deleted_records += 1;
                 continue;
             };
-            let mut record = match decode_record(&payload, Some(&src.join(crate::db::BLOBS_DIR))) {
+            let record = match decode_record(&payload, Some(&src.join(crate::db::BLOBS_DIR))) {
                 Ok(r) => r,
                 Err(e) => {
                     report.skipped += 1;
@@ -180,8 +200,7 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
                     continue;
                 }
             };
-            record.insert("id".into(), Value::Text(id.clone()));
-            match txn.insert(&table, record) {
+            match txn.insert_restored(&table, &id, record) {
                 Ok(_) => {
                     report.recovered_records += 1;
                     in_batch += 1;
@@ -200,7 +219,10 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
             }
         }
         txn.commit()?;
+        out.restore_foreign_keys(&catalog.tables)?;
+        out.wait_vector_indexing()?;
         out.checkpoint()?;
+        out.restore_identity_high_water(&identities)?;
         drop(out);
         Ok(())
     })();

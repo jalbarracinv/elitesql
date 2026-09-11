@@ -1,7 +1,7 @@
 //! Deterministic corruption fuzzing: flip random bytes in the manifest, WAL
 //! and segment files, then open. The engine must never panic and must never
-//! accept invalid state: every open either succeeds with a readable database
-//! or fails with a clean error.
+//! accept invented state: a successful open must equal an exact committed
+//! prefix of the canonical model (only a final incomplete WAL tail may go).
 
 use std::path::Path;
 
@@ -72,6 +72,7 @@ fn candidate_files(db_path: &Path) -> Vec<std::path::PathBuf> {
         }
     }
     files.retain(|f| f.is_file() && std::fs::metadata(f).map(|m| m.len() > 0).unwrap_or(false));
+    files.sort();
     files
 }
 
@@ -80,6 +81,10 @@ fn random_byte_flips_never_panic_or_corrupt_silently() {
     let template_dir = tempfile::tempdir().unwrap();
     let template = template_dir.path().join("template.esql");
     build_template(&template);
+    let expected = {
+        let db = Db::open_read_only(&template).unwrap();
+        db.scan("docs").unwrap()
+    };
 
     let iterations: u64 = std::env::var("ELITESQL_FUZZ_ITERS")
         .ok()
@@ -107,9 +112,15 @@ fn random_byte_flips_never_panic_or_corrupt_silently() {
         // A clean Err refusal is also a valid outcome.
         if let Ok(db) = Db::open(&db_path) {
             let rows = db.scan("docs").expect("open db must be readable");
-            for (_, rec) in &rows {
-                assert!(matches!(rec.get("title"), Some(Value::Text(_))));
-            }
+            assert!(
+                (40..=60).contains(&rows.len()),
+                "seed {seed}: a checkpointed prefix cannot disappear"
+            );
+            assert_eq!(
+                rows,
+                expected[..rows.len()],
+                "seed {seed}: rows, physical keys and values must equal a committed prefix"
+            );
         }
     }
 }

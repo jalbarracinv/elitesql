@@ -54,6 +54,8 @@ pub enum Error {
     /// power loss may still remove it; callers must inspect after reopening
     /// rather than retrying the unit of work blindly.
     CommitUnknown(String),
+    /// Cooperative query cancellation or execution deadline expiration.
+    QueryInterrupted(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -79,6 +81,7 @@ impl Error {
             Error::IndexNotFound { .. } => 15,
             Error::MemoryLimit(_) => 16,
             Error::CommitUnknown(_) => 17,
+            Error::QueryInterrupted(_) => 18,
         }
     }
 }
@@ -115,6 +118,7 @@ impl fmt::Display for Error {
             }
             Error::MemoryLimit(msg) => write!(f, "memory limit exceeded: {msg}"),
             Error::CommitUnknown(msg) => write!(f, "commit outcome unknown: {msg}"),
+            Error::QueryInterrupted(msg) => write!(f, "query interrupted: {msg}"),
         }
     }
 }

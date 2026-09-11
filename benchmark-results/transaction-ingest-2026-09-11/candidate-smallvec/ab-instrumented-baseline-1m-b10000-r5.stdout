@@ -1,0 +1,35 @@
+EliteSQL vs SQLite scalable benchmark
+  EliteSQL:     0.0.1
+  SQLite:       3.45.0 (rusqlite bundled)
+  rows:         1000000
+  batch size:   10000
+  point reads:  1000 (warm cache, plus 1000 untimed warmups)
+  full scans:   1 (unindexed score lookup)
+  durability:   EliteSQL fast <-> SQLite WAL + synchronous=OFF 
+  engines:      EliteSQL only
+  EliteSQL load: batched transactions
+  load timing:  ingest wall, final checkpoint, maintenance drain and worker time separated
+
+EliteSQL
+  EliteSQL: loaded 100000/1000000 rows (10%)
+  EliteSQL: loaded 200000/1000000 rows (20%)
+  EliteSQL: loaded 300000/1000000 rows (30%)
+  EliteSQL: loaded 400000/1000000 rows (40%)
+  EliteSQL: loaded 500000/1000000 rows (50%)
+  EliteSQL: loaded 600000/1000000 rows (60%)
+  EliteSQL: loaded 700000/1000000 rows (70%)
+  EliteSQL: loaded 800000/1000000 rows (80%)
+  EliteSQL: loaded 900000/1000000 rows (90%)
+  EliteSQL: loaded 1000000/1000000 rows (100%)
+  load phases: 0.141 s record construction + 0.192 s staging + 0.625 s commit/bulk calls (automatic primary flushes may overlap)
+  commit internals: 0.622 s total (100), 0.042 s lock wait, 0.130 s prepare, 0.449 s WAL, 0.201 s apply, 0.000 s other/admission wait
+  exclusive commit phases: 0.012 s prepare + 0.083 s record encode + 0.010 s validation + 0.042 s WAL encode + 0.232 s WAL append + 0.000 s sync wait + 0.201 s MVCC apply + 0.000 s maintenance wait
+  primary LSM: 3 runs, 0 promotions (0.000 s worker time), 53.33 MiB checkpoint runs, 0.00 MiB read + 0.00 MiB written by promotions
+  logical memory: 384 MiB configured; query peak 16.00/64 MiB, index-delta peak 113.57/128 MiB, maintenance peak 128.00/128 MiB (3 consolidations)
+
+Result
+engine     ingest wall    final cp       drain  total load       rows/s      point read    full scan
+EliteSQL       0.958 s     0.181 s     0.000 s     1.139 s       877858     1.394 us/op      0.022 s
+           checkpoint work: 0.729 s (3), promotion work: 0.000 s (0), disk: 223.93 MiB
+
+CSV: /Users/jalbarracin/Code/elitesql/crates/elitesql-core/../../benchmark-results/transaction-ingest-2026-09-11/candidate-smallvec/ab-instrumented-baseline-1m-b10000-r5.csv

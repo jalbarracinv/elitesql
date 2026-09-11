@@ -223,6 +223,9 @@ impl Config {
 #[derive(Debug)]
 struct ResultRow {
     engine: &'static str,
+    record_construction_wall: Duration,
+    staging_wall: Duration,
+    commit_call_wall: Duration,
     ingest_wall: Duration,
     final_checkpoint_wall: Duration,
     maintenance_drain_wall: Duration,
@@ -234,6 +237,20 @@ struct ResultRow {
     point_reads: Duration,
     full_scans: Duration,
     disk_bytes: u64,
+    commit_phase_prepare: Duration,
+    commit_phase_record_encode: Duration,
+    commit_phase_validation: Duration,
+    commit_phase_wal_encode: Duration,
+    commit_phase_wal_append: Duration,
+    commit_phase_sync_wait: Duration,
+    commit_phase_apply: Duration,
+    commit_phase_maintenance_wait: Duration,
+    wal_appended_bytes: u64,
+    checkpoint_bytes_written: u64,
+    promotion_bytes_read: u64,
+    promotion_bytes_written: u64,
+    index_delta_peak_bytes: u64,
+    maintenance_peak_bytes: u64,
 }
 
 fn usage() -> &'static str {
@@ -360,6 +377,7 @@ fn run_elitesql(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Er
 
     let maintenance_before = db.maintenance_stats();
     let load_started = Instant::now();
+    let mut record_construction_wall = Duration::ZERO;
     let mut stage_wall = Duration::ZERO;
     let mut commit_wall = Duration::ZERO;
     if config.bulk_sorted {
@@ -374,10 +392,13 @@ fn run_elitesql(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Er
         let mut next_percent = 10;
         for start in (0..config.rows).step_by(config.batch_size) {
             let end = (start + config.batch_size).min(config.rows);
+            let construction_started = Instant::now();
+            let records = (start..end).map(elitesql_record).collect::<Vec<_>>();
+            record_construction_wall += construction_started.elapsed();
             let stage_started = Instant::now();
             let mut transaction = db.begin();
-            for i in start..end {
-                transaction.insert("docs", elitesql_record(i))?;
+            for record in records {
+                transaction.insert("docs", record)?;
             }
             stage_wall += stage_started.elapsed();
             let commit_started = Instant::now();
@@ -425,8 +446,30 @@ fn run_elitesql(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Er
     let commit_apply = maintenance_after
         .commit_apply_time
         .saturating_sub(maintenance_before.commit_apply_time);
+    let phase_prepare = maintenance_after
+        .commit_phase_prepare_time
+        .saturating_sub(maintenance_before.commit_phase_prepare_time);
+    let phase_record_encode = maintenance_after
+        .commit_phase_record_encode_time
+        .saturating_sub(maintenance_before.commit_phase_record_encode_time);
+    let phase_validation = maintenance_after
+        .commit_phase_validation_time
+        .saturating_sub(maintenance_before.commit_phase_validation_time);
+    let phase_wal_encode = maintenance_after
+        .commit_phase_wal_encode_time
+        .saturating_sub(maintenance_before.commit_phase_wal_encode_time);
+    let phase_wal_append = maintenance_after
+        .commit_wal_append_time
+        .saturating_sub(maintenance_before.commit_wal_append_time);
+    let phase_sync_wait = maintenance_after
+        .commit_phase_sync_wait_time
+        .saturating_sub(maintenance_before.commit_phase_sync_wait_time);
+    let phase_maintenance_wait = maintenance_after
+        .commit_phase_maintenance_wait_time
+        .saturating_sub(maintenance_before.commit_phase_maintenance_wait_time);
     println!(
-        "  load phases: {:.3} s staging + {:.3} s commit/bulk calls (automatic primary flushes may overlap)",
+        "  load phases: {:.3} s record construction + {:.3} s staging + {:.3} s commit/bulk calls (automatic primary flushes may overlap)",
+        record_construction_wall.as_secs_f64(),
         stage_wall.as_secs_f64(),
         commit_wall.as_secs_f64()
     );
@@ -444,6 +487,17 @@ fn run_elitesql(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Er
             .saturating_sub(commit_wal)
             .saturating_sub(commit_apply)
             .as_secs_f64(),
+    );
+    println!(
+        "  exclusive commit phases: {:.3} s prepare + {:.3} s record encode + {:.3} s validation + {:.3} s WAL encode + {:.3} s WAL append + {:.3} s sync wait + {:.3} s MVCC apply + {:.3} s maintenance wait",
+        phase_prepare.as_secs_f64(),
+        phase_record_encode.as_secs_f64(),
+        phase_validation.as_secs_f64(),
+        phase_wal_encode.as_secs_f64(),
+        phase_wal_append.as_secs_f64(),
+        phase_sync_wait.as_secs_f64(),
+        commit_apply.as_secs_f64(),
+        phase_maintenance_wait.as_secs_f64(),
     );
     println!(
         "  primary LSM: {} runs, {} promotions ({:.3} s worker time), {:.2} MiB checkpoint runs, {:.2} MiB read + {:.2} MiB written by promotions",
@@ -500,6 +554,9 @@ fn run_elitesql(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Er
         } else {
             "EliteSQL"
         },
+        record_construction_wall,
+        staging_wall: stage_wall,
+        commit_call_wall: commit_wall,
         ingest_wall,
         final_checkpoint_wall,
         maintenance_drain_wall,
@@ -511,6 +568,28 @@ fn run_elitesql(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Er
         point_reads,
         full_scans,
         disk_bytes,
+        commit_phase_prepare: phase_prepare,
+        commit_phase_record_encode: phase_record_encode,
+        commit_phase_validation: phase_validation,
+        commit_phase_wal_encode: phase_wal_encode,
+        commit_phase_wal_append: phase_wal_append,
+        commit_phase_sync_wait: phase_sync_wait,
+        commit_phase_apply: commit_apply,
+        commit_phase_maintenance_wait: phase_maintenance_wait,
+        wal_appended_bytes: maintenance_after
+            .wal_appended_bytes
+            .saturating_sub(maintenance_before.wal_appended_bytes),
+        checkpoint_bytes_written: maintenance_after
+            .primary_checkpoint_bytes_written
+            .saturating_sub(maintenance_before.primary_checkpoint_bytes_written),
+        promotion_bytes_read: maintenance_after
+            .primary_run_compaction_bytes_read
+            .saturating_sub(maintenance_before.primary_run_compaction_bytes_read),
+        promotion_bytes_written: maintenance_after
+            .primary_run_compaction_bytes_written
+            .saturating_sub(maintenance_before.primary_run_compaction_bytes_written),
+        index_delta_peak_bytes: memory.index_delta_peak_bytes,
+        maintenance_peak_bytes: memory.maintenance_peak_bytes,
     })
 }
 
@@ -552,18 +631,24 @@ fn run_sqlite(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Erro
     ))?;
 
     let load_started = Instant::now();
+    let mut record_construction_wall = Duration::ZERO;
     let mut execute_wall = Duration::ZERO;
     let mut commit_wall = Duration::ZERO;
     let mut next_percent = 10;
     for start in (0..config.rows).step_by(config.batch_size) {
         let end = (start + config.batch_size).min(config.rows);
+        let construction_started = Instant::now();
+        let records = (start..end)
+            .map(|i| (row_id(i), title(i), i as i64))
+            .collect::<Vec<_>>();
+        record_construction_wall += construction_started.elapsed();
         let transaction = connection.transaction()?;
         {
             let mut statement = transaction
                 .prepare("INSERT INTO docs (id, title, body, score) VALUES (?1, ?2, ?3, ?4)")?;
             let execute_started = Instant::now();
-            for i in start..end {
-                statement.execute(params![row_id(i), title(i), BODY, i as i64])?;
+            for (id, title, score) in &records {
+                statement.execute(params![id, title, BODY, score])?;
             }
             execute_wall += execute_started.elapsed();
         }
@@ -573,7 +658,8 @@ fn run_sqlite(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Erro
         print_progress("SQLite", end, config.rows, &mut next_percent);
     }
     println!(
-        "  transaction phases: {:.3} s execute + {:.3} s commit calls",
+        "  transaction phases: {:.3} s value construction + {:.3} s execute + {:.3} s commit calls",
+        record_construction_wall.as_secs_f64(),
         execute_wall.as_secs_f64(),
         commit_wall.as_secs_f64()
     );
@@ -628,6 +714,9 @@ fn run_sqlite(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Erro
 
     Ok(ResultRow {
         engine: "SQLite",
+        record_construction_wall,
+        staging_wall: execute_wall,
+        commit_call_wall: commit_wall,
         ingest_wall,
         final_checkpoint_wall,
         maintenance_drain_wall: Duration::ZERO,
@@ -639,6 +728,20 @@ fn run_sqlite(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Erro
         point_reads,
         full_scans,
         disk_bytes,
+        commit_phase_prepare: Duration::ZERO,
+        commit_phase_record_encode: Duration::ZERO,
+        commit_phase_validation: Duration::ZERO,
+        commit_phase_wal_encode: Duration::ZERO,
+        commit_phase_wal_append: Duration::ZERO,
+        commit_phase_sync_wait: Duration::ZERO,
+        commit_phase_apply: Duration::ZERO,
+        commit_phase_maintenance_wait: Duration::ZERO,
+        wal_appended_bytes: 0,
+        checkpoint_bytes_written: 0,
+        promotion_bytes_read: 0,
+        promotion_bytes_written: 0,
+        index_delta_peak_bytes: 0,
+        maintenance_peak_bytes: 0,
     })
 }
 
@@ -782,12 +885,12 @@ fn print_single_result(config: &Config, result: &ResultRow) {
 
 fn csv(config: &Config, results: &[ResultRow]) -> String {
     let mut output = String::from(
-        "engine,rows,batch_size,point_reads,full_scans,durability,bulk_sorted,total_memory_mib,index_delta_mib,maintenance_mib,memtable_mib,ingest_wall_seconds,final_checkpoint_seconds,maintenance_drain_seconds,checkpoint_work_seconds,checkpoint_count,promotion_work_seconds,promotion_count,total_load_seconds,rows_per_second,point_reads_seconds,point_read_us,full_scans_seconds,full_scan_seconds,disk_bytes\n",
+        "engine,rows,batch_size,point_reads,full_scans,durability,bulk_sorted,total_memory_mib,index_delta_mib,maintenance_mib,memtable_mib,record_construction_seconds,staging_seconds,commit_calls_seconds,commit_phase_prepare_seconds,commit_phase_record_encode_seconds,commit_phase_validation_seconds,commit_phase_wal_encode_seconds,commit_phase_wal_append_seconds,commit_phase_sync_wait_seconds,commit_phase_apply_seconds,commit_phase_maintenance_wait_seconds,ingest_wall_seconds,final_checkpoint_seconds,maintenance_drain_seconds,checkpoint_work_seconds,checkpoint_count,promotion_work_seconds,promotion_count,total_load_seconds,rows_per_second,point_reads_seconds,point_read_us,full_scans_seconds,full_scan_seconds,wal_appended_bytes,checkpoint_bytes_written,promotion_bytes_read,promotion_bytes_written,index_delta_peak_bytes,maintenance_peak_bytes,disk_bytes\n",
     );
     let optional = |value: Option<usize>| value.map_or_else(String::new, |value| value.to_string());
     for result in results {
         output.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{:.9},{:.9},{:.9},{:.9},{},{:.9},{},{:.9},{:.3},{:.9},{:.3},{:.9},{:.9},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{:.9},{},{:.9},{:.3},{:.9},{:.3},{:.9},{:.9},{},{},{},{},{},{},{}\n",
             result.engine,
             config.rows,
             config.batch_size,
@@ -799,6 +902,17 @@ fn csv(config: &Config, results: &[ResultRow]) -> String {
             optional(config.index_delta_mib),
             optional(config.maintenance_mib),
             optional(config.memtable_mib),
+            result.record_construction_wall.as_secs_f64(),
+            result.staging_wall.as_secs_f64(),
+            result.commit_call_wall.as_secs_f64(),
+            result.commit_phase_prepare.as_secs_f64(),
+            result.commit_phase_record_encode.as_secs_f64(),
+            result.commit_phase_validation.as_secs_f64(),
+            result.commit_phase_wal_encode.as_secs_f64(),
+            result.commit_phase_wal_append.as_secs_f64(),
+            result.commit_phase_sync_wait.as_secs_f64(),
+            result.commit_phase_apply.as_secs_f64(),
+            result.commit_phase_maintenance_wait.as_secs_f64(),
             result.ingest_wall.as_secs_f64(),
             result.final_checkpoint_wall.as_secs_f64(),
             result.maintenance_drain_wall.as_secs_f64(),
@@ -812,6 +926,12 @@ fn csv(config: &Config, results: &[ResultRow]) -> String {
             result.point_reads.as_secs_f64() * 1_000_000.0 / config.point_reads as f64,
             result.full_scans.as_secs_f64(),
             result.full_scans.as_secs_f64() / config.full_scans as f64,
+            result.wal_appended_bytes,
+            result.checkpoint_bytes_written,
+            result.promotion_bytes_read,
+            result.promotion_bytes_written,
+            result.index_delta_peak_bytes,
+            result.maintenance_peak_bytes,
             result.disk_bytes,
         ));
     }

@@ -28,8 +28,8 @@ use memmap2::{Advice, Mmap, UncheckedAdvice};
 use serde::{Deserialize, Serialize};
 
 use crate::distance::{
-    bytes_as_i8, dot_f32, dot_f32_i8, dot_f32_le_bytes, dot_i8, l2_squared_f32,
-    l2_squared_f32_i8, l2_squared_f32_le_bytes, l2_squared_i8_scaled,
+    bytes_as_i8, dot_f32, dot_f32_i8, dot_f32_le_bytes, dot_i8, l2_squared_f32, l2_squared_f32_i8,
+    l2_squared_f32_le_bytes, l2_squared_i8_scaled,
 };
 use crate::error::{Error, Result};
 use crate::run_manifest::DerivedRunMeta;
@@ -552,8 +552,7 @@ impl HnswIndex {
                     }
                 }
             }
-            let mut out: Vec<(f32, u32)> =
-                results.into_iter().map(|Cand(d, l)| (d, l)).collect();
+            let mut out: Vec<(f32, u32)> = results.into_iter().map(|Cand(d, l)| (d, l)).collect();
             out.sort_by(|a, b| a.0.total_cmp(&b.0));
             out
         })

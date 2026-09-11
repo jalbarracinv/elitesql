@@ -51,6 +51,8 @@
 
 mod backup;
 mod check;
+mod query_control;
+pub use query_control::QueryControl;
 mod collate;
 mod db;
 mod ddl;

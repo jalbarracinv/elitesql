@@ -1,0 +1,838 @@
+
+===== elitesql-acceptance-final-v2.log =====
+d7ddbde9fe1e099f05cbbc17b7601c42a3ab0a5c
+rustc 1.93.1 (01f6ddf75 2026-02-11) (Homebrew)
+binary: rustc
+commit-hash: 01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf
+commit-date: 2026-02-11
+host: aarch64-apple-darwin
+release: 1.93.1
+LLVM version: 21.1.8
+v24.11.1
+Python 3.14.7
+    Checking elitesql-core v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-core)
+   Compiling elitesql-cli v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-cli)
+    Checking elitesql-ffi v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-ffi)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 26.04s
+   Compiling elitesql-core v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-core)
+   Compiling elitesql-cli v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-cli)
+   Compiling elitesql-ffi v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-ffi)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.49s
+     Running unittests src/main.rs (target/debug/deps/elitesql-c68169b92cb02ada)
+
+running 28 tests
+test serve::tests::auth_on_a_trusted_transport_is_rejected ... ok
+test serve::tests::every_op_is_refused_before_authentication ... ok
+test serve::tests::a_transport_must_be_chosen_exactly_once ... ok
+test serve::tests::idle_connection_without_a_transaction_remains_usable ... ok
+test serve::tests::a_wrong_token_neither_authenticates_nor_leaks_which_part_was_wrong ... ok
+test serve::tests::oversized_cursor_row_is_retained_for_retry ... ok
+test serve::tests::sidecar_connection_transaction_is_atomic_and_returns_identity ... ok
+test serve::tests::sidecar_disconnect_rolls_back_active_transaction ... ok
+test serve::tests::sidecar_replaces_an_oversized_response_and_preserves_request_id ... ok
+test serve::tests::sidecar_rejects_an_oversized_request_without_parsing_it ... ok
+test serve::tests::sidecar_query_binds_positional_and_named_parameters ... ok
+test serve::tests::token_comparison_accepts_only_the_exact_value ... ok
+test serve::tests::sidecar_idle_timeout_rolls_back_active_transaction ... ok
+test serve::tests::sidecar_idle_timeout_releases_a_cursor_and_its_memory ... ok
+test tests::extracts_only_semicolon_terminated_statements ... ok
+test tests::ignores_semicolons_in_strings_and_comments ... ok
+test tests::keeps_an_open_block_comment_in_the_pending_buffer ... ok
+test tests::recognizes_plain_star_selects ... ok
+test tests::renders_the_repl_box_format ... ok
+test serve::tests::tcp_without_a_token_refuses_to_start ... ok
+test serve::tests::the_request_id_is_echoed_on_auth_responses_too ... ok
+test serve::tests::the_right_token_opens_the_connection_for_later_requests ... ok
+test serve::tests::unix_listener_refuses_to_delete_a_regular_file_at_the_socket_path ... ok
+test serve::tests::sidecar_streaming_cursor_returns_bounded_ordered_batches ... ok
+test serve::tests::cursor_batches_fit_serialized_bytes_without_skipping_rows ... ok
+test serve::tests::unauthenticated_connection_expires_even_with_a_partial_request ... ok
+test serve::tests::sidecar_caps_a_blocking_select_before_returning_its_result ... ok
+test serve::tests::four_sidecar_workers_keep_credit_and_document_commits_atomic ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+
+     Running tests/repl.rs (target/debug/deps/repl-b100c4f82093b874)
+
+running 5 tests
+test command_help_identifies_the_elitesql_cli ... ok
+test repl_does_not_execute_an_unterminated_statement_at_eof ... ok
+test sqlite_style_repl_session ... ok
+test repl_waits_for_semicolons_outside_strings_and_comments ... ok
+test opening_does_not_create_a_database_by_accident ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+
+     Running tests/serve_tcp.rs (target/debug/deps/serve_tcp-b11e70ff623019f6)
+
+running 5 tests
+test authentication_does_not_carry_across_connections ... ok
+test a_wrong_token_leaves_the_connection_closed_for_business ... ok
+test the_connection_cap_refuses_instead_of_queueing ... ok
+test a_tcp_client_authenticates_then_queries ... ok
+test tcp_and_unix_answer_identically ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running unittests src/lib.rs (target/debug/deps/elitesql_core-3c54794d2c5b0f26)
+
+running 54 tests
+test collate::tests::collation_names_round_trip ... ok
+test collate::tests::base_letters_decide_first ... ok
+test collate::tests::identical_strings_compare_equal ... ok
+test collate::tests::non_letters_compare_by_code_point ... ok
+test collate::tests::spanish_treats_enye_as_its_own_letter ... ok
+test collate::tests::case_is_the_last_resort ... ok
+test collate::tests::accents_and_case_no_longer_sort_after_z ... ok
+test collate::tests::binary_collation_still_available_and_is_the_old_behavior ... ok
+test collate::tests::diacritics_break_ties_in_a_stable_order ... ok
+test collate::tests::other_scripts_are_ordered_not_grouped_arbitrarily ... ok
+test collate::tests::the_comparator_is_a_total_order ... ok
+test db::primary_index_tests::blob_gc_ignores_commit_staging_files_until_publish ... ok
+test db::primary_index_tests::dead_vector_worker_with_backlog_is_reported_instead_of_waiting_forever ... ok
+test db::primary_index_tests::frozen_leases_never_wait_for_merge_memory_but_explicit_maintenance_does ... ok
+test db::primary_index_tests::compaction_gc_preserves_blob_published_before_commit_lock ... ok
+test db::primary_index_tests::open_cleans_only_abandoned_derived_publication_files ... ok
+test db::primary_index_tests::coordinated_safe_sync_failure_is_reported_to_every_batch_member ... ok
+test db::primary_index_tests::ambiguous_manifest_refresh_adopts_generation_and_fences_writes ... ok
+test db::primary_index_tests::commits_continue_and_recover_before_primary_manifest_publication ... ok
+test db::primary_index_tests::vector_merge_group_selection_is_size_tiered_and_budgeted ... ok
+test db::primary_index_tests::point_read_admission_is_inactive_without_writers_and_bounds_mixed_readers ... ok
+test distance::tests::extreme_i8_products_do_not_overflow ... ok
+test distance::tests::f32_kernels_match_sequential_reference ... ok
+test distance::tests::integer_kernels_are_exact ... ok
+test distance::tests::kernels_use_the_common_prefix ... ok
+test db::primary_index_tests::checkpoint_manifest_rename_failure_thaws_and_retries ... ok
+test distance::tests::mixed_kernels_match_sequential_reference ... ok
+test memory::tests::admission_expires_and_transferred_memory_is_not_clamped ... ok
+test memory::tests::query_permits_wait_and_wake ... ok
+test paged::tests::duplicate_keys_can_span_pages_and_stay_queryable ... ok
+test paged::tests::disjoint_v2_merge_copies_pages_without_repacking_entries ... ok
+test db::primary_index_tests::sync_failure_is_reported_as_unknown_after_logical_publication ... ok
+test check::logical::tests::check_detects_checksum_valid_secondary_pairs_not_present_in_canonical_rows ... ok
+test paged::tests::opens_legacy_v1_directory ... ok
+test db::primary_index_tests::stale_async_vector_job_cannot_resurrect_a_deleted_record ... ok
+test paged::tests::legacy_v2_boundaries_must_match_checksummed_entries ... ok
+test paged::tests::writer_rejects_unsorted_input ... ok
+test run_manifest::tests::rejects_traversal_filenames ... ok
+test run_manifest::tests::derived_manifest_checks_identity_generation_and_crc ... ok
+test sql::parser::cache_tests::repeated_sql_uses_a_fresh_clone_from_the_bounded_cache ... ok
+test paged::tests::prefix_cursor_seeks_strictly_after_full_key ... ok
+test wal::tests::an_encoded_commit_can_be_assigned_its_final_version ... ok
+test wal::tests::encoder_rejects_strings_that_do_not_fit_its_frame ... ok
+test wal::tests::scan_stops_before_duplicate_or_regressing_versions ... ok
+test run_manifest::tests::roundtrip_and_atomic_replacement ... ok
+test wal::tests::partial_append_is_rolled_back_before_another_record_is_written ... ok
+test wal::tests::vectored_batch_retains_independent_recovery_frames ... ok
+test db::primary_index_tests::derived_manifest_rename_and_sync_failures_preserve_queryability ... ok
+test db::primary_index_tests::retried_derived_publication_preserves_the_frozen_generation ... ok
+test db::primary_index_tests::commits_and_queries_continue_while_derived_overlays_publish ... ok
+test paged::tests::every_navigation_metadata_byte_is_checked_before_lookup ... ok
+test paged::tests::external_writer_bounds_fan_in_and_cleans_runs ... ok
+test db::primary_index_tests::paged_primary_roundtrips_many_ids_and_versions ... ok
+test db::primary_index_tests::vector_run_merge_reflects_changes_made_while_it_ran ... ok
+
+test result: ok. 54 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.94s
+
+     Running tests/auto_compaction.rs (target/debug/deps/auto_compaction-16c888322a2badac)
+
+running 6 tests
+test debt_is_reconstructed_on_open ... ok
+test disabled_policy_accumulates_debt_until_manual_compaction ... ok
+test live_snapshot_versions_survive_automatic_compaction ... ok
+test obsolete_operation_threshold_compacts_and_reports_reclamation ... ok
+test insert_only_workload_waits_for_the_segment_limit ... ok
+test concurrent_writers_remain_consistent_while_auto_compacting ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s
+
+     Running tests/background_checkpoint.rs (target/debug/deps/background_checkpoint-412e715dc199ed05)
+
+running 1 test
+test indexed_frozen_memtable_stays_queryable_while_wal_tail_keeps_growing ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+     Running tests/backup.rs (target/debug/deps/backup-a19270491bcf3dd7)
+
+running 6 tests
+test backup_refuses_existing_destination ... ok
+test restore_refuses_corrupt_backup_and_existing_destination ... ok
+test concurrent_backups_cannot_share_or_delete_the_same_partial_directory ... ok
+test backup_roundtrip_preserves_data_and_indexes ... ok
+test restore_roundtrip ... ok
+test backup_is_snapshot_consistent_under_concurrent_writers ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+
+     Running tests/basic.rs (target/debug/deps/basic-4c6f0284a0ce01ec)
+
+running 16 tests
+test record_map_with_btreemap_alias ... ok
+test create_refuses_a_nonempty_unowned_directory_without_deleting_files ... ok
+test concurrent_open_or_create_has_one_non_destructive_creator ... ok
+test explicit_id_duplicate_and_reinsert_after_delete ... ok
+test delete_respects_snapshots ... ok
+test oversized_schema_and_rename_names_are_rejected ... ok
+test roundtrip_all_types ... ok
+test core_rejects_nonfinite_vectors_and_out_of_range_times ... ok
+test schema_validation_errors ... ok
+test second_process_is_locked_out ... ok
+test durable_string_length_boundaries_are_checked_before_commit ... ok
+test update_patches_and_snapshots_see_old_versions ... ok
+test reopen_rebuilds_state ... ok
+test snapshot_from_another_database_is_rejected ... ok
+test generated_ids_are_ulids_and_unique ... ok
+test concurrent_readers_and_writer ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s
+
+     Running tests/bulk.rs (target/debug/deps/bulk-29bea4264a8c4d49)
+
+running 4 tests
+test invalid_order_publishes_no_partial_rows ... ok
+test derived_indexes_must_be_created_after_bulk_load ... ok
+test sorted_bulk_load_is_atomic_queryable_and_reopenable ... ok
+test a_large_scan_yields_the_state_lock_to_a_concurrent_writer ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+
+     Running tests/commit_coordinator.rs (target/debug/deps/commit_coordinator-6c743ac6c3f5f845)
+
+running 2 tests
+test fast_coordinator_falls_back_to_conflict_checks_for_duplicate_ids ... ok
+test fast_and_balanced_coordinator_publish_distinct_versions_and_recover_every_frame ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/compaction.rs (target/debug/deps/compaction-a0ede6a4a8335ce5)
+
+running 5 tests
+test compaction_of_empty_and_tombstone_only_tables ... ok
+test secondary_index_correct_after_compaction ... ok
+test stale_primary_dump_from_before_compaction_is_rejected ... ok
+test compaction_preserves_live_snapshot_versions ... ok
+test compaction_purges_deleted_records_and_shrinks_disk ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.88s
+
+     Running tests/concurrent_autocommit.rs (target/debug/deps/concurrent_autocommit-636a35b2c1d5508a)
+
+running 4 tests
+test concurrent_autocommit_arithmetic_updates_all_land ... ok
+test concurrent_autocommit_deletes_never_conflict ... ok
+test concurrent_autocommit_updates_on_one_row_never_conflict ... ok
+test hammered_increments_never_lose_updates ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+     Running tests/corruption.rs (target/debug/deps/corruption-78a28be802ebe409)
+
+running 1 test
+test random_byte_flips_never_panic_or_corrupt_silently ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+
+     Running tests/crash_kill.rs (target/debug/deps/crash_kill-a741669707408678)
+
+running 2 tests
+test crash_worker ... ok
+test kill9_recovers_to_last_committed_state ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.78s
+
+     Running tests/datetime.rs (target/debug/deps/datetime-974f31f1d702ed54)
+
+running 8 tests
+test value_constructors_and_parsing ... ok
+test invalid_literals_are_rejected ... ok
+test sql_roundtrip_and_comparisons ... ok
+test api_roundtrip_and_ordering ... ok
+test dates_group_and_minmax ... ok
+test timestamp_accepts_datetime_literals ... ok
+test survives_reopen_and_compaction ... ok
+test date_indexes_and_find_eq ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+
+     Running tests/ddl.rs (target/debug/deps/ddl-008ade1e9c43e21f)
+
+running 24 tests
+test concurrent_catalog_changes_are_serialized_from_validation_to_publish ... ok
+test ddl_is_rejected_read_only ... ok
+test an_existing_ddl_intent_is_never_overwritten_by_a_new_schema_change ... ok
+test add_column_is_metadata_only_and_reads_null ... ok
+test add_column_not_null_without_default_is_refused_on_a_non_empty_table ... ok
+test add_column_default_feeds_indexes ... ok
+test drop_table_through_sql_with_if_exists ... ok
+test drop_column_keeps_other_columns_including_blobs_and_vectors ... ok
+test drop_index_stops_enforcing_and_still_answers_queries ... ok
+test drop_column_removes_data_and_its_index ... ok
+test drop_index_through_sql ... ok
+test drop_vector_and_text_indexes ... ok
+test interrupted_rename_table_with_data_already_moved_is_completed_on_open ... ok
+test interrupted_drop_column_and_rename_column_are_completed_on_open ... ok
+test interrupted_rename_table_is_completed_on_open ... ok
+test interrupted_add_column_backfill_is_completed_on_open ... ok
+test rename_column_carries_values_and_indexes ... ok
+test recreating_a_dropped_table_does_not_resurrect_its_records ... ok
+test backup_and_salvage_carry_the_altered_schema ... ok
+test rename_table_moves_records_and_indexes ... ok
+test drop_table_is_durable_and_reclaims_space_on_compact ... ok
+test renames_keep_vector_and_text_search_working ... ok
+test salvage_does_not_resurrect_records_of_a_recreated_table ... ok
+test add_column_with_default_backfills_existing_records ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.97s
+
+     Running tests/ddl_crash.rs (target/debug/deps/ddl_crash-34f01bfe2eeeb2ec)
+
+running 2 tests
+test ddl_crash_worker ... ok
+test kill9_during_ddl_leaves_a_consistent_schema ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.67s
+
+     Running tests/derived_run_recovery.rs (target/debug/deps/derived_run_recovery-ad2d2098db6917cb)
+
+running 1 test
+test corrupt_secondary_and_text_manifests_rebuild_from_canonical_data ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/group_commit.rs (target/debug/deps/group_commit-47a84edffaebd68f)
+
+running 2 tests
+test concurrent_safe_commits_share_syncs_and_survive_reopen ... ok
+test safe_group_commits_remain_durable_across_concurrent_checkpoints ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+     Running tests/integrity_regressions.rs (target/debug/deps/integrity_regressions-7dfe14b939acf92d)
+
+running 23 tests
+test failed_first_statement_removes_new_table_staging ... ok
+test cancellation_and_deadlines_release_query_state_without_leaking_to_later_queries ... ok
+test byte_bounded_scans_return_wide_rows_without_advancing_past_a_limit ... ok
+test concurrent_ignore_retries_the_whole_statement ... ok
+test corrupt_interior_wal_is_rejected_without_truncating_acknowledged_commits ... ok
+test corrupt_primary_navigation_is_rebuilt_before_accepting_writes ... ok
+test adding_an_identity_to_an_empty_table_preserves_uniqueness ... ok
+test failed_statement_restores_staging_and_preserves_earlier_statements ... ok
+test failed_statement_preserves_pending_cascade_deletion ... ok
+test identity_primary_key_cannot_lose_its_supporting_index ... ok
+test integer_order_filters_and_extrema_preserve_all_64_bits ... ok
+test offline_check_refuses_an_active_writer ... ok
+test indexed_cursor_keeps_snapshot_when_a_later_commit_changes_membership ... ok
+test staging_accounts_for_nested_json_heap_before_accepting_a_write ... ok
+test statement_memory_failure_restores_prior_staged_writes ... ok
+test parent_update_revalidates_foreign_keys_created_after_staging ... ok
+test missing_final_wal_is_detected_by_check_and_open_even_with_manifest_fallback ... ok
+test ignored_duplicates_do_not_make_multirow_insert_partially_atomic ... ok
+test deep_check_rejects_checksum_valid_orphans_duplicates_and_bad_sequences ... ok
+test replacing_a_referenced_parent_cannot_leave_orphans ... ok
+test numeric_joins_match_with_hash_and_either_index_orientation ... ok
+test backup_and_salvage_preserve_physical_ids_and_identity_sequences ... ok
+test backup_and_salvage_validate_references_after_all_batches_are_copied ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.38s
+
+     Running tests/manual_examples.rs (target/debug/deps/manual_examples-d95e079ddd61f120)
+
+running 4 tests
+test vectors_in_sql_reads_writes_and_refusals ... ok
+test vector_index_options_async_and_drop ... ok
+test vectors_declare_insert_and_search ... ok
+test explain_prints_the_documented_join_plan ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running tests/model.rs (target/debug/deps/model-6653261e67d0b840)
+
+running 1 test
+test engine_matches_model_under_random_workload ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.49s
+
+     Running tests/numeric_differential.rs (target/debug/deps/numeric_differential-f0bf2d75311fd17c)
+
+running 1 test
+test exact_numbers_match_sqlite_across_join_plans_and_spill ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+     Running tests/phase5.rs (target/debug/deps/phase5-91265e5170e308e6)
+
+running 9 tests
+test read_only_reads_and_rejects_writes ... ok
+test text_filter_and_errors ... ok
+test big_blobs_go_out_of_line_and_roundtrip ... ok
+test read_only_opens_a_corrupt_database_best_effort ... ok
+test blob_gc_on_compaction_and_corruption_detection ... ok
+test hybrid_rrf_fuses_both_modalities ... ok
+test bm25_ranks_relevance_sensibly ... ok
+test text_index_tracks_updates_deletes_reopen_compaction ... ok
+test quantized_index_keeps_recall_and_shrinks_dump ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.69s
+
+     Running tests/primary_runs.rs (target/debug/deps/primary_runs-831975a87c2f0bc1)
+
+running 4 tests
+test corrupt_run_manifest_is_rebuilt_from_canonical_segments ... ok
+test missing_run_is_discarded_and_rebuilt_from_canonical_segments ... ok
+test background_checkpoints_and_primary_promotions_preserve_every_run ... ok
+test checkpoints_publish_constant_size_deltas_and_levels_bound_run_count ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.93s
+
+     Running tests/query_memory.rs (target/debug/deps/query_memory-e3d988bedc090ab7)
+
+running 16 tests
+test default_profile_matches_the_measured_vector_restart_budget ... ok
+test invalid_global_pool_layout_is_rejected ... ok
+test ingest_performance_profile_is_valid_and_bounded ... ok
+test oversized_transaction_is_rejected_before_commit ... ok
+test database_query_pool_applies_backpressure_across_threads ... ok
+test cursor_streams_batches_from_one_stable_snapshot ... ok
+test zero_memory_settings_are_rejected ... ok
+test top_k_keeps_only_the_best_rows_without_spilling_the_input ... ok
+test vector_deltas_freeze_into_mmap_runs_under_pressure ... ok
+test unindexed_grace_hash_join_is_bounded_even_for_a_hot_key ... ok
+test index_delta_pool_consolidates_to_mmap_bases ... ok
+test indexed_join_streams_probes_and_spills_only_the_sort ... ok
+test order_by_spills_under_a_tiny_budget_and_cleans_up ... ok
+test high_cardinality_group_by_uses_bounded_sorted_runs ... ok
+test count_distinct_spills_under_the_query_budget ... ok
+test index_creation_and_primary_recovery_spill_with_a_tiny_maintenance_pool ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.60s
+
+     Running tests/recovery.rs (target/debug/deps/recovery-40fda7dedc283b8a)
+
+running 14 tests
+test incomplete_creation_never_removes_unknown_files ... ok
+test incomplete_creation_can_clean_only_known_artifacts ... ok
+test a_wal_version_gap_is_rejected_instead_of_losing_the_missing_commit ... ok
+test missing_active_wal_is_corruption_not_an_empty_replacement ... ok
+test garbage_wal_tail_is_ignored ... ok
+test torn_wal_tail_drops_whole_commit_atomically ... ok
+test checkpoint_plus_wal_tail_restores_both ... ok
+test manifest_fallback_keeps_acknowledged_catalog_generation ... ok
+test wal_replay_restores_unclean_close ... ok
+test check_reports_clean_and_corrupt_states ... ok
+test version_watermark_continues_across_checkpoints ... ok
+test corrupt_manifest_falls_back_to_prev ... ok
+test manifest_fallback_after_compaction_keeps_external_blobs ... ok
+test all_durability_modes_roundtrip ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+     Running tests/repair_jsonio.rs (target/debug/deps/repair_jsonio-37de41eff1db9c2e)
+
+running 7 tests
+test jsonio_rejects_unrepresentable_temporal_and_vector_values ... ok
+test jsonio_value_roundtrip ... ok
+test import_export_type_mapping ... ok
+test salvage_refuses_existing_destination ... ok
+test salvage_never_deletes_an_unrelated_fixed_partial_directory ... ok
+test salvage_preserves_updates_and_deletes_when_segments_are_intact ... ok
+test salvage_recovers_valid_prefix_and_reports_damage ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+
+     Running tests/secondary_runs.rs (target/debug/deps/secondary_runs-c0e2bfd4c94b0fe4)
+
+running 2 tests
+test missing_secondary_level_is_rebuilt_from_canonical_data ... ok
+test equality_deltas_promote_without_resurrecting_old_pairs ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.47s
+
+     Running tests/sql.rs (target/debug/deps/sql-fc2f48fcb523caae)
+
+running 21 tests
+test insert_coercions_and_blob ... ok
+test insert_returns_ids_and_is_atomic ... ok
+test create_table_types_and_errors ... ok
+test create_index_variants ... ok
+test ambiguous_column_requires_qualification ... ok
+test join_star_qualifies_headers ... ok
+test inner_join_with_index_and_pushdown ... ok
+test left_join_preserves_unmatched_left ... ok
+test delete_with_where_reports_count ... ok
+test line_and_block_comments_are_ignored ... ok
+test chained_joins ... ok
+test sql_survives_reopen ... ok
+test select_predicates ... ok
+test right_join_preserves_unmatched_right ... ok
+test unindexed_equality_pushdown_drives_select_update_and_delete_after_checkpoint ... ok
+test select_star_and_aliases ... ok
+test select_where_order_limit_offset ... ok
+test sql_respects_unique_index ... ok
+test sql_and_api_interoperate ... ok
+test unsupported_features_fail_with_clear_errors ... ok
+test update_with_where_reports_count ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.40s
+
+     Running tests/sql_agg.rs (target/debug/deps/sql_agg-bb9f32ed4a7b562a)
+
+running 14 tests
+test aggregates_over_empty_set ... ok
+test global_aggregates ... ok
+test count_star_with_limit_offset ... ok
+test group_by_multiple_columns_and_null_groups ... ok
+test group_by_with_order_and_aliases ... ok
+test group_by_without_aggregates_is_distinct_groups ... ok
+test aggregate_errors_are_clear ... ok
+test having_filters_groups ... ok
+test sum_overflow_is_an_error_not_a_wrap ... ok
+test sum_promotes_to_float_when_mixed ... ok
+test aggregates_compose_with_where_and_joins ... ok
+test hash_aggregation_counts_match_an_independent_tally ... ok
+test count_distinct_per_group_respects_the_budget_fallback ... ok
+test hash_aggregation_and_sort_fallback_agree_row_for_row ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s
+
+     Running tests/sql_collation.rs (target/debug/deps/sql_collation-934e7909d5344a48)
+
+running 8 tests
+test each_key_carries_its_own_collation ... ok
+test collate_syntax_variants_agree ... ok
+test an_unknown_collation_names_the_ones_that_exist ... ok
+test collate_binary_restores_byte_order ... ok
+test aggregate_output_ordering_collates ... ok
+test descending_reverses_the_collated_order ... ok
+test order_by_text_is_alphabetical_by_default ... ok
+test collation_survives_spilling_to_disk ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.07s
+
+     Running tests/sql_current_timestamp.rs (target/debug/deps/sql_current_timestamp-2ea8125f3ef8adc7)
+
+running 2 tests
+test current_timestamp_default_requires_timestamp_type ... ok
+test current_timestamp_defaults_and_now_are_stable_per_statement ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/sql_explain.rs (target/debug/deps/sql_explain-bcf96212e3d93a60)
+
+running 18 tests
+test full_scan_is_reported_as_a_scan ... ok
+test cross_table_predicates_are_evaluated_above_the_join ... ok
+test explain_covers_only_select ... ok
+test explain_validates_the_query_instead_of_printing_a_plan_for_it ... ok
+test id_equality_is_a_point_lookup ... ok
+test aggregates_report_grouping_having_and_output_ordering ... ok
+test a_join_under_an_aggregate_is_not_the_streamed_path ... ok
+test bound_parameters_appear_resolved_in_the_plan ... ok
+test equality_against_null_reads_nothing ... ok
+test explain_does_not_run_the_query ... ok
+test indexed_equality_uses_the_index_and_unindexed_equality_does_not ... ok
+test right_join_always_takes_the_hash_path ... ok
+test sort_and_limit_wrap_the_access_path ... ok
+test long_text_values_are_elided ... ok
+test indexed_join_reports_an_index_nested_loop ... ok
+test the_plan_names_a_collation_only_when_it_is_not_the_default ... ok
+test unindexed_join_column_falls_back_to_the_hash_join ... ok
+test planned_paths_return_the_same_rows_they_promise ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.17s
+
+     Running tests/sql_foreign_keys.rs (target/debug/deps/sql_foreign_keys-fc8b4b4dbecce522)
+
+running 6 tests
+test nullable_foreign_key_accepts_null ... ok
+test concurrent_child_insert_cannot_race_past_parent_delete ... ok
+test inline_foreign_key_rejects_orphans_and_allows_same_transaction_parent ... ok
+test foreign_key_ddl_requires_matching_unique_target_and_protects_dependencies ... ok
+test restrict_and_cascade_are_atomic_and_persist_across_reopen ... ok
+test cascade_cycles_terminate_and_backup_preserves_relations ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+     Running tests/sql_fuzz.rs (target/debug/deps/sql_fuzz-9ecdaa67bd1b95eb)
+
+running 4 tests
+test deep_nesting_hits_guard_not_stack ... ok
+test random_garbage_never_panics ... ok
+test valid_corpus_still_valid_after_setup ... ok
+test mutated_corpus_never_panics ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+     Running tests/sql_identity.rs (target/debug/deps/sql_identity-f2dc875e0f403fb3)
+
+running 10 tests
+test identity_schema_errors_are_explicit ... ok
+test declaring_the_implicit_text_primary_key_is_redundant ... ok
+test conventional_id_auto_increment_primary_key_is_supported ... ok
+test mysql_primary_key_spelling_is_accepted_for_an_identity ... ok
+test explicit_identity_advances_sequence_and_is_immutable_and_unique ... ok
+test rollback_may_leave_a_gap_but_never_reuses_in_process ... ok
+test declared_id_can_be_the_target_of_a_foreign_key ... ok
+test auto_increment_and_standard_identity_generate_and_return_values ... ok
+test concurrent_writers_receive_distinct_identity_values ... ok
+test high_water_survives_wal_checkpoint_delete_and_reopen ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+     Running tests/sql_insert_ignore.rs (target/debug/deps/sql_insert_ignore-0d83fee9ecdda873)
+
+running 2 tests
+test insert_ignore_does_not_hide_foreign_key_or_not_null_errors ... ok
+test insert_ignore_and_on_conflict_only_suppress_uniqueness_errors ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/sql_null_logic.rs (target/debug/deps/sql_null_logic-84db11f4c216b53d)
+
+running 7 tests
+test a_comparison_against_null_never_keeps_the_row ... ok
+test is_null_always_has_a_definite_answer ... ok
+test a_null_in_an_in_list_makes_a_miss_unknown ... ok
+test and_and_or_follow_the_three_valued_truth_tables ... ok
+test not_of_an_unknown_comparison_stays_unknown ... ok
+test having_drops_unknown_groups_too ... ok
+test the_same_rules_hold_through_an_index_and_a_join ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/sql_params.rs (target/debug/deps/sql_params-c76bbc783d0f039b)
+
+running 6 tests
+test parameter_shape_and_count_are_strictly_validated ... ok
+test positional_parameters_preserve_types_and_cannot_inject_sql ... ok
+test json_transport_accepts_tagged_int64_without_losing_precision ... ok
+test update_delete_and_ddl_defaults_bind_without_text_substitution ... ok
+test named_parameters_can_repeat_and_work_in_predicates_and_limit ... ok
+test streaming_cursor_accepts_typed_parameters ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/sql_text_compat.rs (target/debug/deps/sql_text_compat-aa6bdb4fa64a4cfc)
+
+running 2 tests
+test invalid_text_constraints_fail_during_ddl ... ok
+test varchar_longtext_and_enum_validate_without_losing_text_storage ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/sql_update_arithmetic.rs (target/debug/deps/sql_update_arithmetic-1019e5aea1b13ed8)
+
+running 3 tests
+test arithmetic_detects_overflow_division_by_zero_and_invalid_shapes ... ok
+test conditional_decrement_is_atomic_and_reports_insufficient_credit ... ok
+test concurrent_decrements_do_not_lose_updates_or_go_negative ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/text_runs.rs (target/debug/deps/text_runs-f66d20182710ab0f)
+
+running 2 tests
+test missing_text_level_is_rebuilt_from_canonical_data ... ok
+test bm25_deltas_promote_without_resurrecting_postings ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.83s
+
+     Running tests/txn.rs (target/debug/deps/txn-77def3e4ff5fb3aa)
+
+running 21 tests
+test concurrent_delete_vs_update_conflicts ... ok
+test transactional_sql_rollback_discards_every_statement ... ok
+test concurrent_insert_same_id_conflicts ... ok
+test concurrent_update_same_record_conflicts ... ok
+test non_conflicting_txns_both_commit ... ok
+test create_unique_index_fails_on_existing_duplicates ... ok
+test parallel_writers_on_disjoint_records ... ok
+test txn_commit_is_atomic_and_isolated ... ok
+test secondary_index_survives_reopen ... ok
+test txn_reads_from_stable_snapshot ... ok
+test txn_interns_multiple_tables_without_crossing_staged_rows ... ok
+test transactional_sql_sees_staged_rows_and_commits_business_unit_atomically ... ok
+test txn_rollback_discards_everything ... ok
+test txn_preserves_out_of_order_and_replaced_staged_operations ... ok
+test find_eq_with_and_without_index ... ok
+test unique_index_concurrent_txns ... ok
+test unindexed_find_eq_ignores_older_versions_in_the_same_segment ... ok
+test unique_index_rejects_duplicates_at_commit ... ok
+test unique_value_can_move_between_records_in_one_txn ... ok
+test unindexed_find_eq_streams_latest_versions_across_storage_layers ... ok
+test paged_secondary_index_merges_updates_and_pages_hot_keys ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s
+
+     Running tests/vector.rs (target/debug/deps/vector-d3b057edd1a690d0)
+
+running 10 tests
+test vector_roundtrip_and_dimension_validation ... ok
+test search_errors_are_clear ... ok
+test updates_and_deletes_are_reflected ... ok
+test sql_creates_and_fills_vector_columns ... ok
+test async_mode_indexes_in_background ... ok
+test metadata_filter_restricts_results ... ok
+test compaction_rebuilds_dropping_tombstones ... ok
+test dot_and_l2_metrics_work ... ok
+test reopen_rebuilds_index_from_canonical_data ... ok
+test knn_recall_vs_brute_force ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.31s
+
+     Running tests/vector_crash.rs (target/debug/deps/vector_crash-5fe0d1d311daf7fd)
+
+running 2 tests
+test vector_crash_worker ... ok
+test kill9_during_async_indexing_preserves_canonical_data ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+
+     Running tests/vector_persist.rs (target/debug/deps/vector_persist-d699cd490880ed60)
+
+running 9 tests
+test dropping_the_index_removes_its_runs_and_manifest ... ok
+test stale_or_broken_run_manifest_still_opens_correctly ... ok
+test stale_dump_catches_up_with_newer_commits ... ok
+test changes_between_durable_runs_are_replayed_exactly ... ok
+test compaction_refreshes_the_dump ... ok
+test corrupt_dump_falls_back_to_rebuild ... ok
+test clean_close_dumps_and_open_loads_identically ... ok
+test background_runs_survive_reopen_without_a_rebuild ... ok
+test background_merges_bound_the_run_count_and_keep_results ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 47.31s
+
+     Running unittests src/lib.rs (target/debug/deps/elitesql-6f655a4e84219fc7)
+
+running 3 tests
+test tests::ffi_query_params_binds_tagged_values ... ok
+test tests::ffi_serializes_concurrent_calls_on_one_transaction_handle ... ok
+test tests::ffi_transaction_is_atomic_and_returns_generated_identity ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+   Doc-tests elitesql_core
+
+running 1 test
+test crates/elitesql-core/src/lib.rs - (line 22) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+
+   Compiling elitesql-core v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-core)
+   Compiling elitesql-cli v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-cli)
+   Compiling elitesql-ffi v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-ffi)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.75s
+........
+----------------------------------------------------------------------
+Ran 8 tests in 0.811s
+
+OK
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/query_memory.rs (target/debug/deps/query_memory-e3d988bedc090ab7)
+
+running 1 test
+test order_by_spills_under_a_tiny_budget_and_cleans_up ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.15s
+
+
+===== elitesql-allocation-fix-tests.log =====
+   Compiling elitesql-core v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.82s
+     Running tests/corruption.rs (target/debug/deps/corruption-78a28be802ebe409)
+
+running 1 test
+test random_byte_flips_never_panic_or_corrupt_silently ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+
+     Running tests/integrity_regressions.rs (target/debug/deps/integrity_regressions-7dfe14b939acf92d)
+
+running 23 tests
+test cancellation_and_deadlines_release_query_state_without_leaking_to_later_queries ... ok
+test failed_first_statement_removes_new_table_staging ... ok
+test byte_bounded_scans_return_wide_rows_without_advancing_past_a_limit ... ok
+test concurrent_ignore_retries_the_whole_statement ... ok
+test corrupt_interior_wal_is_rejected_without_truncating_acknowledged_commits ... ok
+test corrupt_primary_navigation_is_rebuilt_before_accepting_writes ... ok
+test adding_an_identity_to_an_empty_table_preserves_uniqueness ... ok
+test failed_statement_restores_staging_and_preserves_earlier_statements ... ok
+test identity_primary_key_cannot_lose_its_supporting_index ... ok
+test failed_statement_preserves_pending_cascade_deletion ... ok
+test integer_order_filters_and_extrema_preserve_all_64_bits ... ok
+test indexed_cursor_keeps_snapshot_when_a_later_commit_changes_membership ... ok
+test offline_check_refuses_an_active_writer ... ok
+test staging_accounts_for_nested_json_heap_before_accepting_a_write ... ok
+test statement_memory_failure_restores_prior_staged_writes ... ok
+test parent_update_revalidates_foreign_keys_created_after_staging ... ok
+test missing_final_wal_is_detected_by_check_and_open_even_with_manifest_fallback ... ok
+test ignored_duplicates_do_not_make_multirow_insert_partially_atomic ... ok
+test deep_check_rejects_checksum_valid_orphans_duplicates_and_bad_sequences ... ok
+test replacing_a_referenced_parent_cannot_leave_orphans ... ok
+test numeric_joins_match_with_hash_and_either_index_orientation ... ok
+test backup_and_salvage_preserve_physical_ids_and_identity_sequences ... ok
+test backup_and_salvage_validate_references_after_all_batches_are_copied ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.25s
+
+     Running tests/numeric_differential.rs (target/debug/deps/numeric_differential-f0bf2d75311fd17c)
+
+running 1 test
+test exact_numbers_match_sqlite_across_join_plans_and_spill ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+
+     Running tests/query_memory.rs (target/debug/deps/query_memory-e3d988bedc090ab7)
+
+running 16 tests
+test default_profile_matches_the_measured_vector_restart_budget ... ok
+test invalid_global_pool_layout_is_rejected ... ok
+test ingest_performance_profile_is_valid_and_bounded ... ok
+test oversized_transaction_is_rejected_before_commit ... ok
+test database_query_pool_applies_backpressure_across_threads ... ok
+test cursor_streams_batches_from_one_stable_snapshot ... ok
+test zero_memory_settings_are_rejected ... ok
+test top_k_keeps_only_the_best_rows_without_spilling_the_input ... ok
+test vector_deltas_freeze_into_mmap_runs_under_pressure ... ok
+test unindexed_grace_hash_join_is_bounded_even_for_a_hot_key ... ok
+test index_delta_pool_consolidates_to_mmap_bases ... ok
+test indexed_join_streams_probes_and_spills_only_the_sort ... ok
+test order_by_spills_under_a_tiny_budget_and_cleans_up ... ok
+test high_cardinality_group_by_uses_bounded_sorted_runs ... ok
+test count_distinct_spills_under_the_query_budget ... ok
+test index_creation_and_primary_recovery_spill_with_a_tiny_maintenance_pool ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.34s
+
+
+===== elitesql-optimized-final-clippy.log =====
+    Checking elitesql-core v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-core)
+   Compiling elitesql-cli v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-cli)
+    Checking elitesql-ffi v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-ffi)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 25.71s
+
+===== elitesql-decoder-final-test.log =====
+   Compiling elitesql-core v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.87s
+     Running unittests src/lib.rs (target/debug/deps/elitesql_core-3c54794d2c5b0f26)
+
+running 1 test
+test db::primary_index_tests::record_decoder_rejects_duplicate_fields_and_trailing_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 54 filtered out; finished in 0.00s
+
+
+===== elitesql-final-bindings-build.log =====
+   Compiling elitesql-cli v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-cli)
+   Compiling elitesql-core v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-core)
+   Compiling elitesql-ffi v0.0.1 (/Users/jalbarracin/Code/elitesql/crates/elitesql-ffi)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.91s
+
+===== elitesql-final-python.log =====
+........
+----------------------------------------------------------------------
+Ran 8 tests in 0.878s
+
+OK

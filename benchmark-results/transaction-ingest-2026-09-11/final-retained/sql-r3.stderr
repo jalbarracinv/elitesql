@@ -1,0 +1,28 @@
+Benchmarking sql_1m/point_by_unique_index
+Benchmarking sql_1m/point_by_unique_index: Warming up for 3.0000 s
+Benchmarking sql_1m/point_by_unique_index: Collecting 10 samples in estimated 5.0001 s (1.2M iterations)
+Benchmarking sql_1m/point_by_unique_index: Analyzing
+Benchmarking sql_1m/point_by_unique_index_bound
+Benchmarking sql_1m/point_by_unique_index_bound: Warming up for 3.0000 s
+Benchmarking sql_1m/point_by_unique_index_bound: Collecting 10 samples in estimated 5.0001 s (1.5M iterations)
+Benchmarking sql_1m/point_by_unique_index_bound: Analyzing
+Benchmarking sql_1m/indexed_join_100_of_1m
+Benchmarking sql_1m/indexed_join_100_of_1m: Warming up for 3.0000 s
+Benchmarking sql_1m/indexed_join_100_of_1m: Collecting 10 samples in estimated 5.0041 s (32k iterations)
+Benchmarking sql_1m/indexed_join_100_of_1m: Analyzing
+Benchmarking sql_1m/indexed_join_100_of_1m_bound
+Benchmarking sql_1m/indexed_join_100_of_1m_bound: Warming up for 3.0000 s
+Benchmarking sql_1m/indexed_join_100_of_1m_bound: Collecting 10 samples in estimated 5.0036 s (33k iterations)
+Benchmarking sql_1m/indexed_join_100_of_1m_bound: Analyzing
+Benchmarking sql_1m/full_scan_filter_1m
+Benchmarking sql_1m/full_scan_filter_1m: Warming up for 3.0000 s
+Benchmarking sql_1m/full_scan_filter_1m: Collecting 10 samples in estimated 5.0006 s (16k iterations)
+Benchmarking sql_1m/full_scan_filter_1m: Analyzing
+Benchmarking sql_1m/group_by_997_groups_1m
+Benchmarking sql_1m/group_by_997_groups_1m: Warming up for 3.0000 s
+Benchmarking sql_1m/group_by_997_groups_1m: Collecting 10 samples in estimated 6.2152 s (20 iterations)
+Benchmarking sql_1m/group_by_997_groups_1m: Analyzing
+Benchmarking sql_1m/group_by_10k_groups_1m
+Benchmarking sql_1m/group_by_10k_groups_1m: Warming up for 3.0000 s
+Benchmarking sql_1m/group_by_10k_groups_1m: Collecting 10 samples in estimated 6.7064 s (20 iterations)
+Benchmarking sql_1m/group_by_10k_groups_1m: Analyzing

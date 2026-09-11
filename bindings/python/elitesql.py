@@ -46,6 +46,7 @@ class EliteSQLError(Exception):
 
     CONFLICT_RETRY = 9  # retry the transaction/operation
     COMMIT_UNKNOWN = 17  # do not retry blindly; inspect after reopening
+    QUERY_INTERRUPTED = 18
 
 
 # --- library loading -------------------------------------------------------
@@ -203,6 +204,8 @@ _EPOCH_DATE = _dt.date(1970, 1, 1)
 def _decode_value(v: Any) -> Any:
     if isinstance(v, dict) and "$t" in v:
         t = v["$t"]
+        if t == "int64":
+            return int(v["v"])
         if t == "date":
             return _EPOCH_DATE + _dt.timedelta(days=v["days"])
         if t == "time":
@@ -227,6 +230,9 @@ def _decode_value(v: Any) -> Any:
 
 
 def _decode_result(result: Any) -> Any:
+    if isinstance(result, dict) and "identity" in result:
+        result["identity"]["values"] = [_decode_value(v) for v in result["identity"]["values"]]
+        result["lastrowid"] = _decode_value(result["lastrowid"])
     if isinstance(result, dict) and "rows" in result and "columns" in result:
         result = dict(result)
         result["rows"] = [[_decode_value(c) for c in row] for row in result["rows"]]

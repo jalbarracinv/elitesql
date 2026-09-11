@@ -50,12 +50,17 @@ db.open("app.esql")
 | Phase 5 | BM25 full-text, hybrid search (RRF), int8 vectors, blob chunking | Complete |
 | Cross-cutting | Database-wide memory governor, bounded SQL/index maintenance, typed SQL parameters | Complete |
 
-Current verification: 376 total Rust and doc tests (MVCC, recovery, sorted bulk loading, bounded-memory execution,
+Verification covers Rust and doc tests (MVCC, recovery, sorted bulk loading, bounded-memory execution,
 compaction, salvage, backup/restore, randomized model, SQL and parameter suites,
 query plans, three-valued NULL logic, text collation, sidecar auth and transport
 parity, vector recall, BM25/hybrid, blobs and read-only), crash injection with real
 `kill -9` of live processes, corruption and SQL-parser fuzzing, plus Python FFI
-parameter tests and Node encoding checks. Onboarding docs in [docs/](docs/).
+parameter tests and real Node sidecar roundtrips. Run `bash scripts/acceptance.sh`
+for formatting, Clippy, the workspace suite, FFI, both clients and external sort
+under a 128-descriptor limit. CI defines Linux/macOS and Rust 1.89/1.93.1 jobs.
+The [implementation report](docs/implementacion-plan.md) records local evidence
+and the [audit](docs/auditoria-y-plan-2026-09-10.md) explains the changes.
+Onboarding docs in [docs/](docs/).
 Details in [specs.md](specs.md) and [plan.md](plan.md).
 
 For a sustained mixed SQL workload, run the concurrent stress test. It checks
@@ -497,6 +502,7 @@ let opts = DbOptions {
         maintenance_pool_bytes: 128 * 1024 * 1024,
         reserved_memory_bytes: 8 * 1024 * 1024,
         scan_batch_rows: 512,
+        query_admission_timeout_ms: 5000,
         spill_directory: None,
     },
     ..DbOptions::default()
@@ -553,10 +559,11 @@ indexes), commits continue into a fresh active overlay, and a dedicated worker
 serializes runs/graphs outside the commit mutex. Manifest preparation and I/O
 are ordered by dedicated publication mutexes; the global commit mutex is used
 only for short validation, WAL-writer swap and in-memory adoption. A background worker promotes groups of sixteen same-level primary
-runs, while equality/BM25 retain fanout eight. Disjoint V2 primary ranges copy
+runs, while equality/BM25 retain fanout eight. Disjoint V3 primary ranges copy
 their already checksummed pages directly instead of decoding and rebuilding
 every entry. The atomic `primary.runs` manifest selects one exact generation.
-Paged format V2 retains only one small offset per page in heap; keys remain
+Paged format V3 checksums navigation metadata and retains one small offset per
+page in heap; keys remain
 file-backed. Checkpoint snapshots intern table names and pack IDs contiguously,
 and generate the primary run directly from captured segment offsets instead of
 updating and rescanning the mutable tree. Missing, stale or damaged run state is
@@ -640,6 +647,15 @@ let report = elitesql_core::check("app.esql")?;
 assert!(report.is_ok());
 ```
 
+`check` is offline: close the writer first. It verifies canonical segments and
+the complete WAL chain, independently reconstructs live rows using temporary
+sorted files, and validates types, uniqueness, foreign keys and identity
+watermarks. It compares that image with primary/secondary reads. Canonical
+violations are errors; damaged or inconsistent disposable indexes are warnings
+and can be rebuilt. Temporary files require disk space proportional to the
+database. Legacy manifests cannot prove that a previously missing final WAL
+successor existed; see [disk format](docs/disk-format.md).
+
 To run the crash-injection suite and fuzzing with more iterations:
 
 ```bash
@@ -648,6 +664,11 @@ ELITESQL_FUZZ_ITERS=5000 cargo test --release --test corruption
 ```
 
 ## Performance
+
+The [September 11 integrity/performance review](benchmark-results/review-2026-09-11/README.md)
+compares the implemented fixes with the audited revision across 10K–1M rows,
+including raw repetitions, source patches, allocations, spill and RSS. It
+reports both selective-query gains and scan regressions.
 
 Current measurements are deliberately published even where they are
 unfavorable. The 2026-08-09 Apple Silicon repeat after relational compatibility

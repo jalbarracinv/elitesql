@@ -7,6 +7,7 @@
  *      9 conflict_retry, 10 database_locked, 11 unique_violation, 12 sql,
  *      13 read_only, 14 column_not_found, 15 index_not_found, 16 memory_limit,
  *      17 commit_unknown (do not retry blindly; inspect after reopening),
+ *      18 query_interrupted (cancellation or execution deadline),
  *      100 internal_panic.
  *  - Output strings are heap-allocated UTF-8 JSON; free with
  *    elitesql_free_string(). elitesql_last_error() is thread-local and NOT freed.
@@ -39,7 +40,7 @@ void elitesql_free_string(char *s);
 /* Open (creating if missing). options_json: NULL or
  * {"durability": "safe"|"balanced"|"fast", "read_only"?:bool,
  *  "memory"?: {"total_memory_bytes", "query_pool_bytes",
- *    "query_working_bytes", "index_delta_pool_bytes",
+ *    "query_working_bytes", "query_admission_timeout_ms", "index_delta_pool_bytes",
  *    "maintenance_pool_bytes", "reserved_memory_bytes", "scan_batch_rows",
  *    "spill_directory"?}}. */
 uint32_t elitesql_open(const char *path, const char *options_json, EliteSql **out);
@@ -50,8 +51,9 @@ uint32_t elitesql_close(EliteSql *db);
  * {"columns":[...],"rows":[[...]]} | {"inserted":[ids]} | {"affected":n} |
  * {"ok":true}. Non-JSON-native values are tagged: {"$t":"timestamp","us":...},
  * {"$t":"date","iso":...}, {"$t":"time","us":...}, {"$t":"blob","hex":...},
- * {"$t":"json","v":...}, {"$t":"vector","v":[...]}, or input-only
- * {"$t":"int64","v":"..."}. */
+ * {"$t":"json","v":...}, {"$t":"vector","v":[...]}, or
+ * {"$t":"int64","v":"..."}. Int64 responses outside the exact JavaScript
+ * integer range use this string tag, including identity metadata. */
 uint32_t elitesql_query(EliteSql *db, const char *sql, char **result_json);
 
 /* Execute SQL with parameters supplied separately. params_json is an array

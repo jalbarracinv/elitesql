@@ -1,0 +1,1498 @@
+Analysis of sampling scale_vs_sqlite (pid 34398) every 1 millisecond
+Process:         scale_vs_sqlite [34398]
+Path:            /Users/USER/*/scale_vs_sqlite
+Load Address:    0x102f1c000
+Identifier:      scale_vs_sqlite
+Version:         ???
+Code Type:       ARM64
+Parent Process:  bash [34397]
+Target Type:     live task
+
+Date/Time:       2026-09-11 5:33:23.655 AM -0500
+Launch Time:     2026-09-11 5:33:23.383 AM -0500
+OS Version:      macOS 26.6.2 (25G83)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         119.6M
+Physical footprint (peak):  300.5M
+Idle exit:                  untracked
+----
+
+Call graph:
+    5821 Thread_5294614   DispatchQueue_1: com.apple.main-thread  (serial)
+    + 5821 start  (in dyld) + 6992  [0x182e7c4e4]
+    +   5821 main  (in scale_vs_sqlite) + 896  [0x102f39840]
+    +     5821 std::sys::backtrace::__rust_begin_short_backtrace::hd44789aae8839f76  (in scale_vs_sqlite) + 12  [0x102f2c334]  backtrace.rs:160
+    +       5821 scale_vs_sqlite::main::h9a80d9673bd376e5  (in scale_vs_sqlite) + 6996  [0x102f2a314]  scale_vs_sqlite.rs:992
+    +         3467 scale_vs_sqlite::run_elitesql::h035d62d925377d77  (in scale_vs_sqlite) + 9908  [0x102f22f8c]  scale_vs_sqlite.rs:405
+    +         ! 3467 elitesql_core::db::Txn::commit::h34aa4f6cf68c3161  (in scale_vs_sqlite) + 204  [0x102fb020c]  db.rs:8177
+    +         !   2431 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 17352  [0x102fb8644]  db.rs:8182
+    +         !   : 2430 elitesql_core::db::commit::coordinate_commit::h16a37d7e324353e6  (in scale_vs_sqlite) + 3500  [0x102fc3980]  commit.rs:350
+    +         !   : | 972 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 17780  [0x102fc0f04]  commit.rs:980
+    +         !   : | + 948 elitesql_core::db::apply_one_owned::h020ffd7890ed2075  (in scale_vs_sqlite) + 12164  [0x102fcc700]  db.rs:8781
+    +         !   : | + ! 417 elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite) + 512  [0x102f489f4]  db.rs:595
+    +         !   : | + ! : 401 _platform_memcmp  (in libsystem_platform.dylib) + 140,164,...  [0x18324ef9c,0x18324efb4,...]
+    +         !   : | + ! : 16 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4,0  [0x1031f0ee0,0x1031f0edc]
+    +         !   : | + ! 365 elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite) + 552,500,...  [0x102f48a1c,0x102f489e8,...]  db.rs:595
+    +         !   : | + ! 82 elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite) + 1340  [0x102f48d30]  db.rs:595
+    +         !   : | + ! : 79 alloc::raw_vec::RawVec$LT$T$C$A$GT$::grow_one::he2089f25ff09ca42  (in scale_vs_sqlite) + 60  [0x1031e2efc]  mod.rs:336
+    +         !   : | + ! : | 74 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::h7f491f3301e74f53  (in scale_vs_sqlite) + 280  [0x1031e28d0]  mod.rs:755
+    +         !   : | + ! : | + 32 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 420,256,...  [0x1830690e0,0x18306903c,...]
+    +         !   : | + ! : | + 9 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 120,92,...  [0x183073134,0x183073118,...]
+    +         !   : | + ! : | + 9 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 8,24,...  [0x183063958,0x183063968,...]
+    +         !   : | + ! : | + 8 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 324  [0x18306a7e4]
+    +         !   : | + ! : | + ! 5 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 860  [0x18306b2d8]
+    +         !   : | + ! : | + ! : 5 xzm_chunk_mark_used  (in libsystem_malloc.dylib) + 188  [0x18304befc]
+    +         !   : | + ! : | + ! :   4 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 124  [0x18304bfac]
+    +         !   : | + ! : | + ! :   | 4 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18304ea9c]
+    +         !   : | + ! : | + ! :   |   4 mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x1832172f8]
+    +         !   : | + ! : | + ! :   |     4 mach_absolute_time  (in libsystem_kernel.dylib) + 108,16  [0x18320410c,0x1832040b0]
+    +         !   : | + ! : | + ! :   1 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 76  [0x18304bf7c]
+    +         !   : | + ! : | + ! 2 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 336  [0x18306b0cc]
+    +         !   : | + ! : | + ! : 2 _xzm_xzone_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 588,692  [0x18306adcc,0x18306ae34]
+    +         !   : | + ! : | + ! 1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 84  [0x18306afd0]
+    +         !   : | + ! : | + 6 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 100,112,...  [0x1830631c0,0x1830631cc,...]
+    +         !   : | + ! : | + 6 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 756  [0x18306a994]
+    +         !   : | + ! : | + 2 DYLD-STUB$$malloc  (in scale_vs_sqlite) + 4  [0x1031f0e74]
+    +         !   : | + ! : | + 2 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 248  [0x18306a798]
+    +         !   : | + ! : | +   2 _xzm_xzone_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 112  [0x18306abf0]
+    +         !   : | + ! : | 5 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::h7f491f3301e74f53  (in scale_vs_sqlite) + 44  [0x1031e27e4]  mod.rs:745
+    +         !   : | + ! : 2 alloc::raw_vec::RawVec$LT$T$C$A$GT$::grow_one::he2089f25ff09ca42  (in scale_vs_sqlite) + 20,36  [0x1031e2ed4,0x1031e2ee4]  mod.rs:336
+    +         !   : | + ! : 1 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::h7f491f3301e74f53  (in scale_vs_sqlite) + 316  [0x1031e28f4]  mod.rs:759
+    +         !   : | + ! 30 elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite) + 1296  [0x102f48d04]  db.rs:595
+    +         !   : | + ! : 13 alloc::collections::btree::map::entry::VacantEntry$LT$K$C$V$C$A$GT$::insert_entry::h3e643943d1cb509b  (in scale_vs_sqlite) + 60,976,...  [0x102f48fb0,0x102f49344,...]  entry.rs:411
+    +         !   : | + ! : 8 alloc::collections::btree::map::entry::VacantEntry$LT$K$C$V$C$A$GT$::insert_entry::h3e643943d1cb509b  (in scale_vs_sqlite) + 156  [0x102f49010]  entry.rs:411
+    +         !   : | + ! : | 6 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 88,92,...  [0x183068f94,0x183068f98,...]
+    +         !   : | + ! : | 1 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 120  [0x183073134]
+    +         !   : | + ! : | 1 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 184  [0x183063a08]
+    +         !   : | + ! : 3 alloc::collections::btree::map::entry::VacantEntry$LT$K$C$V$C$A$GT$::insert_entry::h3e643943d1cb509b  (in scale_vs_sqlite) + 36,40  [0x102f48f98,0x102f48f9c]  entry.rs:399
+    +         !   : | + ! : 2 alloc::collections::btree::map::entry::VacantEntry$LT$K$C$V$C$A$GT$::insert_entry::h3e643943d1cb509b  (in scale_vs_sqlite) + 20  [0x102f48f88]  entry.rs:398
+    +         !   : | + ! : 2 alloc::collections::btree::map::entry::VacantEntry$LT$K$C$V$C$A$GT$::insert_entry::h3e643943d1cb509b  (in scale_vs_sqlite) + 1060  [0x102f49398]  entry.rs:411
+    +         !   : | + ! : | 1 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 44  [0x1830730e8]
+    +         !   : | + ! : | 1 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 324  [0x18306a7e4]
+    +         !   : | + ! : |   1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 860  [0x18306b2d8]
+    +         !   : | + ! : |     1 xzm_chunk_mark_used  (in libsystem_malloc.dylib) + 188  [0x18304befc]
+    +         !   : | + ! : |       1 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 124  [0x18304bfac]
+    +         !   : | + ! : |         1 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18304ea9c]
+    +         !   : | + ! : |           1 mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x1832172f8]
+    +         !   : | + ! : |             1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18320410c]
+    +         !   : | + ! : 2 alloc::collections::btree::map::entry::VacantEntry$LT$K$C$V$C$A$GT$::insert_entry::h3e643943d1cb509b  (in scale_vs_sqlite) + 2268  [0x102f49850]  entry.rs:430
+    +         !   : | + ! 23 elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite) + 80  [0x102f48844]  db.rs:594
+    +         !   : | + ! : 9 core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite) + 284  [0x102f48f68]  mod.rs:703
+    +         !   : | + ! : 6 core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite) + 76  [0x102f48e98]  mod.rs:701
+    +         !   : | + ! : | 3 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 12  [0x102f36ce0]  sip.rs:261
+    +         !   : | + ! : | 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 68  [0x102f36d18]  sip.rs:0
+    +         !   : | + ! : | 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 92  [0x102f36d30]  sip.rs:297
+    +         !   : | + ! : | 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 456  [0x102f36e9c]  sip.rs:299
+    +         !   : | + ! : 4 core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite) + 196,168,...  [0x102f48f10,0x102f48ef4,...]  mod.rs:702
+    +         !   : | + ! : 2 core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite) + 44  [0x102f48e78]  mod.rs:700
+    +         !   : | + ! : 2 core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite) + 100  [0x102f48eb0]  mod.rs:701
+    +         !   : | + ! :   1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 12  [0x102f36ce0]  sip.rs:261
+    +         !   : | + ! :   1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 204  [0x102f36da0]  sip.rs:264
+    +         !   : | + ! 13 elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite) + 180  [0x102f488a8]  db.rs:594
+    +         !   : | + ! : 13 _platform_memcmp  (in libsystem_platform.dylib) + 0,140,...  [0x18324ef10,0x18324ef9c,...]
+    +         !   : | + ! 9 alloc::collections::btree::map::entry::VacantEntry$LT$K$C$V$C$A$GT$::insert_entry::h3e643943d1cb509b  (in scale_vs_sqlite) + 2288,2272,...  [0x102f49864,0x102f49854,...]  entry.rs:430
+    +         !   : | + ! 4 elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite) + 56,92,...  [0x102f4882c,0x102f48850,...]  db.rs:594
+    +         !   : | + ! 2 alloc::raw_vec::RawVec$LT$T$C$A$GT$::grow_one::he2089f25ff09ca42  (in scale_vs_sqlite) + 84  [0x1031e2f14]  mod.rs:337
+    +         !   : | + ! 2 elitesql_core::db::apply_one_owned::h020ffd7890ed2075  (in scale_vs_sqlite) + 12164  [0x102fcc700]  db.rs:8781
+    +         !   : | + ! : 2 elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite) + 0  [0x102f487f4]  db.rs:593
+    +         !   : | + ! 1 elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite) + 1232  [0x102f48cc4]  mod.rs:0
+    +         !   : | + 6 elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite) + 1372,1392  [0x102f48d50,0x102f48d64]  db.rs:601
+    +         !   : | + 6 elitesql_core::db::apply_one_owned::h020ffd7890ed2075  (in scale_vs_sqlite) + 84,104  [0x102fc97d0,0x102fc97e4]  db.rs:8773
+    +         !   : | + 5 elitesql_core::db::apply_one_owned::h020ffd7890ed2075  (in scale_vs_sqlite) + 12092  [0x102fcc6b8]  db.rs:8778
+    +         !   : | + 4 elitesql_core::db::apply_one_owned::h020ffd7890ed2075  (in scale_vs_sqlite) + 12072  [0x102fcc6a4]  db.rs:0
+    +         !   : | + 2 elitesql_core::db::apply_one_owned::h020ffd7890ed2075  (in scale_vs_sqlite) + 8  [0x102fc9784]  db.rs:8761
+    +         !   : | + 1 elitesql_core::db::apply_one_owned::h020ffd7890ed2075  (in scale_vs_sqlite) + 64  [0x102fc97bc]  db.rs:8771
+    +         !   : | 491 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 15508  [0x102fc0624]  commit.rs:914
+    +         !   : | + 491 elitesql_core::wal::WalWriter::append_commit_unflushed::hdf2087ac5bf0609e  (in scale_vs_sqlite) + 72  [0x102fddbec]  wal.rs:419
+    +         !   : | +   491 std::io::Write::write_all::h4cf5ff33c3e73aa1  (in scale_vs_sqlite) + 92  [0x102f47ee4]  mod.rs:1877
+    +         !   : | +     491 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +         !   : | 406 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 17860  [0x102fc0f54]  commit.rs:998
+    +         !   : | + 132 core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$elitesql_core..value..Value$GT$$GT$::h3544758cb2576691  (in scale_vs_sqlite) + 216  [0x102f7e210]  mod.rs:805
+    +         !   : | + ! 75 _xzm_free  (in libsystem_malloc.dylib) + 996,28,...  [0x1830644fc,0x183064134,...]
+    +         !   : | + ! 33 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x183064278]
+    +         !   : | + ! : 15 _platform_memset  (in libsystem_platform.dylib) + 180,160,...  [0x183251144,0x183251130,...]
+    +         !   : | + ! : 13 __bzero  (in libsystem_platform.dylib) + 0,24  [0x183251030,0x183251048]
+    +         !   : | + ! : 5 DYLD-STUB$$_platform_bzero  (in libsystem_malloc.dylib) + 12  [0x18307b87c]
+    +         !   : | + ! 20 _free  (in libsystem_malloc.dylib) + 76,0,...  [0x183073d1c,0x183073cd0,...]
+    +         !   : | + ! 4 DYLD-STUB$$free  (in scale_vs_sqlite) + 4  [0x1031f0d90]
+    +         !   : | + 123 core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$elitesql_core..value..Value$GT$$GT$::h3544758cb2576691  (in scale_vs_sqlite) + 132  [0x102f7e1bc]  mod.rs:805
+    +         !   : | + ! 100 _xzm_free  (in libsystem_malloc.dylib) + 28,996,...  [0x183064134,0x1830644fc,...]
+    +         !   : | + ! 14 _free  (in libsystem_malloc.dylib) + 36,76,...  [0x183073cf4,0x183073d1c,...]
+    +         !   : | + ! 9 DYLD-STUB$$free  (in scale_vs_sqlite) + 4  [0x1031f0d90]
+    +         !   : | + 103 core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$elitesql_core..value..Value$GT$$GT$::h3544758cb2576691  (in scale_vs_sqlite) + 100  [0x102f7e19c]  mod.rs:805
+    +         !   : | + ! 76 alloc::collections::btree::map::IntoIter$LT$K$C$V$C$A$GT$::dying_next::h057203cbea8d7590  (in scale_vs_sqlite) + 336  [0x102f35408]  map.rs:1778
+    +         !   : | + ! : 42 _xzm_free  (in libsystem_malloc.dylib) + 780,996,...  [0x183064424,0x1830644fc,...]
+    +         !   : | + ! : 17 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x183064278]
+    +         !   : | + ! : | 14 _platform_memset  (in libsystem_platform.dylib) + 140,160  [0x18325111c,0x183251130]
+    +         !   : | + ! : | 3 __bzero  (in libsystem_platform.dylib) + 0  [0x183251030]
+    +         !   : | + ! : 7 _free  (in libsystem_malloc.dylib) + 0,76,...  [0x183073cd0,0x183073d1c,...]
+    +         !   : | + ! : 7 _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 456  [0x18306c098]
+    +         !   : | + ! : | 6 xzm_reclaim_mark_free_locked  (in libsystem_malloc.dylib) + 116  [0x18304b968]
+    +         !   : | + ! : | + 5 mach_vm_reclaim_try_enter  (in libsystem_kernel.dylib) + 296  [0x18321717c]
+    +         !   : | + ! : | + ! 5 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18320410c]
+    +         !   : | + ! : | + 1 mach_vm_reclaim_try_enter  (in libsystem_kernel.dylib) + 128  [0x1832170d4]
+    +         !   : | + ! : | 1 xzm_reclaim_mark_free_locked  (in libsystem_malloc.dylib) + 0  [0x18304b8f4]
+    +         !   : | + ! : 1 DYLD-STUB$$free  (in scale_vs_sqlite) + 4  [0x1031f0d90]
+    +         !   : | + ! : 1 _xzm_chunk_list_slot_push  (in libsystem_malloc.dylib) + 128  [0x18306c9f8]
+    +         !   : | + ! : | 1 _xzm_chunk_list_push  (in libsystem_malloc.dylib) + 44  [0x18306b870]
+    +         !   : | + ! : 1 _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 224  [0x18306bfb0]
+    +         !   : | + ! :   1 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x18324f3c0]
+    +         !   : | + ! :     1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183211c98]
+    +         !   : | + ! 9 alloc::collections::btree::map::IntoIter$LT$K$C$V$C$A$GT$::dying_next::h057203cbea8d7590  (in scale_vs_sqlite) + 24  [0x102f352d0]  map.rs:1777
+    +         !   : | + ! 9 alloc::collections::btree::map::IntoIter$LT$K$C$V$C$A$GT$::dying_next::h057203cbea8d7590  (in scale_vs_sqlite) + 64,236,...  [0x102f352f8,0x102f353a4,...]  map.rs:1782
+    +         !   : | + ! 3 _xzm_free  (in libsystem_malloc.dylib) + 1568  [0x183064738]
+    +         !   : | + ! 3 alloc::collections::btree::map::IntoIter$LT$K$C$V$C$A$GT$::dying_next::h057203cbea8d7590  (in scale_vs_sqlite) + 16,12  [0x102f352c8,0x102f352c4]  map.rs:1774
+    +         !   : | + ! 1 alloc::collections::btree::map::IntoIter$LT$K$C$V$C$A$GT$::dying_next::h057203cbea8d7590  (in scale_vs_sqlite) + 324  [0x102f353fc]  map.rs:0
+    +         !   : | + ! 1 alloc::collections::btree::map::IntoIter$LT$K$C$V$C$A$GT$::dying_next::h057203cbea8d7590  (in scale_vs_sqlite) + 136  [0x102f35340]  map.rs:1778
+    +         !   : | + ! 1 alloc::collections::btree::map::IntoIter$LT$K$C$V$C$A$GT$::dying_next::h057203cbea8d7590  (in scale_vs_sqlite) + 340  [0x102f3540c]  map.rs:1784
+    +         !   : | + 17 core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$elitesql_core..value..Value$GT$$GT$::h3544758cb2576691  (in scale_vs_sqlite) + 20,88,...  [0x102f7e14c,0x102f7e190,...]  mod.rs:805
+    +         !   : | + 16 _xzm_free  (in libsystem_malloc.dylib) + 1568  [0x183064738]
+    +         !   : | + 15 alloc::collections::btree::map::IntoIter$LT$K$C$V$C$A$GT$::dying_next::h057203cbea8d7590  (in scale_vs_sqlite) + 348,352,...  [0x102f35414,0x102f35418,...]  map.rs:1784
+    +         !   : | 351 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 380  [0x102fbcb0c]  commit.rs:737
+    +         !   : | + 350 elitesql_core::db::CommitMutex::lock::hfe67908f65a4d935  (in scale_vs_sqlite) + 152  [0x102f7d528]  db.rs:2358
+    +         !   : | + ! 350 parking_lot::raw_mutex::RawMutex::lock_slow::hf8548beeaa4cc3be  (in scale_vs_sqlite) + 496  [0x1031eae38]  raw_mutex.rs:262
+    +         !   : | + !   350 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x183248128]
+    +         !   : | + !     350 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18320750c]
+    +         !   : | + 1 elitesql_core::db::CommitMutex::lock::hfe67908f65a4d935  (in scale_vs_sqlite) + 116  [0x102f7d504]  db.rs:0
+    +         !   : | 119 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 15280  [0x102fc0540]  commit.rs:911
+    +         !   : | + 119 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 204,192,...  [0x102f43aa0,0x102f43a94,...]  lib.rs:126
+    +         !   : | 57 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 1724  [0x102fbd04c]  commit.rs:761
+    +         !   : | + 33 elitesql_core::db::State::id_is_above_high_watermark::hece288b870cef1ad  (in scale_vs_sqlite) + 80  [0x102fcd170]  db.rs:2086
+    +         !   : | + ! 11 core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite) + 76  [0x102f48e98]  mod.rs:701
+    +         !   : | + ! : 6 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 100,452,...  [0x102f36d38,0x102f36e98,...]  sip.rs:297
+    +         !   : | + ! : 4 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 12  [0x102f36ce0]  sip.rs:261
+    +         !   : | + ! : 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 8  [0x102f36cdc]  sip.rs:257
+    +         !   : | + ! 7 core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite) + 200,256,...  [0x102f48f14,0x102f48f4c,...]  mod.rs:702
+    +         !   : | + ! 5 core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite) + 48,20,...  [0x102f48e7c,0x102f48e60,...]  mod.rs:700
+    +         !   : | + ! 4 core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite) + 100  [0x102f48eb0]  mod.rs:701
+    +         !   : | + ! : 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 220  [0x102f36db0]  sip.rs:0
+    +         !   : | + ! : 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 164,204  [0x102f36d78,0x102f36da0]  sip.rs:264
+    +         !   : | + ! 4 elitesql_core::db::State::id_is_above_high_watermark::hece288b870cef1ad  (in scale_vs_sqlite) + 152,80  [0x102fcd1b8,0x102fcd170]  db.rs:2086
+    +         !   : | + ! 2 core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite) + 284  [0x102f48f68]  mod.rs:703
+    +         !   : | + 7 elitesql_core::db::State::id_is_above_high_watermark::hece288b870cef1ad  (in scale_vs_sqlite) + 0  [0x102fcd120]  db.rs:2086
+    +         !   : | + 6 elitesql_core::db::State::id_is_above_high_watermark::hece288b870cef1ad  (in scale_vs_sqlite) + 180  [0x102fcd1d4]  db.rs:2086
+    +         !   : | + ! 5 _platform_memcmp  (in libsystem_platform.dylib) + 168,0,...  [0x18324efb8,0x18324ef10,...]
+    +         !   : | + ! 1 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         !   : | + 5 elitesql_core::db::State::id_is_above_high_watermark::hece288b870cef1ad  (in scale_vs_sqlite) + 276  [0x102fcd234]  db.rs:2087
+    +         !   : | + ! 3 _platform_memcmp  (in libsystem_platform.dylib) + 140,152,...  [0x18324ef9c,0x18324efa8,...]
+    +         !   : | + ! 2 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         !   : | + 2 elitesql_core::db::State::id_is_above_high_watermark::hece288b870cef1ad  (in scale_vs_sqlite) + 332  [0x102fcd26c]  db.rs:0
+    +         !   : | + 2 elitesql_core::db::State::id_is_above_high_watermark::hece288b870cef1ad  (in scale_vs_sqlite) + 340  [0x102fcd274]  db.rs:2088
+    +         !   : | + 2 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 1724  [0x102fbd04c]  commit.rs:761
+    +         !   : | +   2 elitesql_core::db::State::id_is_above_high_watermark::hece288b870cef1ad  (in scale_vs_sqlite) + 64  [0x102fcd160]  db.rs:2086
+    +         !   : | 10 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 17500,17320,...  [0x102fc0dec,0x102fc0d38,...]  commit.rs:953
+    +         !   : | 5 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 1648,1640,...  [0x102fbd000,0x102fbcff8,...]  commit.rs:793
+    +         !   : | 5 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 17880,17864  [0x102fc0f68,0x102fc0f58]  commit.rs:998
+    +         !   : | 4 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 21384  [0x102fc1d18]  commit.rs:1151
+    +         !   : | + 4 core::ptr::drop_in_place$LT$alloc..vec..Vec$LT$alloc..vec..Vec$LT$core..option..Option$LT$$LP$u64$C$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$elitesql_core..value..Value$GT$$RP$$GT$$GT$$GT$$GT$::h031f74fdc9e317f1  (in scale_vs_sqlite) + 52  [0x102fbb874]  mod.rs:805
+    +         !   : | +   4 core::ptr::drop_in_place$LT$alloc..vec..Vec$LT$core..option..Option$LT$$LP$u64$C$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$elitesql_core..value..Value$GT$$RP$$GT$$GT$$GT$::h6624f58b01e9b83e  (in scale_vs_sqlite) + 48,68  [0x102fe02d4,0x102fe02e8]  mod.rs:805
+    +         !   : | 3 core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$elitesql_core..value..Value$GT$$GT$::h3544758cb2576691  (in scale_vs_sqlite) + 228  [0x102f7e21c]  mod.rs:805
+    +         !   : | 1 elitesql_core::db::apply_one_owned::h020ffd7890ed2075  (in scale_vs_sqlite) + 12032  [0x102fcc67c]  db.rs:8862
+    +         !   : | 1 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 20964  [0x102fc1b74]  commit.rs:1132
+    +         !   : | 1 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 1692  [0x102fbd02c]  commit.rs:761
+    +         !   : | 1 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 17508  [0x102fc0df4]  commit.rs:955
+    +         !   : | 1 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 17680  [0x102fc0ea0]  commit.rs:976
+    +         !   : | 1 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 17784  [0x102fc0f08]  commit.rs:995
+    +         !   : | 1 elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite) + 17980  [0x102fc0fcc]  commit.rs:998
+    +         !   : |   1 core::ptr::drop_in_place$LT$core..iter..adapters..zip..Zip$LT$alloc..vec..into_iter..IntoIter$LT$elitesql_core..db..PreparedChange$GT$$C$alloc..vec..into_iter..IntoIter$LT$$LP$core..option..Option$LT$elitesql_core..db..VersionEntry$GT$$C$core..option..Option$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$elitesql_core..value..Value$GT$$GT$$RP$$GT$$GT$$GT$::he2d2f6ef4bea711c  (in scale_vs_sqlite) + 52  [0x102fe0108]  mod.rs:805
+    +         !   : |     1 xzm_segment_group_free_chunk  (in libsystem_malloc.dylib) + 0  [0x18304d140]
+    +         !   : 1 elitesql_core::db::commit::coordinate_commit::h16a37d7e324353e6  (in scale_vs_sqlite) + 1524  [0x102fc31c8]  commit.rs:348
+    +         !   :   1 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 0  [0x18306315c]
+    +         !   492 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 11684  [0x102fb7020]  db.rs:8182
+    +         !   : 96 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 192  [0x102f8a4dc]  db.rs:10645
+    +         !   : | 88 _platform_memcmp  (in libsystem_platform.dylib) + 168,0,...  [0x18324efb8,0x18324ef10,...]
+    +         !   : | 8 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         !   : 84 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 620  [0x102f8a688]  db.rs:10661
+    +         !   : | 40 elitesql_core::value::encode_value::hf4b3d8e7ade1246f  (in scale_vs_sqlite) + 656  [0x102f8b1f8]  value.rs:0
+    +         !   : | + 38 _platform_memmove  (in libsystem_platform.dylib) + 452,428,...  [0x183251524,0x18325150c,...]
+    +         !   : | + 2 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         !   : | 17 elitesql_core::value::encode_value::hf4b3d8e7ade1246f  (in scale_vs_sqlite) + 636,584,...  [0x102f8b1e4,0x102f8b1b0,...]  value.rs:0
+    +         !   : | 17 elitesql_core::value::encode_value::hf4b3d8e7ade1246f  (in scale_vs_sqlite) + 40,24,...  [0x102f8af90,0x102f8af80,...]  value.rs:327
+    +         !   : | 6 elitesql_core::value::encode_value::hf4b3d8e7ade1246f  (in scale_vs_sqlite) + 108,104  [0x102f8afd4,0x102f8afd0]  value.rs:342
+    +         !   : | 2 elitesql_core::value::encode_value::hf4b3d8e7ade1246f  (in scale_vs_sqlite) + 4,8  [0x102f8af6c,0x102f8af70]  value.rs:326
+    +         !   : | 1 elitesql_core::value::encode_value::hf4b3d8e7ade1246f  (in scale_vs_sqlite) + 208  [0x102f8b038]  value.rs:334
+    +         !   : | 1 elitesql_core::value::encode_value::hf4b3d8e7ade1246f  (in scale_vs_sqlite) + 768  [0x102f8b268]  value.rs:377
+    +         !   : 79 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 424  [0x102f8a5c4]  db.rs:10645
+    +         !   : | 36 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 420,256,...  [0x1830690e0,0x18306903c,...]
+    +         !   : | 12 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 324  [0x18306a7e4]
+    +         !   : | + 9 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 860  [0x18306b2d8]
+    +         !   : | + ! 9 xzm_chunk_mark_used  (in libsystem_malloc.dylib) + 188  [0x18304befc]
+    +         !   : | + !   8 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 124  [0x18304bfac]
+    +         !   : | + !   : 8 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18304ea9c]
+    +         !   : | + !   :   8 mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x1832172f8]
+    +         !   : | + !   :     8 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18320410c]
+    +         !   : | + !   1 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 96  [0x18304bf90]
+    +         !   : | + !     1 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x18324f3c0]
+    +         !   : | + !       1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183211c98]
+    +         !   : | + 1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 168  [0x18306b024]
+    +         !   : | + ! 1 _xzm_chunk_list_pop  (in libsystem_malloc.dylib) + 160  [0x18306b988]
+    +         !   : | + 1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 336  [0x18306b0cc]
+    +         !   : | + ! 1 _xzm_xzone_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 300  [0x18306acac]
+    +         !   : | + 1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 376  [0x18306b0f4]
+    +         !   : | +   1 _xzm_chunk_list_push  (in libsystem_malloc.dylib) + 44  [0x18306b870]
+    +         !   : | 10 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 756,288  [0x18306a994,0x18306a7c0]
+    +         !   : | 8 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 80,120,...  [0x18307310c,0x183073134,...]
+    +         !   : | 6 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 100,0,...  [0x1830631c0,0x18306315c,...]
+    +         !   : | 5 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 8,24,...  [0x183063958,0x183063968,...]
+    +         !   : | 1 DYLD-STUB$$malloc  (in scale_vs_sqlite) + 4  [0x1031f0e74]
+    +         !   : | 1 xzm_malloc_zone_malloc_type_malloc  (in libsystem_malloc.dylib) + 0  [0x18306f184]
+    +         !   : 61 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 812  [0x102f8a748]  db.rs:10655
+    +         !   : | 58 _platform_memcmp  (in libsystem_platform.dylib) + 140,168,...  [0x18324ef9c,0x18324efb8,...]
+    +         !   : | 3 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         !   : 55 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 220,340,...  [0x102f8a4f8,0x102f8a570,...]  db.rs:10645
+    +         !   : 33 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 740  [0x102f8a700]  db.rs:10654
+    +         !   : | 28 _platform_memmove  (in libsystem_platform.dylib) + 452,12,...  [0x183251524,0x18325136c,...]
+    +         !   : | 5 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         !   : 33 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 840,928,...  [0x102f8a764,0x102f8a7bc,...]  db.rs:10655
+    +         !   : 13 elitesql_core::value::encode_value::hf4b3d8e7ade1246f  (in scale_vs_sqlite) + 780,776  [0x102f8b274,0x102f8b270]  value.rs:377
+    +         !   : 9 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 652,660  [0x102f8a6a8,0x102f8a6b0]  db.rs:10650
+    +         !   : 9 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 704,744  [0x102f8a6dc,0x102f8a704]  db.rs:10654
+    +         !   : 8 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 624,620  [0x102f8a68c,0x102f8a688]  db.rs:0
+    +         !   : 3 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 12,0  [0x102f8a428,0x102f8a41c]  db.rs:10637
+    +         !   : 3 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 668,680  [0x102f8a6b8,0x102f8a6c4]  db.rs:10653
+    +         !   : 3 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 2340  [0x102f8ad40]  db.rs:10665
+    +         !   : 1 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 932  [0x102f8a7c0]  db.rs:10656
+    +         !   : 1 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 608  [0x102f8a67c]  db.rs:10661
+    +         !   : 1 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 2328  [0x102f8ad34]  db.rs:10664
+    +         !   200 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 16044  [0x102fb8128]  db.rs:8182
+    +         !   : 123 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 204,192,...  [0x102f43aa0,0x102f43a94,...]  lib.rs:126
+    +         !   : 21 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 428  [0x102fbae28]  wal.rs:158
+    +         !   : | 16 _platform_memmove  (in libsystem_platform.dylib) + 452,428,...  [0x183251524,0x18325150c,...]
+    +         !   : | 5 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         !   : 15 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 512  [0x102fbae7c]  wal.rs:164
+    +         !   : | 14 _platform_memmove  (in libsystem_platform.dylib) + 180,204,...  [0x183251414,0x18325142c,...]
+    +         !   : | 1 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         !   : 13 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 640  [0x102fbaefc]  wal.rs:164
+    +         !   : | 13 alloc::raw_vec::RawVecInner$LT$A$GT$::reserve::do_reserve_and_handle::h08a9390c6d484031  (in scale_vs_sqlite) + 96  [0x1031e2784]  mod.rs:557
+    +         !   : |   13 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::h7f491f3301e74f53  (in scale_vs_sqlite) + 248  [0x1031e28b0]  mod.rs:752
+    +         !   : |     13 _realloc  (in libsystem_malloc.dylib) + 452  [0x183073f14]
+    +         !   : |       13 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 148  [0x1830736f8]
+    +         !   : |         13 xzm_realloc  (in libsystem_malloc.dylib) + 880  [0x183063ef4]
+    +         !   : |           13 _platform_memmove  (in libsystem_platform.dylib) + 88,180  [0x1832513b8,0x183251414]
+    +         !   : 12 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 340  [0x102fbadd0]  wal.rs:153
+    +         !   : | 11 _platform_memmove  (in libsystem_platform.dylib) + 452,460,...  [0x183251524,0x18325152c,...]
+    +         !   : | 1 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         !   : 3 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 704  [0x102fbaf3c]  wal.rs:153
+    +         !   : | 3 alloc::raw_vec::RawVecInner$LT$A$GT$::reserve::do_reserve_and_handle::h08a9390c6d484031  (in scale_vs_sqlite) + 96  [0x1031e2784]  mod.rs:557
+    +         !   : |   3 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::h7f491f3301e74f53  (in scale_vs_sqlite) + 248  [0x1031e28b0]  mod.rs:752
+    +         !   : |     3 _realloc  (in libsystem_malloc.dylib) + 452  [0x183073f14]
+    +         !   : |       3 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 148  [0x1830736f8]
+    +         !   : |         2 xzm_realloc  (in libsystem_malloc.dylib) + 880  [0x183063ef4]
+    +         !   : |         + 2 _platform_memmove  (in libsystem_platform.dylib) + 88,180  [0x1832513b8,0x183251414]
+    +         !   : |         1 xzm_realloc  (in libsystem_malloc.dylib) + 496  [0x183063d74]
+    +         !   : 3 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 516,512  [0x102fbae80,0x102fbae7c]  wal.rs:164
+    +         !   : 2 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 276,292  [0x102fbad90,0x102fbada0]  wal.rs:152
+    +         !   : 2 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 308  [0x102fbadb0]  wal.rs:153
+    +         !   : 2 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 348  [0x102fbadd8]  wal.rs:154
+    +         !   : 2 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 456  [0x102fbae44]  wal.rs:163
+    +         !   : 1 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 264  [0x102fbad84]  wal.rs:149
+    +         !   : 1 elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite) + 432  [0x102fbae2c]  wal.rs:158
+    +         !   145 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 364  [0x102fb43e8]  db.rs:8181
+    +         !   : 145 _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x18308db20]
+    +         !   :   145 _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x18308d490]
+    +         !   :     145 semaphore_wait_trap  (in libsystem_kernel.dylib) + 8  [0x183203bb0]
+    +         !   94 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 10972,10900,...  [0x102fb6d58,0x102fb6d10,...]  db.rs:8182
+    +         !   70 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 11716  [0x102fb7040]  db.rs:8182
+    +         !   : 36 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 420,88,...  [0x1830690e0,0x183068f94,...]
+    +         !   : 10 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,80,...  [0x1830730c8,0x18307310c,...]
+    +         !   : 8 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 100,0,...  [0x1830631c0,0x18306315c,...]
+    +         !   : 8 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 8,24,...  [0x183063958,0x183063968,...]
+    +         !   : 5 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 756  [0x18306a994]
+    +         !   : 3 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 324  [0x18306a7e4]
+    +         !   :   2 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 860  [0x18306b2d8]
+    +         !   :   + 2 xzm_chunk_mark_used  (in libsystem_malloc.dylib) + 188  [0x18304befc]
+    +         !   :   +   2 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 124  [0x18304bfac]
+    +         !   :   +     2 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18304ea9c]
+    +         !   :   +       2 mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x1832172f8]
+    +         !   :   +         2 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18320410c]
+    +         !   :   1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 788  [0x18306b290]
+    +         !   :     1 _xzm_chunk_list_pop  (in libsystem_malloc.dylib) + 20  [0x18306b8fc]
+    +         !   12 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 804,800,...  [0x102fb45a0,0x102fb459c,...]  db.rs:8181
+    +         !   11 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 11400  [0x102fb6f04]  db.rs:8182
+    +         !   : 10 _platform_memcmp  (in libsystem_platform.dylib) + 0,152,...  [0x18324ef10,0x18324efa8,...]
+    +         !   : 1 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         !   9 elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite) + 2364  [0x102f8ad58]  db.rs:10665
+    +         !   1 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 10480  [0x102fb6b6c]  db.rs:8182
+    +         !   : 1 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 464  [0x183063458]
+    +         !   :   1 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 504  [0x18304c5f4]
+    +         !   :     1 _xzm_segment_group_find_and_allocate_chunk  (in libsystem_malloc.dylib) + 528  [0x18304cc30]
+    +         !   :       1 _xzm_segment_group_span_mark_smaller  (in libsystem_malloc.dylib) + 240  [0x18304e148]
+    +         !   :         1 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18304ea9c]
+    +         !   :           1 mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x1832172f8]
+    +         !   :             1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18320410c]
+    +         !   1 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 13096  [0x102fb75a4]  db.rs:8182
+    +         !   : 1 core::ptr::drop_in_place$LT$alloc..vec..into_iter..IntoIter$LT$$LP$alloc..string..String$C$elitesql_core..db..StagedTable$RP$$GT$$GT$::h2f561010cb11f321  (in scale_vs_sqlite) + 64  [0x102fba888]  mod.rs:805
+    +         !   1 elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite) + 12940  [0x102fb7508]  db.rs:8183
+    +         !     1 _$LT$elitesql_core..db..Snapshot$u20$as$u20$core..ops..drop..Drop$GT$::drop::hb4fafd487a2528e1  (in scale_vs_sqlite) + 556  [0x102fb0668]  db.rs:2813
+    +         !       1 DYLD-STUB$$pthread_mutex_lock  (in scale_vs_sqlite) + 4  [0x1031f1054]
+    +         1129 scale_vs_sqlite::run_elitesql::h035d62d925377d77  (in scale_vs_sqlite) + 9740  [0x102f22ee4]  scale_vs_sqlite.rs:401
+    +         ! 481 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 2504  [0x1030055f0]  db.rs:7874
+    +         ! : 75 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 1120  [0x102f806f8]  db.rs:10520
+    +         ! : | 66 _platform_memcmp  (in libsystem_platform.dylib) + 168,236,...  [0x18324efb8,0x18324effc,...]
+    +         ! : | 9 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4,0  [0x1031f0ee0,0x1031f0edc]
+    +         ! : 67 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 560  [0x102f804c8]  db.rs:10512
+    +         ! : | 47 alloc::collections::btree::remove::_$LT$impl$u20$alloc..collections..btree..node..Handle$LT$alloc..collections..btree..node..NodeRef$LT$alloc..collections..btree..node..marker..Mut$C$K$C$V$C$alloc..collections..btree..node..marker..Leaf$GT$$C$alloc..collections..btree..node..marker..KV$GT$$GT$::remove_leaf_kv::h3f73daf9b0e77d87  (in scale_vs_sqlite) + 104  [0x102f81c40]  remove.rs:31
+    +         ! : | + 44 _platform_memmove  (in libsystem_platform.dylib) + 420,428,...  [0x183251504,0x18325150c,...]
+    +         ! : | + 3 DYLD-STUB$$memmove  (in scale_vs_sqlite) + 4,0  [0x1031f0ef8,0x1031f0ef4]
+    +         ! : | 10 alloc::collections::btree::remove::_$LT$impl$u20$alloc..collections..btree..node..Handle$LT$alloc..collections..btree..node..NodeRef$LT$alloc..collections..btree..node..marker..Mut$C$K$C$V$C$alloc..collections..btree..node..marker..Leaf$GT$$C$alloc..collections..btree..node..marker..KV$GT$$GT$::remove_leaf_kv::h3f73daf9b0e77d87  (in scale_vs_sqlite) + 132  [0x102f81c5c]  remove.rs:31
+    +         ! : | + 8 _platform_memmove  (in libsystem_platform.dylib) + 24,396,...  [0x183251378,0x1832514ec,...]
+    +         ! : | + 2 DYLD-STUB$$memmove  (in scale_vs_sqlite) + 4  [0x1031f0ef8]
+    +         ! : | 7 alloc::collections::btree::remove::_$LT$impl$u20$alloc..collections..btree..node..Handle$LT$alloc..collections..btree..node..NodeRef$LT$alloc..collections..btree..node..marker..Mut$C$K$C$V$C$alloc..collections..btree..node..marker..Leaf$GT$$C$alloc..collections..btree..node..marker..KV$GT$$GT$::remove_leaf_kv::h3f73daf9b0e77d87  (in scale_vs_sqlite) + 132,156,...  [0x102f81c5c,0x102f81c74,...]  remove.rs:31
+    +         ! : | 2 alloc::collections::btree::remove::_$LT$impl$u20$alloc..collections..btree..node..Handle$LT$alloc..collections..btree..node..NodeRef$LT$alloc..collections..btree..node..marker..Mut$C$K$C$V$C$alloc..collections..btree..node..marker..Leaf$GT$$C$alloc..collections..btree..node..marker..KV$GT$$GT$::remove_leaf_kv::h3f73daf9b0e77d87  (in scale_vs_sqlite) + 832  [0x102f81f18]  remove.rs:74
+    +         ! : | 1 alloc::collections::btree::remove::_$LT$impl$u20$alloc..collections..btree..node..Handle$LT$alloc..collections..btree..node..NodeRef$LT$alloc..collections..btree..node..marker..Mut$C$K$C$V$C$alloc..collections..btree..node..marker..Leaf$GT$$C$alloc..collections..btree..node..marker..KV$GT$$GT$::remove_leaf_kv::h3f73daf9b0e77d87  (in scale_vs_sqlite) + 12  [0x102f81be4]  remove.rs:26
+    +         ! : 49 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 2264  [0x102f80b70]  db.rs:10512
+    +         ! : | 39 _xzm_free  (in libsystem_malloc.dylib) + 996,776,...  [0x1830644fc,0x183064420,...]
+    +         ! : | 4 DYLD-STUB$$free  (in scale_vs_sqlite) + 4  [0x1031f0d90]
+    +         ! : | 4 _free  (in libsystem_malloc.dylib) + 76,12  [0x183073d1c,0x183073cdc]
+    +         ! : | 2 free  (in libsystem_malloc.dylib) + 0  [0x18303a6b8]
+    +         ! : 48 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 988  [0x102f80674]  db.rs:10515
+    +         ! : | 40 _platform_memcmp  (in libsystem_platform.dylib) + 140,0,...  [0x18324ef9c,0x18324ef10,...]
+    +         ! : | 8 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         ! : 46 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 2608  [0x102f80cc8]  db.rs:10512
+    +         ! : | 33 _xzm_free  (in libsystem_malloc.dylib) + 996,28,...  [0x1830644fc,0x183064134,...]
+    +         ! : | 9 _free  (in libsystem_malloc.dylib) + 0,36,...  [0x183073cd0,0x183073cf4,...]
+    +         ! : | 4 DYLD-STUB$$free  (in scale_vs_sqlite) + 4  [0x1031f0d90]
+    +         ! : 36 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 1148,1076,...  [0x102f80714,0x102f806cc,...]  db.rs:10520
+    +         ! : 32 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 1252,1208,...  [0x102f8077c,0x102f80750,...]  db.rs:10521
+    +         ! : 31 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 212  [0x102f8036c]  db.rs:10512
+    +         ! : | 28 _platform_memcmp  (in libsystem_platform.dylib) + 272,0,...  [0x18324f020,0x18324ef10,...]
+    +         ! : | 3 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         ! : 28 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 200,600,...  [0x102f80360,0x102f804f0,...]  db.rs:10512
+    +         ! : 20 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 960,948,...  [0x102f80658,0x102f8064c,...]  db.rs:10515
+    +         ! : 13 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 76,52,...  [0x102f802e4,0x102f802cc,...]  db.rs:10511
+    +         ! : 11 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 768,692,...  [0x102f80598,0x102f8054c,...]  db.rs:10514
+    +         ! : 7 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 992,748,...  [0x102f80678,0x102f80584,...]  macros.rs:0
+    +         ! : 6 alloc::collections::btree::remove::_$LT$impl$u20$alloc..collections..btree..node..Handle$LT$alloc..collections..btree..node..NodeRef$LT$alloc..collections..btree..node..marker..Mut$C$K$C$V$C$alloc..collections..btree..node..marker..Leaf$GT$$C$alloc..collections..btree..node..marker..KV$GT$$GT$::remove_leaf_kv::h3f73daf9b0e77d87  (in scale_vs_sqlite) + 880  [0x102f81f48]  remove.rs:75
+    +         ! : 4 _xzm_free  (in libsystem_malloc.dylib) + 1568  [0x183064738]
+    +         ! : 4 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 12  [0x102f802a4]  db.rs:10506
+    +         ! : 2 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 1016  [0x102f80690]  db.rs:0
+    +         ! : 2 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 708  [0x102f8055c]  map.rs:0
+    +         ! 301 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 3760  [0x103005ad8]  db.rs:7874
+    +         ! : 119 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 3420  [0x102fb2d9c]  db.rs:7726
+    +         ! : | 87 hashbrown::raw::RawTable$LT$T$C$A$GT$::reserve_rehash::he89452d280fa06b1  (in scale_vs_sqlite) + 256  [0x1031e714c]  mod.rs:1013
+    +         ! : | + 28 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 76  [0x102f49b64]  mod.rs:701
+    +         ! : | + ! 8 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 376  [0x102f36e4c]  sip.rs:281
+    +         ! : | + ! 8 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 452,100,...  [0x102f36e98,0x102f36d38,...]  sip.rs:297
+    +         ! : | + ! 4 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 316,68,...  [0x102f36e10,0x102f36d18,...]  sip.rs:0
+    +         ! : | + ! 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 320  [0x102f36e14]  sip.rs:104
+    +         ! : | + ! 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 0  [0x102f36cd4]  sip.rs:257
+    +         ! : | + ! 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 12  [0x102f36ce0]  sip.rs:261
+    +         ! : | + ! 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 348  [0x102f36e30]  sip.rs:288
+    +         ! : | + 22 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 284  [0x102f49c34]  mod.rs:703
+    +         ! : | + 17 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 100  [0x102f49b7c]  mod.rs:701
+    +         ! : | + ! 7 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 204,164  [0x102f36da0,0x102f36d78]  sip.rs:264
+    +         ! : | + ! 5 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 220,20  [0x102f36db0,0x102f36ce8]  sip.rs:0
+    +         ! : | + ! 5 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 12  [0x102f36ce0]  sip.rs:261
+    +         ! : | + 9 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 216,252,...  [0x102f49bf0,0x102f49c14,...]  mod.rs:702
+    +         ! : | + 5 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 0,4  [0x102f49b18,0x102f49b1c]  mod.rs:695
+    +         ! : | + 4 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 36,28,...  [0x102f49b3c,0x102f49b34,...]  mod.rs:700
+    +         ! : | + 2 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 64,80  [0x102f49b58,0x102f49b68]  mod.rs:701
+    +         ! : | 29 hashbrown::raw::RawTable$LT$T$C$A$GT$::reserve_rehash::he89452d280fa06b1  (in scale_vs_sqlite) + 196,292,...  [0x1031e7110,0x1031e7170,...]  mod.rs:1013
+    +         ! : | 2 hashbrown::raw::RawTable$LT$T$C$A$GT$::reserve_rehash::he89452d280fa06b1  (in scale_vs_sqlite) + 112  [0x1031e70bc]  mod.rs:1013
+    +         ! : | + 2 hashbrown::raw::RawTableInner::fallible_with_capacity::h00720db5cfbfe868  (in scale_vs_sqlite) + 224  [0x102f49f38]  mod.rs:1672
+    +         ! : | +   1 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 0  [0x18306315c]
+    +         ! : | +   1 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 80  [0x1830632d8]
+    +         ! : | 1 hashbrown::raw::RawTable$LT$T$C$A$GT$::reserve_rehash::he89452d280fa06b1  (in scale_vs_sqlite) + 1000  [0x1031e7434]  mod.rs:1013
+    +         ! : |   1 _xzm_free_outlined  (in libsystem_malloc.dylib) + 232  [0x18306c564]
+    +         ! : 42 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 2428  [0x102fb29bc]  db.rs:7720
+    +         ! : | 34 hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h4114d0283575ef10  (in scale_vs_sqlite) + 72  [0x102fb31e4]  map.rs:1458
+    +         ! : | + 13 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 76  [0x102f49b64]  mod.rs:701
+    +         ! : | + ! 5 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 424,100,...  [0x102f36e7c,0x102f36d38,...]  sip.rs:297
+    +         ! : | + ! 4 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 12  [0x102f36ce0]  sip.rs:261
+    +         ! : | + ! 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 68  [0x102f36d18]  sip.rs:0
+    +         ! : | + ! 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 380  [0x102f36e50]  sip.rs:281
+    +         ! : | + 6 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 160,100,...  [0x102f49bb8,0x102f49b7c,...]  mod.rs:702
+    +         ! : | + 5 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 284  [0x102f49c34]  mod.rs:703
+    +         ! : | + 4 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 100  [0x102f49b7c]  mod.rs:701
+    +         ! : | + ! 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 20,124  [0x102f36ce8,0x102f36d50]  sip.rs:0
+    +         ! : | + ! 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 164,204  [0x102f36d78,0x102f36da0]  sip.rs:264
+    +         ! : | + 3 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 0  [0x102f49b18]  mod.rs:695
+    +         ! : | + 2 hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h4114d0283575ef10  (in scale_vs_sqlite) + 108,200  [0x102fb3208,0x102fb3264]  map.rs:1459
+    +         ! : | + 1 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 56  [0x102f49b50]  mod.rs:700
+    +         ! : | 3 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 2428  [0x102fb29bc]  db.rs:7720
+    +         ! : | + 3 hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h4114d0283575ef10  (in scale_vs_sqlite) + 68  [0x102fb31e0]  map.rs:1458
+    +         ! : | 2 hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h4114d0283575ef10  (in scale_vs_sqlite) + 172  [0x102fb3248]  map.rs:1459
+    +         ! : | + 2 hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h4114d0283575ef10  (in scale_vs_sqlite) + 264  [0x102fb32a4]  map.rs:1459
+    +         ! : | 1 hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h4114d0283575ef10  (in scale_vs_sqlite) + 0  [0x102fb319c]  map.rs:1457
+    +         ! : | 1 hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h4114d0283575ef10  (in scale_vs_sqlite) + 292  [0x102fb32c0]  map.rs:1459
+    +         ! : | 1 hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h4114d0283575ef10  (in scale_vs_sqlite) + 296  [0x102fb32c4]  map.rs:1466
+    +         ! : 34 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 2612  [0x102fb2a74]  db.rs:7726
+    +         ! : | 11 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 76  [0x102f49b64]  mod.rs:701
+    +         ! : | + 4 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 12  [0x102f36ce0]  sip.rs:261
+    +         ! : | + 3 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 68  [0x102f36d18]  sip.rs:0
+    +         ! : | + 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 348,368  [0x102f36e30,0x102f36e44]  sip.rs:288
+    +         ! : | + 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 376  [0x102f36e4c]  sip.rs:281
+    +         ! : | + 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 100  [0x102f36d38]  sip.rs:297
+    +         ! : | 9 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 284  [0x102f49c34]  mod.rs:703
+    +         ! : | 8 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 248,244,...  [0x102f49c10,0x102f49c0c,...]  mod.rs:702
+    +         ! : | 5 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 100  [0x102f49b7c]  mod.rs:701
+    +         ! : | + 3 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 204,32  [0x102f36da0,0x102f36cf4]  sip.rs:264
+    +         ! : | + 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 20,124  [0x102f36ce8,0x102f36d50]  sip.rs:0
+    +         ! : | 1 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 28  [0x102f49b34]  mod.rs:700
+    +         ! : 33 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 464  [0x102fb2210]  db.rs:7671
+    +         ! : | 31 elitesql_core::db::staged_operation_bytes::h1ed382850608c74e  (in scale_vs_sqlite) + 276,220,...  [0x102fb3084,0x102fb304c,...]  db.rs:8285
+    +         ! : | 2 elitesql_core::db::staged_operation_bytes::h1ed382850608c74e  (in scale_vs_sqlite) + 0,20  [0x102fb2f70,0x102fb2f84]  db.rs:8284
+    +         ! : 22 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 184  [0x102fb20f8]  db.rs:7669
+    +         ! : | 10 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 76  [0x102f49b64]  mod.rs:701
+    +         ! : | + 6 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 356  [0x102f36e38]  sip.rs:288
+    +         ! : | + 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 68  [0x102f36d18]  sip.rs:0
+    +         ! : | + 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 0  [0x102f36cd4]  sip.rs:257
+    +         ! : | + 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 12  [0x102f36ce0]  sip.rs:261
+    +         ! : | + 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 100  [0x102f36d38]  sip.rs:297
+    +         ! : | 6 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 284  [0x102f49c34]  mod.rs:703
+    +         ! : | 4 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 100  [0x102f49b7c]  mod.rs:701
+    +         ! : | + 3 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 164,204  [0x102f36d78,0x102f36da0]  sip.rs:264
+    +         ! : | + 1 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 20  [0x102f36ce8]  sip.rs:0
+    +         ! : | 1 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 56  [0x102f49b50]  mod.rs:700
+    +         ! : | 1 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 172  [0x102f49bc4]  mod.rs:702
+    +         ! : 9 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 136  [0x102fb20c8]  db.rs:7664
+    +         ! : | 8 _platform_memcmp  (in libsystem_platform.dylib) + 168,272,...  [0x18324efb8,0x18324f020,...]
+    +         ! : | 1 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         ! : 7 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 3172,2768,...  [0x102fb2ca4,0x102fb2b10,...]  db.rs:7726
+    +         ! : 6 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 348,368,...  [0x102fb219c,0x102fb21b0,...]  db.rs:7669
+    +         ! : 5 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 48  [0x102fb2070]  db.rs:7661
+    +         ! : 5 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 500  [0x102fb2234]  db.rs:7676
+    +         ! : 5 elitesql_core::db::staged_operation_bytes::h1ed382850608c74e  (in scale_vs_sqlite) + 420,424  [0x102fb3114,0x102fb3118]  db.rs:8306
+    +         ! : 4 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 108,136  [0x102fb20ac,0x102fb20c8]  db.rs:7664
+    +         ! : 3 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 528  [0x102fb2250]  db.rs:7706
+    +         ! : 2 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 2572,2584  [0x102fb2a4c,0x102fb2a58]  db.rs:7728
+    +         ! : 2 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 3216  [0x102fb2cd0]  db.rs:7737
+    +         ! : 1 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 296  [0x102fb2168]  db.rs:7669
+    +         ! : | 1 _platform_memcmp  (in libsystem_platform.dylib) + 236  [0x18324effc]
+    +         ! : 1 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 2404  [0x102fb29a4]  db.rs:7720
+    +         ! : 1 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 3208  [0x102fb2cc8]  db.rs:7736
+    +         ! 78 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 2748,760,...  [0x1030056e4,0x103004f20,...]  db.rs:7874
+    +         ! 65 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 1992  [0x1030053f0]  db.rs:7874
+    +         ! : 37 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 284,268,...  [0x183069058,0x183069048,...]
+    +         ! : 11 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 8,184,...  [0x183063958,0x183063a08,...]
+    +         ! : 8 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 100,112,...  [0x1830631c0,0x1830631cc,...]
+    +         ! : 6 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,80  [0x1830730c8,0x18307310c]
+    +         ! : 2 DYLD-STUB$$malloc  (in scale_vs_sqlite) + 4  [0x1031f0e74]
+    +         ! : 1 malloc  (in libsystem_malloc.dylib) + 0  [0x183039ce8]
+    +         ! 52 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 3656  [0x103005a70]  db.rs:7874
+    +         ! : 23 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 420,256,...  [0x1830690e0,0x18306903c,...]
+    +         ! : 11 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 100,136,...  [0x1830631c0,0x1830631e4,...]
+    +         ! : 7 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 44,12,...  [0x1830730e8,0x1830730c8,...]
+    +         ! : 4 DYLD-STUB$$malloc  (in scale_vs_sqlite) + 4,8  [0x1031f0e74,0x1031f0e78]
+    +         ! : 4 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 8,180,...  [0x183063958,0x183063a04,...]
+    +         ! : 2 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 756  [0x18306a994]
+    +         ! : 1 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 324  [0x18306a7e4]
+    +         ! :   1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 564  [0x18306b1b0]
+    +         ! 46 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 2608  [0x103005658]  db.rs:7874
+    +         ! : 23 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 76  [0x102f49b64]  mod.rs:701
+    +         ! : | 8 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 100,112  [0x102f36d38,0x102f36d44]  sip.rs:297
+    +         ! : | 6 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 376  [0x102f36e4c]  sip.rs:281
+    +         ! : | 5 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 12  [0x102f36ce0]  sip.rs:261
+    +         ! : | 4 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 68  [0x102f36d18]  sip.rs:0
+    +         ! : 8 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 100  [0x102f49b7c]  mod.rs:701
+    +         ! : | 3 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 12  [0x102f36ce0]  sip.rs:261
+    +         ! : | 3 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 204  [0x102f36da0]  sip.rs:264
+    +         ! : | 2 _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 20,124  [0x102f36ce8,0x102f36d50]  sip.rs:0
+    +         ! : 7 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 284  [0x102f49c34]  mod.rs:703
+    +         ! : 3 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 28,56  [0x102f49b34,0x102f49b50]  mod.rs:700
+    +         ! : 3 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 60  [0x102f49b54]  mod.rs:701
+    +         ! : 2 core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 168,256  [0x102f49bc0,0x102f49c18]  mod.rs:702
+    +         ! 31 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 420  [0x103004dcc]  db.rs:7874
+    +         ! : 24 _platform_memcmp  (in libsystem_platform.dylib) + 260,272,...  [0x18324f014,0x18324f020,...]
+    +         ! : 7 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         ! 20 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 2452  [0x1030055bc]  db.rs:7874
+    +         ! : 18 _platform_memmove  (in libsystem_platform.dylib) + 452,428,...  [0x183251524,0x18325150c,...]
+    +         ! : 2 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! 14 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 3696  [0x103005a98]  db.rs:7874
+    +         ! : 14 _platform_memmove  (in libsystem_platform.dylib) + 452,12,...  [0x183251524,0x18325136c,...]
+    +         ! 12 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 80  [0x103004c78]  db.rs:7874
+    +         ! : 6 elitesql_core::db::Txn::schema::h545e6698f1ad1558  (in scale_vs_sqlite) + 124  [0x102fb18fc]  db.rs:7750
+    +         ! : | 5 _platform_memcmp  (in libsystem_platform.dylib) + 272,280,...  [0x18324f020,0x18324f028,...]
+    +         ! : | 1 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         ! : 5 elitesql_core::db::Txn::schema::h545e6698f1ad1558  (in scale_vs_sqlite) + 96,52  [0x102fb18e0,0x102fb18b4]  db.rs:7750
+    +         ! : 1 elitesql_core::db::Txn::schema::h545e6698f1ad1558  (in scale_vs_sqlite) + 0  [0x102fb1880]  db.rs:7748
+    +         ! 11 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 2880  [0x103005768]  db.rs:7874
+    +         ! : 10 _platform_memcmp  (in libsystem_platform.dylib) + 140,164,...  [0x18324ef9c,0x18324efb4,...]
+    +         ! : 1 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 8  [0x1031f0ee4]
+    +         ! 7 elitesql_core::db::Txn::schema::h545e6698f1ad1558  (in scale_vs_sqlite) + 1040,1056,...  [0x102fb1c90,0x102fb1ca0,...]  db.rs:7772
+    +         ! 4 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 1492  [0x1030051fc]  db.rs:7874
+    +         ! : 2 ulid::Ulid::from_string::h285a03a14784824f  (in scale_vs_sqlite) + 16  [0x10306dc4c]  lib.rs:127
+    +         ! : 1 ulid::Ulid::from_string::h285a03a14784824f  (in scale_vs_sqlite) + 24  [0x10306dc54]  lib.rs:128
+    +         ! : 1 ulid::Ulid::from_string::h285a03a14784824f  (in scale_vs_sqlite) + 692  [0x10306def0]  lib.rs:132
+    +         ! 4 elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite) + 3244,3232  [0x102fb2cec,0x102fb2ce0]  db.rs:7737
+    +         ! 1 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 12  [0x103004c34]  db.rs:7873
+    +         ! 1 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 2708  [0x1030056bc]  db.rs:7874
+    +         ! : 1 _platform_memcmp  (in libsystem_platform.dylib) + 180  [0x18324efc4]
+    +         ! 1 elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite) + 2568  [0x102f80ca0]  db.rs:10536
+    +         1001 scale_vs_sqlite::run_elitesql::h035d62d925377d77  (in scale_vs_sqlite) + 9464  [0x102f22dd0]  scale_vs_sqlite.rs:396
+    +         ! 291 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 120  [0x102f2cd30]  function.rs:166
+    +         ! : 211 alloc::fmt::format::format_inner::hfd0ba00c746e1ec5  (in scale_vs_sqlite) + 284  [0x102f3a094]
+    +         ! : | 166 core::fmt::write::h8f471e047a46547a  (in scale_vs_sqlite) + 324  [0x102f3f910]
+    +         ! : | + 154 core::fmt::num::imp::_$LT$impl$u20$core..fmt..Display$u20$for$u20$u64$GT$::fmt::h616e1fa88216e8ed  (in scale_vs_sqlite) + 68  [0x102f3d6f8]
+    +         ! : | + ! 107 core::fmt::Formatter::pad_integral::hc977a1d07d0bc8f9  (in scale_vs_sqlite) + 608  [0x102f3fbe0]
+    +         ! : | + ! : 89 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 108  [0x102f3a19c]
+    +         ! : | + ! : | 83 alloc::raw_vec::RawVecInner$LT$A$GT$::reserve::do_reserve_and_handle::h893f0519bacda6d6  (in scale_vs_sqlite) + 68  [0x1031e1a20]
+    +         ! : | + ! : | + 80 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::heb1d24b754422441  (in scale_vs_sqlite) + 56  [0x1031e1994]
+    +         ! : | + ! : | + ! 42 _realloc  (in libsystem_malloc.dylib) + 452  [0x183073f14]
+    +         ! : | + ! : | + ! : 24 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 148  [0x1830736f8]
+    +         ! : | + ! : | + ! : | 24 xzm_realloc  (in libsystem_malloc.dylib) + 292,1084,...  [0x183063ca8,0x183063fc0,...]
+    +         ! : | + ! : | + ! : 14 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 48,80,...  [0x183073694,0x1830736b4,...]
+    +         ! : | + ! : | + ! : 4 xzm_realloc  (in libsystem_malloc.dylib) + 932  [0x183063f28]
+    +         ! : | + ! : | + ! 20 _realloc  (in libsystem_malloc.dylib) + 252  [0x183073e4c]
+    +         ! : | + ! : | + ! : 20 xzm_malloc_zone_size  (in libsystem_malloc.dylib) + 604,272,...  [0x18306e768,0x18306e61c,...]
+    +         ! : | + ! : | + ! 13 _realloc  (in libsystem_malloc.dylib) + 208,248,...  [0x183073e20,0x183073e48,...]
+    +         ! : | + ! : | + ! 2 DYLD-STUB$$realloc  (in scale_vs_sqlite) + 4  [0x1031f10f0]
+    +         ! : | + ! : | + ! 2 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 220  [0x183073740]
+    +         ! : | + ! : | + ! 1 xzm_malloc_zone_size  (in libsystem_malloc.dylib) + 732  [0x18306e7e8]
+    +         ! : | + ! : | + 2 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::heb1d24b754422441  (in scale_vs_sqlite) + 4  [0x1031e1960]
+    +         ! : | + ! : | + 1 _realloc  (in libsystem_malloc.dylib) + 504  [0x183073f48]
+    +         ! : | + ! : | 5 alloc::raw_vec::RawVecInner$LT$A$GT$::reserve::do_reserve_and_handle::h893f0519bacda6d6  (in scale_vs_sqlite) + 8,4,...  [0x1031e19e4,0x1031e19e0,...]
+    +         ! : | + ! : | 1 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::heb1d24b754422441  (in scale_vs_sqlite) + 120  [0x1031e19d4]
+    +         ! : | + ! : 15 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 60  [0x102f3a16c]
+    +         ! : | + ! : | 13 _platform_memmove  (in libsystem_platform.dylib) + 452,0,...  [0x183251524,0x183251360,...]
+    +         ! : | + ! : | 2 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : | + ! : 3 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 28  [0x102f3a14c]
+    +         ! : | + ! 17 core::fmt::Formatter::pad_integral::hc977a1d07d0bc8f9  (in scale_vs_sqlite) + 448,432,...  [0x102f3fb40,0x102f3fb30,...]
+    +         ! : | + ! 12 core::fmt::Formatter::pad_integral::hc977a1d07d0bc8f9  (in scale_vs_sqlite) + 448  [0x102f3fb40]
+    +         ! : | + ! : 12 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_char::hc90507ff9db69e39  (in scale_vs_sqlite) + 44,56,...  [0x102f3a1d4,0x102f3a1e0,...]
+    +         ! : | + ! 8 core::fmt::Formatter::pad_integral::hc977a1d07d0bc8f9  (in scale_vs_sqlite) + 288  [0x102f3faa0]
+    +         ! : | + ! : 8 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 108  [0x102f3a19c]
+    +         ! : | + ! :   8 core::fmt::Formatter::pad_integral::hc977a1d07d0bc8f9  (in scale_vs_sqlite) + 400  [0x102f3fb10]
+    +         ! : | + ! :     8 core::fmt::Formatter::pad_integral::write_prefix::h06257d2de813e0d8  (in scale_vs_sqlite) + 8  [0x102f3fc28]
+    +         ! : | + ! 6 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_char::hc90507ff9db69e39  (in scale_vs_sqlite) + 272,268  [0x102f3a2b8,0x102f3a2b4]
+    +         ! : | + ! 2 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 80  [0x102f3a180]
+    +         ! : | + ! 2 core::fmt::Formatter::pad_integral::write_prefix::h06257d2de813e0d8  (in scale_vs_sqlite) + 116  [0x102f3fc94]
+    +         ! : | + 10 core::fmt::num::imp::_$LT$impl$u20$core..fmt..Display$u20$for$u20$u64$GT$::fmt::h616e1fa88216e8ed  (in scale_vs_sqlite) + 36  [0x102f3d6d8]
+    +         ! : | + ! 10 core::fmt::num::imp::_$LT$impl$u20$u64$GT$::_fmt_inner::ha9d315164282ae0b  (in scale_vs_sqlite) + 88,620,...  [0x102f3d2ac,0x102f3d4c0,...]
+    +         ! : | + 2 core::fmt::Formatter::pad_integral::hc977a1d07d0bc8f9  (in scale_vs_sqlite) + 632,636  [0x102f3fbf8,0x102f3fbfc]
+    +         ! : | 24 core::fmt::write::h8f471e047a46547a  (in scale_vs_sqlite) + 104,20,...  [0x102f3f834,0x102f3f7e0,...]
+    +         ! : | 15 core::fmt::write::h8f471e047a46547a  (in scale_vs_sqlite) + 144  [0x102f3f85c]
+    +         ! : | + 14 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 60  [0x102f3a16c]
+    +         ! : | + ! 13 _platform_memmove  (in libsystem_platform.dylib) + 452,428,...  [0x183251524,0x18325150c,...]
+    +         ! : | + ! 1 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : | + 1 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 28  [0x102f3a14c]
+    +         ! : | 5 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 80  [0x102f3a180]
+    +         ! : | 1 core::fmt::num::imp::_$LT$impl$u20$core..fmt..Display$u20$for$u20$u64$GT$::fmt::h616e1fa88216e8ed  (in scale_vs_sqlite) + 72  [0x102f3d6fc]
+    +         ! : 58 alloc::fmt::format::format_inner::hfd0ba00c746e1ec5  (in scale_vs_sqlite) + 228  [0x102f3a05c]
+    +         ! : | 23 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 256,284,...  [0x18306903c,0x183069058,...]
+    +         ! : | 16 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 100,0,...  [0x1830631c0,0x18306315c,...]
+    +         ! : | 7 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,44,...  [0x1830730c8,0x1830730e8,...]
+    +         ! : | 7 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 8,24,...  [0x183063958,0x183063968,...]
+    +         ! : | 4 DYLD-STUB$$malloc  (in scale_vs_sqlite) + 4  [0x1031f0e74]
+    +         ! : | 1 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 324  [0x18306a7e4]
+    +         ! : |   1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 564  [0x18306b1b0]
+    +         ! : 13 alloc::fmt::format::format_inner::hfd0ba00c746e1ec5  (in scale_vs_sqlite) + 12,96,...  [0x102f39f84,0x102f39fd8,...]
+    +         ! : 9 core::fmt::write::h8f471e047a46547a  (in scale_vs_sqlite) + 424  [0x102f3f974]
+    +         ! 146 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 352  [0x102f2ce18]  function.rs:166
+    +         ! : 79 alloc::fmt::format::format_inner::hfd0ba00c746e1ec5  (in scale_vs_sqlite) + 284  [0x102f3a094]
+    +         ! : | 50 core::fmt::write::h8f471e047a46547a  (in scale_vs_sqlite) + 96  [0x102f3f82c]
+    +         ! : | + 26 core::fmt::num::imp::_$LT$impl$u20$core..fmt..Display$u20$for$u20$u64$GT$::fmt::h616e1fa88216e8ed  (in scale_vs_sqlite) + 68  [0x102f3d6f8]
+    +         ! : | + ! 13 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 60  [0x102f3a16c]
+    +         ! : | + ! : 11 _platform_memmove  (in libsystem_platform.dylib) + 452,460,...  [0x183251524,0x18325152c,...]
+    +         ! : | + ! : 2 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : | + ! 5 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 28,44,...  [0x102f3a14c,0x102f3a15c,...]
+    +         ! : | + ! 5 core::fmt::Formatter::pad_integral::hc977a1d07d0bc8f9  (in scale_vs_sqlite) + 288  [0x102f3faa0]
+    +         ! : | + ! : 5 core::fmt::Formatter::pad_integral::write_prefix::h06257d2de813e0d8  (in scale_vs_sqlite) + 8  [0x102f3fc28]
+    +         ! : | + ! 2 core::fmt::Formatter::pad_integral::hc977a1d07d0bc8f9  (in scale_vs_sqlite) + 24,80  [0x102f3f998,0x102f3f9d0]
+    +         ! : | + ! 1 core::fmt::Formatter::pad_integral::write_prefix::h06257d2de813e0d8  (in scale_vs_sqlite) + 116  [0x102f3fc94]
+    +         ! : | + 11 core::fmt::num::imp::_$LT$impl$u20$core..fmt..Display$u20$for$u20$u64$GT$::fmt::h616e1fa88216e8ed  (in scale_vs_sqlite) + 36  [0x102f3d6d8]
+    +         ! : | + ! 11 core::fmt::num::imp::_$LT$impl$u20$u64$GT$::_fmt_inner::ha9d315164282ae0b  (in scale_vs_sqlite) + 88,0,...  [0x102f3d2ac,0x102f3d254,...]
+    +         ! : | + 8 core::fmt::Formatter::pad_integral::hc977a1d07d0bc8f9  (in scale_vs_sqlite) + 328  [0x102f3fac8]
+    +         ! : | + 5 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 80  [0x102f3a180]
+    +         ! : | 16 core::fmt::write::h8f471e047a46547a  (in scale_vs_sqlite) + 20,84,...  [0x102f3f7e0,0x102f3f820,...]
+    +         ! : | 8 core::fmt::write::h8f471e047a46547a  (in scale_vs_sqlite) + 144  [0x102f3f85c]
+    +         ! : | + 4 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 60  [0x102f3a16c]
+    +         ! : | + ! 4 _platform_memmove  (in libsystem_platform.dylib) + 428  [0x18325150c]
+    +         ! : | + 4 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 28  [0x102f3a14c]
+    +         ! : | 3 _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 80  [0x102f3a180]
+    +         ! : | 2 core::fmt::num::imp::_$LT$impl$u20$core..fmt..Display$u20$for$u20$u64$GT$::fmt::h616e1fa88216e8ed  (in scale_vs_sqlite) + 72  [0x102f3d6fc]
+    +         ! : 50 alloc::fmt::format::format_inner::hfd0ba00c746e1ec5  (in scale_vs_sqlite) + 228  [0x102f3a05c]
+    +         ! : | 27 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 268,12,...  [0x183069048,0x183068f48,...]
+    +         ! : | 9 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 100,136,...  [0x1830631c0,0x1830631e4,...]
+    +         ! : | 7 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 24,184,...  [0x183063968,0x183063a08,...]
+    +         ! : | 6 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,44,...  [0x1830730c8,0x1830730e8,...]
+    +         ! : | 1 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 324  [0x18306a7e4]
+    +         ! : |   1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 860  [0x18306b2d8]
+    +         ! : |     1 xzm_chunk_mark_used  (in libsystem_malloc.dylib) + 188  [0x18304befc]
+    +         ! : |       1 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 124  [0x18304bfac]
+    +         ! : |         1 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18304ea9c]
+    +         ! : |           1 mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x1832172f8]
+    +         ! : |             1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18320410c]
+    +         ! : 11 alloc::fmt::format::format_inner::hfd0ba00c746e1ec5  (in scale_vs_sqlite) + 12,188,...  [0x102f39f84,0x102f3a034,...]
+    +         ! : 6 core::fmt::write::h8f471e047a46547a  (in scale_vs_sqlite) + 424  [0x102f3f974]
+    +         ! 92 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 164  [0x102f2cd5c]  function.rs:166
+    +         ! : 84 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 308  [0x102f349ac]  map.rs:1053
+    +         ! : | 27 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 88,12,...  [0x183068f94,0x183068f48,...]
+    +         ! : | 22 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 324  [0x18306a7e4]
+    +         ! : | + 17 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 860  [0x18306b2d8]
+    +         ! : | + ! 17 xzm_chunk_mark_used  (in libsystem_malloc.dylib) + 188  [0x18304befc]
+    +         ! : | + !   14 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 124  [0x18304bfac]
+    +         ! : | + !   : 13 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18304ea9c]
+    +         ! : | + !   : | 13 mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x1832172f8]
+    +         ! : | + !   : |   13 mach_absolute_time  (in libsystem_kernel.dylib) + 108,112  [0x18320410c,0x183204110]
+    +         ! : | + !   : 1 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 36  [0x18304ea84]
+    +         ! : | + !   2 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 12,76  [0x18304bf3c,0x18304bf7c]
+    +         ! : | + !   1 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 96  [0x18304bf90]
+    +         ! : | + !     1 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x18324f3c0]
+    +         ! : | + !       1 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x183211c98]
+    +         ! : | + 3 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 376  [0x18306b0f4]
+    +         ! : | + ! 3 _xzm_chunk_list_push  (in libsystem_malloc.dylib) + 96,44  [0x18306b8a4,0x18306b870]
+    +         ! : | + 1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 168  [0x18306b024]
+    +         ! : | + ! 1 _xzm_chunk_list_pop  (in libsystem_malloc.dylib) + 160  [0x18306b988]
+    +         ! : | + 1 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 204  [0x18306b048]
+    +         ! : | 17 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,44,...  [0x1830730c8,0x1830730e8,...]
+    +         ! : | 7 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 184,8,...  [0x183063a08,0x183063958,...]
+    +         ! : | 5 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 756  [0x18306a994]
+    +         ! : | 4 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 136,0  [0x1830631e4,0x18306315c]
+    +         ! : | 2 DYLD-STUB$$malloc  (in scale_vs_sqlite) + 4  [0x1031f0e74]
+    +         ! : 5 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 232,40  [0x102f34960,0x102f348a0]  map.rs:1050
+    +         ! : 2 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 308,340  [0x102f349ac,0x102f349cc]  map.rs:1053
+    +         ! : 1 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 12  [0x102f34884]  map.rs:1046
+    +         ! 90 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 812  [0x102f2cfe4]  function.rs:166
+    +         ! : 36 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 120  [0x102f348f0]  map.rs:1050
+    +         ! : | 28 _platform_memcmp  (in libsystem_platform.dylib) + 168,236,...  [0x18324efb8,0x18324effc,...]
+    +         ! : | 8 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         ! : 17 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 40,180,...  [0x102f348a0,0x102f3492c,...]  map.rs:1050
+    +         ! : 17 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 540  [0x102f34a94]  map.rs:1053
+    +         ! : | 14 _platform_memmove  (in libsystem_platform.dylib) + 428,0,...  [0x18325150c,0x183251360,...]
+    +         ! : | 3 DYLD-STUB$$memmove  (in scale_vs_sqlite) + 4  [0x1031f0ef8]
+    +         ! : 14 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 504  [0x102f34a70]  map.rs:1053
+    +         ! : | 13 _platform_memmove  (in libsystem_platform.dylib) + 428,460,...  [0x18325150c,0x18325152c,...]
+    +         ! : | 1 DYLD-STUB$$memmove  (in scale_vs_sqlite) + 4  [0x1031f0ef8]
+    +         ! : 5 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 456,348,...  [0x102f34a40,0x102f349d4,...]  map.rs:1053
+    +         ! : 1 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 4  [0x102f3487c]  map.rs:1046
+    +         ! 61 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 628  [0x102f2cf2c]  function.rs:166
+    +         ! : 19 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 504  [0x102f34a70]  map.rs:1053
+    +         ! : | 15 _platform_memmove  (in libsystem_platform.dylib) + 676,464,...  [0x183251604,0x183251530,...]
+    +         ! : | 4 DYLD-STUB$$memmove  (in scale_vs_sqlite) + 4  [0x1031f0ef8]
+    +         ! : 12 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 540  [0x102f34a94]  map.rs:1053
+    +         ! : | 6 DYLD-STUB$$memmove  (in scale_vs_sqlite) + 4  [0x1031f0ef8]
+    +         ! : | 6 _platform_memmove  (in libsystem_platform.dylib) + 0,648,...  [0x183251360,0x1832515e8,...]
+    +         ! : 11 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 160,40,...  [0x102f34918,0x102f348a0,...]  map.rs:1050
+    +         ! : 10 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 120  [0x102f348f0]  map.rs:1050
+    +         ! : | 7 _platform_memcmp  (in libsystem_platform.dylib) + 280,0,...  [0x18324f028,0x18324ef10,...]
+    +         ! : | 3 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4  [0x1031f0ee0]
+    +         ! : 6 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 456,540  [0x102f34a40,0x102f34a94]  map.rs:1053
+    +         ! : 3 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 8  [0x102f34880]  map.rs:1046
+    +         ! 53 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 280  [0x102f2cdd0]  function.rs:166
+    +         ! : 29 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 268,468,...  [0x183069048,0x183069110,...]
+    +         ! : 11 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 80,12,...  [0x18307310c,0x1830730c8,...]
+    +         ! : 9 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 212,100,...  [0x183063230,0x1830631c0,...]
+    +         ! : 4 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 8,28,...  [0x183063958,0x18306396c,...]
+    +         ! 52 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 52  [0x102f2ccec]  function.rs:166
+    +         ! : 19 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 268,284,...  [0x183069048,0x183069058,...]
+    +         ! : 15 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 100,0,...  [0x1830631c0,0x18306315c,...]
+    +         ! : 9 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,44,...  [0x1830730c8,0x1830730e8,...]
+    +         ! : 8 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 8,24,...  [0x183063958,0x183063968,...]
+    +         ! : 1 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 248  [0x18306a798]
+    +         ! :   1 _xzm_xzone_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 84  [0x18306abd4]
+    +         ! 51 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 512  [0x102f2ceb8]  function.rs:166
+    +         ! : 22 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 284,12,...  [0x183069058,0x183068f48,...]
+    +         ! : 10 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 136,0,...  [0x1830631e4,0x18306315c,...]
+    +         ! : 9 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 24,184,...  [0x183063968,0x183063a08,...]
+    +         ! : 7 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,44,...  [0x1830730c8,0x1830730e8,...]
+    +         ! : 3 DYLD-STUB$$malloc  (in scale_vs_sqlite) + 4  [0x1031f0e74]
+    +         ! 50 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 744  [0x102f2cfa0]  function.rs:166
+    +         ! : 27 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 256,284,...  [0x18306903c,0x183069058,...]
+    +         ! : 10 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 24,184,...  [0x183063968,0x183063a08,...]
+    +         ! : 6 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,120,...  [0x1830730c8,0x183073134,...]
+    +         ! : 5 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 100,112,...  [0x1830631c0,0x1830631cc,...]
+    +         ! : 1 DYLD-STUB$$malloc  (in scale_vs_sqlite) + 4  [0x1031f0e74]
+    +         ! : 1 malloc  (in libsystem_malloc.dylib) + 8  [0x183039cf0]
+    +         ! 45 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 552  [0x102f2cee0]  function.rs:166
+    +         ! : 23 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 420,256,...  [0x1830690e0,0x18306903c,...]
+    +         ! : 8 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,80,...  [0x1830730c8,0x18307310c,...]
+    +         ! : 7 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 0,8,...  [0x18306315c,0x183063164,...]
+    +         ! : 4 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 184,8,...  [0x183063a08,0x183063958,...]
+    +         ! : 2 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 324  [0x18306a7e4]
+    +         ! : | 2 _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 860  [0x18306b2d8]
+    +         ! : |   2 xzm_chunk_mark_used  (in libsystem_malloc.dylib) + 188  [0x18304befc]
+    +         ! : |     2 _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 124  [0x18304bfac]
+    +         ! : |       2 _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18304ea9c]
+    +         ! : |         2 mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x1832172f8]
+    +         ! : |           2 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18320410c]
+    +         ! : 1 DYLD-STUB$$malloc  (in scale_vs_sqlite) + 4  [0x1031f0e74]
+    +         ! 38 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 396  [0x102f2ce44]  function.rs:166
+    +         ! : 22 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 72,92,...  [0x102f348c0,0x102f348d4,...]  map.rs:1050
+    +         ! : 7 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 120  [0x102f348f0]  map.rs:1050
+    +         ! : | 5 _platform_memcmp  (in libsystem_platform.dylib) + 140,260,...  [0x18324ef9c,0x18324f014,...]
+    +         ! : | 2 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 0,4  [0x1031f0edc,0x1031f0ee0]
+    +         ! : 5 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 428,576,...  [0x102f34a24,0x102f34ab8,...]  map.rs:1053
+    +         ! : 4 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 12  [0x102f34884]  map.rs:1046
+    +         ! 17 alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite) + 388,384  [0x102f349fc,0x102f349f8]  map.rs:1057
+    +         ! 11 core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite) + 36,512,...  [0x102f2ccdc,0x102f2ceb8,...]  function.rs:166
+    +         ! 4 alloc::fmt::format::format_inner::hfd0ba00c746e1ec5  (in scale_vs_sqlite) + 312  [0x102f3a0b0]
+    +         170 scale_vs_sqlite::run_elitesql::h035d62d925377d77  (in scale_vs_sqlite) + 9648  [0x102f22e88]  scale_vs_sqlite.rs:399
+    +         ! 170 elitesql_core::db::Db::begin::h075637bab5ec374e  (in scale_vs_sqlite) + 396  [0x103004524]  db.rs:5836
+    +         !   170 _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x18308db20]
+    +         !     170 _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x18308d490]
+    +         !       170 semaphore_wait_trap  (in libsystem_kernel.dylib) + 8  [0x183203bb0]
+    +         34 scale_vs_sqlite::run_elitesql::h035d62d925377d77  (in scale_vs_sqlite) + 9768  [0x102f22f00]  scale_vs_sqlite.rs:401
+    +         ! 27 _xzm_free  (in libsystem_malloc.dylib) + 996,28,...  [0x1830644fc,0x183064134,...]
+    +         ! 6 _free  (in libsystem_malloc.dylib) + 76,0,...  [0x183073d1c,0x183073cd0,...]
+    +         ! 1 DYLD-STUB$$free  (in scale_vs_sqlite) + 4  [0x1031f0d90]
+    +         7 _xzm_free  (in libsystem_malloc.dylib) + 1568  [0x183064738]
+    +         7 elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite) + 332,312  [0x103004d74,0x103004d60]  db.rs:7875
+    +         3 scale_vs_sqlite::run_elitesql::h035d62d925377d77  (in scale_vs_sqlite) + 10040  [0x102f23010]  scale_vs_sqlite.rs:407
+    +         ! 3 scale_vs_sqlite::print_progress::hb44e5dfaa5060b5f  (in scale_vs_sqlite) + 156  [0x102f274d0]  scale_vs_sqlite.rs:336
+    +         !   3 std::io::stdio::_print::h82ffd9d3f3a616e2  (in scale_vs_sqlite) + 112  [0x10305e6e4]
+    +         !     3 core::fmt::write::h8f471e047a46547a  (in scale_vs_sqlite) + 144  [0x102f3f85c]
+    +         !       3 _$LT$std..io..default_write_fmt..Adapter$LT$T$GT$$u20$as$u20$core..fmt..Write$GT$::write_str::hdc41d443cdee5f2d  (in scale_vs_sqlite) + 56  [0x103041e38]
+    +         !         3 _$LT$std..io..buffered..linewritershim..LineWriterShim$LT$W$GT$$u20$as$u20$std..io..Write$GT$::write_all::h06c8fb67d79efb55  (in scale_vs_sqlite) + 180  [0x103064204]
+    +         !           3 std::io::buffered::bufwriter::BufWriter$LT$W$GT$::flush_buf::h3ed1cc912fa82893  (in scale_vs_sqlite) + 112  [0x10304671c]
+    +         !             3 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +         1 scale_vs_sqlite::run_elitesql::h035d62d925377d77  (in scale_vs_sqlite) + 9476  [0x102f22ddc]  scale_vs_sqlite.rs:396
+    +         1 scale_vs_sqlite::run_elitesql::h035d62d925377d77  (in scale_vs_sqlite) + 9696  [0x102f22eb8]  scale_vs_sqlite.rs:400
+    +         1 scale_vs_sqlite::run_elitesql::h035d62d925377d77  (in scale_vs_sqlite) + 9760  [0x102f22ef8]  scale_vs_sqlite.rs:401
+    5821 Thread_5294709
+    + 5821 thread_start  (in libsystem_pthread.dylib) + 8  [0x183242c1c]
+    +   5821 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183247c58]
+    +     5821 std::sys::thread::unix::Thread::new::thread_start::he774dcf8076eca54  (in scale_vs_sqlite) + 552  [0x10304f75c]
+    +       5821 core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::hdd6b50b386ea4aa9  (in scale_vs_sqlite) + 76  [0x10302e8c4]  function.rs:250
+    +         5821 std::sys::backtrace::__rust_begin_short_backtrace::h770c5e05335f503c  (in scale_vs_sqlite) + 536  [0x10302ebf0]  backtrace.rs:160
+    +           5821 std::sync::mpmc::list::Channel$LT$T$GT$::recv::_$u7b$$u7b$closure$u7d$$u7d$::h0177ca6be746d7cf  (in scale_vs_sqlite) + 184  [0x103024dc0]  list.rs:453
+    +             5821 _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x18308db20]
+    +               5821 _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x18308d490]
+    +                 5821 semaphore_wait_trap  (in libsystem_kernel.dylib) + 8  [0x183203bb0]
+    5821 Thread_5294710
+    + 5821 thread_start  (in libsystem_pthread.dylib) + 8  [0x183242c1c]
+    +   5821 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183247c58]
+    +     5821 std::sys::thread::unix::Thread::new::thread_start::he774dcf8076eca54  (in scale_vs_sqlite) + 552  [0x10304f75c]
+    +       5821 core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h0de1942bb481ddbd  (in scale_vs_sqlite) + 76  [0x10301a2f4]  function.rs:250
+    +         5821 std::sys::backtrace::__rust_begin_short_backtrace::h859da8680c97cc3c  (in scale_vs_sqlite) + 48  [0x10301a424]  backtrace.rs:160
+    +           4781 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 648  [0x10301a8b0]  db.rs:3096
+    +           ! 4781 std::sync::mpmc::list::Channel$LT$T$GT$::recv::_$u7b$$u7b$closure$u7d$$u7d$::h0177ca6be746d7cf  (in scale_vs_sqlite) + 184  [0x103024dc0]  list.rs:453
+    +           !   4781 _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x18308db20]
+    +           !     4781 _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x18308d490]
+    +           !       4781 semaphore_wait_trap  (in libsystem_kernel.dylib) + 8  [0x183203bb0]
+    +           607 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 9092  [0x10301c9ac]  db.rs:3139
+    +           ! 594 elitesql_core::paged::PagedIndex::open::h729dd07ad9f50562  (in scale_vs_sqlite) + 1732  [0x102f50ee0]  paged.rs:141
+    +           ! : 594 elitesql_core::paged::read_u32::h97940468bf48bbc5  (in scale_vs_sqlite) + 104  [0x102f75214]  paged.rs:1034
+    +           ! 4 elitesql_core::paged::PagedIndex::open::h729dd07ad9f50562  (in scale_vs_sqlite) + 1876  [0x102f50f70]  paged.rs:163
+    +           ! : 4 _platform_memcmp  (in libsystem_platform.dylib) + 32,36  [0x18324ef30,0x18324ef34]
+    +           ! 2 elitesql_core::paged::PagedIndex::open::h729dd07ad9f50562  (in scale_vs_sqlite) + 1804  [0x102f50f28]  paged.rs:143
+    +           ! : 2 elitesql_core::paged::read_u32::h97940468bf48bbc5  (in scale_vs_sqlite) + 104  [0x102f75214]  paged.rs:1034
+    +           ! 2 elitesql_core::paged::PagedIndex::open::h729dd07ad9f50562  (in scale_vs_sqlite) + 2016  [0x102f50ffc]  paged.rs:180
+    +           ! : 2 elitesql_core::paged::page_view::h68d87287802c0504  (in scale_vs_sqlite) + 264,292  [0x102f75504,0x102f75520]  paged.rs:0
+    +           ! 1 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 40  [0x102f439fc]  lib.rs:124
+    +           ! 1 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 244  [0x102f43ac8]  lib.rs:126
+    +           ! 1 elitesql_core::paged::PagedIndex::open::h729dd07ad9f50562  (in scale_vs_sqlite) + 1768  [0x102f50f04]  paged.rs:142
+    +           ! : 1 elitesql_core::paged::read_u32::h97940468bf48bbc5  (in scale_vs_sqlite) + 104  [0x102f75214]  paged.rs:1034
+    +           ! 1 elitesql_core::paged::PagedIndex::open::h729dd07ad9f50562  (in scale_vs_sqlite) + 1860  [0x102f50f60]  paged.rs:163
+    +           ! 1 elitesql_core::paged::PagedIndex::open::h729dd07ad9f50562  (in scale_vs_sqlite) + 2316  [0x102f51128]  paged.rs:203
+    +           !   1 _platform_memcmp  (in libsystem_platform.dylib) + 8  [0x18324ef18]
+    +           332 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 8552  [0x10301c790]  db.rs:3139
+    +           ! 332 std::io::buffered::bufwriter::BufWriter$LT$W$GT$::flush_buf::hff6d4e170204a455  (in scale_vs_sqlite) + 128  [0x102f4f08c]  bufwriter.rs:236
+    +           !   332 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +           28 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 204,192,...  [0x102f43aa0,0x102f43a94,...]  lib.rs:126
+    +           28 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 9488  [0x10301cb38]  db.rs:3139
+    +           ! 28 std::sys::pal::unix::sync::mutex::Mutex::lock::hd4f81c5bfbbe4378  (in scale_vs_sqlite) + 12  [0x10304f358]
+    +           !   28 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1832428e0]
+    +           !     28 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x183244e9c]
+    +           !       28 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1832069dc]
+    +           18 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 8572  [0x10301c7a4]  db.rs:3139
+    +           ! 18 __lseek  (in libsystem_kernel.dylib) + 8  [0x183205624]
+    +           6 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 8852  [0x10301c8bc]  db.rs:3139
+    +           ! 5 elitesql_core::paged::PagedWriter::finish::h67f1712d7c278b86  (in scale_vs_sqlite) + 908  [0x102f4fc38]  paged.rs:1000
+    +           ! : 5 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +           ! :   5 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +           ! 1 elitesql_core::paged::PagedWriter::finish::h67f1712d7c278b86  (in scale_vs_sqlite) + 744  [0x102f4fb94]  paged.rs:995
+    +           !   1 std::io::buffered::bufwriter::BufWriter$LT$W$GT$::flush_buf::hff6d4e170204a455  (in scale_vs_sqlite) + 128  [0x102f4f08c]  bufwriter.rs:236
+    +           !     1 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +           4 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 12140  [0x10301d594]  db.rs:3139
+    +           ! 4 elitesql_core::run_manifest::PrimaryRunManifest::prepare::hefb5fc280abfdb00  (in scale_vs_sqlite) + 1840  [0x102f473e8]  run_manifest.rs:174
+    +           !   4 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +           !     4 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +           4 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 13832  [0x10301dc30]  db.rs:3139
+    +           ! 4 core::ptr::drop_in_place$LT$alloc..vec..Vec$LT$$LP$elitesql_core..run_manifest..DerivedRunMeta$C$alloc..sync..Arc$LT$elitesql_core..paged..PagedIndex$GT$$RP$$GT$$GT$::h4133089afc9d163a  (in scale_vs_sqlite) + 100  [0x1030266a0]  mod.rs:805
+    +           !   4 alloc::sync::Arc$LT$T$C$A$GT$::drop_slow::h3681487f008e7a6b  (in scale_vs_sqlite) + 120  [0x102f483c4]  sync.rs:2120
+    +           !     4 __munmap  (in libsystem_kernel.dylib) + 8  [0x183207728]
+    +           3 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 8120  [0x10301c5e0]  db.rs:3139
+    +           ! 3 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +           !   3 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +           3 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 12508  [0x10301d704]  db.rs:3139
+    +           ! 3 std::fs::File::sync_all::hf9be9a60c29316b5  (in scale_vs_sqlite) + 28  [0x10305affc]
+    +           !   3 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +           !     3 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +           2 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 8628  [0x10301c7dc]  db.rs:3139
+    +           ! 2 _platform_memmove  (in libsystem_platform.dylib) + 180  [0x183251414]
+    +           2 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 10420  [0x10301cedc]  db.rs:3139
+    +           ! 2 std::fs::File::sync_all::hf9be9a60c29316b5  (in scale_vs_sqlite) + 28  [0x10305affc]
+    +           !   2 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +           !     2 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +           2 elitesql_core::db::finish_db::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hc057007cd4270fa1  (in scale_vs_sqlite) + 12728  [0x10301d7e0]  db.rs:3139
+    +           ! 2 elitesql_core::db::CommitMutex::lock::hfe67908f65a4d935  (in scale_vs_sqlite) + 152  [0x102f7d528]  db.rs:2358
+    +           !   2 parking_lot::raw_mutex::RawMutex::lock_slow::hf8548beeaa4cc3be  (in scale_vs_sqlite) + 496  [0x1031eae38]  raw_mutex.rs:262
+    +           !     2 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x183248128]
+    +           !       2 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18320750c]
+    +           1 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 1520  [0x102f43fc4]  lib.rs:128
+    5821 Thread_5294711
+    + 5821 thread_start  (in libsystem_pthread.dylib) + 8  [0x183242c1c]
+    +   5821 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183247c58]
+    +     5821 std::sys::thread::unix::Thread::new::thread_start::he774dcf8076eca54  (in scale_vs_sqlite) + 552  [0x10304f75c]
+    +       5821 core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h098a1b12dd0c327b  (in scale_vs_sqlite) + 76  [0x103011a80]  function.rs:250
+    +         3308 std::sys::backtrace::__rust_begin_short_backtrace::hdfef48035cacfaf7  (in scale_vs_sqlite) + 3016  [0x10301275c]  backtrace.rs:160
+    +         ! 757 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 4176  [0x103014954]  maintenance.rs:427
+    +         ! : 530 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 452  [0x103017590]  maintenance.rs:453
+    +         ! : | 399 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 308  [0x102f5031c]  paged.rs:908
+    +         ! : | + 333 elitesql_core::paged::PagedWriter::flush_page::hcd89dc46a3a72c0c  (in scale_vs_sqlite) + 48  [0x102f76120]  paged.rs:1008
+    +         ! : | + ! 333 std::io::buffered::bufwriter::BufWriter$LT$W$GT$::flush_buf::hff6d4e170204a455  (in scale_vs_sqlite) + 128  [0x102f4f08c]  bufwriter.rs:236
+    +         ! : | + !   333 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +         ! : | + 42 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 204,216,...  [0x102f43aa0,0x102f43aac,...]  lib.rs:126
+    +         ! : | + 19 elitesql_core::paged::PagedWriter::flush_page::hcd89dc46a3a72c0c  (in scale_vs_sqlite) + 76  [0x102f7613c]  paged.rs:1008
+    +         ! : | + ! 19 __lseek  (in libsystem_kernel.dylib) + 8  [0x183205624]
+    +         ! : | + 3 elitesql_core::paged::PagedWriter::flush_page::hcd89dc46a3a72c0c  (in scale_vs_sqlite) + 356  [0x102f76254]  paged.rs:1021
+    +         ! : | + ! 2 _platform_memmove  (in libsystem_platform.dylib) + 180,192  [0x183251414,0x183251420]
+    +         ! : | + ! 1 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : | + 1 elitesql_core::paged::PagedWriter::flush_page::hcd89dc46a3a72c0c  (in scale_vs_sqlite) + 28  [0x102f7610c]  paged.rs:1005
+    +         ! : | + 1 elitesql_core::paged::PagedWriter::flush_page::hcd89dc46a3a72c0c  (in scale_vs_sqlite) + 420  [0x102f76294]  paged.rs:1024
+    +         ! : | +   1 _xzm_free  (in libsystem_malloc.dylib) + 776  [0x183064420]
+    +         ! : | 24 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 576  [0x102f50428]  paged.rs:918
+    +         ! : | + 23 _platform_memmove  (in libsystem_platform.dylib) + 452,428,...  [0x183251524,0x18325150c,...]
+    +         ! : | + 1 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : | 21 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 408  [0x102f50380]  paged.rs:914
+    +         ! : | + 19 _platform_memmove  (in libsystem_platform.dylib) + 428,452,...  [0x18325150c,0x183251524,...]
+    +         ! : | + 2 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : | 21 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 672  [0x102f50488]  paged.rs:922
+    +         ! : | + 19 _platform_memmove  (in libsystem_platform.dylib) + 428,460,...  [0x18325150c,0x18325152c,...]
+    +         ! : | + 2 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : | 18 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 452  [0x102f503ac]  paged.rs:915
+    +         ! : | + 17 _platform_memmove  (in libsystem_platform.dylib) + 428,0,...  [0x18325150c,0x183251360,...]
+    +         ! : | + 1 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : | 14 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 624  [0x102f50458]  paged.rs:920
+    +         ! : | + 13 _platform_memmove  (in libsystem_platform.dylib) + 452,428,...  [0x183251524,0x18325150c,...]
+    +         ! : | + 1 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : | 7 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 80  [0x102f50238]  paged.rs:896
+    +         ! : | + 7 _platform_memcmp  (in libsystem_platform.dylib) + 128,56,...  [0x18324ef90,0x18324ef48,...]
+    +         ! : | 4 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 52  [0x102f5021c]  paged.rs:895
+    +         ! : | 4 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 364,360,...  [0x102f50354,0x102f50350,...]  paged.rs:913
+    +         ! : | 4 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 488  [0x102f503d0]  paged.rs:916
+    +         ! : | + 2 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 468,712  [0x183069110,0x183069204]
+    +         ! : | + 1 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 36  [0x1830730e0]
+    +         ! : | + 1 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 180  [0x183063a04]
+    +         ! : | 3 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 200  [0x102f502b0]  paged.rs:904
+    +         ! : | 2 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 12  [0x102f501f4]  paged.rs:894
+    +         ! : | 2 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 68,80  [0x102f5022c,0x102f50238]  paged.rs:896
+    +         ! : | 2 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 324,352  [0x102f5032c,0x102f50348]  paged.rs:911
+    +         ! : | 2 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 592  [0x102f50438]  paged.rs:920
+    +         ! : | 1 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 272  [0x102f502f8]  paged.rs:907
+    +         ! : | 1 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 296  [0x102f50310]  paged.rs:908
+    +         ! : | 1 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 420  [0x102f5038c]  paged.rs:914
+    +         ! : 87 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 544  [0x1030175ec]  maintenance.rs:455
+    +         ! : | 84 elitesql_core::paged::PagedWriter::finish::h67f1712d7c278b86  (in scale_vs_sqlite) + 908  [0x102f4fc38]  paged.rs:1000
+    +         ! : | + 84 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : | +   84 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : | 2 elitesql_core::paged::PagedWriter::finish::h67f1712d7c278b86  (in scale_vs_sqlite) + 988  [0x102f4fc88]  paged.rs:1002
+    +         ! : | + 2 close  (in libsystem_kernel.dylib) + 8  [0x1832048f0]
+    +         ! : | 1 elitesql_core::paged::PagedWriter::finish::h67f1712d7c278b86  (in scale_vs_sqlite) + 424  [0x102f4fa54]  paged.rs:979
+    +         ! : |   1 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 12  [0x102f439e0]  lib.rs:122
+    +         ! : 50 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 292  [0x1030174f0]  maintenance.rs:434
+    +         ! : | 50 core::str::converts::from_utf8::h165df01988342ec0  (in scale_vs_sqlite) + 120,44,...  [0x102f3e184,0x102f3e138,...]
+    +         ! : 39 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 328  [0x103017514]  maintenance.rs:436
+    +         ! : | 21 elitesql_core::db::encode_primary_key_into::h154e13c969bbd5d3  (in scale_vs_sqlite) + 148  [0x102f4fed0]  db.rs:916
+    +         ! : | + 21 _platform_memmove  (in libsystem_platform.dylib) + 452,428,...  [0x183251524,0x18325150c,...]
+    +         ! : | 12 elitesql_core::db::encode_primary_key_into::h154e13c969bbd5d3  (in scale_vs_sqlite) + 112  [0x102f4feac]  db.rs:915
+    +         ! : | + 11 _platform_memmove  (in libsystem_platform.dylib) + 452,436,...  [0x183251524,0x183251514,...]
+    +         ! : | + 1 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : | 3 elitesql_core::db::encode_primary_key_into::h154e13c969bbd5d3  (in scale_vs_sqlite) + 52,80  [0x102f4fe70,0x102f4fe8c]  db.rs:914
+    +         ! : | 2 elitesql_core::db::encode_primary_key_into::h154e13c969bbd5d3  (in scale_vs_sqlite) + 120  [0x102f4feb4]  db.rs:915
+    +         ! : | 1 elitesql_core::db::encode_primary_key_into::h154e13c969bbd5d3  (in scale_vs_sqlite) + 44  [0x102f4fe68]  db.rs:913
+    +         ! : 14 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 416  [0x10301756c]  maintenance.rs:446
+    +         ! : | 5 elitesql_core::db::encode_primary_entry_into::h25576fd54adcecd7  (in scale_vs_sqlite) + 184,156,...  [0x102f50010,0x102f4fff4,...]  db.rs:953
+    +         ! : | 4 elitesql_core::db::encode_primary_entry_into::h25576fd54adcecd7  (in scale_vs_sqlite) + 84  [0x102f4ffac]  db.rs:945
+    +         ! : | 2 elitesql_core::db::encode_primary_entry_into::h25576fd54adcecd7  (in scale_vs_sqlite) + 32  [0x102f4ff78]  db.rs:943
+    +         ! : | 2 elitesql_core::db::encode_primary_entry_into::h25576fd54adcecd7  (in scale_vs_sqlite) + 108,120  [0x102f4ffc4,0x102f4ffd0]  db.rs:951
+    +         ! : | 1 elitesql_core::db::encode_primary_entry_into::h25576fd54adcecd7  (in scale_vs_sqlite) + 28  [0x102f4ff74]  db.rs:942
+    +         ! : 6 elitesql_core::db::encode_primary_key_into::h154e13c969bbd5d3  (in scale_vs_sqlite) + 172  [0x102f4fee8]  db.rs:917
+    +         ! : 6 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 224,160,...  [0x1030174ac,0x10301746c,...]  maintenance.rs:430
+    +         ! : 4 elitesql_core::db::encode_primary_entry_into::h25576fd54adcecd7  (in scale_vs_sqlite) + 340,328  [0x102f500ac,0x102f500a0]  db.rs:964
+    +         ! : 4 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 224  [0x1030174ac]  maintenance.rs:430
+    +         ! : | 4 _platform_memcmp  (in libsystem_platform.dylib) + 168,272  [0x18324efb8,0x18324f020]
+    +         ! : 4 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 256,272  [0x1030174cc,0x1030174dc]  maintenance.rs:434
+    +         ! : 4 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 384  [0x10301754c]  maintenance.rs:447
+    +         ! : 4 elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite) + 724,716,...  [0x102f504bc,0x102f504b4,...]  paged.rs:926
+    +         ! : 2 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 80  [0x10301741c]  maintenance.rs:428
+    +         ! : 1 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 132  [0x103017450]  maintenance.rs:429
+    +         ! : 1 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 96  [0x10301742c]  maintenance.rs:431
+    +         ! : 1 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite) + 416  [0x10301756c]  maintenance.rs:446
+    +         ! 314 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 9272  [0x103015d3c]  maintenance.rs:650
+    +         ! : 183 core::iter::traits::iterator::Iterator::try_fold::h4dcc6b3d935c5c0c  (in scale_vs_sqlite) + 584,532,...  [0x103017fd4,0x103017fa0,...]  iterator.rs:2427
+    +         ! : 131 core::iter::traits::iterator::Iterator::try_fold::h4dcc6b3d935c5c0c  (in scale_vs_sqlite) + 544  [0x103017fac]  iterator.rs:2427
+    +         ! :   126 _platform_memcmp  (in libsystem_platform.dylib) + 236,140,...  [0x18324effc,0x18324ef9c,...]
+    +         ! :   5 DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 4,0  [0x1031f0ee0,0x1031f0edc]
+    +         ! 274 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 8824  [0x103015b7c]  maintenance.rs:618
+    +         ! : 137 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 1084  [0x102f51d1c]  manifest.rs:157
+    +         ! : | 69 elitesql_core::manifest::Manifest::refresh_previous::h76b7b5fe88be73a0  (in scale_vs_sqlite) + 112  [0x102f704a4]  manifest.rs:188
+    +         ! : | + 65 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 196  [0x102f70268]  manifest.rs:216
+    +         ! : | + ! 65 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : | + !   65 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : | + 2 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 96  [0x102f70204]  manifest.rs:214
+    +         ! : | + ! 2 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! : | + !   2 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! : | + !     2 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! : | + !       2 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! : | + 1 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 160  [0x102f70244]  manifest.rs:215
+    +         ! : | + ! 1 std::io::Write::write_all::h4cf5ff33c3e73aa1  (in scale_vs_sqlite) + 92  [0x102f47ee4]  mod.rs:1877
+    +         ! : | + !   1 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +         ! : | + 1 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 236  [0x102f70290]  manifest.rs:218
+    +         ! : | +   1 close  (in libsystem_kernel.dylib) + 8  [0x1832048f0]
+    +         ! : | 65 elitesql_core::manifest::Manifest::refresh_previous::h76b7b5fe88be73a0  (in scale_vs_sqlite) + 412  [0x102f705d0]  manifest.rs:194
+    +         ! : | + 65 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : | +   65 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : | 3 elitesql_core::manifest::Manifest::refresh_previous::h76b7b5fe88be73a0  (in scale_vs_sqlite) + 208  [0x102f70504]  manifest.rs:191
+    +         ! : |   3 std::sys::pal::common::small_c_string::run_with_cstr_stack::h2520b31d01173e38  (in scale_vs_sqlite) + 312  [0x1030482d8]
+    +         ! : |     3 std::sys::fs::rename::_$u7b$$u7b$closure$u7d$$u7d$::h0e9b2ab6bc190aba  (in scale_vs_sqlite) + 312  [0x103042ef0]
+    +         ! : |       3 rename  (in libsystem_kernel.dylib) + 16  [0x183207868]
+    +         ! : |         3 __rename  (in libsystem_kernel.dylib) + 8  [0x18320788c]
+    +         ! : 68 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 840  [0x102f51c28]  manifest.rs:154
+    +         ! : | 68 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : |   68 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : 65 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 144  [0x102f51970]  manifest.rs:139
+    +         ! : | 60 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 196  [0x102f70268]  manifest.rs:216
+    +         ! : | + 60 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : | +   60 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : | 3 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 96  [0x102f70204]  manifest.rs:214
+    +         ! : | + 3 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! : | +   3 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! : | +     3 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! : | +       3 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! : | 1 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 160  [0x102f70244]  manifest.rs:215
+    +         ! : | + 1 std::io::Write::write_all::h4cf5ff33c3e73aa1  (in scale_vs_sqlite) + 92  [0x102f47ee4]  mod.rs:1877
+    +         ! : | +   1 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +         ! : | 1 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 236  [0x102f70290]  manifest.rs:218
+    +         ! : |   1 close  (in libsystem_kernel.dylib) + 8  [0x1832048f0]
+    +         ! : 3 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 196  [0x102f519a4]  manifest.rs:140
+    +         ! : | 3 std::sys::fs::metadata::h9f42d5e514f6e489  (in scale_vs_sqlite) + 316  [0x1030430c0]
+    +         ! : |   3 stat  (in libsystem_kernel.dylib) + 8  [0x18320f88c]
+    +         ! : 1 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 388  [0x102f51a64]  manifest.rs:141
+    +         ! :   1 std::sys::pal::common::small_c_string::run_with_cstr_stack::h2520b31d01173e38  (in scale_vs_sqlite) + 312  [0x1030482d8]
+    +         ! :     1 std::sys::fs::rename::_$u7b$$u7b$closure$u7d$$u7d$::h0e9b2ab6bc190aba  (in scale_vs_sqlite) + 312  [0x103042ef0]
+    +         ! :       1 rename  (in libsystem_kernel.dylib) + 16  [0x183207868]
+    +         ! :         1 __rename  (in libsystem_kernel.dylib) + 8  [0x18320788c]
+    +         ! 266 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 7160  [0x1030154fc]  maintenance.rs:531
+    +         ! : 131 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 1084  [0x102f51d1c]  manifest.rs:157
+    +         ! : | 62 elitesql_core::manifest::Manifest::refresh_previous::h76b7b5fe88be73a0  (in scale_vs_sqlite) + 412  [0x102f705d0]  manifest.rs:194
+    +         ! : | + 62 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : | +   62 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : | 61 elitesql_core::manifest::Manifest::refresh_previous::h76b7b5fe88be73a0  (in scale_vs_sqlite) + 112  [0x102f704a4]  manifest.rs:188
+    +         ! : | + 61 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 196  [0x102f70268]  manifest.rs:216
+    +         ! : | +   61 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : | +     61 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : | 7 elitesql_core::manifest::Manifest::refresh_previous::h76b7b5fe88be73a0  (in scale_vs_sqlite) + 208  [0x102f70504]  manifest.rs:191
+    +         ! : | + 7 std::sys::pal::common::small_c_string::run_with_cstr_stack::h2520b31d01173e38  (in scale_vs_sqlite) + 312  [0x1030482d8]
+    +         ! : | +   7 std::sys::fs::rename::_$u7b$$u7b$closure$u7d$$u7d$::h0e9b2ab6bc190aba  (in scale_vs_sqlite) + 312  [0x103042ef0]
+    +         ! : | +     7 rename  (in libsystem_kernel.dylib) + 16  [0x183207868]
+    +         ! : | +       7 __rename  (in libsystem_kernel.dylib) + 8  [0x18320788c]
+    +         ! : | 1 elitesql_core::manifest::Manifest::refresh_previous::h76b7b5fe88be73a0  (in scale_vs_sqlite) + 88  [0x102f7048c]  manifest.rs:188
+    +         ! : |   1 elitesql_core::manifest::Manifest::encode::h7dff7237e75bf407  (in scale_vs_sqlite) + 1204  [0x102f6f7cc]  manifest.rs:74
+    +         ! : |     1 _$LT$serde_json..ser..Compound$LT$W$C$F$GT$$u20$as$u20$serde_core..ser..SerializeMap$GT$::end::hb615a0530f567901  (in scale_vs_sqlite) + 176  [0x102f70abc]  ser.rs:673
+    +         ! : |       1 alloc::raw_vec::RawVecInner$LT$A$GT$::reserve::do_reserve_and_handle::h08a9390c6d484031  (in scale_vs_sqlite) + 96  [0x1031e2784]  mod.rs:557
+    +         ! : |         1 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::h7f491f3301e74f53  (in scale_vs_sqlite) + 248  [0x1031e28b0]  mod.rs:752
+    +         ! : |           1 _realloc  (in libsystem_malloc.dylib) + 452  [0x183073f14]
+    +         ! : |             1 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 148  [0x1830736f8]
+    +         ! : |               1 xzm_realloc  (in libsystem_malloc.dylib) + 808  [0x183063eac]
+    +         ! : |                 1 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 12  [0x183068f48]
+    +         ! : 67 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 144  [0x102f51970]  manifest.rs:139
+    +         ! : | 67 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 196  [0x102f70268]  manifest.rs:216
+    +         ! : |   67 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : |     67 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : 57 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 840  [0x102f51c28]  manifest.rs:154
+    +         ! : | 57 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : |   57 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : 4 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 456  [0x102f51aa8]  manifest.rs:143
+    +         ! : | 4 std::sys::pal::common::small_c_string::run_with_cstr_stack::h2520b31d01173e38  (in scale_vs_sqlite) + 312  [0x1030482d8]
+    +         ! : |   4 std::sys::fs::rename::_$u7b$$u7b$closure$u7d$$u7d$::h0e9b2ab6bc190aba  (in scale_vs_sqlite) + 312  [0x103042ef0]
+    +         ! : |     4 rename  (in libsystem_kernel.dylib) + 16  [0x183207868]
+    +         ! : |       4 __rename  (in libsystem_kernel.dylib) + 8  [0x18320788c]
+    +         ! : 4 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 668  [0x102f51b7c]  manifest.rs:154
+    +         ! : | 4 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! : |   4 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! : |     4 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! : |       4 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! : 3 elitesql_core::manifest::Manifest::publish::hbff616d6b5da90bc  (in scale_vs_sqlite) + 388  [0x102f51a64]  manifest.rs:141
+    +         ! :   3 std::sys::pal::common::small_c_string::run_with_cstr_stack::h2520b31d01173e38  (in scale_vs_sqlite) + 312  [0x1030482d8]
+    +         ! :     3 std::sys::fs::rename::_$u7b$$u7b$closure$u7d$$u7d$::h0e9b2ab6bc190aba  (in scale_vs_sqlite) + 312  [0x103042ef0]
+    +         ! :       3 rename  (in libsystem_kernel.dylib) + 16  [0x183207868]
+    +         ! :         3 __rename  (in libsystem_kernel.dylib) + 8  [0x18320788c]
+    +         ! 224 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 3064  [0x1030144fc]  maintenance.rs:398
+    +         ! : 224 std::fs::File::sync_all::hf9be9a60c29316b5  (in scale_vs_sqlite) + 28  [0x10305affc]
+    +         ! :   224 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! :     224 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! 133 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 7244  [0x103015550]  maintenance.rs:536
+    +         ! : 65 elitesql_core::manifest::Manifest::refresh_previous::h76b7b5fe88be73a0  (in scale_vs_sqlite) + 412  [0x102f705d0]  manifest.rs:194
+    +         ! : | 65 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : |   65 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : 64 elitesql_core::manifest::Manifest::refresh_previous::h76b7b5fe88be73a0  (in scale_vs_sqlite) + 112  [0x102f704a4]  manifest.rs:188
+    +         ! : | 57 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 196  [0x102f70268]  manifest.rs:216
+    +         ! : | + 57 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : | +   57 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : | 4 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 96  [0x102f70204]  manifest.rs:214
+    +         ! : | + 4 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! : | +   4 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! : | +     4 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! : | +       4 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! : | 3 elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 160  [0x102f70244]  manifest.rs:215
+    +         ! : |   3 std::io::Write::write_all::h4cf5ff33c3e73aa1  (in scale_vs_sqlite) + 92  [0x102f47ee4]  mod.rs:1877
+    +         ! : |     3 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +         ! : 4 elitesql_core::manifest::Manifest::refresh_previous::h76b7b5fe88be73a0  (in scale_vs_sqlite) + 208  [0x102f70504]  manifest.rs:191
+    +         ! :   4 std::sys::pal::common::small_c_string::run_with_cstr_stack::h2520b31d01173e38  (in scale_vs_sqlite) + 312  [0x1030482d8]
+    +         ! :     4 std::sys::fs::rename::_$u7b$$u7b$closure$u7d$$u7d$::h0e9b2ab6bc190aba  (in scale_vs_sqlite) + 312  [0x103042ef0]
+    +         ! :       4 rename  (in libsystem_kernel.dylib) + 16  [0x183207868]
+    +         ! :         4 __rename  (in libsystem_kernel.dylib) + 8  [0x18320788c]
+    +         ! 133 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 8536  [0x103015a5c]  maintenance.rs:598
+    +         ! : 65 elitesql_core::run_manifest::PrimaryRunManifest::publish::h2a00c921679ffac6  (in scale_vs_sqlite) + 28  [0x102f46bc0]  run_manifest.rs:160
+    +         ! : | 63 elitesql_core::run_manifest::PrimaryRunManifest::prepare::hefb5fc280abfdb00  (in scale_vs_sqlite) + 1840  [0x102f473e8]  run_manifest.rs:174
+    +         ! : | + 63 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : | +   63 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : | 2 elitesql_core::run_manifest::PrimaryRunManifest::prepare::hefb5fc280abfdb00  (in scale_vs_sqlite) + 312  [0x102f46df0]  run_manifest.rs:172
+    +         ! : |   2 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! : |     2 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! : |       2 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! : |         2 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! : 56 elitesql_core::run_manifest::PrimaryRunManifest::publish::h2a00c921679ffac6  (in scale_vs_sqlite) + 208  [0x102f46c74]  run_manifest.rs:160
+    +         ! : | 56 elitesql_core::manifest::fsync_dir::h6fdaf9ab1dbeb5ac  (in scale_vs_sqlite) + 136  [0x102f47704]  manifest.rs:221
+    +         ! : |   56 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : |     56 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : 12 elitesql_core::run_manifest::PrimaryRunManifest::publish::h2a00c921679ffac6  (in scale_vs_sqlite) + 176  [0x102f46c54]  run_manifest.rs:160
+    +         ! :   12 std::sys::pal::common::small_c_string::run_with_cstr_stack::h2520b31d01173e38  (in scale_vs_sqlite) + 312  [0x1030482d8]
+    +         ! :     12 std::sys::fs::rename::_$u7b$$u7b$closure$u7d$$u7d$::h0e9b2ab6bc190aba  (in scale_vs_sqlite) + 312  [0x103042ef0]
+    +         ! :       12 rename  (in libsystem_kernel.dylib) + 16  [0x183207868]
+    +         ! :         12 __rename  (in libsystem_kernel.dylib) + 8  [0x18320788c]
+    +         ! 118 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 8280  [0x10301595c]  maintenance.rs:579
+    +         ! : 118 std::fs::File::sync_all::hf9be9a60c29316b5  (in scale_vs_sqlite) + 28  [0x10305affc]
+    +         ! :   118 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! :     118 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! 111 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2620  [0x103014340]  maintenance.rs:377
+    +         ! : 40 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 244,108,...  [0x102f43ac8,0x102f43a40,...]  lib.rs:126
+    +         ! : 18 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 772  [0x102f4f5ac]  segment.rs:70
+    +         ! : | 15 _platform_memmove  (in libsystem_platform.dylib) + 180,0,...  [0x183251414,0x183251360,...]
+    +         ! : | 3 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : 17 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 624  [0x102f4f518]  segment.rs:64
+    +         ! : | 13 _platform_memmove  (in libsystem_platform.dylib) + 452,460,...  [0x183251524,0x18325152c,...]
+    +         ! : | 4 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : 9 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 456  [0x102f4f470]  segment.rs:59
+    +         ! : | 7 _platform_memmove  (in libsystem_platform.dylib) + 452,0,...  [0x183251524,0x183251360,...]
+    +         ! : | 2 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4  [0x1031f0eec]
+    +         ! : 5 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 40,44  [0x102f439fc,0x102f43a00]  lib.rs:124
+    +         ! : 5 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 0  [0x102f4f2a8]  segment.rs:38
+    +         ! : 4 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 88  [0x102f4f300]  segment.rs:52
+    +         ! : 4 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 736,708  [0x102f4f588,0x102f4f56c]  segment.rs:68
+    +         ! : 2 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 72  [0x102f4f2f0]  segment.rs:51
+    +         ! : 2 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 812  [0x102f4f5d4]  segment.rs:71
+    +         ! : | 2 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 4  [0x102f439d8]  lib.rs:122
+    +         ! : 1 crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 1512  [0x102f43fbc]  lib.rs:128
+    +         ! : 1 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 100  [0x102f4f30c]  mod.rs:0
+    +         ! : 1 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 124  [0x102f4f324]  segment.rs:53
+    +         ! : 1 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 460  [0x102f4f474]  segment.rs:59
+    +         ! : 1 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 568  [0x102f4f4e0]  segment.rs:63
+    +         ! 88 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2764  [0x1030143d0]  maintenance.rs:391
+    +         ! : 88 std::io::buffered::bufwriter::BufWriter$LT$W$GT$::write_all_cold::h328b0d55afc384ad  (in scale_vs_sqlite) + 56  [0x1031e2938]  bufwriter.rs:408
+    +         ! :   88 std::io::buffered::bufwriter::BufWriter$LT$W$GT$::flush_buf::hff6d4e170204a455  (in scale_vs_sqlite) + 128  [0x102f4f08c]  bufwriter.rs:236
+    +         ! :     88 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +         ! 78 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 504,492,...  [0x103013afc,0x103013af0,...]  maintenance.rs:319
+    +         ! 70 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 4588  [0x103014af0]  maintenance.rs:462
+    +         ! : 65 elitesql_core::manifest::fsync_dir::h6fdaf9ab1dbeb5ac  (in scale_vs_sqlite) + 136  [0x102f47704]  manifest.rs:221
+    +         ! : | 65 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : |   65 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : 5 elitesql_core::manifest::fsync_dir::h6fdaf9ab1dbeb5ac  (in scale_vs_sqlite) + 76  [0x102f476c8]  manifest.rs:221
+    +         ! :   5 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! :     5 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! :       5 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! :         5 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! 70 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 7504  [0x103015654]  maintenance.rs:554
+    +         ! : 70 elitesql_core::wal::WalWriter::sync_data::h3b3c06b3c5e009ca  (in scale_vs_sqlite) + 32  [0x1030178b8]  wal.rs:504
+    +         ! :   70 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! :     70 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! 65 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 5456  [0x103014e54]  maintenance.rs:491
+    +         ! : 65 std::fs::File::sync_all::hf9be9a60c29316b5  (in scale_vs_sqlite) + 28  [0x10305affc]
+    +         ! :   65 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! :     65 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! 63 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 5688  [0x103014f3c]  maintenance.rs:496
+    +         ! : 63 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h931f49c35b571511  (in scale_vs_sqlite) + 28  [0x1030176e8]  maintenance.rs:496
+    +         ! :   63 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! :     63 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! 60 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 8404  [0x1030159d8]  maintenance.rs:581
+    +         ! : 60 elitesql_core::manifest::fsync_dir::h6fdaf9ab1dbeb5ac  (in scale_vs_sqlite) + 136  [0x102f47704]  manifest.rs:221
+    +         ! :   60 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! :     60 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! 59 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 216,204,...  [0x1030139dc,0x1030139d0,...]  maintenance.rs:313
+    +         ! 55 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 3396  [0x103014648]  maintenance.rs:399
+    +         ! : 50 elitesql_core::manifest::fsync_dir::h6fdaf9ab1dbeb5ac  (in scale_vs_sqlite) + 136  [0x102f47704]  manifest.rs:221
+    +         ! : | 50 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! : |   50 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! : 5 elitesql_core::manifest::fsync_dir::h6fdaf9ab1dbeb5ac  (in scale_vs_sqlite) + 76  [0x102f476c8]  manifest.rs:221
+    +         ! :   5 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! :     5 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! :       5 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! :         5 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! 49 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 1416  [0x103013e8c]  maintenance.rs:334
+    +         ! : 45 _platform_memmove  (in libsystem_platform.dylib) + 452,460,...  [0x183251524,0x18325152c,...]
+    +         ! : 4 DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 4,8  [0x1031f0eec,0x1031f0ef0]
+    +         ! 46 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 8108  [0x1030158b0]  maintenance.rs:569
+    +         ! : 32 std::io::copy::generic_copy::hddf69d06eb12430c  (in scale_vs_sqlite) + 552  [0x103017c80]  copy.rs:89
+    +         ! : | 32 std::io::buffered::bufwriter::BufWriter$LT$W$GT$::flush_buf::hff6d4e170204a455  (in scale_vs_sqlite) + 128  [0x102f4f08c]  bufwriter.rs:236
+    +         ! : |   32 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +         ! : 14 std::io::copy::generic_copy::hddf69d06eb12430c  (in scale_vs_sqlite) + 668  [0x103017cf4]  copy.rs:89
+    +         ! :   14 read  (in libsystem_kernel.dylib) + 8  [0x18320491c]
+    +         ! 31 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2552  [0x1030142fc]  maintenance.rs:375
+    +         ! : 31 core::str::converts::from_utf8::h165df01988342ec0  (in scale_vs_sqlite) + 120,44,...  [0x102f3e184,0x102f3e138,...]
+    +         ! 29 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 5936  [0x103015034]  maintenance.rs:506
+    +         ! : 29 elitesql_core::manifest::fsync_dir::h6fdaf9ab1dbeb5ac  (in scale_vs_sqlite) + 136  [0x102f47704]  manifest.rs:221
+    +         ! :   29 fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+    +         ! :     29 __fcntl  (in libsystem_kernel.dylib) + 8  [0x1832048c4]
+    +         ! 27 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 9612  [0x103015e90]  maintenance.rs:670
+    +         ! : 27 elitesql_core::db::PrimaryIdx::delta_memory_bytes::hf610829081ee4433  (in scale_vs_sqlite) + 180,208,...  [0x102f48544,0x102f48560,...]  db.rs:608
+    +         ! 18 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2720  [0x1030143a4]  maintenance.rs:391
+    +         ! : 18 _platform_memmove  (in libsystem_platform.dylib) + 168,180,...  [0x183251408,0x183251414,...]
+    +         ! 15 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 4788  [0x103014bb8]  maintenance.rs:470
+    +         ! : 14 elitesql_core::paged::PagedIndex::open::h729dd07ad9f50562  (in scale_vs_sqlite) + 1732  [0x102f50ee0]  paged.rs:141
+    +         ! : | 14 elitesql_core::paged::read_u32::h97940468bf48bbc5  (in scale_vs_sqlite) + 104  [0x102f75214]  paged.rs:1034
+    +         ! : 1 elitesql_core::paged::PagedIndex::open::h729dd07ad9f50562  (in scale_vs_sqlite) + 2316  [0x102f51128]  paged.rs:203
+    +         ! :   1 _platform_memcmp  (in libsystem_platform.dylib) + 124  [0x18324ef8c]
+    +         ! 15 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 8868  [0x103015ba8]  maintenance.rs:639
+    +         ! : 15 elitesql_core::db::CommitMutex::lock::hfe67908f65a4d935  (in scale_vs_sqlite) + 152  [0x102f7d528]  db.rs:2358
+    +         ! :   15 parking_lot::raw_mutex::RawMutex::lock_slow::hf8548beeaa4cc3be  (in scale_vs_sqlite) + 496  [0x1031eae38]  raw_mutex.rs:262
+    +         ! :     15 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x183248128]
+    +         ! :       15 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18320750c]
+    +         ! 13 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 10760  [0x10301630c]  maintenance.rs:710
+    +         ! : 13 core::ptr::drop_in_place$LT$elitesql_core..wal..WalWriter$GT$::h0ff273111f716b02  (in scale_vs_sqlite) + 24  [0x102f55afc]  mod.rs:805
+    +         ! :   13 close  (in libsystem_kernel.dylib) + 8  [0x1832048f0]
+    +         ! 11 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 1184,1168  [0x103013da4,0x103013d94]  navigate.rs:0
+    +         ! 10 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 1528,1524  [0x103013efc,0x103013ef8]  maintenance.rs:337
+    +         ! 8 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 11000  [0x1030163fc]  maintenance.rs:710
+    +         ! : 8 core::ptr::drop_in_place$LT$alloc..vec..Vec$LT$elitesql_core..db..maintenance..checkpoint_locked..MemEntry$GT$$GT$::h6ab346725b982e85  (in scale_vs_sqlite) + 68,44,...  [0x102f55a98,0x102f55a80,...]  mod.rs:805
+    +         ! 7 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 1260,1300,...  [0x103013df0,0x103013e18,...]  maintenance.rs:329
+    +         ! 7 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 1372,1384  [0x103013e60,0x103013e6c]  maintenance.rs:334
+    +         ! 7 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 1500,1512  [0x103013ee0,0x103013eec]  maintenance.rs:336
+    +         ! 7 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 10356  [0x103016178]  maintenance.rs:676
+    +         ! : 3 elitesql_core::db::cleanup_orphans::h0d1c22b28ba40e9d  (in scale_vs_sqlite) + 2020  [0x102f556ec]  db.rs:8612
+    +         ! : | 3 std::sys::fs::remove_file::h197af39455909f15  (in scale_vs_sqlite) + 304  [0x103042900]
+    +         ! : |   3 unlink  (in libsystem_kernel.dylib) + 16  [0x183207c88]
+    +         ! : |     3 __unlink  (in libsystem_kernel.dylib) + 8  [0x183207cac]
+    +         ! : 2 elitesql_core::db::cleanup_orphans::h0d1c22b28ba40e9d  (in scale_vs_sqlite) + 488  [0x102f550f0]  db.rs:8590
+    +         ! : | 2 _$LT$std..fs..ReadDir$u20$as$u20$core..iter..traits..iterator..Iterator$GT$::next::he8e3373577c33ab3  (in scale_vs_sqlite) + 124  [0x10305c4bc]
+    +         ! : |   2 readdir_r  (in libsystem_c.dylib) + 72  [0x183126ca0]
+    +         ! : |     2 _readdir_unlocked  (in libsystem_c.dylib) + 224  [0x183126b44]
+    +         ! : |       2 __getdirentries64  (in libsystem_kernel.dylib) + 8  [0x1832059c4]
+    +         ! : 1 elitesql_core::db::cleanup_orphans::h0d1c22b28ba40e9d  (in scale_vs_sqlite) + 92  [0x102f54f64]  db.rs:8585
+    +         ! : | 1 std::fs::read::inner::he3d666dec7a2806f  (in scale_vs_sqlite) + 92  [0x10305b08c]
+    +         ! : |   1 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! : |     1 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! : |       1 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! : |         1 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! : 1 elitesql_core::db::cleanup_orphans::h0d1c22b28ba40e9d  (in scale_vs_sqlite) + 144  [0x102f54f98]  db.rs:8585
+    +         ! :   1 elitesql_core::manifest::Manifest::decode::h8e35db6e1fbf16e3  (in scale_vs_sqlite) + 4592  [0x102f5777c]  manifest.rs:95
+    +         ! 6 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 1484,1476  [0x103013ed0,0x103013ec8]  maintenance.rs:341
+    +         ! 6 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2268  [0x1030141e0]  maintenance.rs:363
+    +         ! : 6 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! :   6 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! :     6 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! :       6 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! 6 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 4208  [0x103014974]  maintenance.rs:461
+    +         ! : 6 std::sys::fs::rename::h827e7a98d7fb81f5  (in scale_vs_sqlite) + 40  [0x103042da4]
+    +         ! :   6 std::sys::pal::common::small_c_string::run_with_cstr_stack::h2520b31d01173e38  (in scale_vs_sqlite) + 312  [0x1030482d8]
+    +         ! :     6 std::sys::fs::rename::_$u7b$$u7b$closure$u7d$$u7d$::h0e9b2ab6bc190aba  (in scale_vs_sqlite) + 312  [0x103042ef0]
+    +         ! :       6 rename  (in libsystem_kernel.dylib) + 16  [0x183207868]
+    +         ! :         6 __rename  (in libsystem_kernel.dylib) + 8  [0x18320788c]
+    +         ! 5 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 8312  [0x10301597c]  maintenance.rs:580
+    +         ! : 5 std::sys::fs::rename::h827e7a98d7fb81f5  (in scale_vs_sqlite) + 40  [0x103042da4]
+    +         ! :   5 std::sys::pal::common::small_c_string::run_with_cstr_stack::h2520b31d01173e38  (in scale_vs_sqlite) + 312  [0x1030482d8]
+    +         ! :     5 std::sys::fs::rename::_$u7b$$u7b$closure$u7d$$u7d$::h0e9b2ab6bc190aba  (in scale_vs_sqlite) + 312  [0x103042ef0]
+    +         ! :       5 rename  (in libsystem_kernel.dylib) + 16  [0x183207868]
+    +         ! :         5 __rename  (in libsystem_kernel.dylib) + 8  [0x18320788c]
+    +         ! 4 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 1424,1428  [0x103013e94,0x103013e98]  maintenance.rs:335
+    +         ! 4 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2720,2684,...  [0x1030143a4,0x103014380,...]  maintenance.rs:391
+    +         ! 4 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 5660  [0x103014f20]  maintenance.rs:495
+    +         ! : 4 std::fs::OpenOptions::_open::h6c9e1716e3323a1f  (in scale_vs_sqlite) + 56  [0x10305af14]
+    +         ! :   4 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! :     4 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! :       4 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! :         4 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! 3 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 5120  [0x103014d04]  maintenance.rs:362
+    +         ! : 3 core::slice::sort::unstable::ipnsort::h1006ceea8719df9f  (in scale_vs_sqlite) + 188,172  [0x1030171a4,0x103017194]  mod.rs:66
+    +         ! 3 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2508,2504  [0x1030142d0,0x1030142cc]  maintenance.rs:375
+    +         ! 3 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 6196  [0x103015138]  maintenance.rs:512
+    +         ! : 3 elitesql_core::db::maintenance::lock_commit_after_group_sync::h7510be4f227ed19e  (in scale_vs_sqlite) + 60  [0x102f7d37c]  maintenance.rs:93
+    +         ! :   3 elitesql_core::db::CommitMutex::lock::hfe67908f65a4d935  (in scale_vs_sqlite) + 152  [0x102f7d528]  db.rs:2358
+    +         ! :     3 parking_lot::raw_mutex::RawMutex::lock_slow::hf8548beeaa4cc3be  (in scale_vs_sqlite) + 496  [0x1031eae38]  raw_mutex.rs:262
+    +         ! :       3 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x183248128]
+    +         ! :         3 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18320750c]
+    +         ! 3 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 8044  [0x103015870]  maintenance.rs:567
+    +         ! : 3 std::fs::File::create::h3c488ab6ebfe67af  (in scale_vs_sqlite) + 84  [0x102f2bdf8]  fs.rs:602
+    +         ! :   3 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! :     3 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! :       3 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! :         3 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! 3 elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite) + 556,552  [0x102f4f4d4,0x102f4f4d0]  segment.rs:74
+    +         ! 2 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 1884  [0x103014060]  maintenance.rs:360
+    +         ! : 2 _xzm_malloc_large_huge  (in libsystem_malloc.dylib) + 464  [0x183063458]
+    +         ! :   2 xzm_segment_group_alloc_chunk  (in libsystem_malloc.dylib) + 1368  [0x18304c954]
+    +         ! :     2 __bzero  (in libsystem_platform.dylib) + 68  [0x183251074]
+    +         ! 2 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2492  [0x1030142c0]  maintenance.rs:374
+    +         ! 2 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2552  [0x1030142fc]  maintenance.rs:376
+    +         ! 2 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2612,2624  [0x103014338,0x103014344]  maintenance.rs:377
+    +         ! 2 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2648,2656  [0x10301435c,0x103014364]  maintenance.rs:384
+    +         ! 2 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 3828  [0x1030147f8]  maintenance.rs:424
+    +         ! : 2 elitesql_core::paged::PagedWriter::create::hbfc9e68e43bf4d67  (in scale_vs_sqlite) + 80  [0x102f4f778]  paged.rs:875
+    +         ! :   2 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! :     2 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! :       2 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! :         2 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! 2 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 8140  [0x1030158d0]  maintenance.rs:575
+    +         ! : 2 std::io::buffered::bufwriter::BufWriter$LT$W$GT$::flush_buf::hff6d4e170204a455  (in scale_vs_sqlite) + 128  [0x102f4f08c]  bufwriter.rs:236
+    +         ! :   2 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +         ! 1 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 1540  [0x103013f08]  maintenance.rs:345
+    +         ! 1 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2468  [0x1030142a8]  maintenance.rs:373
+    +         ! 1 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 2812  [0x103014400]  maintenance.rs:394
+    +         ! : 1 std::io::buffered::bufwriter::BufWriter$LT$W$GT$::flush_buf::hff6d4e170204a455  (in scale_vs_sqlite) + 128  [0x102f4f08c]  bufwriter.rs:236
+    +         ! :   1 write  (in libsystem_kernel.dylib) + 8  [0x183207834]
+    +         ! 1 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 5416  [0x103014e2c]  maintenance.rs:490
+    +         ! : 1 std::fs::OpenOptions::_open::h6c9e1716e3323a1f  (in scale_vs_sqlite) + 56  [0x10305af14]
+    +         ! :   1 std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+    +         ! :     1 std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+    +         ! :       1 open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+    +         ! :         1 __open  (in libsystem_kernel.dylib) + 8  [0x183204694]
+    +         ! 1 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 6908  [0x103015400]  maintenance.rs:529
+    +         ! : 1 elitesql_core::manifest::Manifest::load::h6008ed7ca1c7c7a3  (in scale_vs_sqlite) + 116  [0x102fa8910]  manifest.rs:121
+    +         ! :   1 elitesql_core::manifest::Manifest::decode::h8e35db6e1fbf16e3  (in scale_vs_sqlite) + 2592  [0x102f56fac]  manifest.rs:95
+    +         ! :     1 _$LT$core..marker..PhantomData$LT$T$GT$$u20$as$u20$serde_core..de..DeserializeSeed$GT$::deserialize::h6e32bab9df459dde  (in scale_vs_sqlite) + 828  [0x102f59540]  mod.rs:825
+    +         ! :       1 _$LT$core..marker..PhantomData$LT$T$GT$$u20$as$u20$serde_core..de..DeserializeSeed$GT$::deserialize::hd954a2caafe6845c  (in scale_vs_sqlite) + 2492  [0x102f5f85c]  mod.rs:825
+    +         ! :         1 _$LT$core..marker..PhantomData$LT$T$GT$$u20$as$u20$serde_core..de..DeserializeSeed$GT$::deserialize::h5ca865dca2cc6fe5  (in scale_vs_sqlite) + 1676  [0x102f64160]  mod.rs:825
+    +         ! 1 elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite) + 7908  [0x1030157e8]  maintenance.rs:564
+    +         !   1 elitesql_core::wal::wal_path::h01706fe34d21d002  (in scale_vs_sqlite) + 48  [0x102f51624]  wal.rs:31
+    +         !     1 std::path::Path::_join::ha11c1cdceec39f05  (in scale_vs_sqlite) + 212  [0x103047d74]
+    +         !       1 alloc::raw_vec::RawVecInner$LT$A$GT$::reserve::do_reserve_and_handle::hbada8ea7920843f0  (in scale_vs_sqlite) + 88  [0x1031f0a88]
+    +         !         1 alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::h67c709930d32d711  (in scale_vs_sqlite) + 248  [0x1031f04ac]
+    +         !           1 _realloc  (in libsystem_malloc.dylib) + 452  [0x183073f14]
+    +         !             1 _malloc_zone_realloc  (in libsystem_malloc.dylib) + 148  [0x1830736f8]
+    +         !               1 xzm_realloc  (in libsystem_malloc.dylib) + 904  [0x183063f0c]
+    +         !                 1 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x183064278]
+    +         !                   1 __bzero  (in libsystem_platform.dylib) + 0  [0x183251030]
+    +         2149 std::sys::backtrace::__rust_begin_short_backtrace::hdfef48035cacfaf7  (in scale_vs_sqlite) + 560  [0x103011dc4]  backtrace.rs:160
+    +         ! 2149 std::sync::mpmc::list::Channel$LT$T$GT$::recv::_$u7b$$u7b$closure$u7d$$u7d$::h0177ca6be746d7cf  (in scale_vs_sqlite) + 184  [0x103024dc0]  list.rs:453
+    +         !   2149 _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x18308db20]
+    +         !     2149 _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x18308d490]
+    +         !       2149 semaphore_wait_trap  (in libsystem_kernel.dylib) + 8  [0x183203bb0]
+    +         364 std::sys::backtrace::__rust_begin_short_backtrace::hdfef48035cacfaf7  (in scale_vs_sqlite) + 3216  [0x103012824]  backtrace.rs:160
+    +           364 core::ptr::drop_in_place$LT$elitesql_core..db..FrozenCheckpointJob$GT$::h4dd0d6a1bd92d1d5  (in scale_vs_sqlite) + 60  [0x102fd33c4]  mod.rs:805
+    +             364 alloc::sync::Arc$LT$T$C$A$GT$::drop_slow::hfe7eae86f9ae17fd  (in scale_vs_sqlite) + 24  [0x102fd3318]  sync.rs:2120
+    +               364 core::ptr::drop_in_place$LT$std..collections..hash..map..HashMap$LT$alloc..string..String$C$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$alloc..vec..Vec$LT$elitesql_core..db..VersionEntry$GT$$GT$$GT$$GT$::hfc0749bb21384f49  (in scale_vs_sqlite) + 96  [0x102fd326c]  mod.rs:805
+    +                 158 core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$alloc..vec..Vec$LT$elitesql_core..db..VersionEntry$GT$$GT$$GT$::h3db9b09b2d45d61a  (in scale_vs_sqlite) + 300  [0x102f49d6c]  mod.rs:805
+    +                 : 67 alloc::sync::Arc$LT$T$C$A$GT$::drop_slow::h820ebcf9b475f68f  (in scale_vs_sqlite) + 32  [0x102f49adc]  sync.rs:2120
+    +                 : | 40 _xzm_free  (in libsystem_malloc.dylib) + 996,692,...  [0x1830644fc,0x1830643cc,...]
+    +                 : | 14 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x183064278]
+    +                 : | + 8 __bzero  (in libsystem_platform.dylib) + 0  [0x183251030]
+    +                 : | + 4 _platform_memset  (in libsystem_platform.dylib) + 140,160  [0x18325111c,0x183251130]
+    +                 : | + 2 DYLD-STUB$$_platform_bzero  (in libsystem_malloc.dylib) + 12  [0x18307b87c]
+    +                 : | 7 _free  (in libsystem_malloc.dylib) + 0,28,...  [0x183073cd0,0x183073cec,...]
+    +                 : | 5 _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 456  [0x18306c098]
+    +                 : | + 3 xzm_reclaim_mark_free_locked  (in libsystem_malloc.dylib) + 232  [0x18304b9dc]
+    +                 : | + ! 3 mach_vm_reclaim_ring_resize  (in libsystem_kernel.dylib) + 88  [0x183216fc4]
+    +                 : | + !   3 mach_vm_deferred_reclamation_buffer_resize  (in libsystem_kernel.dylib) + 140  [0x18322c500]
+    +                 : | + !     3 mach_msg2_internal  (in libsystem_kernel.dylib) + 76  [0x1832165a4]
+    +                 : | + !       3 mach_msg2_trap  (in libsystem_kernel.dylib) + 8  [0x183203c34]
+    +                 : | + 2 xzm_reclaim_mark_free_locked  (in libsystem_malloc.dylib) + 116  [0x18304b968]
+    +                 : | +   2 mach_vm_reclaim_try_enter  (in libsystem_kernel.dylib) + 296  [0x18321717c]
+    +                 : | +     2 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18320410c]
+    +                 : | 1 _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 132  [0x18306bf54]
+    +                 : 38 _xzm_free  (in libsystem_malloc.dylib) + 996,684,...  [0x1830644fc,0x1830643c4,...]
+    +                 : 20 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x183064278]
+    +                 : | 10 __bzero  (in libsystem_platform.dylib) + 0  [0x183251030]
+    +                 : | 10 _platform_memset  (in libsystem_platform.dylib) + 208,180  [0x183251160,0x183251144]
+    +                 : 13 _free  (in libsystem_malloc.dylib) + 76,36,...  [0x183073d1c,0x183073cf4,...]
+    +                 : 11 free  (in libsystem_malloc.dylib) + 0  [0x18303a6b8]
+    +                 : 3 alloc::sync::Arc$LT$T$C$A$GT$::drop_slow::h820ebcf9b475f68f  (in scale_vs_sqlite) + 16  [0x102f49acc]  sync.rs:2120
+    +                 : 3 alloc::sync::Arc$LT$T$C$A$GT$::drop_slow::h820ebcf9b475f68f  (in scale_vs_sqlite) + 52  [0x102f49af0]  sync.rs:2121
+    +                 : 1 DYLD-STUB$$free  (in scale_vs_sqlite) + 4  [0x1031f0d90]
+    +                 : 1 _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 456  [0x18306c098]
+    +                 : | 1 xzm_reclaim_mark_free_locked  (in libsystem_malloc.dylib) + 232  [0x18304b9dc]
+    +                 : |   1 mach_vm_reclaim_ring_resize  (in libsystem_kernel.dylib) + 88  [0x183216fc4]
+    +                 : |     1 mach_vm_deferred_reclamation_buffer_resize  (in libsystem_kernel.dylib) + 140  [0x18322c500]
+    +                 : |       1 mach_msg2_internal  (in libsystem_kernel.dylib) + 76  [0x1832165a4]
+    +                 : |         1 mach_msg2_trap  (in libsystem_kernel.dylib) + 8  [0x183203c34]
+    +                 : 1 _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 576  [0x18306c110]
+    +                 :   1 _xzm_xzone_freelist_chunks_mark_empty  (in libsystem_malloc.dylib) + 128  [0x18306c308]
+    +                 78 core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$alloc..vec..Vec$LT$elitesql_core..db..VersionEntry$GT$$GT$$GT$::h3db9b09b2d45d61a  (in scale_vs_sqlite) + 336  [0x102f49d90]  mod.rs:805
+    +                 : 37 _xzm_free  (in libsystem_malloc.dylib) + 28,996,...  [0x183064134,0x1830644fc,...]
+    +                 : 15 _free  (in libsystem_malloc.dylib) + 76,36,...  [0x183073d1c,0x183073cf4,...]
+    +                 : 12 DYLD-STUB$$free  (in scale_vs_sqlite) + 0,4  [0x1031f0d8c,0x1031f0d90]
+    +                 : 11 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x183064278]
+    +                 : | 7 __bzero  (in libsystem_platform.dylib) + 0  [0x183251030]
+    +                 : | 2 DYLD-STUB$$_platform_bzero  (in libsystem_malloc.dylib) + 12  [0x18307b87c]
+    +                 : | 2 _platform_memset  (in libsystem_platform.dylib) + 160  [0x183251130]
+    +                 : 1 _xzm_chunk_list_push  (in libsystem_malloc.dylib) + 160  [0x18306b8e4]
+    +                 : 1 _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 456  [0x18306c098]
+    +                 : | 1 xzm_reclaim_mark_free_locked  (in libsystem_malloc.dylib) + 116  [0x18304b968]
+    +                 : |   1 mach_vm_reclaim_try_enter  (in libsystem_kernel.dylib) + 296  [0x18321717c]
+    +                 : |     1 mach_absolute_time  (in libsystem_kernel.dylib) + 112  [0x183204110]
+    +                 : 1 _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 188  [0x18306bf8c]
+    +                 50 core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$alloc..vec..Vec$LT$elitesql_core..db..VersionEntry$GT$$GT$$GT$::h3db9b09b2d45d61a  (in scale_vs_sqlite) + 232  [0x102f49d28]  mod.rs:805
+    +                 : 39 _xzm_free  (in libsystem_malloc.dylib) + 996,28,...  [0x1830644fc,0x183064134,...]
+    +                 : 10 _free  (in libsystem_malloc.dylib) + 0,36,...  [0x183073cd0,0x183073cf4,...]
+    +                 : 1 DYLD-STUB$$free  (in scale_vs_sqlite) + 4  [0x1031f0d90]
+    +                 38 core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$alloc..vec..Vec$LT$elitesql_core..db..VersionEntry$GT$$GT$$GT$::h3db9b09b2d45d61a  (in scale_vs_sqlite) + 64,352,...  [0x102f49c80,0x102f49da0,...]  mod.rs:805
+    +                 20 _xzm_free  (in libsystem_malloc.dylib) + 1568,1556  [0x183064738,0x18306472c]
+    +                 19 core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$alloc..vec..Vec$LT$elitesql_core..db..VersionEntry$GT$$GT$$GT$::h3db9b09b2d45d61a  (in scale_vs_sqlite) + 156  [0x102f49cdc]  mod.rs:805
+    +                 : 10 _xzm_free  (in libsystem_malloc.dylib) + 780,20,...  [0x183064424,0x18306412c,...]
+    +                 : 6 _xzm_free  (in libsystem_malloc.dylib) + 352  [0x183064278]
+    +                 : | 5 _platform_memset  (in libsystem_platform.dylib) + 140,160  [0x18325111c,0x183251130]
+    +                 : | 1 __bzero  (in libsystem_platform.dylib) + 0  [0x183251030]
+    +                 : 1 _free  (in libsystem_malloc.dylib) + 76  [0x183073d1c]
+    +                 : 1 _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 456  [0x18306c098]
+    +                 : | 1 xzm_reclaim_mark_free_locked  (in libsystem_malloc.dylib) + 116  [0x18304b968]
+    +                 : |   1 mach_vm_reclaim_try_enter  (in libsystem_kernel.dylib) + 296  [0x18321717c]
+    +                 : |     1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18320410c]
+    +                 : 1 _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 148  [0x18306bf64]
+    +                 1 alloc::sync::Arc$LT$T$C$A$GT$::drop_slow::h820ebcf9b475f68f  (in scale_vs_sqlite) + 72  [0x102f49b04]  sync.rs:2121
+    5821 Thread_5294712
+      5821 thread_start  (in libsystem_pthread.dylib) + 8  [0x183242c1c]
+        5821 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183247c58]
+          5821 std::sys::thread::unix::Thread::new::thread_start::he774dcf8076eca54  (in scale_vs_sqlite) + 552  [0x10304f75c]
+            5821 core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h7c98aee7a41042f4  (in scale_vs_sqlite) + 76  [0x103009dc0]  function.rs:250
+              5821 std::sys::backtrace::__rust_begin_short_backtrace::h982ac39e8938033c  (in scale_vs_sqlite) + 596  [0x10300a13c]  backtrace.rs:160
+                5821 std::sync::mpmc::list::Channel$LT$T$GT$::recv::_$u7b$$u7b$closure$u7d$$u7d$::h0177ca6be746d7cf  (in scale_vs_sqlite) + 184  [0x103024dc0]  list.rs:453
+                  5821 _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x18308db20]
+                    5821 _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x18308d490]
+                      5821 semaphore_wait_trap  (in libsystem_kernel.dylib) + 8  [0x183203bb0]
+
+Total number in stack (recursive counted multiple, when >=5):
+        33       _platform_memmove  (in libsystem_platform.dylib) + 0  [0x183251360]
+        27       __fcntl  (in libsystem_kernel.dylib) + 0  [0x1832048bc]
+        27       fcntl  (in libsystem_kernel.dylib) + 88  [0x18320476c]
+        25       _platform_memcmp  (in libsystem_platform.dylib) + 0  [0x18324ef10]
+        20       DYLD-STUB$$memcpy  (in scale_vs_sqlite) + 0  [0x1031f0ee8]
+        17       DYLD-STUB$$memcmp  (in scale_vs_sqlite) + 0  [0x1031f0edc]
+        17       _xzm_free  (in libsystem_malloc.dylib) + 0  [0x183064118]
+        16       _malloc_zone_malloc  (in libsystem_malloc.dylib) + 0  [0x1830730bc]
+        16       _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 0  [0x183068f3c]
+        15       <deduplicated_symbol>  (in libsystem_malloc.dylib) + 0  [0x18306315c]
+        15       _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 0  [0x183063950]
+        13       __open  (in libsystem_kernel.dylib) + 0  [0x18320468c]
+        13       open  (in libsystem_kernel.dylib) + 64  [0x18320f8f0]
+        13       std::sys::fs::unix::File::open::_$u7b$$u7b$closure$u7d$$u7d$::h0e81c9e5298b6e1e  (in scale_vs_sqlite) + 256  [0x10305ace0]
+        13       std::sys::pal::common::small_c_string::run_with_cstr_stack::h9d9b27fd261cd5d2  (in scale_vs_sqlite) + 292  [0x103048420]
+        12       _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 0  [0x102f36cd4]  sip.rs:0
+        12       mach_absolute_time  (in libsystem_kernel.dylib) + 0  [0x1832040a0]
+        12       write  (in libsystem_kernel.dylib) + 0  [0x18320782c]
+        11       _free  (in libsystem_malloc.dylib) + 0  [0x183073cd0]
+        10       _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 0  [0x102f36cd4]  sip.rs:261
+        9       DYLD-STUB$$free  (in scale_vs_sqlite) + 0  [0x1031f0d8c]
+        9       DYLD-STUB$$malloc  (in scale_vs_sqlite) + 0  [0x1031f0e70]
+        9       __rename  (in libsystem_kernel.dylib) + 0  [0x183207884]
+        9       _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 324  [0x18306a7e4]
+        9       rename  (in libsystem_kernel.dylib) + 16  [0x183207868]
+        9       std::sys::fs::rename::_$u7b$$u7b$closure$u7d$$u7d$::h0e9b2ab6bc190aba  (in scale_vs_sqlite) + 312  [0x103042ef0]
+        9       std::sys::pal::common::small_c_string::run_with_cstr_stack::h2520b31d01173e38  (in scale_vs_sqlite) + 312  [0x1030482d8]
+        8       _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite) + 0  [0x102f3a130]
+        8       __bzero  (in libsystem_platform.dylib) + 0  [0x183251030]
+        8       _xzm_reclaim_mark_used_locked  (in libsystem_malloc.dylib) + 60  [0x18304ea9c]
+        8       mach_vm_reclaim_try_cancel  (in libsystem_kernel.dylib) + 260  [0x1832172f8]
+        7       _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 0  [0x102f36cd4]  sip.rs:264
+        7       _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite) + 0  [0x102f36cd4]  sip.rs:297
+        7       _xzm_free  (in libsystem_malloc.dylib) + 352  [0x183064278]
+        7       _xzm_reclaim_mark_used  (in libsystem_malloc.dylib) + 124  [0x18304bfac]
+        7       _xzm_xzone_find_and_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 860  [0x18306b2d8]
+        7       std::io::buffered::bufwriter::BufWriter$LT$W$GT$::flush_buf::hff6d4e170204a455  (in scale_vs_sqlite) + 128  [0x102f4f08c]  bufwriter.rs:236
+        7       xzm_chunk_mark_used  (in libsystem_malloc.dylib) + 188  [0x18304befc]
+        6       DYLD-STUB$$memmove  (in scale_vs_sqlite) + 0  [0x1031f0ef4]
+        6       _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x18308d490]
+        6       _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x18308db20]
+        6       _platform_memset  (in libsystem_platform.dylib) + 0  [0x183251090]
+        6       crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite) + 0  [0x102f439d4]  lib.rs:126
+        6       semaphore_wait_trap  (in libsystem_kernel.dylib) + 0  [0x183203ba8]
+        5       _malloc_zone_realloc  (in libsystem_malloc.dylib) + 148  [0x1830736f8]
+        5       _realloc  (in libsystem_malloc.dylib) + 452  [0x183073f14]
+        5       _xzm_xzone_madvise_batch  (in libsystem_malloc.dylib) + 456  [0x18306c098]
+        5       _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 0  [0x18306a6a0]
+        5       core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 0  [0x102f49b18]  mod.rs:700
+        5       core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 0  [0x102f49b18]  mod.rs:702
+        5       core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 0  [0x102f49b18]  mod.rs:703
+        5       core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 100  [0x102f49b7c]  mod.rs:701
+        5       core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite) + 76  [0x102f49b64]  mod.rs:701
+        5       elitesql_core::manifest::fsync_dir::h6fdaf9ab1dbeb5ac  (in scale_vs_sqlite) + 136  [0x102f47704]  manifest.rs:221
+        5       elitesql_core::manifest::write_synced::h5f3772cdec954dfa  (in scale_vs_sqlite) + 196  [0x102f70268]  manifest.rs:216
+        5       std::fs::File::sync_all::hf9be9a60c29316b5  (in scale_vs_sqlite) + 28  [0x10305affc]
+
+Sort by top of stack, same collapsed (when >= 5):
+        semaphore_wait_trap  (in libsystem_kernel.dylib)        18887
+        __fcntl  (in libsystem_kernel.dylib)        1591
+        write  (in libsystem_kernel.dylib)        1288
+        _platform_memcmp  (in libsystem_platform.dylib)        944
+        elitesql_core::paged::read_u32::h97940468bf48bbc5  (in scale_vs_sqlite)        611
+        _xzm_free  (in libsystem_malloc.dylib)        531
+        _platform_memmove  (in libsystem_platform.dylib)        520
+        elitesql_core::db::PrimaryIdx::push::hdce1fdcbefdc9698  (in scale_vs_sqlite)        378
+        __psynch_cvwait  (in libsystem_kernel.dylib)        370
+        _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib)        370
+        crc32fast::Hasher::update::ha22c7b31aa82ae97  (in scale_vs_sqlite)        364
+        elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::h9b9dba57a0d04f5e  (in scale_vs_sqlite)        206
+        core::iter::traits::iterator::Iterator::try_fold::h4dcc6b3d935c5c0c  (in scale_vs_sqlite)        183
+        elitesql_core::db::normalize_record::h0d534d22e7983927  (in scale_vs_sqlite)        156
+        _$LT$core..hash..sip..Hasher$LT$S$GT$$u20$as$u20$core..hash..Hasher$GT$::write::h3e0146fc50273f30  (in scale_vs_sqlite)        146
+        elitesql_core::db::encode_record_ordered::hf6efce641b77e746  (in scale_vs_sqlite)        135
+        <deduplicated_symbol>  (in libsystem_malloc.dylib)        116
+        _malloc_zone_malloc  (in libsystem_malloc.dylib)        114
+        _free  (in libsystem_malloc.dylib)        106
+        elitesql_core::db::Txn::commit_uncontrolled::h61c71d7b0e7a9b82  (in scale_vs_sqlite)        106
+        alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::h1cb3bb387e502833  (in scale_vs_sqlite)        99
+        core::hash::BuildHasher::hash_one::h9fb53767732c599d  (in scale_vs_sqlite)        98
+        _xzm_xzone_malloc  (in libsystem_malloc.dylib)        95
+        elitesql_core::db::Txn::insert::h295622982ff231c4  (in scale_vs_sqlite)        86
+        core::str::converts::from_utf8::h165df01988342ec0  (in scale_vs_sqlite)        81
+        DYLD-STUB$$memcmp  (in scale_vs_sqlite)        79
+        elitesql_core::value::encode_value::hf4b3d8e7ade1246f  (in scale_vs_sqlite)        57
+        core::fmt::write::h8f471e047a46547a  (in scale_vs_sqlite)        55
+        _platform_memset  (in libsystem_platform.dylib)        50
+        __bzero  (in libsystem_platform.dylib)        45
+        __rename  (in libsystem_kernel.dylib)        45
+        DYLD-STUB$$memcpy  (in scale_vs_sqlite)        43
+        __open  (in libsystem_kernel.dylib)        42
+        mach_absolute_time  (in libsystem_kernel.dylib)        41
+        elitesql_core::db::Txn::stage::h770ebbb75c4f1bf0  (in scale_vs_sqlite)        40
+        alloc::collections::btree::map::IntoIter$LT$K$C$V$C$A$GT$::dying_next::h057203cbea8d7590  (in scale_vs_sqlite)        39
+        core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$alloc..vec..Vec$LT$elitesql_core..db..VersionEntry$GT$$GT$$GT$::h3db9b09b2d45d61a  (in scale_vs_sqlite)        38
+        elitesql_core::db::staged_operation_bytes::h1ed382850608c74e  (in scale_vs_sqlite)        38
+        DYLD-STUB$$free  (in scale_vs_sqlite)        37
+        __lseek  (in libsystem_kernel.dylib)        37
+        alloc::collections::btree::map::entry::VacantEntry$LT$K$C$V$C$A$GT$::insert_entry::h3e643943d1cb509b  (in scale_vs_sqlite)        29
+        core::fmt::Formatter::pad_integral::hc977a1d07d0bc8f9  (in scale_vs_sqlite)        29
+        core::hash::BuildHasher::hash_one::ha3ac34470816b829  (in scale_vs_sqlite)        29
+        hashbrown::raw::RawTable$LT$T$C$A$GT$::reserve_rehash::he89452d280fa06b1  (in scale_vs_sqlite)        29
+        xzm_realloc  (in libsystem_malloc.dylib)        29
+        _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_str::h5833fcb1d4cddf05  (in scale_vs_sqlite)        28
+        __psynch_mutexwait  (in libsystem_kernel.dylib)        28
+        _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib)        28
+        alloc::fmt::format::format_inner::hfd0ba00c746e1ec5  (in scale_vs_sqlite)        28
+        elitesql_core::db::PrimaryIdx::delta_memory_bytes::hf610829081ee4433  (in scale_vs_sqlite)        27
+        elitesql_core::paged::PagedWriter::add::h547fbe0fb8ec8bfd  (in scale_vs_sqlite)        26
+        elitesql_core::db::commit::finish_prepared_commit::hbe551cdae7dd6bf5  (in scale_vs_sqlite)        25
+        elitesql_core::segment::encode_entry_into::h79a2e0c20bb3599e  (in scale_vs_sqlite)        22
+        core::fmt::num::imp::_$LT$impl$u20$u64$GT$::_fmt_inner::ha9d315164282ae0b  (in scale_vs_sqlite)        21
+        xzm_malloc_zone_size  (in libsystem_malloc.dylib)        21
+        DYLD-STUB$$malloc  (in scale_vs_sqlite)        20
+        core::ptr::drop_in_place$LT$alloc..collections..btree..map..BTreeMap$LT$alloc..string..String$C$elitesql_core..value..Value$GT$$GT$::h3544758cb2576691  (in scale_vs_sqlite)        20
+        DYLD-STUB$$memmove  (in scale_vs_sqlite)        19
+        elitesql_core::db::apply_one_owned::h020ffd7890ed2075  (in scale_vs_sqlite)        19
+        elitesql_core::db::maintenance::flush_frozen_checkpoint_inner::_$u7b$$u7b$closure$u7d$$u7d$::h488cfc8e75f72890  (in scale_vs_sqlite)        19
+        _$LT$alloc..string..String$u20$as$u20$core..fmt..Write$GT$::write_char::hc90507ff9db69e39  (in scale_vs_sqlite)        18
+        elitesql_core::db::encode_primary_entry_into::h25576fd54adcecd7  (in scale_vs_sqlite)        18
+        close  (in libsystem_kernel.dylib)        17
+        elitesql_core::db::State::id_is_above_high_watermark::hece288b870cef1ad  (in scale_vs_sqlite)        17
+        _malloc_zone_realloc  (in libsystem_malloc.dylib)        16
+        alloc::collections::btree::remove::_$LT$impl$u20$alloc..collections..btree..node..Handle$LT$alloc..collections..btree..node..NodeRef$LT$alloc..collections..btree..node..marker..Mut$C$K$C$V$C$alloc..collections..btree..node..marker..Leaf$GT$$C$alloc..collections..btree..node..marker..KV$GT$$GT$::remove_leaf_kv::h3f73daf9b0e77d87  (in scale_vs_sqlite)        16
+        core::fmt::Formatter::pad_integral::write_prefix::h06257d2de813e0d8  (in scale_vs_sqlite)        16
+        _realloc  (in libsystem_malloc.dylib)        14
+        read  (in libsystem_kernel.dylib)        14
+        elitesql_core::db::Txn::schema::h545e6698f1ad1558  (in scale_vs_sqlite)        13
+        elitesql_core::wal::encode_commit::h4a3de69c53423448  (in scale_vs_sqlite)        13
+        free  (in libsystem_malloc.dylib)        13
+        elitesql_core::db::encode_primary_key_into::h154e13c969bbd5d3  (in scale_vs_sqlite)        12
+        core::ops::function::FnMut::call_mut::hb5923ded4ff970c2  (in scale_vs_sqlite)        11
+        hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h4114d0283575ef10  (in scale_vs_sqlite)        10
+        DYLD-STUB$$_platform_bzero  (in libsystem_malloc.dylib)        9
+        core::ptr::drop_in_place$LT$alloc..vec..Vec$LT$elitesql_core..db..maintenance..checkpoint_locked..MemEntry$GT$$GT$::h6ab346725b982e85  (in scale_vs_sqlite)        8
+        alloc::sync::Arc$LT$T$C$A$GT$::drop_slow::h820ebcf9b475f68f  (in scale_vs_sqlite)        7
+        _xzm_chunk_list_push  (in libsystem_malloc.dylib)        6
+        _xzm_xzone_malloc_from_freelist_chunk  (in libsystem_malloc.dylib)        6
+        alloc::raw_vec::RawVecInner$LT$A$GT$::finish_grow::h7f491f3301e74f53  (in scale_vs_sqlite)        6
+        alloc::raw_vec::RawVecInner$LT$A$GT$::reserve::do_reserve_and_handle::h893f0519bacda6d6  (in scale_vs_sqlite)        5
+
+Binary images description not available
+

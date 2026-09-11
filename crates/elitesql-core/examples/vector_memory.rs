@@ -62,6 +62,7 @@ impl Args {
             memtable_max_bytes: (self.memtable_mib * MIB) as u64,
             auto_compaction: AutoCompactionOptions::disabled(),
             memory: MemoryOptions {
+                query_admission_timeout_ms: 5_000,
                 total_memory_bytes: self.total_mib * MIB,
                 query_pool_bytes: 64 * MIB,
                 query_working_bytes: 16 * MIB,

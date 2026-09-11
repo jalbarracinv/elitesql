@@ -1,0 +1,55 @@
+{
+  "name": "contention",
+  "bench": "contention_matrix",
+  "argv": [
+    "/Users/jalbarracin/Code/elitesql/target/release/deps/contention_matrix-6f7ea11fa0b4f368",
+    "--workloads",
+    "insert,update,delete,identity,foreign-key,derived",
+    "--cache",
+    "warm,cold",
+    "--readers",
+    "16",
+    "--writers",
+    "4",
+    "--rows",
+    "50k",
+    "--read-operations",
+    "100k",
+    "--write-rows",
+    "5k",
+    "--batch-size",
+    "10",
+    "--repetitions",
+    "3",
+    "--csv",
+    "/Users/jalbarracin/Code/elitesql/benchmark-results/refresh-2026-09-11/contention.csv"
+  ],
+  "before": {
+    "utc": "2026-09-11T10:04:54Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "returncode": 0,
+  "wall_seconds": 14.72354304199689,
+  "after": {
+    "utc": "2026-09-11T10:05:09Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  }
+}

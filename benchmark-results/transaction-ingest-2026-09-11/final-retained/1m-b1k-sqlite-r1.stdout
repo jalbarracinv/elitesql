@@ -1,0 +1,31 @@
+EliteSQL vs SQLite scalable benchmark
+  EliteSQL:     0.0.1
+  SQLite:       3.45.0 (rusqlite bundled)
+  rows:         1000000
+  batch size:   1000
+  point reads:  1000 (warm cache, plus 1000 untimed warmups)
+  full scans:   1 (unindexed score lookup)
+  durability:   EliteSQL fast <-> SQLite WAL + synchronous=OFF 
+  engines:      SQLite only
+  EliteSQL load: batched transactions
+  load timing:  ingest wall, final checkpoint, maintenance drain and worker time separated
+
+SQLite
+  SQLite: loaded 100000/1000000 rows (10%)
+  SQLite: loaded 200000/1000000 rows (20%)
+  SQLite: loaded 300000/1000000 rows (30%)
+  SQLite: loaded 400000/1000000 rows (40%)
+  SQLite: loaded 500000/1000000 rows (50%)
+  SQLite: loaded 600000/1000000 rows (60%)
+  SQLite: loaded 700000/1000000 rows (70%)
+  SQLite: loaded 800000/1000000 rows (80%)
+  SQLite: loaded 900000/1000000 rows (90%)
+  SQLite: loaded 1000000/1000000 rows (100%)
+  transaction phases: 0.062 s value construction + 0.353 s execute + 0.202 s commit calls
+
+Result
+engine     ingest wall    final cp       drain  total load       rows/s      point read    full scan
+SQLite         0.632 s     0.122 s     0.000 s     0.754 s      1325799     2.288 us/op      0.027 s
+           checkpoint work: 0.122 s (1), promotion work: 0.000 s (0), disk: 151.51 MiB
+
+CSV: /Users/jalbarracin/Code/elitesql/crates/elitesql-core/../../benchmark-results/transaction-ingest-2026-09-11/final-retained/1m-b1k-sqlite-r1.csv

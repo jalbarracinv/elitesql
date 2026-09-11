@@ -237,11 +237,28 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         "export" => {
             let [db_path, table] = take::<2>(&args)?;
             let db = open(&db_path, opts, create)?;
-            let rows = db.scan(&table).map_err(|e| e.to_string())?;
+            let snapshot = db.snapshot();
+            let mut cursor = None;
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            for (_, record) in &rows {
-                writeln!(out, "{}", jsonio::record_to_json(record)).map_err(|e| e.to_string())?;
+            loop {
+                let rows = db
+                    .scan_batch_at_bytes(
+                        &snapshot,
+                        &table,
+                        cursor.as_deref(),
+                        512,
+                        (db.memory_options().query_working_bytes / 2).max(1),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if rows.is_empty() {
+                    break;
+                }
+                for (_, record) in &rows {
+                    writeln!(out, "{}", jsonio::record_to_json(record))
+                        .map_err(|e| e.to_string())?;
+                }
+                cursor = rows.last().map(|(id, _)| id.clone());
             }
             Ok(())
         }

@@ -1,0 +1,1 @@
+{"group_id":"insert_1k_rows","function_id":"sqlite_autocommit","value_str":null,"throughput":{"Elements":1000},"full_id":"insert_1k_rows/sqlite_autocommit","directory_name":"insert_1k_rows/sqlite_autocommit","title":"insert_1k_rows/sqlite_autocommit"}

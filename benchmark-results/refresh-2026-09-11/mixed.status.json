@@ -1,0 +1,51 @@
+{
+  "name": "mixed",
+  "bench": "concurrent_rw",
+  "argv": [
+    "/Users/jalbarracin/Code/elitesql/target/release/deps/concurrent_rw-dc1d60a85da992a7",
+    "--rows",
+    "100k",
+    "--read-operations",
+    "1m",
+    "--write-rows",
+    "40k",
+    "--batch-size",
+    "10",
+    "--readers",
+    "1,2,4,8,16",
+    "--writers",
+    "0,1,4",
+    "--repetitions",
+    "3",
+    "--csv",
+    "/Users/jalbarracin/Code/elitesql/benchmark-results/refresh-2026-09-11/mixed.csv"
+  ],
+  "before": {
+    "utc": "2026-09-11T10:04:20Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "returncode": 0,
+  "wall_seconds": 33.7517862500099,
+  "after": {
+    "utc": "2026-09-11T10:04:54Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  }
+}

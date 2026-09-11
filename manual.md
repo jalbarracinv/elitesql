@@ -33,6 +33,10 @@ General rules:
 - Line comments with `--` and block comments with `/* ... */`.
 - SELECT reads the latest committed state (read committed). For snapshot-consistent reads use the Rust API (`db.snapshot()` + `scan_at`/`get_at`).
 - UPDATE/DELETE run inside a transaction with automatic retries on optimistic conflict. A multi-row INSERT is a single atomic commit: all rows land or none do.
+- Inside an explicit transaction, a failed INSERT/UPDATE/DELETE restores the
+  writes that preceded that statement. Earlier successful statements remain
+  staged and can still be committed. Rollback bookkeeping shares the transaction
+  memory budget; identity reservations may leave gaps after a failed statement.
 
 ### Bound parameters
 
@@ -131,6 +135,38 @@ it automatically. The tagged transport can preserve blobs, dates/times,
 timestamps, JSON, vectors, non-finite floats and lossless `int64`. Python maps
 its date/time classes directly; Node maps `Date` to a timestamp and `BigInt` to
 an exact `int64`.
+
+Responses encode `int64` outside JavaScript's safe integer interval
+[-9007199254740991, 9007199254740991] as
+`{"$t":"int64","v":"9007199254740993"}`. This includes returned identities and
+`lastrowid`: Node decodes them as `bigint`, Python as `int`, while safe values
+remain JSON numbers. Raw C/JSON consumers must decode this tag; upgrade the
+client with the server because older clients do not understand tagged integer
+responses. Numbers inside a user JSON value keep JSON's own semantics; use
+decimal strings when those values must roundtrip exactly through JavaScript.
+
+Streaming cursors use the same point/equality index selection as buffered
+queries. A cursor retains its opening snapshot; if later writes change indexed
+membership, subsequent batches use a snapshot scan to preserve results.
+The order of equivalent `AND` predicates does not hide an available index.
+
+`query` and `query_open` requests accept `timeout_ms` (default 30000); Node
+exposes `query(sql, params, {timeoutMs})` and `stream(sql, params, {timeoutMs})`.
+The deadline covers the whole cursor lifetime. An interruption returns error
+18. Rust callers can use `QueryControl::with_timeout`, `run`, and `cancel`;
+`QueryCursor::control()` can be cloned and cancelled from another thread.
+Cancellation is cooperative at work boundaries, not a preemption of arbitrary
+I/O. Once transaction commit publication starts, it completes without query
+cancellation so the timeout cannot split a commit.
+
+Idle remote cursors and stalled writes expire after 30 seconds. Leaving a Node
+`for await` loop closes its cursor, including on `break` or exception. Node
+respects socket backpressure and allows at most 128 outstanding requests and
+16 MiB of their encoded payloads per connection; await pending requests before
+retrying a queue-full error. Closing a client rejects its pending requests.
+Response batches obey both row and serialized-byte limits. A row that does not
+fit stays pending for the next batch. If one row exceeds the 8 MiB frame, use a
+smaller projection and close that cursor; retrying cannot make that row fit.
 
 ## Running SQL from another process, or another host
 
@@ -388,7 +424,9 @@ INSERT INTO users VALUES ('ana', 'ana@x.com', 30, NULL, NULL)
   ids. With `RETURNING`, it instead returns the requested columns as rows.
 - `INSERT IGNORE` and `ON CONFLICT DO NOTHING` suppress only duplicate physical
   ids and unique-index conflicts. Other schema, foreign-key and type errors are
-  still reported. A multi-row statement keeps the rows that do not conflict.
+  abort the whole statement. All rows that do not conflict are published in one
+  atomic commit. Concurrent conflicts retry the entire statement; no prefix is
+  committed before validation of the remaining rows.
 - `INSERT ... SELECT` is not supported. `RETURNING` is supported only for
   `INSERT`, not for `UPDATE` or `DELETE`.
 
@@ -546,6 +584,23 @@ The default 384 MiB envelope assigns 128 MiB each to mutable indexes and
 maintenance. This retains the complete measured 100K x 64-dimensional HNSW
 graph across restart; smaller envelopes remain an explicit deployment choice.
 
+`query_admission_timeout_ms` bounds waiting for query memory (default 5000 ms).
+Unconsumed cursors hold no query reservation; buffered cursor rows retain an
+estimate of their actual bytes, released on exhaustion, close or cancellation.
+Backup, restore counting and CLI export process byte-bounded batches.
+`scan_batch_at_bytes` rejects a single row exceeding its batch budget without
+advancing a caller's continuation key.
+
+These budgets are admission and estimated working-memory limits, not a hard
+RSS ceiling. Nested JSON allocations and ownership transfers are accounted;
+frozen maintenance ownership may temporarily exceed its pool and is reported
+without clamping. Returned values, transport buffers, allocator overhead,
+thread stacks and resident mapped pages contribute additional process memory.
+External sort merges at most 32 runs per pass using a heap, and uses a top-k
+heap when `LIMIT + OFFSET` fits. Its telemetry includes merge buffers and heads;
+very small budgets still need at least two merge heads and one encoded row,
+which can exceed the nominal operator budget for wide rows.
+
 Crossing the memtable threshold freezes the current primary delta and flushes it on a
 dedicated worker while later commits use a fresh active delta. Both generations
 remain queryable. The frozen generation consumes the maintenance pool rather
@@ -581,8 +636,11 @@ mapped pages are counted when touched even though the OS can reclaim them.
 
 An index does not have to fit entirely in heap memory. The primary directory is
 a generation-bound set of immutable checksummed paged runs mapped read-only,
-plus a bounded recent delta. Primary runs use fanout 16 and copy checksummed V2
-pages directly when the promoted key ranges do not overlap. Equality and BM25
+plus a bounded recent delta. Primary runs use fanout 16 and copy checksummed V3
+pages directly when the promoted key ranges do not overlap. V3 also protects
+navigation metadata before any lookup can report that a key is absent. Older
+V1/V2 runs have their boundaries verified against checksummed entries on open.
+Equality and BM25
 use fanout 8 with versioned additions and tombstones, preventing an older value
 or posting from reappearing after update/delete. A checkpoint publishes only
 each current delta and the background worker performs promotions. Persisted HNSW
@@ -948,6 +1006,33 @@ All of this fails with a clear error, never with surprise behavior:
 | `LIMIT offset, count` (MySQL order) | `LIMIT count OFFSET offset` — the operands swap |
 | `FOR UPDATE` / `LOCK IN SHARE MODE` | commits are optimistic; retry on `Error::Conflict` instead of locking rows |
 | Vector/text/hybrid search in SQL (`distance(...)`, `ORDER BY` a vector) | Rust API and bindings: `search_vector` (see [Vectors](#vectors-storing-and-searching-embeddings)), `search_text` (BM25) and `search_hybrid` (RRF); a SQL surface is left for a future phase |
+
+## Backup and recovery integrity
+
+Logical backup and salvage preserve physical row keys separately from a SQL
+column named `id`. They also preserve durable identity high-water marks, so a
+deleted maximum is not reused, including in an empty table. A backup captures
+sequence reservations with its snapshot; reservations may include gaps from
+uncommitted or failed writes.
+
+Copies load bounded batches into a private destination, then validate foreign
+keys over the complete copy before publishing it. This supports self references
+that cross batch boundaries. If salvage cannot rebuild a valid relational
+state, it returns an error and does not publish the destination.
+
+Normal recovery checks all required WAL successors before changing canonical
+files. A checksum error or a missing required successor rejects the open;
+explicit salvage remains available to recover a reported valid prefix. Only an
+incomplete final record is eligible for automatic truncation. See
+[the disk format](docs/disk-format.md) for legacy-manifest limitations.
+
+Run `elitesql check` after closing the writer. In addition to checksums, it
+builds an independent, externally sorted canonical image and checks row types,
+unique keys, foreign keys and identity watermarks. Derived primary and
+secondary discrepancies are rebuildable warnings; invalid canonical state is
+an error. The checker needs temporary disk proportional to the data, and its
+structural parsers can hold segment/WAL files and their entries in memory; it
+is not a constant-RSS online scan.
 
 ## Reference performance
 

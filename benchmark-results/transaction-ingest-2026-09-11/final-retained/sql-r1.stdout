@@ -1,0 +1,32 @@
+sql_1m/point_by_unique_index
+                        time:   [4.0981 µs 4.1027 µs 4.1077 µs]
+                        change: [-4.1430% -3.7455% -3.3253%] (p = 0.00 < 0.05)
+                        Performance has improved.
+sql_1m/point_by_unique_index_bound
+                        time:   [3.4115 µs 3.4154 µs 3.4176 µs]
+                        change: [-5.3943% -4.6800% -4.2197%] (p = 0.00 < 0.05)
+                        Performance has improved.
+sql_1m/indexed_join_100_of_1m
+                        time:   [155.02 µs 155.59 µs 156.17 µs]
+                        change: [-6.3263% -5.6183% -4.9282%] (p = 0.00 < 0.05)
+                        Performance has improved.
+sql_1m/indexed_join_100_of_1m_bound
+                        time:   [151.77 µs 152.04 µs 152.55 µs]
+                        change: [-5.9627% -5.5389% -5.1177%] (p = 0.00 < 0.05)
+                        Performance has improved.
+sql_1m/full_scan_filter_1m
+                        time:   [302.72 µs 303.07 µs 303.33 µs]
+                        change: [-8.0398% -7.0862% -6.4643%] (p = 0.00 < 0.05)
+                        Performance has improved.
+sql_1m/group_by_997_groups_1m
+                        time:   [314.22 ms 317.02 ms 320.50 ms]
+                        change: [-4.1816% -3.0137% -1.8132%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 10 measurements (30.00%)
+  1 (10.00%) low mild
+  2 (20.00%) high severe
+sql_1m/group_by_10k_groups_1m
+                        time:   [343.03 ms 346.54 ms 349.92 ms]
+                        change: [-4.1474% -2.8514% -1.7066%] (p = 0.00 < 0.05)
+                        Performance has improved.
+

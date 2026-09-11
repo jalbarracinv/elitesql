@@ -1,0 +1,1 @@
+{"group_id":"insert_1k_rows","function_id":"elitesql_single_txn_explicit_steady","value_str":null,"throughput":{"Elements":1000},"full_id":"insert_1k_rows/elitesql_single_txn_explicit_steady","directory_name":"insert_1k_rows/elitesql_single_txn_explicit_steady","title":"insert_1k_rows/elitesql_single_txn_explicit_steady"}

@@ -1,0 +1,37 @@
+sql_1m/point_by_unique_index
+                        time:   [4.2481 µs 4.3075 µs 4.3734 µs]
+                        change: [-0.1736% +0.7506% +1.8194%] (p = 0.21 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+sql_1m/point_by_unique_index_bound
+                        time:   [3.5404 µs 3.5452 µs 3.5503 µs]
+                        change: [+0.2127% +0.5335% +0.8776%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+sql_1m/indexed_join_100_of_1m
+                        time:   [162.07 µs 162.41 µs 162.86 µs]
+                        change: [+0.6201% +1.1697% +1.7180%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+sql_1m/indexed_join_100_of_1m_bound
+                        time:   [160.75 µs 161.16 µs 161.78 µs]
+                        change: [-3.5647% -0.5002% +2.1325%] (p = 0.77 > 0.05)
+                        No change in performance detected.
+sql_1m/full_scan_filter_1m
+                        time:   [306.81 µs 307.06 µs 307.35 µs]
+                        change: [-2.8979% -1.3871% -0.0140%] (p = 0.09 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+sql_1m/group_by_997_groups_1m
+                        time:   [316.98 ms 319.66 ms 323.57 ms]
+                        change: [-2.6414% -1.0479% +0.4158%] (p = 0.25 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+sql_1m/group_by_10k_groups_1m
+                        time:   [348.10 ms 348.78 ms 349.55 ms]
+                        change: [-1.3573% -0.7512% -0.2088%] (p = 0.02 < 0.05)
+                        Change within noise threshold.
+

@@ -1,0 +1,4404 @@
+{
+  "allocation_diagnostic": {
+    "final": {
+      "checkpoint": {
+        "allocated_bytes": {
+          "cv_percent": 0.0019844282348708,
+          "max": 18213284.0,
+          "mean": 18212866.666666668,
+          "median": 18212658.0,
+          "min": 18212658.0,
+          "n": 3,
+          "sample_stdev": 361.42126851270575
+        },
+        "allocations": {
+          "cv_percent": 0.17204378520674224,
+          "max": 2690.0,
+          "mean": 2684.6666666666665,
+          "median": 2682.0,
+          "min": 2682.0,
+          "n": 3,
+          "sample_stdev": 4.618802153517006
+        },
+        "seconds": {
+          "cv_percent": 21.495922378836198,
+          "max": 0.265889542,
+          "mean": 0.21327405533333332,
+          "median": 0.192015333,
+          "min": 0.181917291,
+          "n": 3,
+          "sample_stdev": 0.0458452253886495
+        }
+      },
+      "checkpoint_bytes_written": {
+        "cv_percent": 0.0,
+        "max": 559191396.0,
+        "mean": 559191396.0,
+        "median": 559191396.0,
+        "min": 559191396.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "commit_calls": {
+        "allocated_bytes": {
+          "cv_percent": 0.23057360815615108,
+          "max": 11178182688.0,
+          "mean": 11154647341.666666,
+          "median": 11158566197.0,
+          "min": 11127193140.0,
+          "n": 3,
+          "sample_stdev": 25719672.85277502
+        },
+        "allocations": {
+          "cv_percent": 0.008100794479365455,
+          "max": 10112072.0,
+          "mean": 10111139.333333334,
+          "median": 10110809.0,
+          "min": 10110537.0,
+          "n": 3,
+          "sample_stdev": 819.0826169156157
+        },
+        "seconds": {
+          "cv_percent": 10.994105672368686,
+          "max": 4.143600577,
+          "mean": 3.6871318546666667,
+          "median": 3.548618024,
+          "min": 3.369176963,
+          "n": 3,
+          "sample_stdev": 0.4053671723816208
+        }
+      },
+      "construction": {
+        "allocated_bytes": {
+          "cv_percent": 0.5538714431949259,
+          "max": 8644469829.0,
+          "mean": 8589538951.333333,
+          "median": 8562647928.0,
+          "min": 8561499097.0,
+          "n": 3,
+          "sample_stdev": 47575003.353540234
+        },
+        "allocations": {
+          "cv_percent": 0.0002469879415575264,
+          "max": 90041109.0,
+          "mean": 90040852.33333333,
+          "median": 90040731.0,
+          "min": 90040717.0,
+          "n": 3,
+          "sample_stdev": 222.39004773895195
+        },
+        "seconds": {
+          "cv_percent": 1.0968700841960348,
+          "max": 1.893383993,
+          "mean": 1.8709134186666667,
+          "median": 1.8661924619999999,
+          "min": 1.853163801,
+          "n": 3,
+          "sample_stdev": 0.02052148959056398
+        }
+      },
+      "index_delta_peak_bytes": {
+        "cv_percent": 0.0,
+        "max": 118788890.0,
+        "mean": 118788890.0,
+        "median": 118788890.0,
+        "min": 118788890.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "live_bytes_at_end": {
+        "cv_percent": 0.0,
+        "max": 1110176.0,
+        "mean": 1110176.0,
+        "median": 1110176.0,
+        "min": 1110176.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "maintenance_peak_bytes": {
+        "cv_percent": 0.0,
+        "max": 134217728.0,
+        "mean": 134217728.0,
+        "median": 134217728.0,
+        "min": 134217728.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "peak_live_bytes": {
+        "cv_percent": 0.45409310161027405,
+        "max": 228188791.0,
+        "mean": 227592111.0,
+        "median": 228188791.0,
+        "min": 226398751.0,
+        "n": 3,
+        "sample_stdev": 1033480.0758601977
+      },
+      "promotion_bytes_read": {
+        "cv_percent": 0.0,
+        "max": 366829504.0,
+        "mean": 366829504.0,
+        "median": 366829504.0,
+        "min": 366829504.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "promotion_bytes_written": {
+        "cv_percent": 0.0,
+        "max": 366828664.0,
+        "mean": 366828664.0,
+        "median": 366828664.0,
+        "min": 366828664.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "staging": {
+        "allocated_bytes": {
+          "cv_percent": 0.7468672559822267,
+          "max": 3500721071.0,
+          "mean": 3476594693.3333335,
+          "median": 3479947343.0,
+          "min": 3449115666.0,
+          "n": 3,
+          "sample_stdev": 25965547.387722377
+        },
+        "allocations": {
+          "cv_percent": 0.003223216611293458,
+          "max": 20055585.0,
+          "mean": 20055157.666666668,
+          "median": 20055474.0,
+          "min": 20054414.0,
+          "n": 3,
+          "sample_stdev": 646.4211733330935
+        },
+        "seconds": {
+          "cv_percent": 1.313076332601364,
+          "max": 1.416046602,
+          "mean": 1.404152884,
+          "median": 1.413498169,
+          "min": 1.382913881,
+          "n": 3,
+          "sample_stdev": 0.018437599193343483
+        }
+      },
+      "total_allocated_bytes": {
+        "cv_percent": 0.0,
+        "max": 23239006257.0,
+        "mean": 23239006257.0,
+        "median": 23239006257.0,
+        "min": 23239006257.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "total_allocations": {
+        "cv_percent": 0.0,
+        "max": 120209959.0,
+        "mean": 120209959.0,
+        "median": 120209959.0,
+        "min": 120209959.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "total_deallocated_bytes": {
+        "cv_percent": 0.0,
+        "max": 23237911027.0,
+        "mean": 23237911027.0,
+        "median": 23237911027.0,
+        "min": 23237911027.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "total_seconds": {
+        "cv_percent": 6.555675652687436,
+        "max": 7.812090792,
+        "mean": 7.277427264,
+        "median": 7.125033875,
+        "min": 6.895157125,
+        "n": 3,
+        "sample_stdev": 0.4770845272880854
+      },
+      "wal_appended_bytes": {
+        "cv_percent": 0.0,
+        "max": 1598904890.0,
+        "mean": 1598904890.0,
+        "median": 1598904890.0,
+        "min": 1598904890.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      }
+    },
+    "initial": {
+      "checkpoint": {
+        "allocated_bytes": {
+          "cv_percent": 0.023888177431578287,
+          "max": 15859383.0,
+          "mean": 15857196.0,
+          "median": 15859383.0,
+          "min": 15852822.0,
+          "n": 3,
+          "sample_stdev": 3787.995116153135
+        },
+        "allocations": {
+          "cv_percent": 0.33257503985577525,
+          "max": 2609.0,
+          "mean": 2604.0,
+          "median": 2609.0,
+          "min": 2594.0,
+          "n": 3,
+          "sample_stdev": 8.660254037844387
+        },
+        "seconds": {
+          "cv_percent": 9.352510003648238,
+          "max": 0.214014125,
+          "mean": 0.19316756933333334,
+          "median": 0.183412708,
+          "min": 0.182075875,
+          "n": 3,
+          "sample_stdev": 0.01806601624570415
+        }
+      },
+      "checkpoint_bytes_written": {
+        "cv_percent": 0.0,
+        "max": 559191396.0,
+        "mean": 559191396.0,
+        "median": 559191396.0,
+        "min": 559191396.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "commit_calls": {
+        "allocated_bytes": {
+          "cv_percent": 1.1376284451550362,
+          "max": 11543106413.0,
+          "mean": 11436321805.666666,
+          "median": 11474442000.0,
+          "min": 11291417004.0,
+          "n": 3,
+          "sample_stdev": 130102849.94073206
+        },
+        "allocations": {
+          "cv_percent": 0.0034351137019123035,
+          "max": 31781251.0,
+          "mean": 31780493.333333332,
+          "median": 31780987.0,
+          "min": 31779242.0,
+          "n": 3,
+          "sample_stdev": 1091.6960810286594
+        },
+        "seconds": {
+          "cv_percent": 20.280107595528836,
+          "max": 7.685920095,
+          "mean": 6.237378925,
+          "median": 5.675551159,
+          "min": 5.350665521,
+          "n": 3,
+          "sample_stdev": 1.26494715713084
+        }
+      },
+      "construction": {
+        "allocated_bytes": {
+          "cv_percent": 1.5665976676982198,
+          "max": 8354538106.0,
+          "mean": 8212662099.0,
+          "median": 8179889960.0,
+          "min": 8103558231.0,
+          "n": 3,
+          "sample_stdev": 128659372.89886966
+        },
+        "allocations": {
+          "cv_percent": 0.0009325653944614864,
+          "max": 90031933.0,
+          "mean": 90031018.0,
+          "median": 90030838.0,
+          "min": 90030283.0,
+          "n": 3,
+          "sample_stdev": 839.5981181493918
+        },
+        "seconds": {
+          "cv_percent": 0.6502721000888317,
+          "max": 2.213089667,
+          "mean": 2.203485654,
+          "median": 2.21035123,
+          "min": 2.187016065,
+          "n": 3,
+          "sample_stdev": 0.01432865243742193
+        }
+      },
+      "index_delta_peak_bytes": {
+        "cv_percent": 0.0,
+        "max": 118788890.0,
+        "mean": 118788890.0,
+        "median": 118788890.0,
+        "min": 118788890.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "live_bytes_at_end": {
+        "cv_percent": 0.0,
+        "max": 1110176.0,
+        "mean": 1110176.0,
+        "median": 1110176.0,
+        "min": 1110176.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "maintenance_peak_bytes": {
+        "cv_percent": 0.0,
+        "max": 134217728.0,
+        "mean": 134217728.0,
+        "median": 134217728.0,
+        "min": 134217728.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "peak_live_bytes": {
+        "cv_percent": 1.4435106823842647,
+        "max": 321106927.0,
+        "mean": 315903053.3333333,
+        "median": 313996986.0,
+        "min": 312605247.0,
+        "n": 3,
+        "sample_stdev": 4560094.320844728
+      },
+      "promotion_bytes_read": {
+        "cv_percent": 0.0,
+        "max": 366829504.0,
+        "mean": 366829504.0,
+        "median": 366829504.0,
+        "min": 366829504.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "promotion_bytes_written": {
+        "cv_percent": 0.0,
+        "max": 366828664.0,
+        "mean": 366828664.0,
+        "median": 366828664.0,
+        "min": 366828664.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      },
+      "staging": {
+        "allocated_bytes": {
+          "cv_percent": 0.12856096953234983,
+          "max": 3493359404.0,
+          "mean": 3490102055.0,
+          "median": 3491962594.0,
+          "min": 3484984167.0,
+          "n": 3,
+          "sample_stdev": 4486909.039576465
+        },
+        "allocations": {
+          "cv_percent": 0.0014078994758200084,
+          "max": 20056856.0,
+          "mean": 20056561.666666668,
+          "median": 20056536.0,
+          "min": 20056293.0,
+          "n": 3,
+          "sample_stdev": 282.37622657251677
+        },
+        "seconds": {
+          "cv_percent": 0.4490772359544832,
+          "max": 1.967166261,
+          "mean": 1.9587171986666667,
+          "median": 1.959374503,
+          "min": 1.9496108319999998,
+          "n": 3,
+          "sample_stdev": 0.00879615305593735
+        }
+      },
+      "total_allocated_bytes": {
+        "cv_percent": 5.5657528239054636e-05,
+        "max": 23155216193.0,
+        "mean": 23155201311.666668,
+        "median": 23155193871.0,
+        "min": 23155193871.0,
+        "n": 3,
+        "sample_stdev": 12887.612708850826
+      },
+      "total_allocations": {
+        "cv_percent": 2.93007426419749e-05,
+        "max": 141870921.0,
+        "mean": 141870873.0,
+        "median": 141870849.0,
+        "min": 141870849.0,
+        "n": 3,
+        "sample_stdev": 41.569219381653056
+      },
+      "total_deallocated_bytes": {
+        "cv_percent": 5.5660160938172374e-05,
+        "max": 23154120963.0,
+        "mean": 23154106081.666668,
+        "median": 23154098641.0,
+        "min": 23154098641.0,
+        "n": 3,
+        "sample_stdev": 12887.612708850826
+      },
+      "total_seconds": {
+        "cv_percent": 12.348915531605162,
+        "max": 12.540019834,
+        "mean": 10.987814250333333,
+        "median": 10.396388417,
+        "min": 10.0270345,
+        "n": 3,
+        "sample_stdev": 1.3568759005433382
+      },
+      "wal_appended_bytes": {
+        "cv_percent": 0.0,
+        "max": 1598904890.0,
+        "mean": 1598904890.0,
+        "median": 1598904890.0,
+        "min": 1598904890.0,
+        "n": 3,
+        "sample_stdev": 0.0
+      }
+    }
+  },
+  "definition": {
+    "cv_percent": "sample standard deviation divided by mean",
+    "paired_reduction_percent": "(initial-final)/initial for matching repetition",
+    "ranges": "minimum and maximum across independent processes",
+    "total_load_seconds": "ingest + explicit final checkpoint + maintenance drain"
+  },
+  "instrumentation_invariant": {
+    "exclusive_phase_sum_never_exceeded_commit_call_wall": true,
+    "maximum_exclusive_sum_over_commit_call_wall": 0.9243486978866162
+  },
+  "uninstrumented_baseline": {
+    "10m-b10k": {
+      "final_reduction_percent": 29.320285426606713,
+      "total_load_seconds": {
+        "cv_percent": 12.633414248575978,
+        "max": 10.6147975,
+        "mean": 9.2787390502,
+        "median": 8.782730625,
+        "min": 7.885122792,
+        "n": 5,
+        "sample_stdev": 1.1722215412561503
+      }
+    },
+    "10m-b1k": {
+      "final_reduction_percent": 18.16988385507872,
+      "total_load_seconds": {
+        "cv_percent": 2.388388679205485,
+        "max": 9.084757625,
+        "mean": 8.8263924168,
+        "median": 8.876034084,
+        "min": 8.523728375,
+        "n": 5,
+        "sample_stdev": 0.21080855726510261
+      }
+    },
+    "1m-b10k": {
+      "final_reduction_percent": 21.979561081600707,
+      "total_load_seconds": {
+        "cv_percent": 0.6964274407727465,
+        "max": 0.897858834,
+        "mean": 0.8880166254,
+        "median": 0.886810625,
+        "min": 0.880740584,
+        "n": 5,
+        "sample_stdev": 0.0061843914579097275
+      }
+    },
+    "1m-b1k": {
+      "final_reduction_percent": 19.473374159833742,
+      "total_load_seconds": {
+        "cv_percent": 1.1179047852304513,
+        "max": 0.966498333,
+        "mean": 0.9476543834,
+        "median": 0.942883167,
+        "min": 0.941556042,
+        "n": 5,
+        "sample_stdev": 0.010593873699474727
+      }
+    }
+  },
+  "workloads": {
+    "10m-b10k": {
+      "headline": {
+        "median_reduction_percent": 32.1034371820788,
+        "sqlite_time_over_final_time": 1.2386513662370988
+      },
+      "paired": {
+        "checkpoint_work_seconds": {
+          "cv_percent": 240.93718314333623,
+          "max": 45.869933317982095,
+          "mean": 9.19373760788408,
+          "median": 9.572413643510458,
+          "min": -37.773451668076234,
+          "n": 10,
+          "sample_stdev": 22.151132418025444
+        },
+        "commit_calls_seconds": {
+          "cv_percent": 97.45755826583382,
+          "max": 54.37700077340843,
+          "mean": 21.821105024199948,
+          "median": 26.775853119847092,
+          "min": -21.794824986357796,
+          "n": 10,
+          "sample_stdev": 21.266316143208456
+        },
+        "commit_phase_apply_seconds": {
+          "cv_percent": 3.2561702062790356,
+          "max": 55.694218133314735,
+          "mean": 53.58072439366529,
+          "median": 53.873594779871894,
+          "min": 51.05781838350937,
+          "n": 10,
+          "sample_stdev": 1.7446795840150124
+        },
+        "commit_phase_maintenance_wait_seconds": {
+          "cv_percent": -115.60150895562398,
+          "max": 7.420090671575654,
+          "mean": -9.482059469016104,
+          "median": -13.236455211639303,
+          "min": -23.737292549463398,
+          "n": 10,
+          "sample_stdev": 10.961403826252242
+        },
+        "commit_phase_prepare_seconds": {
+          "cv_percent": 2.948110416579272,
+          "max": 63.047507891900345,
+          "mean": 60.67502757448987,
+          "median": 60.67037532768548,
+          "min": 57.44299988265369,
+          "n": 10,
+          "sample_stdev": 1.7887668081858814
+        },
+        "commit_phase_record_encode_seconds": {
+          "cv_percent": 15.658738537844751,
+          "max": 32.30632250227997,
+          "mean": 27.50311335174193,
+          "median": 28.835781216104763,
+          "min": 17.618494657313917,
+          "n": 10,
+          "sample_stdev": 4.306640609516339
+        },
+        "commit_phase_validation_seconds": {
+          "cv_percent": -92.04887398185477,
+          "max": 0.5800237344484075,
+          "mean": -3.5810260837354786,
+          "median": -2.5394678957773715,
+          "min": -7.887775363931898,
+          "n": 10,
+          "sample_stdev": 3.2962941870750195
+        },
+        "commit_phase_wal_append_seconds": {
+          "cv_percent": -529.0396302486266,
+          "max": 81.87682202627677,
+          "mean": -14.698252498349195,
+          "median": -14.135713269026176,
+          "min": -210.65201876354521,
+          "n": 10,
+          "sample_stdev": 77.7595806702761
+        },
+        "commit_phase_wal_encode_seconds": {
+          "cv_percent": -60.63075533968906,
+          "max": -0.3600424614418112,
+          "mean": -5.8135087486275445,
+          "median": -5.7021360648562744,
+          "min": -11.040020731565157,
+          "n": 10,
+          "sample_stdev": 3.5247742660317853
+        },
+        "final_checkpoint_seconds": {
+          "cv_percent": 136.8417329499517,
+          "max": 32.53658251556858,
+          "mean": 10.197416354496946,
+          "median": 6.168290268449875,
+          "min": -3.5924657091121923,
+          "n": 10,
+          "sample_stdev": 13.954321255615412
+        },
+        "full_scan_seconds": {
+          "cv_percent": 92.23105637160286,
+          "max": 83.84651701462658,
+          "mean": 37.63527225013519,
+          "median": 40.03159175512611,
+          "min": -0.05649791778169552,
+          "n": 10,
+          "sample_stdev": 34.71140916462839
+        },
+        "ingest_wall_seconds": {
+          "cv_percent": 75.99441909329154,
+          "max": 44.261853086791156,
+          "mean": 19.824507509176303,
+          "median": 22.851504759431545,
+          "min": -9.35327704394011,
+          "n": 10,
+          "sample_stdev": 15.065519319704492
+        },
+        "maintenance_drain_seconds": {
+          "cv_percent": -436.02761579356485,
+          "max": 43.06666666666667,
+          "mean": -14.413598849926474,
+          "median": 0.2438532707107257,
+          "min": -175.78181818181818,
+          "n": 10,
+          "sample_stdev": 62.847271415383084
+        },
+        "point_read_us": {
+          "cv_percent": -495.37146538198067,
+          "max": 25.97047566976489,
+          "mean": -4.2677529821620785,
+          "median": -3.2137921429566254,
+          "min": -46.76724137931036,
+          "n": 10,
+          "sample_stdev": 21.14123048661947
+        },
+        "promotion_work_seconds": {
+          "cv_percent": -103.54226407544517,
+          "max": 20.90106830691216,
+          "mean": -29.863481495853794,
+          "median": -40.36397050985382,
+          "min": -62.108316140240774,
+          "n": 10,
+          "sample_stdev": 30.921324872558642
+        },
+        "record_construction_seconds": {
+          "cv_percent": 566.6960834939316,
+          "max": 6.485313707434498,
+          "mean": 0.5950260503066739,
+          "median": 1.2033903288393077,
+          "min": -4.589659103250355,
+          "n": 10,
+          "sample_stdev": 3.3719893228565523
+        },
+        "rows_per_second": {
+          "cv_percent": -86.31585817513546,
+          "max": 8.340281022640662,
+          "mean": -28.49167979847559,
+          "median": -28.899599829683574,
+          "min": -78.43908613400492,
+          "n": 10,
+          "sample_stdev": 24.592837926565913
+        },
+        "staging_seconds": {
+          "cv_percent": 19.87712915364062,
+          "max": 36.0173857252629,
+          "mean": 28.053275829620134,
+          "median": 28.31471313187116,
+          "min": 19.93215480489953,
+          "n": 10,
+          "sample_stdev": 5.576185868480641
+        },
+        "total_load_seconds": {
+          "cv_percent": 75.65738462182959,
+          "max": 43.95846661896288,
+          "mean": 19.676382295211933,
+          "median": 22.417338616990484,
+          "min": -9.099178030761648,
+          "n": 10,
+          "sample_stdev": 14.886636232750075
+        }
+      },
+      "variants": {
+        "final": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 559191928.0,
+            "mean": 559191928.0,
+            "median": 559191928.0,
+            "min": 559191928.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 30.270079675002254,
+            "max": 7.457006335,
+            "mean": 5.3456543664,
+            "median": 4.314347146499999,
+            "min": 3.987027331,
+            "n": 10,
+            "sample_stdev": 1.6181338358595168
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 33.22586511569287,
+            "max": 6.248567535,
+            "mean": 4.3473366612,
+            "median": 3.4424053595000004,
+            "min": 3.121277931,
+            "n": 10,
+            "sample_stdev": 1.444440215175378
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 3.9288537816631988,
+            "max": 0.914709289,
+            "mean": 0.8642214235,
+            "median": 0.8442084965,
+            "min": 0.830297798,
+            "n": 10,
+            "sample_stdev": 0.03395399607912328
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 8.36513900697503,
+            "max": 0.000205252,
+            "mean": 0.00018611190000000002,
+            "median": 0.00018941500000000002,
+            "min": 0.000161938,
+            "n": 10,
+            "sample_stdev": 1.556851914352236e-05
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 4.115321720933061,
+            "max": 0.046881982,
+            "mean": 0.0444443485,
+            "median": 0.044336656,
+            "min": 0.042442641,
+            "n": 10,
+            "sample_stdev": 0.001829027927547687
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 6.345571095903388,
+            "max": 0.633787688,
+            "mean": 0.5540136421,
+            "median": 0.543300068,
+            "min": 0.52337269,
+            "n": 10,
+            "sample_stdev": 0.035155329540459246
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 3.4747353222895816,
+            "max": 0.106965993,
+            "mean": 0.1016839858,
+            "median": 0.1002904775,
+            "min": 0.098001925,
+            "n": 10,
+            "sample_stdev": 0.0035332493717045222
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 81.36375281661168,
+            "max": 3.547294978,
+            "mean": 1.7259642331,
+            "median": 0.832057689,
+            "min": 0.541233146,
+            "n": 10,
+            "sample_stdev": 1.4043092723226114
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 3.0835084882141173,
+            "max": 0.458313198,
+            "mean": 0.4399113934,
+            "median": 0.432394342,
+            "min": 0.425854374,
+            "n": 10,
+            "sample_stdev": 0.013564705156109998
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 2358085909.0,
+            "mean": 2358085909.0,
+            "median": 2358085909.0,
+            "min": 2358085909.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 16.726617732569753,
+            "max": 0.195526875,
+            "mean": 0.1512244917,
+            "median": 0.149132771,
+            "min": 0.123695541,
+            "n": 10,
+            "sample_stdev": 0.025294742644680675
+          },
+          "full_scan_seconds": {
+            "cv_percent": 55.29500814485988,
+            "max": 1.416119042,
+            "mean": 0.9064571709,
+            "median": 0.900952417,
+            "min": 0.250817459,
+            "n": 10,
+            "sample_stdev": 0.5012255664788214
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 119088890.0,
+            "mean": 119088890.0,
+            "median": 119088890.0,
+            "min": 119088890.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 22.73882212137873,
+            "max": 9.213952,
+            "mean": 7.0928689582,
+            "median": 6.0551369165,
+            "min": 5.689619958,
+            "n": 10,
+            "sample_stdev": 1.6128348557075864
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 31.549738112325553,
+            "max": 3.792e-06,
+            "mean": 2.175e-06,
+            "median": 2.1665e-06,
+            "min": 1.291e-06,
+            "n": 10,
+            "sample_stdev": 6.862068039430808e-07
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 134217728.0,
+            "mean": 134217728.0,
+            "median": 134217728.0,
+            "min": 134217728.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 14.552333656717344,
+            "max": 2.043,
+            "mean": 1.4972,
+            "median": 1.422,
+            "min": 1.303,
+            "n": 10,
+            "sample_stdev": 0.2178775395083721
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 349494924.0,
+            "mean": 349494924.0,
+            "median": 349494924.0,
+            "min": 349494924.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 349494084.0,
+            "mean": 349494084.0,
+            "median": 349494084.0,
+            "min": 349494084.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 30.093536273056927,
+            "max": 1.184882125,
+            "mean": 0.7981805208,
+            "median": 0.7212295835,
+            "min": 0.569484959,
+            "n": 10,
+            "sample_stdev": 0.24020074455142268
+          },
+          "record_construction_seconds": {
+            "cv_percent": 4.106826414125354,
+            "max": 1.450142603,
+            "mean": 1.3699462266,
+            "median": 1.346542827,
+            "min": 1.303230995,
+            "n": 10,
+            "sample_stdev": 0.05626131349332238
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 21.136179136971638,
+              "max": 623232416,
+              "mean": 571660417.6,
+              "median": 608380332.0,
+              "min": 228622936,
+              "n": 10,
+              "sample_stdev": 120827169.91909614
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 7.869537559162351,
+              "max": 1396523008,
+              "mean": 1339108556.8,
+              "median": 1356955648.0,
+              "min": 1044217856,
+              "n": 10,
+              "sample_stdev": 105381650.8353329
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 20.892792774922388,
+            "max": 1719678.824,
+            "mean": 1441481.6538,
+            "median": 1613374.7119999998,
+            "min": 1065294.08,
+            "n": 10,
+            "sample_stdev": 301165.7748169582
+          },
+          "staging_seconds": {
+            "cv_percent": 8.448086852672313,
+            "max": 1.523218958,
+            "mean": 1.3642315408,
+            "median": 1.300083292,
+            "min": 1.252833917,
+            "n": 10,
+            "sample_stdev": 0.11525146543833373
+          },
+          "total_load_seconds": {
+            "cv_percent": 22.552358151926867,
+            "max": 9.387079292,
+            "mean": 7.2440957124,
+            "median": 6.2076089375,
+            "min": 5.815039333,
+            "n": 10,
+            "sample_stdev": 1.633714409928826
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 1678904890.0,
+            "mean": 1678904890.0,
+            "median": 1678904890.0,
+            "min": 1678904890.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          }
+        },
+        "initial": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 559191928.0,
+            "mean": 559191928.0,
+            "median": 559191928.0,
+            "min": 559191928.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 22.753015069188127,
+            "max": 7.539002457,
+            "mean": 5.9544291461,
+            "median": 6.073428228,
+            "min": 4.40649383,
+            "n": 10,
+            "sample_stdev": 1.3548121608962629
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 20.54968100203015,
+            "max": 6.850284716,
+            "mean": 5.586506723399999,
+            "median": 5.67696857,
+            "min": 4.276865824,
+            "n": 10,
+            "sample_stdev": 1.1480093108156668
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 1.9559768564108622,
+            "max": 1.900665079,
+            "mean": 1.8619959788,
+            "median": 1.869623658,
+            "min": 1.792600345,
+            "n": 10,
+            "sample_stdev": 0.036420210412628905
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 5.865765558742204,
+            "max": 0.000191581,
+            "mean": 0.0001704885,
+            "median": 0.000168559,
+            "min": 0.000155519,
+            "n": 10,
+            "sample_stdev": 1.0000455714616204e-05
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 1.7655152070922404,
+            "max": 0.114990308,
+            "mean": 0.11305295879999999,
+            "median": 0.113865662,
+            "min": 0.109743546,
+            "n": 10,
+            "sample_stdev": 0.001995967179681725
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 1.6415208120423752,
+            "max": 0.778461944,
+            "mean": 0.7641229404,
+            "median": 0.7691279865,
+            "min": 0.746069451,
+            "n": 10,
+            "sample_stdev": 0.012543237096256153
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 1.3775077560296354,
+            "max": 0.100315903,
+            "mean": 0.0981686624,
+            "median": 0.098232477,
+            "min": 0.096265952,
+            "n": 10,
+            "sample_stdev": 0.0013522809385505485
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 65.33353259677878,
+            "max": 2.98641412,
+            "mean": 1.70410052,
+            "median": 1.7470276354999998,
+            "min": 0.498282494,
+            "n": 10,
+            "sample_stdev": 1.1133490687160768
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 1.569489944891286,
+            "max": 0.424326618,
+            "mean": 0.4158202735,
+            "median": 0.415763507,
+            "min": 0.407131868,
+            "n": 10,
+            "sample_stdev": 0.0065262573814019445
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 2358085909.0,
+            "mean": 2358085909.0,
+            "median": 2358085909.0,
+            "min": 2358085909.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 12.446228584446462,
+            "max": 0.198120292,
+            "mean": 0.1695734125,
+            "median": 0.17549522899999997,
+            "min": 0.133200125,
+            "n": 10,
+            "sample_stdev": 0.02110549453819631
+          },
+          "full_scan_seconds": {
+            "cv_percent": 4.5030310817389365,
+            "max": 1.591372667,
+            "mean": 1.4599930706,
+            "median": 1.436271708,
+            "min": 1.4036725,
+            "n": 10,
+            "sample_stdev": 0.0657439417603527
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 119088890.0,
+            "mean": 119088890.0,
+            "median": 119088890.0,
+            "min": 119088890.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 14.001682091973104,
+            "max": 10.249462334,
+            "mean": 8.8683406001,
+            "median": 8.96156675,
+            "min": 7.426770584,
+            "n": 10,
+            "sample_stdev": 1.2417168576593818
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 21.880315665876815,
+            "max": 3e-06,
+            "mean": 2.0668e-06,
+            "median": 2.021e-06,
+            "min": 1.375e-06,
+            "n": 10,
+            "sample_stdev": 4.5222236418234196e-07
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 134217728.0,
+            "mean": 134217728.0,
+            "median": 134217728.0,
+            "min": 134217728.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 14.373871989118477,
+            "max": 1.883,
+            "mean": 1.463,
+            "median": 1.39,
+            "min": 1.314,
+            "n": 10,
+            "sample_stdev": 0.21028974720080335
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 349494924.0,
+            "mean": 349494924.0,
+            "median": 349494924.0,
+            "min": 349494924.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 349494084.0,
+            "mean": 349494084.0,
+            "median": 349494084.0,
+            "min": 349494084.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 21.414313030834858,
+            "max": 0.820121916,
+            "mean": 0.6223676580999999,
+            "median": 0.6805630205,
+            "min": 0.452677833,
+            "n": 10,
+            "sample_stdev": 0.13327575850821002
+          },
+          "record_construction_seconds": {
+            "cv_percent": 2.277923567118016,
+            "max": 1.425103709,
+            "mean": 1.378147904,
+            "median": 1.3898838224999999,
+            "min": 1.341721065,
+            "n": 10,
+            "sample_stdev": 0.031393155894958974
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 1.4211871213672516,
+              "max": 333087368,
+              "mean": 327289077.6,
+              "median": 327598740.0,
+              "min": 319259320,
+              "n": 10,
+              "sample_stdev": 4651390.220492871
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 0.9579852392367096,
+              "max": 1129447424,
+              "mean": 1113615564.8,
+              "median": 1111728128.0,
+              "min": 1096384512,
+              "n": 10,
+              "sample_stdev": 10668272.732626515
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 13.929381893132964,
+            "max": 1322601.714,
+            "mean": 1125930.6617,
+            "median": 1102837.5755,
+            "min": 958405.007,
+            "n": 10,
+            "sample_stdev": 156835.18172007197
+          },
+          "staging_seconds": {
+            "cv_percent": 3.834523925098067,
+            "max": 2.012145757,
+            "mean": 1.8965830055,
+            "median": 1.894146868,
+            "min": 1.802540322,
+            "n": 10,
+            "sample_stdev": 0.07272492910524149
+          },
+          "total_load_seconds": {
+            "cv_percent": 13.818027182543124,
+            "max": 10.43400225,
+            "mean": 9.037916216700001,
+            "median": 9.142744021,
+            "min": 7.560855167,
+            "n": 10,
+            "sample_stdev": 1.2488617195590792
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 1678904890.0,
+            "mean": 1678904890.0,
+            "median": 1678904890.0,
+            "min": 1678904890.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          }
+        },
+        "sqlite": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 27.501933300296916,
+            "max": 2.555230917,
+            "mean": 1.8554649875,
+            "median": 2.033945354,
+            "min": 1.049885417,
+            "n": 10,
+            "sample_stdev": 0.5102887432726125
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 2.6984969510001666,
+            "max": 1.254558209,
+            "mean": 1.2197245769,
+            "median": 1.2285010525,
+            "min": 1.164040174,
+            "n": 10,
+            "sample_stdev": 0.032914230518246185
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 1593950208.0,
+            "mean": 1593950208.0,
+            "median": 1593950208.0,
+            "min": 1593950208.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 27.501933300296916,
+            "max": 2.555230917,
+            "mean": 1.8554649875,
+            "median": 2.033945354,
+            "min": 1.049885417,
+            "n": 10,
+            "sample_stdev": 0.5102887432726125
+          },
+          "full_scan_seconds": {
+            "cv_percent": 33.89576918033911,
+            "max": 1.957816417,
+            "mean": 1.1920967,
+            "median": 1.1722919164999999,
+            "min": 0.482423958,
+            "n": 10,
+            "sample_stdev": 0.4040703458384396
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 0.9902527259364311,
+            "max": 5.747455666,
+            "mean": 5.6630077583,
+            "median": 5.6567508125,
+            "min": 5.58201725,
+            "n": 10,
+            "sample_stdev": 0.05607808869655733
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 4.806314958229821,
+            "max": 3.314,
+            "mean": 3.0217,
+            "median": 3.01,
+            "min": 2.838,
+            "n": 10,
+            "sample_stdev": 0.14523241909283052
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          },
+          "record_construction_seconds": {
+            "cv_percent": 0.9089631375230917,
+            "max": 0.572693839,
+            "mean": 0.5679961832,
+            "median": 0.57000719,
+            "min": 0.558561584,
+            "n": 10,
+            "sample_stdev": 0.0051628759278261275
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 5.467083280815856,
+              "max": 5914984,
+              "mean": 5602044.8,
+              "median": 5603664.0,
+              "min": 5292392,
+              "n": 10,
+              "sample_stdev": 306268.454644614
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 2.8456976111504355,
+              "max": 11075584,
+              "mean": 10765926.4,
+              "median": 10780672.0,
+              "min": 10452992,
+              "n": 10,
+              "sample_stdev": 306365.7103830141
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 6.570368572375494,
+            "max": 1471163.486,
+            "mean": 1335059.5097999999,
+            "median": 1300589.2415,
+            "min": 1228916.68,
+            "n": 10,
+            "sample_stdev": 87718.33045440953
+          },
+          "staging_seconds": {
+            "cv_percent": 1.0493368233209934,
+            "max": 3.795088758,
+            "mean": 3.7486027983,
+            "median": 3.7442151085,
+            "min": 3.690244929,
+            "n": 10,
+            "sample_stdev": 0.03933546952260309
+          },
+          "total_load_seconds": {
+            "cv_percent": 6.342105912946352,
+            "max": 8.137248167,
+            "mean": 7.5184727458000005,
+            "median": 7.6890632915,
+            "min": 6.797341083,
+            "n": 10,
+            "sample_stdev": 0.47682950457464185
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 10,
+            "sample_stdev": 0.0
+          }
+        }
+      }
+    },
+    "10m-b1k": {
+      "headline": {
+        "median_reduction_percent": 21.321919018625994,
+        "sqlite_time_over_final_time": 1.2677203955959773
+      },
+      "paired": {
+        "checkpoint_work_seconds": {
+          "cv_percent": 133.99025088579418,
+          "max": 44.936907305039746,
+          "mean": 17.03133227359421,
+          "median": 20.19610897357169,
+          "min": -13.326742823224864,
+          "n": 5,
+          "sample_stdev": 22.820324842582117
+        },
+        "commit_calls_seconds": {
+          "cv_percent": 60.8560423532123,
+          "max": 49.112187882276395,
+          "mean": 27.767782055530976,
+          "median": 29.037804255702387,
+          "min": 4.052042628646262,
+          "n": 5,
+          "sample_stdev": 16.898373208261617
+        },
+        "commit_phase_apply_seconds": {
+          "cv_percent": 3.8972667732208954,
+          "max": 57.31728390082528,
+          "mean": 54.97165482777894,
+          "median": 54.829995901587814,
+          "min": 51.79280204055574,
+          "n": 5,
+          "sample_stdev": 2.142392038292709
+        },
+        "commit_phase_maintenance_wait_seconds": {
+          "cv_percent": 177.11933949160652,
+          "max": 6.792960260317399,
+          "mean": 2.59577337630831,
+          "median": 4.725580734989943,
+          "min": -3.969446613600716,
+          "n": 5,
+          "sample_stdev": 4.597616658816253
+        },
+        "commit_phase_prepare_seconds": {
+          "cv_percent": 2.1300191062086515,
+          "max": 62.75353497309432,
+          "mean": 61.18248168823609,
+          "median": 61.34792661512118,
+          "min": 59.243722977819665,
+          "n": 5,
+          "sample_stdev": 1.3031985496120382
+        },
+        "commit_phase_record_encode_seconds": {
+          "cv_percent": 9.365843103731516,
+          "max": 28.471362868917883,
+          "mean": 26.837354664627156,
+          "median": 27.786498588282193,
+          "min": 22.415920195037113,
+          "n": 5,
+          "sample_stdev": 2.5135445310809508
+        },
+        "commit_phase_validation_seconds": {
+          "cv_percent": 740.4668211547058,
+          "max": 6.020252580838087,
+          "mean": 0.6704391650987647,
+          "median": 2.433929460433487,
+          "min": -7.165911989871432,
+          "n": 5,
+          "sample_stdev": 4.964379573582972
+        },
+        "commit_phase_wal_append_seconds": {
+          "cv_percent": 574.0988520303459,
+          "max": 63.009843363893815,
+          "mean": 8.403500157479199,
+          "median": 21.28870194021167,
+          "min": -57.307763510303985,
+          "n": 5,
+          "sample_stdev": 48.244397934456394
+        },
+        "commit_phase_wal_encode_seconds": {
+          "cv_percent": -37.59154686236909,
+          "max": -4.072564760009253,
+          "mean": -7.267419904778678,
+          "median": -7.362611787252958,
+          "min": -11.47098442587383,
+          "n": 5,
+          "sample_stdev": 2.731935559190016
+        },
+        "final_checkpoint_seconds": {
+          "cv_percent": 131.90562048205214,
+          "max": 45.91972674065367,
+          "mean": 17.51322265907993,
+          "median": 18.300328993360537,
+          "min": -16.739897998292324,
+          "n": 5,
+          "sample_stdev": 23.10092501486273
+        },
+        "full_scan_seconds": {
+          "cv_percent": -215.4457965602506,
+          "max": 5.817024690168246,
+          "mean": -152.36611297904435,
+          "median": -7.217355028851717,
+          "min": -739.4470623359359,
+          "n": 5,
+          "sample_stdev": 328.2663857955935
+        },
+        "ingest_wall_seconds": {
+          "cv_percent": 51.457111310642645,
+          "max": 40.02648982729568,
+          "mean": 24.35227603589594,
+          "median": 24.659511747950997,
+          "min": 6.7756556587391294,
+          "n": 5,
+          "sample_stdev": 12.530977786465927
+        },
+        "maintenance_drain_seconds": {
+          "cv_percent": 87.25302427299603,
+          "max": 67.52882517918354,
+          "mean": 29.40623668256553,
+          "median": 12.17798594847775,
+          "min": 10.830090791180288,
+          "n": 5,
+          "sample_stdev": 25.657830830413566
+        },
+        "point_read_us": {
+          "cv_percent": -695.4943254754245,
+          "max": 16.594960049170254,
+          "mean": -3.2370112071372485,
+          "median": 5.680224403927067,
+          "min": -35.31914893617021,
+          "n": 5,
+          "sample_stdev": 22.513229260643104
+        },
+        "promotion_work_seconds": {
+          "cv_percent": -181.9386066071996,
+          "max": 11.33869733283995,
+          "mean": -44.45332383691768,
+          "median": -15.682573674541676,
+          "min": -186.75874164573662,
+          "n": 5,
+          "sample_stdev": 80.87775797947415
+        },
+        "record_construction_seconds": {
+          "cv_percent": 136.00403676292132,
+          "max": 4.842537784197988,
+          "mean": 2.5940943004295844,
+          "median": 4.094484831219368,
+          "min": -3.6545166325738303,
+          "n": 5,
+          "sample_stdev": 3.5280729660210985
+        },
+        "rows_per_second": {
+          "cv_percent": -63.82931215010063,
+          "max": -6.791483326332391,
+          "mean": -34.98374765191197,
+          "median": -33.62840058626718,
+          "min": -66.24295034741347,
+          "n": 5,
+          "sample_stdev": 22.329885490542388
+        },
+        "staging_seconds": {
+          "cv_percent": 13.236993720500958,
+          "max": 31.270040887336936,
+          "mean": 27.589674256932053,
+          "median": 27.02734028786014,
+          "min": 22.221076586815787,
+          "n": 5,
+          "sample_stdev": 3.652043448896765
+        },
+        "total_load_seconds": {
+          "cv_percent": 51.868114071738106,
+          "max": 39.84707333837306,
+          "mean": 24.269341744154204,
+          "median": 25.165608865270084,
+          "min": 6.359573915493454,
+          "n": 5,
+          "sample_stdev": 12.588049860317856
+        }
+      },
+      "variants": {
+        "final": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 559191860.0,
+            "mean": 559191860.0,
+            "median": 559191860.0,
+            "min": 559191860.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 13.263974061859926,
+            "max": 5.160714626,
+            "mean": 4.4796918502,
+            "median": 4.248847291,
+            "min": 3.946822753,
+            "n": 5,
+            "sample_stdev": 0.594185165061781
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 12.348120648499277,
+            "max": 5.149777264,
+            "mean": 4.4911112312,
+            "median": 4.275691039,
+            "min": 3.996018578,
+            "n": 5,
+            "sample_stdev": 0.5545678332868773
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 2.5174329207582145,
+            "max": 0.874802521,
+            "mean": 0.853915885,
+            "median": 0.86581367,
+            "min": 0.829546209,
+            "n": 5,
+            "sample_stdev": 0.021496759604573857
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 2.6774967005604946,
+            "max": 0.000316876,
+            "mean": 0.0003083882,
+            "median": 0.000309256,
+            "min": 0.000295264,
+            "n": 5,
+            "sample_stdev": 8.2570838799179e-06
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 2.053826369798678,
+            "max": 0.043670791,
+            "mean": 0.0426672386,
+            "median": 0.042875749,
+            "min": 0.041286034,
+            "n": 5,
+            "sample_stdev": 0.0008763109976317202
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 2.3729842090454922,
+            "max": 0.549997798,
+            "mean": 0.5396231690000001,
+            "median": 0.544409859,
+            "min": 0.51951598,
+            "n": 5,
+            "sample_stdev": 0.01280517258872087
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 2.5113272801068307,
+            "max": 0.106487665,
+            "mean": 0.1042167564,
+            "median": 0.10547715,
+            "min": 0.101234468,
+            "n": 5,
+            "sample_stdev": 0.0026172238339156814
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 27.087141326427293,
+            "max": 2.542903206,
+            "mean": 1.9154270886,
+            "median": 1.675268721,
+            "min": 1.453711273,
+            "n": 5,
+            "sample_stdev": 0.5188344424937538
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 1.4736509805452935,
+            "max": 0.4671799,
+            "mean": 0.4590518768,
+            "median": 0.459307534,
+            "min": 0.451517505,
+            "n": 5,
+            "sample_stdev": 0.006764822483674772
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 2358085844.0,
+            "mean": 2358085844.0,
+            "median": 2358085844.0,
+            "min": 2358085844.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 20.39361171480403,
+            "max": 0.178619583,
+            "mean": 0.1417177998,
+            "median": 0.127726458,
+            "min": 0.11659275,
+            "n": 5,
+            "sample_stdev": 0.02890137782197532
+          },
+          "full_scan_seconds": {
+            "cv_percent": 3.2952072655827025,
+            "max": 1.629825667,
+            "mean": 1.5475349334,
+            "median": 1.5473065,
+            "min": 1.501170666,
+            "n": 5,
+            "sample_stdev": 0.050994483562827236
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 116406890.0,
+            "mean": 116406890.0,
+            "median": 116406890.0,
+            "min": 116406890.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 8.056358297036459,
+            "max": 8.000240042,
+            "mean": 7.3323217664,
+            "median": 7.146675083,
+            "min": 6.789585666,
+            "n": 5,
+            "sample_stdev": 0.5907181129927767
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 14.751751697312137,
+            "max": 1.542e-06,
+            "mean": 1.3918e-06,
+            "median": 1.5e-06,
+            "min": 1.042e-06,
+            "n": 5,
+            "sample_stdev": 2.0531488012319033e-07
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 134217728.0,
+            "mean": 134217728.0,
+            "median": 134217728.0,
+            "min": 134217728.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 24.643576146973935,
+            "max": 2.226,
+            "mean": 1.5462,
+            "median": 1.386,
+            "min": 1.345,
+            "n": 5,
+            "sample_stdev": 0.38103897438451095
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 347425924.0,
+            "mean": 347425924.0,
+            "median": 347425924.0,
+            "min": 347425924.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 347425084.0,
+            "mean": 347425084.0,
+            "median": 347425084.0,
+            "min": 347425084.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 37.83759901915571,
+            "max": 1.397771792,
+            "mean": 0.873846875,
+            "median": 0.895641333,
+            "min": 0.584017542,
+            "n": 5,
+            "sample_stdev": 0.3306426766039228
+          },
+          "record_construction_seconds": {
+            "cv_percent": 1.8251716268638993,
+            "max": 1.44554059,
+            "mean": 1.4122951522,
+            "median": 1.413412902,
+            "min": 1.375486051,
+            "n": 5,
+            "sample_stdev": 0.025776810405528726
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 6.590751409442658,
+              "max": 611699088,
+              "mean": 569955942.4,
+              "median": 545753512,
+              "min": 540314024,
+              "n": 5,
+              "sample_stdev": 37564379.306930184
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 2.783831628348788,
+              "max": 1335689216,
+              "mean": 1272424038.4,
+              "median": 1256554496,
+              "min": 1254391808,
+              "n": 5,
+              "sample_stdev": 35422142.82769213
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 8.109827772269231,
+            "max": 1447506.092,
+            "mean": 1345170.4644,
+            "median": 1376790.533,
+            "min": 1224433.035,
+            "n": 5,
+            "sample_stdev": 109091.00790627417
+          },
+          "staging_seconds": {
+            "cv_percent": 1.8427607731759488,
+            "max": 1.456021868,
+            "mean": 1.4274361744000001,
+            "median": 1.424786518,
+            "min": 1.398099675,
+            "n": 5,
+            "sample_stdev": 0.02630423388396663
+          },
+          "total_load_seconds": {
+            "cv_percent": 8.260783716472842,
+            "max": 8.16704525,
+            "mean": 7.474041058,
+            "median": 7.263269,
+            "min": 6.908433791,
+            "n": 5,
+            "sample_stdev": 0.6174143666817585
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 1679048890.0,
+            "mean": 1679048890.0,
+            "median": 1679048890.0,
+            "min": 1679048890.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          }
+        },
+        "initial": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 559191860.0,
+            "mean": 559191860.0,
+            "median": 559191860.0,
+            "min": 559191860.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 26.149762480120987,
+            "max": 7.406509624,
+            "mean": 5.681220491,
+            "median": 4.974416123,
+            "min": 4.381541414,
+            "n": 5,
+            "sample_stdev": 1.4856256643684633
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 21.73360796914667,
+            "max": 8.062661117,
+            "mean": 6.436634882,
+            "median": 5.6583656,
+            "min": 5.230719798,
+            "n": 5,
+            "sample_stdev": 1.3989129916592264
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 4.898321560209343,
+            "max": 2.028487756,
+            "mean": 1.8994242114,
+            "median": 1.913128187,
+            "min": 1.799764211,
+            "n": 5,
+            "sample_stdev": 0.09303990566684249
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 3.5486961067762834,
+            "max": 0.000329444,
+            "mean": 0.0003169518,
+            "median": 0.000312265,
+            "min": 0.000304778,
+            "n": 5,
+            "sample_stdev": 1.1247656186957353e-05
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 3.537356738915451,
+            "max": 0.115113606,
+            "mean": 0.1100030102,
+            "median": 0.111312068,
+            "min": 0.105442315,
+            "n": 5,
+            "sample_stdev": 0.003891198894319551
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 3.350562086140269,
+            "max": 0.760899587,
+            "mean": 0.7380708686,
+            "median": 0.747560691,
+            "min": 0.708905486,
+            "n": 5,
+            "sample_stdev": 0.024729522692157765
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 4.515912320848766,
+            "max": 0.109376652,
+            "mean": 0.1050831074,
+            "median": 0.108037095,
+            "min": 0.099240055,
+            "n": 5,
+            "sample_stdev": 0.004745460994207342
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 52.13078644968646,
+            "max": 4.092658195,
+            "mean": 2.5642521876,
+            "median": 1.905933904,
+            "min": 1.36378122,
+            "n": 5,
+            "sample_stdev": 1.3367648319491696
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 2.3970929303440354,
+            "max": 0.441188134,
+            "mean": 0.4281221482,
+            "median": 0.42710538,
+            "min": 0.416337066,
+            "n": 5,
+            "sample_stdev": 0.010262485747739214
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 2358085844.0,
+            "mean": 2358085844.0,
+            "median": 2358085844.0,
+            "min": 2358085844.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 17.27364171843749,
+            "max": 0.219759583,
+            "mean": 0.1765506584,
+            "median": 0.178486125,
+            "min": 0.142708959,
+            "n": 5,
+            "sample_stdev": 0.03049672818355846
+          },
+          "full_scan_seconds": {
+            "cv_percent": 48.3195021225625,
+            "max": 1.645963875,
+            "mean": 1.2203479502,
+            "median": 1.429858459,
+            "min": 0.179779542,
+            "n": 5,
+            "sample_stdev": 0.589666053699537
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 116406890.0,
+            "mean": 116406890.0,
+            "median": 116406890.0,
+            "min": 116406890.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 15.160590938123237,
+            "max": 11.620605958,
+            "mean": 9.862911725,
+            "median": 9.011868417,
+            "min": 8.494348916,
+            "n": 5,
+            "sample_stdev": 1.495275701215444
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 33.59600343039707,
+            "max": 3.209e-06,
+            "mean": 2.1834e-06,
+            "median": 1.75e-06,
+            "min": 1.542e-06,
+            "n": 5,
+            "sample_stdev": 7.335351388992896e-07
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 134217728.0,
+            "mean": 134217728.0,
+            "median": 134217728.0,
+            "min": 134217728.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 12.653112976787565,
+            "max": 1.645,
+            "mean": 1.5048,
+            "median": 1.622,
+            "min": 1.204,
+            "n": 5,
+            "sample_stdev": 0.19040404407469924
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 347425924.0,
+            "mean": 347425924.0,
+            "median": 347425924.0,
+            "min": 347425924.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 347425084.0,
+            "mean": 347425084.0,
+            "median": 347425084.0,
+            "min": 347425084.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 27.06779351966534,
+            "max": 0.869025541,
+            "mean": 0.6508658914000001,
+            "median": 0.65870625,
+            "min": 0.464936208,
+            "n": 5,
+            "sample_stdev": 0.17617503557408126
+          },
+          "record_construction_seconds": {
+            "cv_percent": 2.36196099450484,
+            "max": 1.484117844,
+            "mean": 1.4507803208,
+            "median": 1.463894073,
+            "min": 1.394575593,
+            "n": 5,
+            "sample_stdev": 0.03426686529324819
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 0.4875309891335284,
+              "max": 277693040,
+              "mean": 275953073.6,
+              "median": 276169328,
+              "min": 274006640,
+              "n": 5,
+              "sample_stdev": 1345356.7492664538
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 1.3897390253624675,
+              "max": 1071087616,
+              "mean": 1048002560,
+              "median": 1045626880,
+              "min": 1031012352,
+              "n": 5,
+              "sample_stdev": 14564500.563117707
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 14.330879937117647,
+            "max": 1156422.658,
+            "mean": 1013465.7898,
+            "median": 1083232.371,
+            "min": 846783.083,
+            "n": 5,
+            "sample_stdev": 145238.5655399991
+          },
+          "staging_seconds": {
+            "cv_percent": 4.3267978574162465,
+            "max": 2.073021047,
+            "mean": 1.974519309,
+            "median": 1.995297792,
+            "min": 1.867270424,
+            "n": 5,
+            "sample_stdev": 0.08543345915608208
+          },
+          "total_load_seconds": {
+            "cv_percent": 14.98753840789587,
+            "max": 11.809399833,
+            "mean": 10.0394646584,
+            "median": 9.231629584,
+            "min": 8.647357375,
+            "n": 5,
+            "sample_stdev": 1.504668621624832
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 1679048890.0,
+            "mean": 1679048890.0,
+            "median": 1679048890.0,
+            "min": 1679048890.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          }
+        },
+        "sqlite": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 18.941656375680303,
+            "max": 4.68400825,
+            "mean": 3.5142521918,
+            "median": 3.277992,
+            "min": 3.059873542,
+            "n": 5,
+            "sample_stdev": 0.6656575743455695
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 1.5688930231902698,
+            "max": 1.476093535,
+            "mean": 1.4501348854,
+            "median": 1.455654595,
+            "min": 1.423828646,
+            "n": 5,
+            "sample_stdev": 0.022751065043888814
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 1594572800.0,
+            "mean": 1594572800.0,
+            "median": 1594572800.0,
+            "min": 1594572800.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 18.941656375680303,
+            "max": 4.68400825,
+            "mean": 3.5142521918,
+            "median": 3.277992,
+            "min": 3.059873542,
+            "n": 5,
+            "sample_stdev": 0.6656575743455695
+          },
+          "full_scan_seconds": {
+            "cv_percent": 18.207150509665894,
+            "max": 2.236445708,
+            "mean": 1.7062150334,
+            "median": 1.599073,
+            "min": 1.443571708,
+            "n": 5,
+            "sample_stdev": 0.3106531391496842
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 1.0527120642069552,
+            "max": 6.017353125,
+            "mean": 5.9489953918,
+            "median": 5.93871475,
+            "min": 5.859606542,
+            "n": 5,
+            "sample_stdev": 0.06262579218859442
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 20.10611035672166,
+            "max": 4.575,
+            "mean": 3.3718,
+            "median": 3.154,
+            "min": 2.976,
+            "n": 5,
+            "sample_stdev": 0.677937829007941
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "record_construction_seconds": {
+            "cv_percent": 1.455822074956574,
+            "max": 0.587988753,
+            "mean": 0.5768614264,
+            "median": 0.577079392,
+            "min": 0.566260906,
+            "n": 5,
+            "sample_stdev": 0.00839807598744057
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 0.9810104246328225,
+              "max": 5112168,
+              "mean": 5066273.6,
+              "median": 5079376,
+              "min": 4981072,
+              "n": 5,
+              "sample_stdev": 49700.67215642058
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 0.42661042605523236,
+              "max": 10895360,
+              "mean": 10862592,
+              "median": 10878976,
+              "min": 10780672,
+              "n": 5,
+              "sample_stdev": 46340.95001184158
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 6.480673975656385,
+            "max": 1108883.769,
+            "mean": 1060574.3991999999,
+            "median": 1086036.43,
+            "min": 941378.213,
+            "n": 5,
+            "sample_stdev": 68732.36908142846
+          },
+          "staging_seconds": {
+            "cv_percent": 1.461229463224762,
+            "max": 3.852130068,
+            "mean": 3.7848808182,
+            "median": 3.770047191,
+            "min": 3.722027647,
+            "n": 5,
+            "sample_stdev": 0.05530579366348084
+          },
+          "total_load_seconds": {
+            "cv_percent": 7.013730450848323,
+            "max": 10.622723,
+            "mean": 9.4632475836,
+            "median": 9.20779425,
+            "min": 9.018077709,
+            "n": 5,
+            "sample_stdev": 0.6637266774101213
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          }
+        }
+      }
+    },
+    "1m-b10k": {
+      "headline": {
+        "median_reduction_percent": 21.2263959392435,
+        "sqlite_time_over_final_time": 1.0165920857807342
+      },
+      "paired": {
+        "checkpoint_work_seconds": {
+          "cv_percent": 64.6235754763592,
+          "max": 10.030480965818413,
+          "mean": 6.488846314406988,
+          "median": 8.047913850290898,
+          "min": 0.3692783458005914,
+          "n": 5,
+          "sample_stdev": 4.1933244955357525
+        },
+        "commit_calls_seconds": {
+          "cv_percent": 36.832158317363636,
+          "max": 37.328106075516246,
+          "mean": 28.449411195284423,
+          "median": 32.367275622829474,
+          "min": 10.461132505297352,
+          "n": 5,
+          "sample_stdev": 10.478532171804934
+        },
+        "commit_phase_apply_seconds": {
+          "cv_percent": 2.1462720122370205,
+          "max": 57.24666727035084,
+          "mean": 55.98513923482942,
+          "median": 56.26863676413022,
+          "min": 54.217112997384,
+          "n": 5,
+          "sample_stdev": 1.201593374409071
+        },
+        "commit_phase_maintenance_wait_seconds": {
+          "cv_percent": -55.17623655544409,
+          "max": -10.747219962028757,
+          "mean": -24.546625062674206,
+          "median": -20.95921066015665,
+          "min": -47.19861504564055,
+          "n": 5,
+          "sample_stdev": 13.543903910959045
+        },
+        "commit_phase_prepare_seconds": {
+          "cv_percent": 12.574930136895912,
+          "max": 60.84199995742959,
+          "mean": 49.75469542238695,
+          "median": 47.39565247174877,
+          "min": 45.729484425012686,
+          "n": 5,
+          "sample_stdev": 6.256618189190508
+        },
+        "commit_phase_record_encode_seconds": {
+          "cv_percent": 9.945907927344514,
+          "max": 37.98312467766951,
+          "mean": 32.50167739970464,
+          "median": 31.743940518730156,
+          "min": 29.52009870667037,
+          "n": 5,
+          "sample_stdev": 3.232586909017164
+        },
+        "commit_phase_validation_seconds": {
+          "cv_percent": -64.70466655498286,
+          "max": 1.1163785450749486,
+          "mean": -8.184553719217634,
+          "median": -11.021680076734391,
+          "min": -11.128521055742382,
+          "n": 5,
+          "sample_stdev": 5.295788193033218
+        },
+        "commit_phase_wal_append_seconds": {
+          "cv_percent": -208.6409127706908,
+          "max": 29.43383588595538,
+          "mean": -12.633236136837153,
+          "median": -22.26998233159969,
+          "min": -38.41132444745614,
+          "n": 5,
+          "sample_stdev": 26.358099188373792
+        },
+        "commit_phase_wal_encode_seconds": {
+          "cv_percent": -15.022153374596437,
+          "max": -15.980565707623567,
+          "mean": -21.085282004393644,
+          "median": -21.222362683108432,
+          "min": -24.47322501929058,
+          "n": 5,
+          "sample_stdev": 3.1674634021661947
+        },
+        "final_checkpoint_seconds": {
+          "cv_percent": -122.36215223935565,
+          "max": 10.296148890351796,
+          "mean": -11.057490294043397,
+          "median": -14.454218627562938,
+          "min": -24.749171530776536,
+          "n": 5,
+          "sample_stdev": 13.530183107449357
+        },
+        "full_scan_seconds": {
+          "cv_percent": -84.68250826238626,
+          "max": -0.42477127700468786,
+          "mean": -3.372634038512552,
+          "median": -2.81913665217112,
+          "min": -8.048880154326596,
+          "n": 5,
+          "sample_stdev": 2.8560310983234434
+        },
+        "ingest_wall_seconds": {
+          "cv_percent": 32.88739417851359,
+          "max": 30.465939925023157,
+          "mean": 23.089921073801325,
+          "median": 24.678142336351357,
+          "min": 10.228424142847405,
+          "n": 5,
+          "sample_stdev": 7.5936733590487195
+        },
+        "maintenance_drain_seconds": {
+          "cv_percent": 138.08079250742074,
+          "max": 41.451990632318505,
+          "mean": 14.882840659001904,
+          "median": 8.573388203017837,
+          "min": -9.485714285714284,
+          "n": 5,
+          "sample_stdev": 20.550344329566467
+        },
+        "point_read_us": {
+          "cv_percent": -88.47953698156687,
+          "max": 1.4251781472683922,
+          "mean": -4.540424668581685,
+          "median": -4.712460063897759,
+          "min": -8.391608391608399,
+          "n": 5,
+          "sample_stdev": 4.017346723757917
+        },
+        "record_construction_seconds": {
+          "cv_percent": 85.55632200150147,
+          "max": 7.5380106311553,
+          "mean": 4.316735011250179,
+          "median": 6.2190583879544565,
+          "min": -0.09129607538249991,
+          "n": 5,
+          "sample_stdev": 3.693239706176754
+        },
+        "rows_per_second": {
+          "cv_percent": -29.309652692429445,
+          "max": -11.409581836912706,
+          "mean": -22.49367004016726,
+          "median": -24.607802456480115,
+          "min": -28.924638759514863,
+          "n": 5,
+          "sample_stdev": 6.592816566554078
+        },
+        "staging_seconds": {
+          "cv_percent": 26.993278943084754,
+          "max": 34.9156977462633,
+          "mean": 26.98766583291824,
+          "median": 26.34646775151478,
+          "min": 16.185020327674728,
+          "n": 5,
+          "sample_stdev": 7.284855918507198
+        },
+        "total_load_seconds": {
+          "cv_percent": 25.60082909471736,
+          "max": 22.435307230629316,
+          "mean": 18.163069101355404,
+          "median": 19.748203519621967,
+          "min": 10.24111363689331,
+          "n": 5,
+          "sample_stdev": 4.649896278993413
+        }
+      },
+      "variants": {
+        "final": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 55919188.0,
+            "mean": 55919188.0,
+            "median": 55919188.0,
+            "min": 55919188.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 28.99318472025481,
+            "max": 0.71344825,
+            "mean": 0.4698305664,
+            "median": 0.410302791,
+            "min": 0.404512707,
+            "n": 5,
+            "sample_stdev": 0.13621884398857143
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 31.991718721855573,
+            "max": 0.524512042,
+            "mean": 0.3338699504,
+            "median": 0.288839084,
+            "min": 0.276303039,
+            "n": 5,
+            "sample_stdev": 0.1068107354287667
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 2.6410360226831786,
+            "max": 0.088185623,
+            "mean": 0.0847476158,
+            "median": 0.0839425,
+            "min": 0.082888542,
+            "n": 5,
+            "sample_stdev": 0.002238215061643141
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 14.36629994134639,
+            "max": 2.3783e-05,
+            "mean": 1.91876e-05,
+            "median": 1.8706e-05,
+            "min": 1.6333e-05,
+            "n": 5,
+            "sample_stdev": 2.75654816754578e-06
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 11.695596298593154,
+            "max": 0.00623817,
+            "mean": 0.0057348298,
+            "median": 0.005840642,
+            "min": 0.004599205,
+            "n": 5,
+            "sample_stdev": 0.0006707225418194171
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 7.271158450564094,
+            "max": 0.062617339,
+            "mean": 0.0554963394,
+            "median": 0.053861734,
+            "min": 0.052814216,
+            "n": 5,
+            "sample_stdev": 0.0040352267720368306
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 3.133520458442074,
+            "max": 0.010936999,
+            "mean": 0.010628408399999999,
+            "median": 0.010695251,
+            "min": 0.010119911,
+            "n": 5,
+            "sample_stdev": 0.0003330433516207759
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 127.43153042554522,
+            "max": 0.265632957,
+            "mean": 0.0811139256,
+            "median": 0.037091005,
+            "min": 0.024313454,
+            "n": 5,
+            "sample_stdev": 0.10336471678031811
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 2.9834964796434185,
+            "max": 0.050929878,
+            "mean": 0.0490383088,
+            "median": 0.048487049,
+            "min": 0.04724087,
+            "n": 5,
+            "sample_stdev": 0.0014630562167246687
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 234810722.0,
+            "mean": 234810722.0,
+            "median": 234810722.0,
+            "min": 234810722.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 13.57257304127731,
+            "max": 0.188312791,
+            "mean": 0.154782058,
+            "median": 0.14533225,
+            "min": 0.136309833,
+            "n": 5,
+            "sample_stdev": 0.021007907876842213
+          },
+          "full_scan_seconds": {
+            "cv_percent": 6.307477551582355,
+            "max": 0.0219895,
+            "mean": 0.0204035166,
+            "median": 0.019593375,
+            "min": 0.019315333,
+            "n": 5,
+            "sample_stdev": 0.0012869472292783794
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 119088890.0,
+            "mean": 119088890.0,
+            "median": 119088890.0,
+            "min": 119088890.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 20.082164132111757,
+            "max": 0.816048125,
+            "mean": 0.6009868002,
+            "median": 0.552013542,
+            "min": 0.530046,
+            "n": 5,
+            "sample_stdev": 0.12069115562849055
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 16.724727781604113,
+            "max": 1.333e-06,
+            "mean": 1.0416e-06,
+            "median": 1e-06,
+            "min": 8.75e-07,
+            "n": 5,
+            "sample_stdev": 1.7420476457318842e-07
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 134217728.0,
+            "mean": 134217728.0,
+            "median": 134217728.0,
+            "min": 134217728.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 9.070454773893905,
+            "max": 1.569,
+            "mean": 1.3684,
+            "median": 1.322,
+            "min": 1.245,
+            "n": 5,
+            "sample_stdev": 0.1241201031259642
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "record_construction_seconds": {
+            "cv_percent": 3.177040927239142,
+            "max": 0.143340625,
+            "mean": 0.1357050154,
+            "median": 0.134109951,
+            "min": 0.132919626,
+            "n": 5,
+            "sample_stdev": 0.00431140387957418
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 2.1517867102342345,
+              "max": 225673792,
+              "mean": 221250116.8,
+              "median": 223429208,
+              "min": 213779008,
+              "n": 5,
+              "sample_stdev": 4760830.609680122
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 0.23112181918122054,
+              "max": 321716224,
+              "mean": 320595558.4,
+              "median": 320389120,
+              "min": 319913984,
+              "n": 5,
+              "sample_stdev": 740966.2867882722
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 14.781550505680194,
+            "max": 1452803.498,
+            "mean": 1352587.4802,
+            "median": 1445309.053,
+            "min": 995656.986,
+            "n": 5,
+            "sample_stdev": 199933.40151927012
+          },
+          "staging_seconds": {
+            "cv_percent": 7.919918747548266,
+            "max": 0.142531039,
+            "mean": 0.1260863424,
+            "median": 0.124154666,
+            "min": 0.115528921,
+            "n": 5,
+            "sample_stdev": 0.009985935869835498
+          },
+          "total_load_seconds": {
+            "cv_percent": 18.405544007201925,
+            "max": 1.004361958,
+            "mean": 0.7557700086,
+            "median": 0.691893542,
+            "min": 0.688324334,
+            "n": 5,
+            "sample_stdev": 0.13910358152610677
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 166890490.0,
+            "mean": 166890490.0,
+            "median": 166890490.0,
+            "min": 166890490.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          }
+        },
+        "initial": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 55919188.0,
+            "mean": 55919188.0,
+            "median": 55919188.0,
+            "min": 55919188.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 24.407495845853074,
+            "max": 0.716092625,
+            "mean": 0.4991059916,
+            "median": 0.449195708,
+            "min": 0.427618,
+            "n": 5,
+            "sample_stdev": 0.1218192741661738
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 15.822430771440654,
+            "max": 0.58579258,
+            "mean": 0.459105924,
+            "median": 0.437438877,
+            "min": 0.400061458,
+            "n": 5,
+            "sample_stdev": 0.07264171699248294
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 1.9921292588056427,
+            "max": 0.19606475,
+            "mean": 0.1925779922,
+            "median": 0.193876212,
+            "min": 0.186079917,
+            "n": 5,
+            "sample_stdev": 0.0038364025286366484
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 16.458423652057494,
+            "max": 1.9662e-05,
+            "mean": 1.5514e-05,
+            "median": 1.4875e-05,
+            "min": 1.2708e-05,
+            "n": 5,
+            "sample_stdev": 2.5533598453802e-06
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 2.8680923196339045,
+            "max": 0.01174525,
+            "mean": 0.011428986,
+            "median": 0.011494584,
+            "min": 0.010963149,
+            "n": 5,
+            "sample_stdev": 0.00032779386967803423
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 5.6350738398046465,
+            "max": 0.088844249,
+            "mean": 0.0822353594,
+            "median": 0.080071458,
+            "min": 0.07759771,
+            "n": 5,
+            "sample_stdev": 0.004634023224618732
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 2.4771417915688705,
+            "max": 0.010234163,
+            "mean": 0.0098326282,
+            "median": 0.009809421,
+            "min": 0.009624964,
+            "n": 5,
+            "sample_stdev": 0.000243568142351786
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 109.11613843574955,
+            "max": 0.191915624,
+            "mean": 0.0651048492,
+            "median": 0.034454833,
+            "min": 0.029279335,
+            "n": 5,
+            "sample_stdev": 0.07103989738145798
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 1.1170070753255854,
+            "max": 0.040916332,
+            "mean": 0.0404978516,
+            "median": 0.040731712,
+            "min": 0.039965258,
+            "n": 5,
+            "sample_stdev": 0.0004523638677268558
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 234810722.0,
+            "mean": 234810722.0,
+            "median": 234810722.0,
+            "min": 234810722.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 26.764545929418798,
+            "max": 0.209927209,
+            "mean": 0.142707817,
+            "median": 0.129737167,
+            "min": 0.114518,
+            "n": 5,
+            "sample_stdev": 0.03819509922583592
+          },
+          "full_scan_seconds": {
+            "cv_percent": 5.310949157562794,
+            "max": 0.021386583,
+            "mean": 0.0197346084,
+            "median": 0.0195105,
+            "min": 0.018658917,
+            "n": 5,
+            "sample_stdev": 0.0010480950185681164
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 119088890.0,
+            "mean": 119088890.0,
+            "median": 119088890.0,
+            "min": 119088890.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 9.746410677030063,
+            "max": 0.909027292,
+            "mean": 0.7761801914,
+            "median": 0.751351333,
+            "min": 0.727670416,
+            "n": 5,
+            "sample_stdev": 0.07564970904760199
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 25.356633490591037,
+            "max": 1.708e-06,
+            "mean": 1.275e-06,
+            "median": 1.25e-06,
+            "min": 8.75e-07,
+            "n": 5,
+            "sample_stdev": 3.2329707700503574e-07
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 134217728.0,
+            "mean": 134217728.0,
+            "median": 134217728.0,
+            "min": 134217728.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 6.312304024448405,
+            "max": 1.453,
+            "mean": 1.3075999999999999,
+            "median": 1.283,
+            "min": 1.252,
+            "n": 5,
+            "sample_stdev": 0.08253968742368734
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "record_construction_seconds": {
+            "cv_percent": 2.5180963772246368,
+            "max": 0.14395337,
+            "mean": 0.1418921924,
+            "median": 0.14320988,
+            "min": 0.135538329,
+            "n": 5,
+            "sample_stdev": 0.0035729821563890117
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 1.352510245613302,
+              "max": 328499872,
+              "mean": 323778003.2,
+              "median": 324518560,
+              "min": 316621448,
+              "n": 5,
+              "sample_stdev": 4379130.666322164
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 1.9600753863356204,
+              "max": 485081088,
+              "mean": 472858624,
+              "median": 471138304,
+              "min": 461946880,
+              "n": 5,
+              "sample_stdev": 9268385.501189299
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 10.696712689316435,
+            "max": 1183307.67,
+            "mean": 1099858.6572,
+            "median": 1138522.031,
+            "min": 893690.623,
+            "n": 5,
+            "sample_stdev": 117648.72054925775
+          },
+          "staging_seconds": {
+            "cv_percent": 4.423069461695272,
+            "max": 0.183553241,
+            "mean": 0.1730841462,
+            "median": 0.170741074,
+            "min": 0.163565459,
+            "n": 5,
+            "sample_stdev": 0.0076556320136081995
+          },
+          "total_load_seconds": {
+            "cv_percent": 12.324617814138177,
+            "max": 1.118955458,
+            "mean": 0.9188893832,
+            "median": 0.878331708,
+            "min": 0.84508875,
+            "n": 5,
+            "sample_stdev": 0.11324960461409163
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 166890490.0,
+            "mean": 166890490.0,
+            "median": 166890490.0,
+            "min": 166890490.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          }
+        },
+        "sqlite": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 1.1578158595253443,
+            "max": 0.125935083,
+            "mean": 0.1236776916,
+            "median": 0.123483708,
+            "min": 0.122336334,
+            "n": 5,
+            "sample_stdev": 0.0014319599280396447
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 2.19389236246239,
+            "max": 0.170620506,
+            "mean": 0.1644046686,
+            "median": 0.16272105,
+            "min": 0.161898377,
+            "n": 5,
+            "sample_stdev": 0.0036068614679470026
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 158801920.0,
+            "mean": 158801920.0,
+            "median": 158801920.0,
+            "min": 158801920.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 1.1578158595253443,
+            "max": 0.125935083,
+            "mean": 0.1236776916,
+            "median": 0.123483708,
+            "min": 0.122336334,
+            "n": 5,
+            "sample_stdev": 0.0014319599280396447
+          },
+          "full_scan_seconds": {
+            "cv_percent": 7.184861213820056,
+            "max": 0.031986416,
+            "mean": 0.0284178498,
+            "median": 0.027634042,
+            "min": 0.027091875,
+            "n": 5,
+            "sample_stdev": 0.0020417830680818402
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 1.6521192772696387,
+            "max": 0.598142167,
+            "mean": 0.5819056416,
+            "median": 0.579889791,
+            "min": 0.573723333,
+            "n": 5,
+            "sample_stdev": 0.009613775280393174
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 5.049786981401416,
+            "max": 2.396,
+            "mean": 2.269,
+            "median": 2.25,
+            "min": 2.151,
+            "n": 5,
+            "sample_stdev": 0.11457966660799813
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "record_construction_seconds": {
+            "cv_percent": 1.7225544165153535,
+            "max": 0.060577836,
+            "mean": 0.059231577,
+            "median": 0.059187084,
+            "min": 0.057742711,
+            "n": 5,
+            "sample_stdev": 0.0010202961455851923
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 5.225597979741335,
+              "max": 5636432,
+              "mean": 5154742.4,
+              "median": 5030224,
+              "min": 5030224,
+              "n": 5,
+              "sample_stdev": 269366.11471527
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 3.6165426529040756,
+              "max": 7929856,
+              "mean": 7448166.4,
+              "median": 7323648,
+              "min": 7323648,
+              "n": 5,
+              "sample_stdev": 269366.11471527
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 1.498951518186123,
+            "max": 1433177.731,
+            "mean": 1417526.0536,
+            "median": 1421719.757,
+            "min": 1381068.111,
+            "n": 5,
+            "sample_stdev": 21248.028301121038
+          },
+          "staging_seconds": {
+            "cv_percent": 1.650567596733181,
+            "max": 0.353308874,
+            "mean": 0.345324285,
+            "median": 0.34515396,
+            "min": 0.338970752,
+            "n": 5,
+            "sample_stdev": 0.0056998107518605404
+          },
+          "total_load_seconds": {
+            "cv_percent": 1.5238238867922886,
+            "max": 0.72407725,
+            "mean": 0.7055833332,
+            "median": 0.703373499,
+            "min": 0.697750166,
+            "n": 5,
+            "sample_stdev": 0.010751847372526825
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          }
+        }
+      }
+    },
+    "1m-b1k": {
+      "headline": {
+        "median_reduction_percent": 18.189015341606865,
+        "sqlite_time_over_final_time": 0.9934017927699165
+      },
+      "paired": {
+        "checkpoint_work_seconds": {
+          "cv_percent": 185.48234150572108,
+          "max": 8.870593343574802,
+          "mean": 4.199570249740406,
+          "median": 8.361894214633201,
+          "min": -9.290151303613047,
+          "n": 5,
+          "sample_stdev": 7.789461232396164
+        },
+        "commit_calls_seconds": {
+          "cv_percent": 13.644767670862484,
+          "max": 29.080306101692305,
+          "mean": 25.140025961281463,
+          "median": 25.280202998429115,
+          "min": 20.75115098003517,
+          "n": 5,
+          "sample_stdev": 3.430298134811369
+        },
+        "commit_phase_apply_seconds": {
+          "cv_percent": 4.093219539951617,
+          "max": 56.81807835774817,
+          "mean": 54.22072598213633,
+          "median": 53.11985460147765,
+          "min": 51.871654233524275,
+          "n": 5,
+          "sample_stdev": 2.2193733506044278
+        },
+        "commit_phase_maintenance_wait_seconds": {
+          "cv_percent": -87.47364432481054,
+          "max": 2.8148635317329824,
+          "mean": -23.526197332822264,
+          "median": -18.625857352416453,
+          "min": -45.765856950067466,
+          "n": 5,
+          "sample_stdev": 20.57922217806601
+        },
+        "commit_phase_prepare_seconds": {
+          "cv_percent": 3.674990594853702,
+          "max": 63.79280797512998,
+          "mean": 60.73257013193807,
+          "median": 60.696403619196595,
+          "min": 58.07968648189138,
+          "n": 5,
+          "sample_stdev": 2.2319162403616524
+        },
+        "commit_phase_record_encode_seconds": {
+          "cv_percent": 10.650957905044743,
+          "max": 35.516806846074054,
+          "mean": 31.222030654460596,
+          "median": 31.43912158813467,
+          "min": 26.22072354091242,
+          "n": 5,
+          "sample_stdev": 3.325445342106764
+        },
+        "commit_phase_validation_seconds": {
+          "cv_percent": -199.3324122857995,
+          "max": 4.082949723130495,
+          "mean": -2.1103541362962774,
+          "median": -1.8146588237157015,
+          "min": -7.394768445798296,
+          "n": 5,
+          "sample_stdev": 4.206619807652519
+        },
+        "commit_phase_wal_append_seconds": {
+          "cv_percent": -357.8611884578566,
+          "max": 8.532332631441367,
+          "mean": -3.370270228624719,
+          "median": -0.4314870526455868,
+          "min": -21.64316024029434,
+          "n": 5,
+          "sample_stdev": 12.060889094397739
+        },
+        "commit_phase_wal_encode_seconds": {
+          "cv_percent": -27.94258646767191,
+          "max": -10.526834206848088,
+          "mean": -16.9780534854176,
+          "median": -17.153773794513395,
+          "min": -23.37976286876529,
+          "n": 5,
+          "sample_stdev": 4.744107275690397
+        },
+        "final_checkpoint_seconds": {
+          "cv_percent": -4634.051057781488,
+          "max": 10.252596876660734,
+          "mean": -0.36809800423204725,
+          "median": 5.489053569442161,
+          "min": -30.654427006218526,
+          "n": 5,
+          "sample_stdev": 17.057849458787732
+        },
+        "full_scan_seconds": {
+          "cv_percent": -181.54693566108395,
+          "max": 3.610234926687334,
+          "mean": -2.793622921158713,
+          "median": -1.6221985272902861,
+          "min": -10.022834240665283,
+          "n": 5,
+          "sample_stdev": 5.0717368072893025
+        },
+        "ingest_wall_seconds": {
+          "cv_percent": 16.062639350738955,
+          "max": 23.943860214330815,
+          "mean": 20.019677483400375,
+          "median": 19.709486996830343,
+          "min": 16.773232232187112,
+          "n": 5,
+          "sample_stdev": 3.215688593339695
+        },
+        "maintenance_drain_seconds": {
+          "cv_percent": -267.6991292977417,
+          "max": 33.292307692307695,
+          "mean": -14.825992549886456,
+          "median": -8.768267223382043,
+          "min": -63.63636363636365,
+          "n": 5,
+          "sample_stdev": 39.6890529657941
+        },
+        "point_read_us": {
+          "cv_percent": -91.65687314531738,
+          "max": 1.7678708685626372,
+          "mean": -11.1876442412925,
+          "median": -10.195758564437195,
+          "min": -22.02429149797569,
+          "n": 5,
+          "sample_stdev": 10.25424489019087
+        },
+        "record_construction_seconds": {
+          "cv_percent": -2809.147054882262,
+          "max": 4.71640818741316,
+          "mean": -0.12191000620916688,
+          "median": -2.482375162397488,
+          "min": -2.652862175148601,
+          "n": 5,
+          "sample_stdev": 3.424631349031594
+        },
+        "rows_per_second": {
+          "cv_percent": -29.677292555767664,
+          "max": -12.051628972438712,
+          "mean": -21.369007237781254,
+          "median": -22.232974460501303,
+          "min": -27.538702318377577,
+          "n": 5,
+          "sample_stdev": 6.34174279421951
+        },
+        "staging_seconds": {
+          "cv_percent": 19.61951231599138,
+          "max": 29.27697881618635,
+          "mean": 22.258720224195613,
+          "median": 21.318861258587898,
+          "min": 17.24748519331227,
+          "n": 5,
+          "sample_stdev": 4.367052355768123
+        },
+        "total_load_seconds": {
+          "cv_percent": 25.417834449829225,
+          "max": 21.59242792067865,
+          "mean": 17.421669597641042,
+          "median": 18.189015341606865,
+          "min": 10.75542504419651,
+          "n": 5,
+          "sample_stdev": 4.428211136724629
+        }
+      },
+      "variants": {
+        "final": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 55919120.0,
+            "mean": 55919120.0,
+            "median": 55919120.0,
+            "min": 55919120.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 6.916561499691339,
+            "max": 0.473770666,
+            "mean": 0.4219420332,
+            "median": 0.408660667,
+            "min": 0.405759417,
+            "n": 5,
+            "sample_stdev": 0.029183880219326046
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 3.2537544462258134,
+            "max": 0.381982119,
+            "mean": 0.365924458,
+            "median": 0.365706693,
+            "min": 0.35012996,
+            "n": 5,
+            "sample_stdev": 0.01190628332200271
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 2.3841672988765796,
+            "max": 0.088459,
+            "mean": 0.0860788406,
+            "median": 0.086180542,
+            "min": 0.082944032,
+            "n": 5,
+            "sample_stdev": 0.0020522635688372966
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 20.01904664721762,
+            "max": 4.3406e-05,
+            "mean": 3.5559199999999997e-05,
+            "median": 3.171e-05,
+            "min": 2.9554e-05,
+            "n": 5,
+            "sample_stdev": 7.118612835377408e-06
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 3.276309233501853,
+            "max": 0.004441077,
+            "mean": 0.0042375816,
+            "median": 0.004191703,
+            "min": 0.004090608,
+            "n": 5,
+            "sample_stdev": 0.00013883627723797556
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 3.6636082416200026,
+            "max": 0.055287094,
+            "mean": 0.0528255794,
+            "median": 0.051779623,
+            "min": 0.051076014,
+            "n": 5,
+            "sample_stdev": 0.0019353222805819183
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 3.8179309554703535,
+            "max": 0.011151368,
+            "mean": 0.010471327800000001,
+            "median": 0.010288412,
+            "min": 0.01017633,
+            "n": 5,
+            "sample_stdev": 0.00039978806552497275
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 9.236292396212695,
+            "max": 0.134563688,
+            "mean": 0.1166194304,
+            "median": 0.113722899,
+            "min": 0.105557163,
+            "n": 5,
+            "sample_stdev": 0.010771311582541757
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 1.8470146357171129,
+            "max": 0.051202361,
+            "mean": 0.0496254778,
+            "median": 0.049193206,
+            "min": 0.049016588,
+            "n": 5,
+            "sample_stdev": 0.0009165898380105467
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 234810656.0,
+            "mean": 234810656.0,
+            "median": 234810656.0,
+            "min": 234810656.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 15.047474995564624,
+            "max": 0.151669375,
+            "mean": 0.1195290248,
+            "median": 0.111512875,
+            "min": 0.110710625,
+            "n": 5,
+            "sample_stdev": 0.017986100119222238
+          },
+          "full_scan_seconds": {
+            "cv_percent": 3.215545839030813,
+            "max": 0.020840709,
+            "mean": 0.019917566799999998,
+            "median": 0.01975525,
+            "min": 0.019212167,
+            "n": 5,
+            "sample_stdev": 0.0006404584904735825
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 116406890.0,
+            "mean": 116406890.0,
+            "median": 116406890.0,
+            "min": 116406890.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 2.4250141838452053,
+            "max": 0.666867167,
+            "mean": 0.6498059668,
+            "median": 0.64856,
+            "min": 0.634250458,
+            "n": 5,
+            "sample_stdev": 0.015757886862372467
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 37.66028172050405,
+            "max": 2.25e-06,
+            "mean": 1.3584e-06,
+            "median": 1.084e-06,
+            "min": 1.042e-06,
+            "n": 5,
+            "sample_stdev": 5.115772668913271e-07
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 134217728.0,
+            "mean": 134217728.0,
+            "median": 134217728.0,
+            "min": 134217728.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 7.983550123530534,
+            "max": 1.507,
+            "mean": 1.3856,
+            "median": 1.351,
+            "min": 1.278,
+            "n": 5,
+            "sample_stdev": 0.11062007051163908
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "record_construction_seconds": {
+            "cv_percent": 0.8074132703754369,
+            "max": 0.146214495,
+            "mean": 0.1445080662,
+            "median": 0.143983976,
+            "min": 0.143480468,
+            "n": 5,
+            "sample_stdev": 0.0011667773032617212
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 0.5901351900449373,
+              "max": 172720680,
+              "mean": 171498438.4,
+              "median": 171131432,
+              "min": 170230312,
+              "n": 5,
+              "sample_stdev": 1012072.6353759398
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 0.35379421073321127,
+              "max": 333840384,
+              "mean": 331854643.2,
+              "median": 331251712,
+              "min": 331022336,
+              "n": 5,
+              "sample_stdev": 1174082.5156909544
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 3.7223920596539757,
+            "max": 1341978.358,
+            "mean": 1301305.265,
+            "median": 1317051.07,
+            "min": 1224755.929,
+            "n": 5,
+            "sample_stdev": 48439.68385621912
+          },
+          "staging_seconds": {
+            "cv_percent": 4.8011090925508295,
+            "max": 0.149108707,
+            "mean": 0.13922114459999999,
+            "median": 0.138680927,
+            "min": 0.13047751,
+            "n": 5,
+            "sample_stdev": 0.006684159032143937
+          },
+          "total_load_seconds": {
+            "cv_percent": 3.830130454438687,
+            "max": 0.816489209,
+            "mean": 0.7693364168,
+            "median": 0.759272,
+            "min": 0.7451685,
+            "n": 5,
+            "sample_stdev": 0.029466588396944153
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 166904890.0,
+            "mean": 166904890.0,
+            "median": 166904890.0,
+            "min": 166904890.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          }
+        },
+        "initial": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 55919120.0,
+            "mean": 55919120.0,
+            "median": 55919120.0,
+            "min": 55919120.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 1.5629471981652585,
+            "max": 0.446216583,
+            "mean": 0.4407847834,
+            "median": 0.445256292,
+            "min": 0.433002417,
+            "n": 5,
+            "sample_stdev": 0.006889233422089103
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 1.5570348373689333,
+            "max": 0.498983847,
+            "mean": 0.4890619614,
+            "median": 0.489437482,
+            "min": 0.481185915,
+            "n": 5,
+            "sample_stdev": 0.007614865115317807
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 3.404239838056595,
+            "max": 0.197476741,
+            "mean": 0.188251909,
+            "median": 0.185915507,
+            "min": 0.18198871,
+            "n": 5,
+            "sample_stdev": 0.006408546482080048
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 7.620488214629166,
+            "max": 3.041e-05,
+            "mean": 2.87342e-05,
+            "median": 2.964e-05,
+            "min": 2.5223e-05,
+            "n": 5,
+            "sample_stdev": 2.189686324567974e-06
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 4.022272895349686,
+            "max": 0.01157699,
+            "mean": 0.0108078494,
+            "median": 0.010594093,
+            "min": 0.010571041,
+            "n": 5,
+            "sample_stdev": 0.0004347211969864136
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 2.6536805076121204,
+            "max": 0.079208258,
+            "mean": 0.0768578782,
+            "median": 0.075693813,
+            "min": 0.074935804,
+            "n": 5,
+            "sample_stdev": 0.002039562532357665
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 2.259764909852753,
+            "max": 0.010609511,
+            "mean": 0.0102581858,
+            "median": 0.01010504,
+            "min": 0.010093493,
+            "n": 5,
+            "sample_stdev": 0.00023181088309589789
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 4.317691090235018,
+            "max": 0.119858666,
+            "mean": 0.1131279072,
+            "median": 0.112839307,
+            "min": 0.1069161,
+            "n": 5,
+            "sample_stdev": 0.004884513569743738
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 2.8702773618099733,
+            "max": 0.04450793,
+            "mean": 0.042458887,
+            "median": 0.041879665,
+            "min": 0.041499805,
+            "n": 5,
+            "sample_stdev": 0.0012186878216374777
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 234810656.0,
+            "mean": 234810656.0,
+            "median": 234810656.0,
+            "min": 234810656.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 2.3550390364940754,
+            "max": 0.123587791,
+            "mean": 0.1193725414,
+            "median": 0.118888041,
+            "min": 0.116084375,
+            "n": 5,
+            "sample_stdev": 0.0028112699488250514
+          },
+          "full_scan_seconds": {
+            "cv_percent": 2.723645020630262,
+            "max": 0.01993175,
+            "mean": 0.0193928332,
+            "median": 0.019344666,
+            "min": 0.018816333,
+            "n": 5,
+            "sample_stdev": 0.0005281919358109322
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 116406890.0,
+            "mean": 116406890.0,
+            "median": 116406890.0,
+            "min": 116406890.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 1.7415549581055247,
+            "max": 0.834296167,
+            "mean": 0.8128920749999999,
+            "median": 0.807766666,
+            "min": 0.798804,
+            "n": 5,
+            "sample_stdev": 0.01415696223620938
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 24.264936327385712,
+            "max": 1.625e-06,
+            "mean": 1.2166e-06,
+            "median": 1.208e-06,
+            "min": 9.17e-07,
+            "n": 5,
+            "sample_stdev": 2.9520721535897454e-07
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 134217728.0,
+            "mean": 134217728.0,
+            "median": 134217728.0,
+            "min": 134217728.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 2.430923749169623,
+            "max": 1.301,
+            "mean": 1.2476,
+            "median": 1.235,
+            "min": 1.226,
+            "n": 5,
+            "sample_stdev": 0.030328204694640218
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "record_construction_seconds": {
+            "cv_percent": 2.9416190637834347,
+            "max": 0.150582556,
+            "mean": 0.1444463052,
+            "median": 0.142654143,
+            "min": 0.14049633,
+            "n": 5,
+            "sample_stdev": 0.0042490600506940035
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 0.5332708489637836,
+              "max": 277660248,
+              "mean": 275799049.6,
+              "median": 275743344,
+              "min": 274023024,
+              "n": 5,
+              "sample_stdev": 1470755.9332359668
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 1.0491524619315693,
+              "max": 418283520,
+              "mean": 412024832,
+              "median": 411598848,
+              "min": 406781952,
+              "n": 5,
+              "sample_stdev": 4322768.668697412
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 1.667383268714203,
+            "max": 1093028.223,
+            "mean": 1072894.8994,
+            "median": 1077492.449,
+            "min": 1049113.185,
+            "n": 5,
+            "sample_stdev": 17889.27004348368
+          },
+          "staging_seconds": {
+            "cv_percent": 1.8790184564567012,
+            "max": 0.18449086,
+            "mean": 0.1791759416,
+            "median": 0.178362355,
+            "min": 0.176088869,
+            "n": 5,
+            "sample_stdev": 0.0033667490121940804
+          },
+          "total_load_seconds": {
+            "cv_percent": 1.674509224498078,
+            "max": 0.953186,
+            "mean": 0.9322659668,
+            "median": 0.92808075,
+            "min": 0.914889459,
+            "n": 5,
+            "sample_stdev": 0.015610879610922185
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 166904890.0,
+            "mean": 166904890.0,
+            "median": 166904890.0,
+            "min": 166904890.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          }
+        },
+        "sqlite": {
+          "checkpoint_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "checkpoint_work_seconds": {
+            "cv_percent": 1.8126191269350125,
+            "max": 0.1277745,
+            "mean": 0.1262535914,
+            "median": 0.126928291,
+            "min": 0.122240166,
+            "n": 5,
+            "sample_stdev": 0.002288496746158778
+          },
+          "commit_calls_seconds": {
+            "cv_percent": 4.20079754879149,
+            "max": 0.217248221,
+            "mean": 0.2028981752,
+            "median": 0.20191315,
+            "min": 0.195166228,
+            "n": 5,
+            "sample_stdev": 0.008523341570344263
+          },
+          "commit_phase_apply_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_maintenance_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_prepare_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_record_encode_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_sync_wait_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_validation_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_wal_append_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "commit_phase_wal_encode_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "disk_bytes": {
+            "cv_percent": 0.0,
+            "max": 158867456.0,
+            "mean": 158867456.0,
+            "median": 158867456.0,
+            "min": 158867456.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "final_checkpoint_seconds": {
+            "cv_percent": 1.8126191269350125,
+            "max": 0.1277745,
+            "mean": 0.1262535914,
+            "median": 0.126928291,
+            "min": 0.122240166,
+            "n": 5,
+            "sample_stdev": 0.002288496746158778
+          },
+          "full_scan_seconds": {
+            "cv_percent": 1.0056844439679697,
+            "max": 0.027748083,
+            "mean": 0.0273956918,
+            "median": 0.027338083,
+            "min": 0.027091167,
+            "n": 5,
+            "sample_stdev": 0.0002755142107500087
+          },
+          "index_delta_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "ingest_wall_seconds": {
+            "cv_percent": 2.7563800376065792,
+            "max": 0.657646584,
+            "mean": 0.6314374584,
+            "median": 0.632022,
+            "min": 0.615432042,
+            "n": 5,
+            "sample_stdev": 0.01740481605330795
+          },
+          "maintenance_drain_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "maintenance_peak_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "point_read_us": {
+            "cv_percent": 1.3813364416572853,
+            "max": 2.34,
+            "mean": 2.2878,
+            "median": 2.279,
+            "min": 2.255,
+            "n": 5,
+            "sample_stdev": 0.03160221511223537
+          },
+          "promotion_bytes_read": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_bytes_written": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "promotion_work_seconds": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          },
+          "record_construction_seconds": {
+            "cv_percent": 2.838685571255838,
+            "max": 0.062053798,
+            "mean": 0.0600649554,
+            "median": 0.060304962,
+            "min": 0.057415979,
+            "n": 5,
+            "sample_stdev": 0.0017050552223210544
+          },
+          "resources": {
+            "peak_physical_footprint_bytes": {
+              "cv_percent": 1.2656682766901854,
+              "max": 4243792,
+              "mean": 4194640,
+              "median": 4227408,
+              "min": 4129104,
+              "n": 5,
+              "sample_stdev": 53090.22780135719
+            },
+            "peak_rss_bytes": {
+              "cv_percent": 0.8100925873009825,
+              "max": 6602752,
+              "mean": 6553600,
+              "median": 6586368,
+              "min": 6488064,
+              "n": 5,
+              "sample_stdev": 53090.22780135719
+            }
+          },
+          "rows_per_second": {
+            "cv_percent": 2.221949329088082,
+            "max": 1345798.719,
+            "mean": 1320328.1016,
+            "median": 1325798.966,
+            "min": 1274940.288,
+            "n": 5,
+            "sample_stdev": 29337.021395262607
+          },
+          "staging_seconds": {
+            "cv_percent": 2.3430421856467465,
+            "max": 0.365119756,
+            "mean": 0.3539809156,
+            "median": 0.353196608,
+            "min": 0.345663782,
+            "n": 5,
+            "sample_stdev": 0.008293922181646604
+          },
+          "total_load_seconds": {
+            "cv_percent": 2.2540783823317105,
+            "max": 0.784350459,
+            "mean": 0.7576910498,
+            "median": 0.754262166,
+            "min": 0.743053167,
+            "n": 5,
+            "sample_stdev": 0.017078950158403994
+          },
+          "wal_appended_bytes": {
+            "cv_percent": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 5,
+            "sample_stdev": 0.0
+          }
+        }
+      }
+    }
+  }
+}

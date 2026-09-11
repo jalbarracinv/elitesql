@@ -284,7 +284,10 @@ mod tests {
             let l2: f32 = a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum();
             assert!(close(dot_f32(&a, &b), dot), "dot len {len}");
             assert!(close(l2_squared_f32(&a, &b), l2), "l2 len {len}");
-            assert!(close(dot_f32_le_bytes(&a, &le_bytes(&b)), dot), "dot bytes {len}");
+            assert!(
+                close(dot_f32_le_bytes(&a, &le_bytes(&b)), dot),
+                "dot bytes {len}"
+            );
             assert!(
                 close(l2_squared_f32_le_bytes(&a, &le_bytes(&b)), l2),
                 "l2 bytes {len}"
@@ -308,7 +311,10 @@ mod tests {
                 })
                 .sum();
             assert!(close(dot_f32_i8(&a, &q), dot), "dot i8 len {len}");
-            assert!(close(l2_squared_f32_i8(&a, &q, scale), l2), "l2 i8 len {len}");
+            assert!(
+                close(l2_squared_f32_i8(&a, &q, scale), l2),
+                "l2 i8 len {len}"
+            );
             let bytes: Vec<u8> = q.iter().map(|v| *v as u8).collect();
             assert_eq!(bytes_as_i8(&bytes), q.as_slice());
         }
@@ -316,7 +322,10 @@ mod tests {
 
     #[test]
     fn integer_kernels_are_exact() {
-        for len in LENGTHS.into_iter().chain([INT_BLOCK - 1, INT_BLOCK, INT_BLOCK * 2 + 5]) {
+        for len in LENGTHS
+            .into_iter()
+            .chain([INT_BLOCK - 1, INT_BLOCK, INT_BLOCK * 2 + 5])
+        {
             let a = sample_i8(len, 5);
             let b = sample_i8(len, 9);
             let expected: i64 = a.iter().zip(&b).map(|(&x, &y)| x as i64 * y as i64).sum();
@@ -330,7 +339,10 @@ mod tests {
                     d * d
                 })
                 .sum();
-            assert!(close(l2_squared_i8_scaled(&a, sa, &b, sb), l2), "l2 len {len}");
+            assert!(
+                close(l2_squared_i8_scaled(&a, sa, &b, sb), l2),
+                "l2 len {len}"
+            );
         }
     }
 
