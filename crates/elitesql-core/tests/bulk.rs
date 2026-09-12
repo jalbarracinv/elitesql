@@ -115,30 +115,43 @@ fn a_large_scan_yields_the_state_lock_to_a_concurrent_writer() {
     let baseline = baseline_started.elapsed();
 
     let db = Arc::new(db);
-    let scanner = db.clone();
-    let (started_tx, started_rx) = mpsc::channel();
-    let (done_tx, done_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        started_tx.send(()).unwrap();
-        let rows = scanner.scan("docs").unwrap();
-        done_tx.send(rows.len()).unwrap();
-    });
-    started_rx.recv().unwrap();
-    // Let the scan get under way, but never sleep long enough for it to
-    // finish: mapped segment reads make even this fixture scan fast.
-    std::thread::sleep((baseline / 5).min(Duration::from_millis(10)));
+    // Wall-clock timing on a shared CI runner is noisy: with two cores the
+    // committing thread competes for CPU with the scanning thread and the
+    // engine's background workers. A single slow attempt is therefore not
+    // evidence of the state lock being held for the whole scan; three
+    // consecutive slow attempts are.
+    const ATTEMPTS: usize = 3;
+    let mut observations = Vec::new();
+    for attempt in 1..=ATTEMPTS {
+        let scanner = db.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let rows = scanner.scan("docs").unwrap();
+            done_tx.send(rows.len()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        // Let the scan get under way, but never sleep long enough for it to
+        // finish: mapped segment reads make even this fixture scan fast.
+        std::thread::sleep((baseline / 5).min(Duration::from_millis(10)));
 
-    let commit_started = Instant::now();
-    db.insert("docs", record(ROWS + 1)).unwrap();
-    let commit_elapsed = commit_started.elapsed();
-    assert!(
-        commit_elapsed < baseline / 2,
-        "commit waited {commit_elapsed:?} behind a scan whose baseline is {baseline:?}"
+        let commit_started = Instant::now();
+        db.insert("docs", record(ROWS + attempt)).unwrap();
+        let commit_elapsed = commit_started.elapsed();
+        let scan_still_running = done_rx.try_recv().is_err();
+        let rows = done_rx.recv().unwrap();
+        worker.join().unwrap();
+        assert!(rows >= ROWS, "attempt {attempt}: scan lost rows");
+        if commit_elapsed < baseline / 2 && scan_still_running {
+            return;
+        }
+        observations.push(format!(
+            "attempt {attempt}: commit took {commit_elapsed:?}, scan still running: {scan_still_running}"
+        ));
+    }
+    panic!(
+        "the concurrent commit never made progress behind a scan whose baseline is {baseline:?}: {}",
+        observations.join("; ")
     );
-    assert!(
-        done_rx.try_recv().is_err(),
-        "the scan fixture finished before the concurrent commit could demonstrate progress"
-    );
-    assert_eq!(done_rx.recv().unwrap(), ROWS);
-    worker.join().unwrap();
 }

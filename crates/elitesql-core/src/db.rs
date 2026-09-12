@@ -7029,12 +7029,20 @@ impl Db {
         // as compaction (snapshots -> state). This lets record decoding continue
         // after the state lock is released without blob/segment GC invalidating
         // the captured sources.
+        //
+        // Lock order also governs the guard's *drop*: `Snapshot::drop` takes
+        // the snapshot registry, so it must run after the state read guard is
+        // gone. Declaring the guard first makes it drop last. Holding the state
+        // lock while waiting for the registry deadlocked against
+        // `Db::snapshot` (registry held, state read blocked behind a queued
+        // writer that in turn waited for this reader).
+        let _snapshot_guard: Snapshot;
         let mut snapshots = self.shared.snapshots.lock().unwrap();
         let st = self.shared.state.read().unwrap();
         let version = st.committed_version;
         *snapshots.entry(version).or_insert(0) += 1;
         drop(snapshots);
-        let _snapshot_guard = Snapshot {
+        _snapshot_guard = Snapshot {
             version,
             shared: self.shared.clone(),
         };

@@ -46,6 +46,31 @@ fallo descarta el run y dispara la reconstrucción desde segmentos. Coste: una
 pasada CRC sobre los índices al abrir (crc32 por hardware, del orden de
 milisegundos por decenas de MB); no afecta a commits ni consultas.
 
+### Dos fallos de CI detectados tras el primer push
+
+La ejecución de `Acceptance` sobre el commit anterior y sobre `2a8ca0f` dejó
+un job colgado hasta el límite de 30 minutos (Ubuntu 1.89 primero, macOS
+1.93.1 después) y otro fallido por tiempos. Ambos eran preexistentes e
+intermitentes; los logs de los jobs los localizan:
+
+- **Interbloqueo en `find_eq_unbudgeted`** (`db.rs`). La función registraba un
+  snapshot con el orden correcto de cerrojos (registro → estado), pero
+  declaraba el guard del snapshot *después* del guard de lectura del estado,
+  así que al salir soltaba el snapshot (que toma el registro) mientras aún
+  sostenía el estado. Con un `Db::snapshot()` concurrente (registro tomado,
+  lectura del estado encolada) y un commit esperando la escritura del estado,
+  el `RwLock` de la biblioteca estándar, que prioriza al escritor, cerraba el
+  ciclo. Reproducido localmente 2 veces en 150 ejecuciones de
+  `concurrent_autocommit_deletes_never_conflict` y confirmado con una muestra
+  de pilas del proceso colgado. Corrección: declarar el guard antes que el
+  estado para que se libere después. Regla que documenta el código: nunca
+  soltar un `Snapshot` con el estado tomado.
+- **`a_large_scan_yields_the_state_lock_to_a_concurrent_writer`** (`tests/bulk.rs`)
+  comparaba tiempos de reloj con un solo intento; en un runner de dos núcleos
+  el hilo del commit compite por CPU con el del escaneo y fallaba por ruido.
+  Ahora hace hasta tres intentos y exige además que el escaneo siguiera en
+  curso cuando el commit terminó, que es la propiedad que importa.
+
 ## Límites que permanecen
 
 - **Bit rot en el último registro del WAL** es indistinguible de una
