@@ -1,15 +1,41 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "elitesql"
 version = "0.0.1"
-description = "EliteSQL Python binding: embedded (ctypes over libelitesql) and sidecar client"
+description = "EliteSQL: embedded SQL + vector database for Python (ctypes over libelitesql) and sidecar client"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT OR Apache-2.0" }
-keywords = ["database", "embedded", "vector-search", "full-text"]
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+keywords = ["database", "embedded", "vector-search", "full-text", "sqlite-alternative"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Topic :: Database",
+  "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Homepage = "https://github.com/jalbarracinv/elitesql"
+Documentation = "https://github.com/jalbarracinv/elitesql/blob/main/bindings/python/README.md"
+Source = "https://github.com/jalbarracinv/elitesql"
+Issues = "https://github.com/jalbarracinv/elitesql/issues"
 
 [tool.setuptools]
-py-modules = ["elitesql"]
+packages = ["elitesql"]
+include-package-data = true
+
+# The native engine travels inside the package: `build_wheel.sh` copies the
+# `libelitesql` built for the current platform next to `__init__.py` and
+# retags the wheel with that platform. A source checkout without the copy
+# still works: `_candidate_paths` also looks in `target/release`.
+[tool.setuptools.package-data]
+elitesql = ["libelitesql.so", "libelitesql.dylib", "elitesql.dll"]

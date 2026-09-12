@@ -82,43 +82,32 @@ See [stress-test.md](stress-test.md) for the workload and all options.
 
 ## Install for Python
 
-EliteSQL ships as a small pure-Python module (`elitesql.py`, standard library
-only) plus one native shared library, `libelitesql`, that the module loads with
-`ctypes`. Python 3.9 or newer; Linux and macOS.
+Python 3.9 or newer; Linux (x86_64, aarch64, glibc 2.28+) and macOS (Apple
+Silicon). The wheel contains the whole engine: no Rust, no compiler, no
+separate library to install.
 
-**1. Build the shared library once.** This is the only step that needs the
-Rust toolchain ([rustup](https://rustup.rs), Rust 1.89 or newer):
+```bash
+pip install elitesql
+```
+
+Until the first PyPI release lands, the same wheels are attached to every
+[GitHub Release](https://github.com/jalbarracinv/elitesql/releases); install
+one with `pip install <wheel-url>`.
+
+**From source** (any platform with the Rust toolchain, 1.89 or newer):
 
 ```bash
 git clone https://github.com/jalbarracinv/elitesql.git
 cd elitesql
-cargo build --release -p elitesql-ffi
-# -> target/release/libelitesql.so (Linux) or libelitesql.dylib (macOS)
+pip install build wheel
+bash bindings/python/build_wheel.sh          # builds libelitesql and the wheel
+pip install bindings/python/dist/elitesql-*.whl
 ```
 
-**2. Install the Python package** from the repository:
-
-```bash
-pip install ./bindings/python
-```
-
-The module finds `libelitesql` automatically when it lives inside the repository
-checkout (`target/release`). Anywhere else, point to it once:
-
-```bash
-export ELITESQL_LIB=/opt/elitesql/libelitesql.so
-```
-
-or pass `EliteSQL("app.esql", lib_path="/opt/elitesql/libelitesql.so")`. Deploying
-to a machine without Rust means copying two files: `elitesql.py` (or the wheel
-from `python -m build --wheel` in `bindings/python`) and a `libelitesql.so`
-built for that platform, for example inside a `rust:1.89-bookworm` Docker
-container when the target is Linux.
-
-EliteSQL is not on PyPI yet. Publishing wheels that bundle `libelitesql` for
-Linux x86_64/aarch64 and macOS (via `maturin` or `cibuildwheel`) is planned so
-that `pip install elitesql` becomes the whole installation; until then the two
-steps above are it.
+For development inside the checkout, `pip install -e ./bindings/python` after
+`cargo build --release -p elitesql-ffi` also works: the package finds the
+library in `target/release`. A library elsewhere is reached with
+`ELITESQL_LIB=/path/to/libelitesql.so` or `EliteSQL(path, lib_path=...)`.
 
 ## Quick start (Python)
 

@@ -2,11 +2,20 @@
 
 Python binding for EliteSQL.
 
+```bash
+pip install elitesql
+```
+
+Wheels for Linux x86_64/aarch64 (manylinux_2_28) and macOS arm64 ship the
+engine (`libelitesql`) inside the package; Python 3.9 or newer. Until the first
+PyPI release, install the wheel attached to a
+[GitHub Release](https://github.com/jalbarracinv/elitesql/releases).
+
 - `EliteSQL(path)`: embedded in-process over the C ABI (`libelitesql`).
   ctypes releases the GIL on every foreign call, so threads truly
-  parallelize. Requires `libelitesql` to be built
-  (`cargo build --release -p elitesql-ffi`); it is located automatically
-  inside the repo or via `ELITESQL_LIB`.
+  parallelize. The library is loaded from the package itself; a source
+  checkout also finds `target/release`, and `ELITESQL_LIB=/path` or
+  `EliteSQL(path, lib_path=...)` point anywhere else.
 - `SidecarClient(socket)`: client for the sidecar mode
   (`elitesql serve <db> <socket>`) for multi-worker deployments
   (gunicorn, uwsgi).
@@ -34,8 +43,24 @@ Sequences use `?` or `%s`; mappings use `%(name)s`. Supported Python values
 include `None`, booleans, signed 64-bit integers, floats, strings, bytes,
 `datetime`/`date`/`time`, JSON dicts/lists and numeric lists for vector columns.
 
-Wheel build: `python -m build --wheel` in this directory (requires
-`pip install build`). `libelitesql` ships separately or via `ELITESQL_LIB`.
+## Building and releasing wheels
+
+`bash bindings/python/build_wheel.sh` builds `libelitesql` with Cargo, copies
+it into the package and produces `dist/elitesql-<version>-py3-none-<platform>.whl`
+(`pip install build wheel` first). `ELITESQL_LIB=` reuses an existing library
+and `ELITESQL_WHEEL_PLATFORM=` names the platform tag; Linux wheels meant for
+distribution are built inside `quay.io/pypa/manylinux_2_28_<arch>` so they run
+on glibc 2.28 or newer.
+
+The `Wheels` GitHub workflow does this for Linux x86_64, Linux aarch64 and
+macOS arm64 on every `v*` tag, smoke-tests each wheel from a clean virtualenv,
+attaches them to the GitHub Release, and uploads them to PyPI through
+[trusted publishing](https://docs.pypi.org/trusted-publishers/) when the
+repository variable `PYPI_PUBLISH` is `true`. One-time setup on PyPI: add a
+pending publisher for project `elitesql` with owner `jalbarracinv`, repository
+`elitesql`, workflow `wheels.yml`, environment `pypi`; then create the `pypi`
+environment in the repository settings and set the variable. The package
+version comes from `pyproject.toml` and should match the tag.
 
 ## Error codes and retries
 
