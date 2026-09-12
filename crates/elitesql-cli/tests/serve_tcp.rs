@@ -86,9 +86,22 @@ impl Client {
     /// refusal on accept when the connection cap is reached, so a test that
     /// wrote first would race the close that follows it.
     fn read(&mut self) -> serde_json::Value {
+        self.try_read().unwrap()
+    }
+
+    /// Like `read`, but a transport error (the server closed a refused
+    /// connection while our request was still in flight) is returned so a
+    /// retry loop can treat it as "not admitted yet".
+    fn try_read(&mut self) -> std::io::Result<serde_json::Value> {
         let mut line = String::new();
-        self.reader.read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad response {line:?}: {e}"))
+        self.reader.read_line(&mut line)?;
+        Ok(serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad response {line:?}: {e}")))
+    }
+
+    fn try_call(&mut self, request: serde_json::Value) -> std::io::Result<serde_json::Value> {
+        writeln!(self.writer, "{request}")?;
+        self.writer.flush()?;
+        self.try_read()
     }
 }
 
@@ -209,11 +222,14 @@ fn the_connection_cap_refuses_instead_of_queueing() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let mut c = Client::connect(server.port);
-        let response = c.call(serde_json::json!({"op": "auth", "token": "s3cr3t"}));
-        if response["ok"] == true {
-            break;
+        // Until the dropped connection's thread has released its slot, the
+        // server still refuses; if our auth line raced its close, the read
+        // reports a reset instead of the refusal. Both mean "try again".
+        match c.try_call(serde_json::json!({"op": "auth", "token": "s3cr3t"})) {
+            Ok(response) if response["ok"] == true => break,
+            Ok(response) => assert!(Instant::now() < deadline, "slot never freed: {response}"),
+            Err(error) => assert!(Instant::now() < deadline, "slot never freed: {error}"),
         }
-        assert!(Instant::now() < deadline, "slot never freed: {response}");
         std::thread::sleep(Duration::from_millis(50));
     }
 }
