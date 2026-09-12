@@ -369,6 +369,29 @@ impl PagedIndex {
         }
     }
 
+    /// Verify every page payload against its CRC. Derived indexes are
+    /// disposable: a loader that finds damage here rebuilds from canonical
+    /// data instead of surfacing the error from a later lookup, which would
+    /// make an index failure look like a database failure.
+    pub(crate) fn validate_pages(&self) -> Result<()> {
+        for directory_entry in &self.pages {
+            let page = self.page(*directory_entry);
+            let stored_len = read_u32(&self.mmap, page.offset)? as usize;
+            let stored_crc = read_u32(&self.mmap, page.offset + 4)?;
+            if stored_len != page.payload_len {
+                return Err(Error::Corrupt("paged index: page length mismatch".into()));
+            }
+            let payload = self
+                .mmap
+                .get(page.payload_offset..page.payload_offset + page.payload_len)
+                .ok_or_else(|| Error::Corrupt("paged index: truncated page".into()))?;
+            if crc32fast::hash(payload) != stored_crc {
+                return Err(Error::Corrupt("paged index: page crc mismatch".into()));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn scan(&self, mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()> {
         for directory_entry in &self.pages {
             let page = self.page(*directory_entry);

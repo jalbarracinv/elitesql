@@ -64,7 +64,9 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 fn candidate_files(db_path: &Path) -> Vec<std::path::PathBuf> {
     let mut files = vec![db_path.join("manifest")];
-    for sub in ["wal", "segments"] {
+    // Derived index files are disposable: a flipped byte there must be
+    // detected and rebuilt, never change what a query returns.
+    for sub in ["wal", "segments", "indexes"] {
         if let Ok(entries) = std::fs::read_dir(db_path.join(sub)) {
             for e in entries.flatten() {
                 files.push(e.path());
@@ -108,19 +110,49 @@ fn random_byte_flips_never_panic_or_corrupt_silently() {
         }
         std::fs::write(target, &bytes).unwrap();
 
-        // Must not panic. Ok => the surviving state must be fully readable.
-        // A clean Err refusal is also a valid outcome.
-        if let Ok(db) = Db::open(&db_path) {
-            let rows = db.scan("docs").expect("open db must be readable");
-            assert!(
-                (40..=60).contains(&rows.len()),
-                "seed {seed}: a checkpointed prefix cannot disappear"
-            );
-            assert_eq!(
-                rows,
-                expected[..rows.len()],
-                "seed {seed}: rows, physical keys and values must equal a committed prefix"
-            );
+        // Must not panic. Ok => the surviving state must be fully readable
+        // and agree with the offline verifier. A clean Err refusal is valid
+        // only when `check` also finds the damage: open and check must never
+        // disagree about whether the database is usable.
+        let derived_only = target.starts_with(db_path.join("indexes"));
+        match Db::open(&db_path) {
+            Ok(db) => {
+                let rows = db.scan("docs").expect("open db must be readable");
+                assert!(
+                    (40..=60).contains(&rows.len()),
+                    "seed {seed}: a checkpointed prefix cannot disappear"
+                );
+                assert_eq!(
+                    rows,
+                    expected[..rows.len()],
+                    "seed {seed}: rows, physical keys and values must equal a committed prefix"
+                );
+                if derived_only {
+                    assert_eq!(
+                        rows.len(),
+                        expected.len(),
+                        "seed {seed}: index damage loses nothing"
+                    );
+                }
+                drop(db);
+                let report = elitesql_core::check(&db_path).unwrap();
+                assert!(
+                    report.is_ok(),
+                    "seed {seed}: a database that opened must validate: {:?}",
+                    report.errors
+                );
+            }
+            Err(error) => {
+                assert!(
+                    !derived_only,
+                    "seed {seed}: a derived index flip must be rebuilt, got {error}"
+                );
+                let report = elitesql_core::check(&db_path).unwrap();
+                assert!(
+                    !report.is_ok(),
+                    "seed {seed}: open refused ({error}) but check found no error"
+                );
+            }
         }
     }
 }

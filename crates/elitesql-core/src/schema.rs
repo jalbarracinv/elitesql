@@ -373,6 +373,14 @@ impl TableSchema {
             ));
         }
         validate_short_string("table name", &self.name)?;
+        if self.name.chars().any(char::is_control) {
+            // The identity high-water mark travels through the WAL as a
+            // pseudo-table whose name starts with NUL; a user table there
+            // would be misread as metadata on the next open.
+            return Err(Error::InvalidArgument(
+                "table name must not contain control characters".into(),
+            ));
+        }
         if self.columns.len() > MAX_SHORT_STRING_BYTES {
             return Err(Error::InvalidArgument(format!(
                 "table '{}' has more than {MAX_SHORT_STRING_BYTES} columns",

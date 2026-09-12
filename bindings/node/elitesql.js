@@ -7,9 +7,13 @@
 //   const { inserted } = await db.query("INSERT INTO docs (title) VALUES ('hola')");
 //   const { columns, rows } = await db.query('SELECT * FROM docs');
 //
-// Values: scalars are native; date/time/timestamp arrive as Date objects
-// (dates at UTC midnight), blobs as Buffer, vectors as number arrays.
-// Int64 values outside Number's safe integer range arrive as BigInt.
+// Values: scalars are native; date/timestamp arrive as Date objects (dates at
+// UTC midnight; `timestampMicros(date)` recovers the exact microseconds a
+// Date cannot hold), time as milliseconds since midnight, blobs as Buffer,
+// vectors as number arrays. Int64 values outside Number's safe integer range
+// arrive as BigInt (inside Number's range they are plain numbers: compare
+// with `==` or normalize with BigInt() when a column may hold both). JSON
+// column values keep large integers exact as BigInt.
 
 'use strict';
 
@@ -17,6 +21,92 @@ const net = require('net');
 const readline = require('readline');
 
 const US_PER_DAY = 86_400_000_000n;
+
+// Microseconds a Date cannot hold. `timestampMicros(date)` reads it back and
+// `encodeParam` uses it, so a value read from the database round-trips
+// exactly even though Date itself only resolves milliseconds.
+const MICROS = Symbol.for('elitesql.micros');
+
+/** Exact microseconds since the Unix epoch of a Date decoded by this client. */
+function timestampMicros(date) {
+  if (!(date instanceof Date)) throw new TypeError('timestampMicros expects a Date');
+  return date[MICROS] !== undefined ? date[MICROS] : BigInt(date.getTime()) * 1000n;
+}
+
+function decodeFloatRepr(repr) {
+  switch (repr) {
+    case 'inf': return Infinity;
+    case '-inf': return -Infinity;
+    case 'NaN': return NaN;
+    default: {
+      const n = Number(repr);
+      if (Number.isNaN(n)) throw new EliteSQLError(2, `unrecognized float64 representation ${repr}`);
+      return n;
+    }
+  }
+}
+
+// JSON.parse rounds integers beyond 2^53 before a reviver can see them. The
+// server sends JSON column values that contain such integers as exact text;
+// this small parser turns those integers into BigInt and everything else into
+// the ordinary JSON.parse result.
+function parseJsonExact(text) {
+  let i = 0;
+  const fail = (what) => { throw new EliteSQLError(2, `invalid json text from sidecar: ${what} at ${i}`); };
+  const ws = () => { while (i < text.length && ' \t\n\r'.includes(text[i])) i++; };
+  const value = () => {
+    ws();
+    const c = text[i];
+    if (c === '{') {
+      i++; const out = {}; ws();
+      if (text[i] === '}') { i++; return out; }
+      for (;;) {
+        ws(); if (text[i] !== '"') fail('expected key');
+        const key = string(); ws();
+        if (text[i] !== ':') fail('expected colon'); i++;
+        out[key] = value(); ws();
+        if (text[i] === ',') { i++; continue; }
+        if (text[i] === '}') { i++; return out; }
+        fail('expected , or }');
+      }
+    }
+    if (c === '[') {
+      i++; const out = []; ws();
+      if (text[i] === ']') { i++; return out; }
+      for (;;) {
+        out.push(value()); ws();
+        if (text[i] === ',') { i++; continue; }
+        if (text[i] === ']') { i++; return out; }
+        fail('expected , or ]');
+      }
+    }
+    if (c === '"') return string();
+    if (text.startsWith('true', i)) { i += 4; return true; }
+    if (text.startsWith('false', i)) { i += 5; return false; }
+    if (text.startsWith('null', i)) { i += 4; return null; }
+    const match = /^-?\d+(\.\d+)?([eE][+-]?\d+)?/.exec(text.slice(i));
+    if (!match) fail('unexpected token');
+    i += match[0].length;
+    if (match[1] === undefined && match[2] === undefined) {
+      const big = BigInt(match[0]);
+      return Number.isSafeInteger(Number(big)) ? Number(big) : big;
+    }
+    return Number(match[0]);
+  };
+  const string = () => {
+    // Delegate escapes to JSON.parse on the exact string token.
+    let j = i + 1;
+    while (j < text.length && text[j] !== '"') { if (text[j] === '\\') j++; j++; }
+    if (j >= text.length) fail('unterminated string');
+    const out = JSON.parse(text.slice(i, j + 1));
+    i = j + 1;
+    return out;
+  };
+  const out = value();
+  ws();
+  if (i !== text.length) fail('trailing characters');
+  return out;
+}
 
 function decodeValue(v) {
   if (v && typeof v === 'object' && !Array.isArray(v) && '$t' in v) {
@@ -27,16 +117,22 @@ function decodeValue(v) {
         return new Date(v.days * 86_400_000);
       case 'time': // milliseconds since midnight as a number
         return v.us / 1000;
-      case 'timestamp':
-        return new Date(Number(BigInt(v.us) / 1000n));
+      case 'timestamp': {
+        // Date resolves milliseconds; keep the exact microseconds alongside
+        // so a read-modify-write does not truncate the stored instant.
+        const us = BigInt(v.us);
+        const date = new Date(Number(us / 1000n) - (us < 0n && us % 1000n !== 0n ? 1 : 0));
+        if (us % 1000n !== 0n) Object.defineProperty(date, MICROS, { value: us, enumerable: false });
+        return date;
+      }
       case 'blob':
         return Buffer.from(v.hex, 'hex');
       case 'vector':
         return v.v;
       case 'json':
-        return v.v;
+        return v.text !== undefined ? parseJsonExact(v.text) : v.v;
       case 'float64':
-        return Number(v.repr);
+        return decodeFloatRepr(v.repr);
       default:
         return v;
     }
@@ -100,7 +196,7 @@ function encodeParam(value) {
   }
   if (value instanceof Date) {
     if (Number.isNaN(value.getTime())) throw new TypeError('invalid Date parameter');
-    return { $t: 'timestamp', us: value.getTime() * 1000 };
+    return { $t: 'timestamp', us: Number(timestampMicros(value)) };
   }
   if (Array.isArray(value) || (value && Object.getPrototypeOf(value) === Object.prototype)) {
     return { $t: 'json', v: jsonNative(value) };
@@ -122,9 +218,26 @@ class EliteSQLError extends Error {
     this.code = code;
   }
 }
-EliteSQLError.CONFLICT_RETRY = 9;
-EliteSQLError.COMMIT_UNKNOWN = 17;
+// Stable status codes (see README "Error codes and retries").
+EliteSQLError.IO = 1;                 // also a lost connection: a sent commit MAY be published
+EliteSQLError.CORRUPT = 2;
+EliteSQLError.CONFLICT_RETRY = 9;     // safe to retry the whole transaction
+EliteSQLError.DATABASE_LOCKED = 10;
+EliteSQLError.UNIQUE_VIOLATION = 11;
+EliteSQLError.READ_ONLY = 13;
+EliteSQLError.MEMORY_LIMIT = 16;
+EliteSQLError.COMMIT_UNKNOWN = 17;    // the write IS published; crash durability unknown
 EliteSQLError.QUERY_INTERRUPTED = 18;
+EliteSQLError.AUTH = 20;
+EliteSQLError.TRANSACTION_EXPIRED = 21; // rolled back at the sidecar deadline; retry as a whole
+/** Nothing of the failed unit of work can have been published. */
+Object.defineProperty(EliteSQLError.prototype, 'retrySafe', {
+  get() { return this.code === EliteSQLError.CONFLICT_RETRY || this.code === EliteSQLError.TRANSACTION_EXPIRED; },
+});
+/** The write may already be visible despite the error: verify before retrying. */
+Object.defineProperty(EliteSQLError.prototype, 'maybePublished', {
+  get() { return this.code === EliteSQLError.COMMIT_UNKNOWN || this.code === EliteSQLError.IO; },
+});
 
 class SidecarClient {
   constructor(socket) {
@@ -135,6 +248,8 @@ class SidecarClient {
     this._writeQueue = Promise.resolve();
     this._cursorActive = false;
     const rl = readline.createInterface({ input: socket });
+    this._closing = false;
+    this._drainWaiter = null;
     rl.on('line', (line) => {
       const waiter = this._pending.shift();
       if (!waiter) return;
@@ -145,6 +260,11 @@ class SidecarClient {
         else waiter.reject(new EliteSQLError(response.code ?? 1, response.error ?? 'unknown'));
       } catch (e) {
         waiter.reject(e);
+      }
+      if (this._pending.length === 0 && this._drainWaiter) {
+        const drained = this._drainWaiter;
+        this._drainWaiter = null;
+        drained();
       }
     });
     socket.on('error', (e) => this._failAll(e));
@@ -194,10 +314,15 @@ class SidecarClient {
     this._pending = [];
     this._pendingBytes = 0;
     for (const waiter of pending) waiter.reject(err);
+    if (this._drainWaiter) {
+      const drained = this._drainWaiter;
+      this._drainWaiter = null;
+      drained();
+    }
   }
 
   _call(request) {
-    if (this._closed || this._socket.destroyed) {
+    if (this._closed || this._closing || this._socket.destroyed) {
       return Promise.reject(new EliteSQLError(1, 'sidecar connection is closed'));
     }
     if (this._cursorActive && !['query_open', 'query_next', 'query_close'].includes(request.op)) {
@@ -317,8 +442,21 @@ class SidecarClient {
     return this._call({ op: 'compact' });
   }
 
-  close() {
-    this._failAll(new EliteSQLError(1, 'sidecar client is closed'));
+  /**
+   * Stops accepting requests, waits for every request already sent to be
+   * answered (the server executes them regardless), then ends the socket.
+   * Rejecting them early would report as failed a write the server commits.
+   */
+  async close() {
+    if (this._closed) return;
+    this._closing = true;
+    if (this._pending.length > 0) {
+      await new Promise((resolve) => {
+        this._drainWaiter = resolve;
+        // A dying socket still resolves this through _failAll.
+      });
+    }
+    this._closed = true;
     this._socket.end();
   }
 }
@@ -374,4 +512,6 @@ module.exports = {
   decodeValue,
   encodeParam,
   encodeParams,
+  timestampMicros,
+  parseJsonExact,
 };

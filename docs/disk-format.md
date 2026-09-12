@@ -59,10 +59,14 @@ u32  crc32 of the whole record
 ```
 
 Idempotent replay: records at or below the manifest's watermark are skipped.
-Recovery checks the entire WAL chain before modifying canonical files. An
-incomplete final record can be truncated; a checksum error, malformed record,
-version gap, or incomplete record before another valid record is corruption.
-Normal open refuses these cases and preserves the WAL for explicit salvage.
+Recovery checks the entire WAL chain before modifying canonical files. The
+tail a crash leaves (a strict prefix of a record, a zero-filled extent, a
+record with a bad CRC or unknown kind) is an incomplete final record and is
+truncated **only when no complete, checksummed record follows it**; the same
+damage before a later valid record, or a version gap, is corruption. Normal
+open refuses corruption and preserves the WAL for explicit salvage. Bit rot
+confined to the last record is therefore indistinguishable from a torn write
+and is truncated; every earlier record keeps its CRC protection.
 
 Background checkpoint reserves a bridge WAL (id+1) and a new writer (id+2).
 Before switching writers, it persists `required_wal_id` in both manifest copies.
@@ -70,6 +74,10 @@ The final manifest anchors the bridge and still requires the new writer.
 Thus deleting even an empty required successor is detectable. Older manifests
 default this field to zero and discover consecutive successors by enumeration;
 they cannot prove that an absent last successor existed before this upgrade.
+When recovery resumes writing in a successor beyond `required_wal_id` (the
+checkpoint that reserved it never published), open republishes the manifest
+with the real extent before accepting commits. An incomplete tail before
+successors is accepted only while those successors hold no records.
 Obsolete WALs are removed only after canonical publication is durable.
 
 ## Record payload

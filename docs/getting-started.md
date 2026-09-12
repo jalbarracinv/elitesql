@@ -170,11 +170,15 @@ filesystems provide neither reliably.
 
 ## Durability
 
-| Mode | fsync | Loses on OS crash |
+| Mode | fsync | Loses on OS crash / power loss |
 |---|---|---|
-| `safe` (default) | per concurrent commit group | nothing |
-| `balanced` | every ~25ms, grouped | last few ms |
-| `fast` | at checkpoints | recent commits |
+| `safe` (default) | per concurrent commit group, before the ack | nothing (macOS: set `full_fsync`) |
+| `balanced` | within ~25 ms of a commit (next commit or timer) | commits acknowledged in the last interval |
+| `fast` | at checkpoints and clean close | commits since the last checkpoint or close |
+
+A clean close syncs the WAL in every mode. A torn or zero-filled tail after a
+power loss is truncated to the last complete commit; corruption followed by a
+complete commit is refused (`elitesql repair` salvages).
 
 Overlapping `safe` and due `balanced` commits can share one physical WAL sync;
 each commit waits for that shared sync to complete before it returns.

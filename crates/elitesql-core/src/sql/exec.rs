@@ -3977,24 +3977,24 @@ fn exec_update_txn(
         label: table.to_owned(),
     }];
     let predicates = resolve_where(&tables, where_clause)?;
-    let matching: Vec<Record> = txn
+    // The physical row key travels with the tuple: with a declared `id`
+    // column (`id int AUTO_INCREMENT PRIMARY KEY`) `record["id"]` is the SQL
+    // value, not the ULID.
+    let matching: Vec<(String, Record)> = txn
         .scan(table)?
         .into_iter()
-        .map(|(_, record)| record)
-        .filter_map(|record| {
+        .filter_map(|(id, record)| {
             let row = vec![Some(record.clone())];
             match eval_all(&row, &predicates) {
-                Ok(true) => Some(Ok(record)),
+                Ok(true) => Some(Ok((id, record))),
                 Ok(false) => None,
                 Err(error) => Some(Err(error)),
             }
         })
         .collect::<Result<_>>()?;
     let mut affected = 0u64;
-    for record in matching {
-        let Value::Text(id) = &record[ID_COLUMN] else {
-            return Err(Error::Corrupt("record has non-text id".into()));
-        };
+    for (id, record) in matching {
+        let id = &id;
         let mut patch = Record::new();
         for (column, set) in sets {
             let target = tables[0].schema.column(column).expect("validated above");

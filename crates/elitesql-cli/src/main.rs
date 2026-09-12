@@ -38,6 +38,15 @@ OPTIONS:
   --durability safe|balanced|fast    (query/repl/import/serve; default safe)
   --read-only                        open without touching disk; writes fail
   --create                           create the database if it does not exist
+  --full-fsync                       flush the drive cache at every barrier
+                                     (macOS; needed for safe to survive power
+                                     loss there; much slower)
+  --batch <n>                        import: commit every n rows instead of
+                                     one transaction for the whole input
+
+EXIT STATUS:
+  0 success   1 failure   3 completed with warnings (check/restore/export
+  --read-only over a damaged database)   4 repair finished but skipped entries
 
   Opening never creates a database on its own: a mistyped subcommand is read
   as a path, and would otherwise leave a directory named after the typo.
@@ -100,10 +109,18 @@ EXAMPLE
 Run elitesql --help outside the shell for database maintenance commands.
 ";
 
+/// Exit status when a command completed but the result needs attention: the
+/// database validated with warnings, a restore carried warnings, a read-only
+/// export exposed a partial state. Scripts must treat it as "look before you
+/// trust", distinct from 0 (clean) and 1 (failed).
+const EXIT_WARNINGS: u8 = 3;
+/// Exit status for a salvage that finished but could not recover every entry.
+const EXIT_PARTIAL: u8 = 4;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(msg) => {
             eprintln!("error: {msg}");
             ExitCode::FAILURE
@@ -111,7 +128,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(mut args: Vec<String>) -> Result<(), String> {
+fn run(mut args: Vec<String>) -> Result<ExitCode, String> {
+    let code = run_command(&mut args)?;
+    Ok(code)
+}
+
+fn run_command(args: &mut Vec<String>) -> Result<ExitCode, String> {
     // Extract global options.
     let mut durability = Durability::Safe;
     if let Some(i) = args.iter().position(|a| a == "--durability") {
@@ -136,62 +158,89 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
         create = true;
         args.remove(i);
     }
+    let mut full_fsync = false;
+    if let Some(i) = args.iter().position(|a| a == "--full-fsync") {
+        full_fsync = true;
+        args.remove(i);
+    }
+    let mut import_batch: Option<usize> = None;
+    if let Some(i) = args.iter().position(|a| a == "--batch") {
+        let value = args
+            .get(i + 1)
+            .ok_or("--batch requires a row count")?
+            .parse::<usize>()
+            .ok()
+            .filter(|rows| *rows > 0)
+            .ok_or("--batch requires a positive row count")?;
+        import_batch = Some(value);
+        args.drain(i..=i + 1);
+    }
     let opts = DbOptions {
         durability,
         read_only,
+        full_fsync,
         ..DbOptions::default()
     };
+    let args: &Vec<String> = args;
 
     let cmd = args.first().cloned().unwrap_or_default();
     match cmd.as_str() {
         "query" => {
-            let [db_path, sql] = take::<2>(&args)?;
+            let [db_path, sql] = take::<2>(args)?;
             let db = open(&db_path, opts, create)?;
             let out = db.query(&sql).map_err(|e| e.to_string())?;
             match out {
                 QueryOutput::Rows { rows, .. } if is_explain(sql.trim()) => print_plan(&rows),
                 other => print_output(other),
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         "repl" => {
-            let [db_path] = take::<1>(&args)?;
-            repl(&db_path, opts, create)
+            let [db_path] = take::<1>(args)?;
+            repl(&db_path, opts, create)?;
+            Ok(ExitCode::SUCCESS)
         }
         "tables" => {
-            let [db_path] = take::<1>(&args)?;
+            let [db_path] = take::<1>(args)?;
             let db = open(&db_path, opts, create)?;
             for name in db.tables() {
                 let schema = db.table_schema(&name).expect("listed");
                 println!("{}", serde_json::to_string_pretty(&schema).unwrap());
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         "check" => {
-            let [db_path] = take::<1>(&args)?;
+            let [db_path] = take::<1>(args)?;
             let report = elitesql_core::check(&db_path).map_err(|e| e.to_string())?;
             for w in &report.warnings {
-                println!("warning: {w}");
+                eprintln!("warning: {w}");
             }
             for e in &report.errors {
-                println!("ERROR: {e}");
+                eprintln!("ERROR: {e}");
             }
-            if report.is_ok() {
+            if !report.is_ok() {
+                return Err(format!("{} integrity error(s) found", report.errors.len()));
+            }
+            if report.warnings.is_empty() {
                 println!("ok: database validates");
-                Ok(())
+                Ok(ExitCode::SUCCESS)
             } else {
-                Err(format!("{} integrity error(s) found", report.errors.len()))
+                println!(
+                    "ok: database validates with {} warning(s); derived indexes may be rebuilt on open",
+                    report.warnings.len()
+                );
+                Ok(ExitCode::from(EXIT_WARNINGS))
             }
         }
         "compact" => {
-            let [db_path] = take::<1>(&args)?;
+            let [db_path] = take::<1>(args)?;
             let db = open(&db_path, opts, create)?;
             db.compact().map_err(|e| e.to_string())?;
             println!("ok: compacted");
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         "backup" => {
-            let [db_path, dst] = take::<2>(&args)?;
+            let [db_path, dst] = take::<2>(args)?;
             let db = open(&db_path, opts, create)?;
             let report = db.backup(&dst).map_err(|e| e.to_string())?;
             let check = elitesql_core::check(&dst).map_err(|e| e.to_string())?;
@@ -205,22 +254,26 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 "ok: backed up {} table(s), {} record(s) into {dst} (verified)",
                 report.tables, report.records
             );
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         "restore" => {
-            let [src, dst] = take::<2>(&args)?;
+            let [src, dst] = take::<2>(args)?;
             let report = elitesql_core::restore(&src, &dst).map_err(|e| e.to_string())?;
             for w in &report.warnings {
-                println!("warning: {w}");
+                eprintln!("warning: {w}");
             }
             println!(
                 "ok: restored {} table(s), {} record(s) into {dst}",
                 report.tables, report.records
             );
-            Ok(())
+            Ok(if report.warnings.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(EXIT_WARNINGS)
+            })
         }
         "repair" => {
-            let [src, dst] = take::<2>(&args)?;
+            let [src, dst] = take::<2>(args)?;
             let report = elitesql_core::salvage(&src, &dst).map_err(|e| e.to_string())?;
             println!("tables:             {}", report.tables.join(", "));
             println!("recovered records:  {}", report.recovered_records);
@@ -229,14 +282,31 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             println!("segments scanned:   {}", report.segments_scanned);
             println!("wal files scanned:  {}", report.wal_files_scanned);
             for note in &report.notes {
-                println!("note: {note}");
+                eprintln!("note: {note}");
             }
-            println!("salvaged into {dst}");
-            Ok(())
+            if report.skipped > 0 || !report.notes.is_empty() {
+                println!(
+                    "salvaged into {dst} (PARTIAL: {} entr{} skipped, {} note(s))",
+                    report.skipped,
+                    if report.skipped == 1 { "y" } else { "ies" },
+                    report.notes.len()
+                );
+                Ok(ExitCode::from(EXIT_PARTIAL))
+            } else {
+                println!("salvaged into {dst}");
+                Ok(ExitCode::SUCCESS)
+            }
         }
         "export" => {
-            let [db_path, table] = take::<2>(&args)?;
+            let [db_path, table] = take::<2>(args)?;
             let db = open(&db_path, opts, create)?;
+            // A read-only open exposes the valid prefix of damaged files. Say
+            // so, on stderr and in the exit status, so the export is never
+            // mistaken for a complete copy.
+            let partial = db.recovery_warnings();
+            for warning in &partial {
+                eprintln!("warning: {warning}");
+            }
             let snapshot = db.snapshot();
             let mut cursor = None;
             let stdout = std::io::stdout();
@@ -260,15 +330,23 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                 }
                 cursor = rows.last().map(|(id, _)| id.clone());
             }
-            Ok(())
+            Ok(if partial.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                eprintln!(
+                    "warning: export is PARTIAL: the database opened read-only over damaged files"
+                );
+                ExitCode::from(EXIT_WARNINGS)
+            })
         }
         "import" => {
-            let [db_path, table] = take::<2>(&args)?;
+            let [db_path, table] = take::<2>(args)?;
             let db = open(&db_path, opts, create)?;
-            import(&db, &table)
+            import(&db, &table, import_batch)?;
+            Ok(ExitCode::SUCCESS)
         }
         "serve" => {
-            let mut args = args;
+            let mut args = args.clone();
             let tcp = take_option(&mut args, "--tcp")?;
             let token_file = take_option(&mut args, "--token-file")?;
             let max_connections = match take_option(&mut args, "--max-connections")? {
@@ -307,17 +385,21 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
                     token,
                     max_connections,
                 },
-            )
+            )?;
+            Ok(ExitCode::SUCCESS)
         }
         "version" => {
             println!("{}", version_banner());
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         "" | "help" | "--help" | "-h" => {
             print!("{USAGE}");
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
-        path if args.len() == 1 => repl(path, opts, create),
+        path if args.len() == 1 => {
+            repl(path, opts, create)?;
+            Ok(ExitCode::SUCCESS)
+        }
         other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
     }
 }
@@ -557,51 +639,71 @@ fn is_star_select(sql: &str) -> bool {
             .is_some_and(|word| word.eq_ignore_ascii_case("from"))
 }
 
-fn import(db: &Db, table: &str) -> Result<(), String> {
+/// Load JSON lines into `table`. By default the whole input is one
+/// transaction: a bad line leaves nothing behind and the command can simply
+/// be rerun. `--batch N` trades that for bounded staging memory; on error the
+/// message then states how many rows were already committed, so the caller
+/// knows the file must not be replayed from the start without explicit ids.
+fn import(db: &Db, table: &str, batch: Option<usize>) -> Result<(), String> {
     let schema = db
         .table_schema(table)
         .ok_or_else(|| format!("table '{table}' does not exist; create it first (CREATE TABLE)"))?;
     let stdin = std::io::stdin();
     let mut txn = db.begin();
     let mut imported = 0u64;
+    let mut committed = 0u64;
     let mut in_batch = 0usize;
+    let committed_hint = |committed: u64| {
+        if committed > 0 {
+            format!("; {committed} row(s) from earlier batches are already committed, do not replay them")
+        } else {
+            String::from("; nothing was committed")
+        }
+    };
     for (line_no, line) in stdin.lock().lines().enumerate() {
         let line = line.map_err(|e| e.to_string())?;
         if line.trim().is_empty() {
             continue;
         }
-        let j: serde_json::Value =
-            serde_json::from_str(&line).map_err(|e| format!("line {}: {e}", line_no + 1))?;
+        let fail = |message: String| {
+            format!(
+                "line {}: {message}{}",
+                line_no + 1,
+                committed_hint(committed)
+            )
+        };
+        let j: serde_json::Value = serde_json::from_str(&line).map_err(|e| fail(e.to_string()))?;
         let obj = j
             .as_object()
-            .ok_or_else(|| format!("line {}: expected a JSON object", line_no + 1))?;
+            .ok_or_else(|| fail("expected a JSON object".into()))?;
         let mut record = elitesql_core::Record::new();
         for (k, v) in obj {
-            let value = if k == "id" {
+            let value = if k == "id" && schema.column("id").is_none() {
                 match v.as_str() {
                     Some(s) => Value::Text(s.to_owned()),
-                    None => return Err(format!("line {}: id must be a string", line_no + 1)),
+                    None => return Err(fail("id must be a string".into())),
                 }
             } else {
                 let col = schema
                     .column(k)
-                    .ok_or_else(|| format!("line {}: unknown column '{k}'", line_no + 1))?;
-                jsonio::json_to_value_for_type(v, col.ty)
-                    .map_err(|e| format!("line {}: {e}", line_no + 1))?
+                    .ok_or_else(|| fail(format!("unknown column '{k}'")))?;
+                jsonio::json_to_value_for_type(v, col.ty).map_err(|e| fail(e.to_string()))?
             };
             record.insert(k.clone(), value);
         }
-        txn.insert(table, record)
-            .map_err(|e| format!("line {}: {e}", line_no + 1))?;
+        txn.insert(table, record).map_err(|e| fail(e.to_string()))?;
         imported += 1;
         in_batch += 1;
-        if in_batch >= 1000 {
-            txn.commit().map_err(|e| e.to_string())?;
+        if batch.is_some_and(|rows| in_batch >= rows) {
+            txn.commit()
+                .map_err(|e| format!("{e}{}", committed_hint(committed)))?;
+            committed = imported;
             txn = db.begin();
             in_batch = 0;
         }
     }
-    txn.commit().map_err(|e| e.to_string())?;
+    txn.commit()
+        .map_err(|e| format!("{e}{}", committed_hint(committed)))?;
     eprintln!("imported {imported} record(s) into {table}");
     Ok(())
 }

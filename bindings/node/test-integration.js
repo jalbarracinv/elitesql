@@ -48,7 +48,7 @@ async function main() {
     );
     assert.equal(await client.ping(), true);
   } finally {
-    if (client) client.close();
+    if (client) await client.close();
     if (server.exitCode === null && !startupError) {
       const exited = once(server, 'exit');
       server.kill();

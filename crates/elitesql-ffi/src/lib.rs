@@ -135,7 +135,8 @@ pub unsafe extern "C" fn elitesql_free_string(s: *mut c_char) {
 }
 
 /// Open (creating if missing) a database. `options_json` may be NULL or a
-/// JSON object: {"durability": "safe"|"balanced"|"fast", "memory"?: {...}}.
+/// JSON object: {"durability": "safe"|"balanced"|"fast", "read_only"?: bool,
+/// "full_fsync"?: bool (macOS drive-cache flush), "memory"?: {...}}.
 ///
 /// # Safety
 /// `path`/`options_json` must be valid NUL-terminated strings; `out` valid.
@@ -166,6 +167,9 @@ pub unsafe extern "C" fn elitesql_open(
                 }
                 if let Some(ro) = j.get("read_only").and_then(|r| r.as_bool()) {
                     opts.read_only = ro;
+                }
+                if let Some(full) = j.get("full_fsync").and_then(|r| r.as_bool()) {
+                    opts.full_fsync = full;
                 }
                 if let Some(memory) = j.get("memory") {
                     if !memory.is_object() {

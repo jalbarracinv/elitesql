@@ -63,8 +63,17 @@ away by a checkpoint mid-copy.
 ### 1. `elitesql check <db>` — diagnosis
 
 Offline validation of checksums and structure: manifest and its fallback,
-segment entries, WAL records, referenced blob chunks, orphan files. Modifies
-nothing. Non-zero exit code when errors exist.
+segment entries, WAL records, referenced blob chunks, orphan files, then a
+deep logical pass (uniqueness, foreign keys, identities, derived indexes
+against an independent canonical image). Modifies nothing. Exit status 0 is
+clean, 3 is valid with warnings (printed on stderr: derived indexes that will
+be rebuilt, a torn tail that will be truncated), 1 means integrity errors.
+
+`restore` exits 3 when the pre-restore check carried warnings; `repair` exits
+4 when it finished but skipped entries or recorded damage notes; `export
+--read-only` exits 3 when the read-only open had to skip damaged files (the
+export is then a prefix, announced on stderr). Scripts must treat 3 and 4 as
+"inspect", not success.
 
 ### 2. `--read-only` — inspecting a damaged database
 
@@ -93,13 +102,33 @@ a corruption point within a file is lost (and the report says how much).
 
 ## Semantics per durability mode
 
-- `safe`: an acknowledged commit survives both process AND OS crashes.
-- `balanced`: survives process crashes; an OS crash may lose the last ~25ms
-  of commits.
+- `safe`: an acknowledged commit survives both process AND OS crashes. On
+  macOS a *power loss* additionally needs `DbOptions::full_fsync`
+  (`--full-fsync`), because plain `fsync` there stops at the drive cache.
+- `balanced`: survives process crashes; an OS crash may lose the commits
+  acknowledged within the last `balanced_sync_interval_ms` (a timer syncs an
+  idle writer, so the window is bounded even without further commits).
 - `fast`: survives process crashes (the WAL was written; the page cache has
-  it); an OS crash may lose commits since the last checkpoint.
+  it); an OS crash may lose commits since the last checkpoint or clean close.
 
-In all three modes atomicity holds: never half a commit.
+A clean close syncs the WAL in every mode. In all three modes atomicity
+holds: never half a commit.
+
+What the WAL scanner does with the bytes a crash leaves behind:
+
+- a strict prefix of a record, a zero-filled region, or a record whose CRC
+  fails **with no complete record after it**: an incomplete tail, truncated
+  on open (`check` reports it as a warning);
+- any of those **followed by a complete, checksummed record**, a version gap,
+  or an unknown change kind before a later valid record: corruption. Normal
+  open refuses and leaves the files untouched for `repair`;
+- an incomplete tail in a WAL that has successors is accepted only while every
+  successor is empty (the window in which a checkpoint has reserved them but
+  not yet synced the old writer); a successor with commits makes it corruption.
+
+A WAL sync failure (`CommitUnknown`, code 17) fences the handle: the commit
+is visible but its durability is unknown, and no later commit may build on it
+until the database is reopened and the chain re-validated.
 
 ## What does NOT self-repair
 

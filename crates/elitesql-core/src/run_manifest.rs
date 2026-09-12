@@ -179,12 +179,17 @@ impl PrimaryRunManifest {
         })
     }
 
-    pub(crate) fn referenced_files(indexes_dir: &Path) -> Vec<String> {
-        read_manifest(&indexes_dir.join(PRIMARY_RUN_MANIFEST))
-            .into_iter()
-            .flat_map(|manifest| manifest.runs)
-            .map(|run| run.file)
-            .collect()
+    /// Files the on-disk manifest lists. `None` when a manifest exists but
+    /// cannot be read (I/O error or damage): callers sweeping orphans must
+    /// then do nothing rather than treat every run as unreferenced.
+    pub(crate) fn referenced_files(indexes_dir: &Path) -> Option<Vec<String>> {
+        match fs::read(indexes_dir.join(PRIMARY_RUN_MANIFEST)) {
+            Ok(bytes) => Self::decode(&bytes)
+                .ok()
+                .map(|manifest| manifest.runs.into_iter().map(|run| run.file).collect()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+            Err(_) => None,
+        }
     }
 }
 
@@ -316,21 +321,31 @@ impl DerivedRunManifest {
         })
     }
 
+    /// Files the on-disk manifest lists for this index. A missing manifest
+    /// references nothing; an unreadable one yields `None` so orphan sweeps
+    /// skip the index instead of deleting its live runs.
     pub(crate) fn referenced_files(
         path: &Path,
         kind: DerivedRunKind,
         table: &str,
         column: &str,
-    ) -> Vec<String> {
-        Self::decode(&fs::read(path).unwrap_or_default())
-            .ok()
-            .filter(|manifest| {
-                manifest.kind == kind && manifest.table == table && manifest.column == column
-            })
-            .into_iter()
-            .flat_map(|manifest| manifest.runs)
-            .map(|run| run.file)
-            .collect()
+    ) -> Option<Vec<String>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+            Err(_) => return None,
+        };
+        Some(
+            Self::decode(&bytes)
+                .ok()
+                .filter(|manifest| {
+                    manifest.kind == kind && manifest.table == table && manifest.column == column
+                })
+                .into_iter()
+                .flat_map(|manifest| manifest.runs)
+                .map(|run| run.file)
+                .collect(),
+        )
     }
 }
 

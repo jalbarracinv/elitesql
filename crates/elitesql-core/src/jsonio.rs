@@ -40,6 +40,24 @@ pub fn format_timestamp(micros: i64) -> String {
     format!("{} {}Z", format_date(days as i32), format_time(tod))
 }
 
+/// Whether any integer in `j` lies outside JavaScript's exactly representable
+/// range (|n| > 2^53 - 1).
+fn json_has_unsafe_integer(j: &J) -> bool {
+    const SAFE: i128 = 9_007_199_254_740_991;
+    match j {
+        J::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                !(-SAFE..=SAFE).contains(&(i as i128))
+            } else {
+                n.as_u64().is_some_and(|u| u as i128 > SAFE)
+            }
+        }
+        J::Array(items) => items.iter().any(json_has_unsafe_integer),
+        J::Object(map) => map.values().any(json_has_unsafe_integer),
+        _ => false,
+    }
+}
+
 pub fn value_to_json(v: &Value) -> J {
     match v {
         Value::Null => J::Null,
@@ -55,6 +73,12 @@ pub fn value_to_json(v: &Value) -> J {
         Value::Text(s) => json!(s),
         Value::Blob(b) => json!({"$t": "blob", "hex": hex_encode(b)}),
         Value::Timestamp(us) => json!({"$t": "timestamp", "us": us, "iso": format_timestamp(*us)}),
+        // JavaScript's JSON.parse rounds integers beyond 2^53 before any
+        // reviver runs, so such values travel as their exact JSON text and
+        // are parsed by a precision-preserving parser in the client.
+        Value::Json(j) if json_has_unsafe_integer(j) => {
+            json!({"$t": "json", "text": j.to_string()})
+        }
         Value::Json(j) => json!({"$t": "json", "v": j}),
         Value::Vector(v) => {
             json!({"$t": "vector", "v": v.iter().map(|x| *x as f64).collect::<Vec<_>>()})
@@ -131,7 +155,13 @@ fn tagged_to_value(map: &Map<String, J>) -> Result<Value> {
             (None, Some(iso)) => Value::Time(parse_time_str(iso).ok_or_else(|| bad("bad iso"))?),
             _ => return Err(bad("missing us/iso")),
         },
-        "json" => Value::Json(map.get("v").cloned().ok_or_else(|| bad("missing v"))?),
+        "json" => match (map.get("v"), map.get("text").and_then(|text| text.as_str())) {
+            (Some(v), _) => Value::Json(v.clone()),
+            (None, Some(text)) => {
+                Value::Json(serde_json::from_str(text).map_err(|_| bad("bad json text"))?)
+            }
+            _ => return Err(bad("missing v/text")),
+        },
         "vector" => {
             let arr = map
                 .get("v")

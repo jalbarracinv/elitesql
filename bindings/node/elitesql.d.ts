@@ -15,9 +15,21 @@ export interface Hit {
 
 export class EliteSQLError extends Error {
   code: number;
+  /** Nothing of the failed unit of work can have been published (codes 9, 21). */
+  readonly retrySafe: boolean;
+  /** The write may already be visible despite the error (codes 17, 1): verify before retrying. */
+  readonly maybePublished: boolean;
+  static IO: number;
+  static CORRUPT: number;
   static CONFLICT_RETRY: number;
+  static DATABASE_LOCKED: number;
+  static UNIQUE_VIOLATION: number;
+  static READ_ONLY: number;
+  static MEMORY_LIMIT: number;
   static COMMIT_UNKNOWN: number;
   static QUERY_INTERRUPTED: number;
+  static AUTH: number;
+  static TRANSACTION_EXPIRED: number;
 }
 
 export class SidecarClient {
@@ -60,7 +72,8 @@ export class SidecarClient {
   ): Promise<Hit[]>;
   checkpoint(): Promise<unknown>;
   compact(): Promise<unknown>;
-  close(): void;
+  /** Waits for requests already sent to be answered, then ends the connection. */
+  close(): Promise<void>;
 }
 
 export class SidecarQueryCursor implements AsyncIterable<unknown[]> {
@@ -72,5 +85,9 @@ export class SidecarQueryCursor implements AsyncIterable<unknown[]> {
 }
 
 export function decodeValue(v: unknown): unknown;
+/** Exact microseconds since the epoch of a Date decoded by this client. */
+export function timestampMicros(date: Date): bigint;
+/** JSON.parse that keeps integers beyond 2^53 exact as BigInt. */
+export function parseJsonExact(text: string): unknown;
 export function encodeParam(v: unknown): unknown;
 export function encodeParams(v: unknown[] | Record<string, unknown>): unknown;
