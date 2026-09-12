@@ -139,8 +139,12 @@ fn a_large_scan_yields_the_state_lock_to_a_concurrent_writer() {
         let commit_started = Instant::now();
         db.insert("docs", record(ROWS + attempt)).unwrap();
         let commit_elapsed = commit_started.elapsed();
-        let scan_still_running = done_rx.try_recv().is_err();
-        let rows = done_rx.recv().unwrap();
+        // `try_recv` consumes the result when the scan already finished, so
+        // take the row count from whichever call delivers it.
+        let (scan_still_running, rows) = match done_rx.try_recv() {
+            Ok(rows) => (false, rows),
+            Err(_) => (true, done_rx.recv().unwrap()),
+        };
         worker.join().unwrap();
         assert!(rows >= ROWS, "attempt {attempt}: scan lost rows");
         if commit_elapsed < baseline / 2 && scan_still_running {

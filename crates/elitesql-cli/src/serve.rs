@@ -138,6 +138,7 @@ trait Stream: Read + Write + Send + Sized + 'static {
     fn duplicate(&self) -> std::io::Result<Self>;
     fn peer(&self) -> String;
     fn set_timeouts(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn shutdown_write(&self) -> std::io::Result<()>;
 }
 
 impl Stream for UnixStream {
@@ -150,6 +151,9 @@ impl Stream for UnixStream {
     fn set_timeouts(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.set_read_timeout(timeout)?;
         self.set_write_timeout(timeout)
+    }
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
     }
 }
 
@@ -165,6 +169,9 @@ impl Stream for TcpStream {
     fn set_timeouts(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.set_read_timeout(timeout)?;
         self.set_write_timeout(timeout)
+    }
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
     }
 }
 
@@ -273,6 +280,15 @@ fn accept_loop<S: Stream>(
                     let _ = writeln!(stream, "{refusal}");
                     let _ = stream.flush();
                     eprintln!("refused {}: connection limit {max} reached", stream.peer());
+                    // Closing a TCP socket with unread input makes the kernel
+                    // send RST, and a client that already wrote its first
+                    // request would then see "connection reset" instead of
+                    // this refusal. Announce the close and drain what the
+                    // client sent (briefly) before dropping the socket.
+                    let _ = stream.shutdown_write();
+                    let _ = stream.set_timeouts(Some(Duration::from_millis(200)));
+                    let mut sink = [0u8; 4096];
+                    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
                     continue;
                 }
                 live.fetch_add(1, Ordering::Relaxed);
