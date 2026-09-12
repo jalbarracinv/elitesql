@@ -9,7 +9,7 @@
 > **A tiny operational database for AI-native apps.**
 > SQLite-fast reads, better concurrent writes, native ANN.
 
-EliteSQL is an **embedded** database engine (no enforced server, no daemon, no ceremonial tuning) written in Rust. A database is a self-contained directory you can copy, back up and move. When several processes need it, or the app runs on another machine, the same binary can [serve it](#multi-worker-and-remote-the-sidecar-mode) over a socket or a port — a deployment option, not a requirement.
+EliteSQL is an **embedded** database engine (no enforced server, no daemon, no ceremonial tuning) written in Rust and made for **Python** applications first: one `pip install`, one shared library, `import elitesql`. A database is a self-contained directory you can copy, back up and move. When several processes need it, or the app runs on another machine, the same binary can [serve it](#multi-worker-and-remote-the-sidecar-mode) over a socket or a port — a deployment option, not a requirement.
 
 It does not compete with big db projects like PostgreSQL or MySQL: it competes against the complexity of operating this tower in a modern app:
 
@@ -21,8 +21,9 @@ But also it delivers [strong performance](benchmark.md) enough to handle million
 
 The promise is opening a single file and having records, JSON, blobs, indexes, ANN vector search, snapshots and sane concurrency inside:
 
-```text
-db.open("app.esql")
+```python
+from elitesql import EliteSQL
+db = EliteSQL("app.esql")
 ```
 
 ## Why EliteSQL
@@ -79,241 +80,213 @@ cargo run --release -p elitesql-core --example stress -- --duration 3m
 The generated database is retained under `target/stress-runs/` for inspection.
 See [stress-test.md](stress-test.md) for the workload and all options.
 
-## Quick installation
+## Install for Python
 
-Requirements: [Rust](https://rustup.rs) 1.89 or newer. We recommend installing
-Rust with `rustup` instead of an operating-system package, which may provide an
-older version of Cargo:
+EliteSQL ships as a small pure-Python module (`elitesql.py`, standard library
+only) plus one native shared library, `libelitesql`, that the module loads with
+`ctypes`. Python 3.9 or newer; Linux and macOS.
 
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y --default-toolchain 1.89.0 --profile minimal
-source "$HOME/.cargo/env"
-rustc --version
-```
-
-Install the `elitesql` command:
+**1. Build the shared library once.** This is the only step that needs the
+Rust toolchain ([rustup](https://rustup.rs), Rust 1.89 or newer):
 
 ```bash
 git clone https://github.com/jalbarracinv/elitesql.git
 cd elitesql
-cargo install --locked --path crates/elitesql-cli
-elitesql --help
+cargo build --release -p elitesql-ffi
+# -> target/release/libelitesql.so (Linux) or libelitesql.dylib (macOS)
 ```
 
-`cargo build --release` only creates `target/release/elitesql`; it does not add
-the command to your `PATH`. `cargo install` copies it to `~/.cargo/bin`, which
-`rustup` adds to your `PATH`.
-
-To update an existing installation when a new release is available:
+**2. Install the Python package** from the repository:
 
 ```bash
-cd elitesql
-git pull --ff-only
-cargo install --locked --path crates/elitesql-cli --force
+pip install ./bindings/python
 ```
 
-For development, run the test suite and benchmarks from the repository:
+The module finds `libelitesql` automatically when it lives inside the repository
+checkout (`target/release`). Anywhere else, point to it once:
 
 ```bash
-cargo test --locked
-cargo bench --locked
+export ELITESQL_LIB=/opt/elitesql/libelitesql.so
 ```
 
-To use it as a dependency in another Rust project:
+or pass `EliteSQL("app.esql", lib_path="/opt/elitesql/libelitesql.so")`. Deploying
+to a machine without Rust means copying two files: `elitesql.py` (or the wheel
+from `python -m build --wheel` in `bindings/python`) and a `libelitesql.so`
+built for that platform, for example inside a `rust:1.89-bookworm` Docker
+container when the target is Linux.
 
-```toml
-[dependencies]
-elitesql-core = { path = "../elitesql/crates/elitesql-core" }
-# or straight from git:
-# elitesql-core = { git = "<repo-url>" }
+EliteSQL is not on PyPI yet. Publishing wheels that bundle `libelitesql` for
+Linux x86_64/aarch64 and macOS (via `maturin` or `cibuildwheel`) is planned so
+that `pip install elitesql` becomes the whole installation; until then the two
+steps above are it.
+
+## Quick start (Python)
+
+```python
+from elitesql import EliteSQL
+
+with EliteSQL("app.esql") as db:                 # creates the directory if missing
+    db.query("""
+        CREATE TABLE users (
+          id int AUTO_INCREMENT PRIMARY KEY,
+          email varchar(255) NOT NULL,
+          plan enum('free', 'pro') NOT NULL DEFAULT 'free',
+          created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    db.query("CREATE UNIQUE INDEX ON users (email)")
+
+    # Parameters are bound as typed values, never interpolated.
+    result = db.query("INSERT INTO users (email) VALUES (%s)", ["ana@example.com"])
+    ana_id = result["lastrowid"]                 # 1
+
+    rows = db.query(
+        "SELECT id, email, plan FROM users WHERE plan = %(plan)s ORDER BY id LIMIT %(n)s",
+        {"plan": "free", "n": 10},
+    )
+    print(rows["columns"], rows["rows"])         # ['id', 'email', 'plan'] [[1, 'ana@example.com', 'free']]
+
+    updated = db.query("UPDATE users SET plan = 'pro' WHERE id = %s", [ana_id])
+    print(updated["affected"])                   # 1
 ```
 
-## Quick start
+`query()` returns `{"columns", "rows"}` for `SELECT`, `{"inserted": [...],
+"lastrowid": ...}` for `INSERT`, `{"affected": n}` for `UPDATE`/`DELETE` and
+`{"ok": True}` for DDL. Values come back as Python types: `int`, `float`, `str`,
+`bytes`, `bool`, `None`, `datetime.date`/`time`/`datetime` (UTC), `dict`/`list`
+for `json`, and `list[float]` for vectors.
 
-```rust
-use elitesql_core::{Column, ColumnType, Db, Record, TableSchema, Value};
+### DB-API style cursors
 
-fn main() -> elitesql_core::Result<()> {
-    let db = Db::open_or_create("app.esql")?;
+```python
+cur = db.cursor()
+cur.execute("SELECT id, email FROM users WHERE id = ?", [ana_id])
+print(cur.description[0][0])   # 'id'
+print(cur.fetchone())          # [1, 'ana@example.com']
 
-    db.create_table(TableSchema::new(
-        "docs",
-        vec![
-            Column::new("title", ColumnType::Text).not_null(),
-            Column::new("score", ColumnType::Int64),
-            Column::new("meta", ColumnType::Json),
-        ],
-    ))?;
-    db.create_index("docs", "title", false)?;
-
-    // Simple write (auto-commit). The id is a ULID generated by the engine.
-    let mut rec = Record::new();
-    rec.insert("title".into(), Value::Text("hello".into()));
-    rec.insert("score".into(), Value::Int64(10));
-    let id = db.insert("docs", rec)?;
-
-    // Multi-operation transaction: atomic, isolated, optimistically
-    // validated at commit (Error::Conflict => retry).
-    let mut txn = db.begin();
-    let mut patch = Record::new();
-    patch.insert("score".into(), Value::Int64(99));
-    txn.update("docs", &id, patch)?;
-    txn.commit()?;
-
-    // Snapshots: stable reads while others write.
-    let snap = db.snapshot();
-    let current = db.get("docs", &id)?.unwrap();
-    let at_snapshot = db.get_at(&snap, "docs", &id)?.unwrap();
-    assert_eq!(current["score"], at_snapshot["score"]);
-
-    // Equality lookup (uses the secondary index when one exists).
-    let hits = db.find_eq("docs", "title", &Value::Text("hello".into()))?;
-    assert_eq!(hits.len(), 1);
-    Ok(())
-}
+cur.execute("INSERT INTO users (email) VALUES (%s)", ["bo@example.com"])
+print(cur.lastrowid)           # 2
+cur.executemany("INSERT INTO users (email) VALUES (%s)", [["c@x.com"], ["d@x.com"]])
+print(cur.rowcount)            # 2
 ```
 
-### Relational and MySQL compatibility
+### Transactions
 
-Every table has an immutable physical ULID, while `id` is available for an
-ordinary declared SQL column. This permits direct MySQL-style primary keys:
+Several operations become one atomic commit. Writers prepare in parallel and
+only meet at commit; a conflict raises `EliteSQLError` with code 9
+(`CONFLICT_RETRY`) and the whole unit can be rerun.
 
-```sql
-CREATE TABLE users (
-  id int AUTO_INCREMENT PRIMARY KEY,
-  email varchar(255) NOT NULL,
-  plan enum('free', 'pro') NOT NULL DEFAULT 'free',
-  created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE UNIQUE INDEX ON users (email);
+```python
+from elitesql import EliteSQLError
 
-CREATE TABLE documents (
-  id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-  owner_id int NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  body longtext
-);
+with db.transaction() as tx:                      # commits on success, rolls back on exception
+    new = tx.insert("users", {"email": "eve@example.com"})
+    tx.query("UPDATE users SET plan = 'pro' WHERE id = %s", [new["record"]["id"]])
+    row = tx.get("users", new["id"])              # new["id"] is the physical ULID
+    tx.update("users", new["id"], {"plan": "free"})
 
-INSERT INTO users (email) VALUES ('ana@example.com') RETURNING id;
-UPDATE accounts SET credits = credits - 1
-WHERE id = 7 AND credits >= 1;
+def promote(tx):
+    tx.query("UPDATE accounts SET credits = credits - 1 WHERE id = 7 AND credits >= 1")
+    return tx.query("SELECT credits FROM accounts WHERE id = 7")["rows"][0][0]
+
+credits = db.run_transaction(promote)             # retries only on code 9
+
+try:
+    db.query("INSERT INTO users (email) VALUES (%s)", ["ana@example.com"])
+except EliteSQLError as error:
+    print(error.code, error.retry_safe, error.maybe_published)   # 11 False False
 ```
 
-The identity high-water mark is durable and advances past explicitly imported
-values. One-column foreign keys support `RESTRICT` and `CASCADE` and are
-validated at optimistic commit. `INSERT IGNORE` and `ON CONFLICT DO NOTHING`
-suppress uniqueness conflicts; global `COUNT(DISTINCT col)`, `NOW()` and
-`CURRENT_TIMESTAMP` are also supported. Python exposes DB-API-style
-`fetchone`, `fetchall` and `lastrowid`, while Rust, embedded Python and the
-sidecar can run multi-statement SQL through an explicit transaction. See the
-[SQL manual](manual.md) and [MySQL migration guide](mysql2elite.md) for limits
-and retry rules.
+Every error carries a stable `code`; `error.retry_safe` tells you when nothing
+was published (safe to rerun) and `error.maybe_published` when the write may
+already be visible (verify before retrying). The table of codes is in the
+[Python README](bindings/python/README.md#error-codes-and-retries).
 
-### Vector search (ANN)
+### Vectors, full text and hybrid search
 
-Embeddings as a first-class type, with our own HNSW and metadata filters:
+Embeddings are an ordinary column type with a native HNSW index; BM25 full-text
+and reciprocal-rank-fusion hybrid search sit next to it.
 
-```rust
-use elitesql_core::{Column, ColumnType, TableSchema, VectorIndexOptions, VectorSearchOptions};
+```python
+db.query("CREATE TABLE notes (body text NOT NULL, workspace text, emb vector(768))")
+db.create_vector_index("notes", "emb", metric="cosine")   # sync by default; mode="async", quantized=True available
+db.create_text_index("notes", "body")                     # BM25
 
-db.create_table(TableSchema::new(
-    "notes",
-    vec![
-        Column::new("body", ColumnType::Text).not_null(),
-        Column::new("workspace", ColumnType::Text),
-        Column::vector("embedding", 768),
-    ],
-))?;
-db.create_vector_index("notes", "embedding", VectorIndexOptions::default())?; // cosine, sync
+db.query("INSERT INTO notes (body, workspace, emb) VALUES (%s, %s, %s)",
+         ["quarterly numbers look good", "acme", embedding])
 
-// ... insert records with Value::Vector(...) ...
+hits = db.search_vector("notes", "emb", query_embedding, top_k=10, filter={"workspace": "acme"})
+for hit in hits:
+    print(hit["id"], hit["distance"], hit["record"]["body"])
 
-let mut filter = elitesql_core::Record::new();
-filter.insert("workspace".into(), Value::Text("acme".into()));
-let hits = db.search_vector(
-    "notes", "embedding", &query_embedding, 20,
-    &VectorSearchOptions { filter: Some(filter), ..Default::default() },
-)?;
-for hit in hits {
-    println!("{} (dist {:.3})", hit.id, hit.distance);
-}
+hits = db.search_text("notes", "body", "quarterly numbers", top_k=10)
+hits = db.search_hybrid("notes", text=("body", "quarterly numbers"),
+                        vector=("emb", query_embedding), top_k=10)
 ```
 
-Vectors are ordinary typed columns, so replacing an embedding is a single SQL
-update; the vector index follows the committed record automatically:
+Replacing an embedding is a plain `UPDATE`; the index follows the committed
+row. Vector, filter and text search also work over the sidecar with the same
+method names.
 
-```sql
-UPDATE notes
-SET embedding = '[0.12, -0.04, 0.87, ...]'
-WHERE id = 'note-42';
+### Snapshots and threads
+
+`EliteSQL` is thread-safe and `ctypes` releases the GIL on every call, so
+Python threads read and write in parallel. A snapshot is a stable read
+position while others keep committing:
+
+```python
+with db.snapshot() as snap:
+    before = snap.scan("users")          # every row as of this instant
+    one = snap.get("users", some_ulid)
 ```
 
-The replacement vector must have the column's declared dimension (768 above).
+### Multiple processes: gunicorn, uwsgi, cron jobs
 
-The current 100K-vector synthetic benchmark (dim 64) obtains recall@10 of
-0.994 at `ef_search=128` and 0.998 at 256 (1.0 at 512), with mean search
-intervals of about 0.42 ms and 0.77 ms respectively. An `Async` mode is available so commits do not
-wait for indexing, plus a `quantized` (int8) option for roughly 4x smaller
-vector payloads. See [benchmark.md](benchmark.md) for the measured memory,
-latency, and quality trade-offs.
-
-### Full-text and hybrid
-
-```rust
-db.create_text_index("notes", "body")?;                    // BM25
-let hits = db.search_text("notes", "body", "query", 10, None)?;
-let hits = db.search_hybrid("notes", &HybridQuery {        // RRF: text + vector
-    text: Some(("body", "query")),
-    vector: Some(("emb", &embedding)),
-    top_k: 10,
-    ..Default::default()
-})?;
-```
+A database directory is owned by one process. When several processes need it,
+run `elitesql serve` and connect each worker with `SidecarClient`; the API is
+the same, the engine is the same, only the transport changes. See
+[the sidecar section](#multi-worker-and-remote-the-sidecar-mode) and the
+runnable demo in `examples/gunicorn_demo/run_demo.sh`.
 
 ### SQL
 
-The same engine exposes a deliberately small SQL dialect — full reference with examples in [manual.md](manual.md), and a migration guide for people arriving from MySQL in [mysql2elite.md](mysql2elite.md):
+The dialect is deliberately small and documented in [manual.md](manual.md),
+with a [MySQL migration guide](mysql2elite.md). It covers `CREATE TABLE` with
+`AUTO_INCREMENT`/identity primary keys, `enum`, `varchar(N)`, defaults and
+`CURRENT_TIMESTAMP`, one-column foreign keys with `RESTRICT`/`CASCADE`,
+unique indexes, `INSERT ... RETURNING`, `INSERT IGNORE`/`ON CONFLICT DO
+NOTHING`, `UPDATE`/`DELETE` with arithmetic and automatic conflict retry,
+`SELECT` with joins, `GROUP BY`/`HAVING`, aggregates including
+`COUNT(DISTINCT col)`, `ORDER BY`/`LIMIT`/`OFFSET`, date ranges, `EXPLAIN`,
+and `ALTER TABLE` (add, drop and rename columns, rename tables) that is
+crash-safe through an intent journal. Placeholders are `?`, `%s` or
+`%(name)s`; `LIMIT`/`OFFSET` may be parameters.
 
-```rust
-use elitesql_core::{QueryOutput, Record, Value};
+```python
+db.query("""
+    SELECT u.name, o.amount FROM users u
+    JOIN orders o ON o.user_id = u.id
+    WHERE u.email = %s ORDER BY o.amount DESC LIMIT 10
+""", ["ana@x.com"])
 
-db.query("CREATE TABLE users (name text NOT NULL, email text, age int, since date)")?;
-db.query("CREATE UNIQUE INDEX ON users (email)")?;
-db.query("INSERT INTO users (name, email, age, since) VALUES ('ana', 'ana@x.com', 30, '2026-08-07')")?;
-
-if let QueryOutput::Rows { columns, rows } = db.query(
-    "SELECT u.name, o.amount FROM users u \
-     JOIN orders o ON o.user_id = u.id \
-     WHERE u.email = 'ana@x.com' ORDER BY o.amount DESC LIMIT 10",
-)? {
-    // ...
-}
-
-// Aggregates with GROUP BY/HAVING and date-range filters:
-db.query(
-    "SELECT age, count(*) AS n FROM users \
-     WHERE since >= '2026-01-01' GROUP BY age HAVING count(*) > 1 ORDER BY n DESC",
-)?;
-
-// Parameters are parsed and bound as typed values, never interpolated.
-db.query_params(
-    "SELECT name FROM users WHERE email = %s LIMIT ?",
-    &[Value::Text("ana@x.com".into()), Value::Int64(10)],
-)?;
-
-let mut params = Record::new();
-params.insert("email".into(), Value::Text("ana@x.com".into()));
-params.insert("limit".into(), Value::Int64(10));
-db.query_named_params(
-    "SELECT name FROM users WHERE email = %(email)s LIMIT %(limit)s",
-    &params,
-)?;
+db.query("""
+    SELECT age, count(*) AS n FROM users
+    WHERE since >= '2026-01-01' GROUP BY age HAVING count(*) > 1 ORDER BY n DESC
+""")
 ```
 
 ## CLI
 
+The `elitesql` command creates, inspects, checks, backs up, repairs and serves
+databases. Install it once from the checkout (needs the Rust toolchain):
+
 ```bash
-cargo build --release -p elitesql-cli     # produces target/release/elitesql
+cargo install --locked --path crates/elitesql-cli   # copies it to ~/.cargo/bin
+elitesql --help
+# update later with: git pull --ff-only && cargo install --locked --path crates/elitesql-cli --force
+```
+
+```bash
 
 elitesql --create app.esql               # create a new database (once)
 elitesql query app.esql "SELECT count(*) AS n FROM docs"
@@ -414,32 +387,18 @@ What the server mode is **not**, so the boundaries are clear:
 
 Use TCP when the app genuinely has to live on another machine — to give it separate resources, for instance. To scale workers, keep them on one host with the Unix socket and skip the network entirely.
 
-## Bindings
+## Other bindings
 
-**Python** ([bindings/python/elitesql.py](bindings/python/elitesql.py)) — embedded via the C ABI (ctypes releases the GIL on every call: threads truly parallelize) or via the sidecar:
-
-```python
-from elitesql import EliteSQL
-
-with EliteSQL("app.esql") as db:
-    db.query("CREATE TABLE notes (body text NOT NULL, emb vector(768))")
-    db.create_vector_index("notes", "emb", metric="cosine")
-    db.query("INSERT INTO notes (body, emb) VALUES (%s, %s)", ["hello", embedding])
-    rows = db.query(
-        "SELECT * FROM notes WHERE body = %(body)s LIMIT %(limit)s",
-        {"body": "hello", "limit": 10},
-    )
-    hits = db.search_vector("notes", "emb", embedding, top_k=10, filter={"ws": "acme"})
-```
+**Python** is covered above and in [bindings/python/README.md](bindings/python/README.md)
+(error codes, retries, timeouts, durability notes).
 
 Positional `?`/`%s` and named `%(name)s` placeholders are supported by the
-Rust API, C ABI, embedded Python binding, sidecar protocol and Node client.
-Parameter count and names are validated strictly; strings containing quotes or
-SQL syntax stay data and cannot alter the parsed statement. Binding preserves
-nulls, booleans, signed 64-bit integers, floats, text, blobs,
+Python binding, the sidecar protocol, the Node client, the C ABI and the Rust
+API. Parameter count and names are validated strictly; strings containing
+quotes or SQL syntax stay data and cannot alter the parsed statement. Binding
+preserves nulls, booleans, signed 64-bit integers, floats, text, blobs,
 date/time/timestamp, JSON and vectors. `LIMIT` and `OFFSET` may be parameters
-but must receive a non-negative `int64`. Rust also provides parameterized
-cursor variants for large results.
+but must receive a non-negative `int64`.
 
 **Node** ([bindings/node/elitesql.js](bindings/node/elitesql.js)) — dependency-free sidecar client:
 
@@ -448,21 +407,40 @@ const { SidecarClient } = require('./elitesql');
 const db = await SidecarClient.connect('/tmp/elitesql.sock');
 const { rows } = await db.query('SELECT * FROM notes WHERE body = %s LIMIT %s', ['hello', 10]);
 const hits = await db.searchVector('notes', 'emb', embedding, { topK: 10 });
+await db.close();   // waits for requests already sent
 ```
 
-**C** — header at [crates/elitesql-ffi/include/elitesql.h](crates/elitesql-ffi/include/elitesql.h); `cargo build --release -p elitesql-ffi` produces `libelitesql`.
+Int64 values beyond 2^53 arrive as `BigInt`, timestamps keep their microseconds
+(`timestampMicros(date)`), and JSON columns keep large integers exact.
+
+**C** — header at [crates/elitesql-ffi/include/elitesql.h](crates/elitesql-ffi/include/elitesql.h); `cargo build --release -p elitesql-ffi` produces `libelitesql`, the same library the Python binding loads.
 
 ## Durability
 
-| Mode | fsync | On process crash | On OS crash |
+| Mode | fsync | On process crash | On OS crash / power loss |
 |---|---|---|---|
-| `Safe` (default) | Every commit group | Loses nothing | Loses nothing |
-| `Balanced` | Every ~25 ms, grouped | Loses nothing | May lose the last few ms |
-| `Fast` | Checkpoints only | Loses nothing | May lose recent commits |
+| `Safe` (default) | Every commit group, before acknowledging | Loses nothing | Loses nothing (see the macOS note) |
+| `Balanced` | Within `balanced_sync_interval_ms` (25 ms) of a commit, by the next commit or a timer | Loses nothing | May lose commits acknowledged in the last interval |
+| `Fast` | Checkpoints and clean close only | Loses nothing | May lose every commit since the last checkpoint or close |
+
+In every mode a clean `close()`/drop syncs the WAL, so nothing acknowledged
+is left in the page cache; only a crash before close can lose the tail. A
+torn or zero-filled WAL tail left by a power loss is truncated to the last
+complete commit; damage *followed by* a complete commit is refused as
+corruption. Atomicity holds in all modes: never half a commit.
 
 Concurrent `Safe`/`Balanced` commits share a physical WAL sync when they overlap;
 every caller still waits for that group's sync result before returning. This
 reduces sync amplification without weakening the selected durability contract.
+If a sync fails, the commit returns `CommitUnknown` (the write is visible, its
+durability is not) and further writes are fenced until the database is reopened
+and its WAL chain re-validated.
+
+**macOS:** `fsync` does not flush the drive's write cache, so `Safe` survives
+a process or kernel crash but not a power loss unless you set
+`DbOptions { full_fsync: true, .. }` (`F_FULLFSYNC`, opt-in like SQLite's
+`fullfsync`; roughly an order of magnitude slower per barrier). Linux needs
+nothing. The published benchmarks use the default.
 
 ```rust
 use elitesql_core::{Db, DbOptions, Durability};
@@ -794,6 +772,215 @@ cargo bench -p elitesql-core --bench contention_matrix -- \
 It gives both engines the same deterministic rows and 10K-row transaction batches. Durability is matched explicitly: EliteSQL `fast` ↔ SQLite WAL/`synchronous=OFF`, `balanced` ↔ `NORMAL`, and `safe` ↔ `FULL`. Use `--bulk-sorted` for the direct import path; `--durability balanced|safe`, `--batch-size`, `--point-reads`, `--full-scans`, `--engine both|elitesql|sqlite`, `--total-memory-mib`, `--index-delta-mib`, `--maintenance-mib`, and `--memtable-mib` change or isolate the workload; `--smoke` runs a quick 10K-row correctness check.
 
 See [benchmark.md](benchmark.md) for the complete methodology, exact environment, timing definitions, reproducible commands, 1M/10M results, and the 1/2/4/8 concurrent-writer comparison with CSV data and SVG charts. The scalable benchmark reports the write path separately from all automatic/final checkpoints and prints `SQLite time / EliteSQL time`; a ratio above 1 means EliteSQL was faster.
+
+## Using from Rust
+
+The engine is a Rust crate, `elitesql-core`; everything the Python binding does
+goes through this API. Requirements: [Rust](https://rustup.rs) 1.89 or newer,
+installed with `rustup` rather than an operating-system package:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --default-toolchain 1.89.0 --profile minimal
+source "$HOME/.cargo/env"
+```
+
+```toml
+[dependencies]
+elitesql-core = { path = "../elitesql/crates/elitesql-core" }
+# or straight from git:
+# elitesql-core = { git = "https://github.com/jalbarracinv/elitesql.git" }
+```
+
+For development, run the test suite and benchmarks from the repository:
+
+```bash
+cargo test --locked
+cargo bench --locked
+bash scripts/acceptance.sh     # fmt, clippy, workspace tests, FFI, Python, Node
+```
+
+### Quick start (Rust)
+
+```rust
+use elitesql_core::{Column, ColumnType, Db, Record, TableSchema, Value};
+
+fn main() -> elitesql_core::Result<()> {
+    let db = Db::open_or_create("app.esql")?;
+
+    db.create_table(TableSchema::new(
+        "docs",
+        vec![
+            Column::new("title", ColumnType::Text).not_null(),
+            Column::new("score", ColumnType::Int64),
+            Column::new("meta", ColumnType::Json),
+        ],
+    ))?;
+    db.create_index("docs", "title", false)?;
+
+    // Simple write (auto-commit). The id is a ULID generated by the engine.
+    let mut rec = Record::new();
+    rec.insert("title".into(), Value::Text("hello".into()));
+    rec.insert("score".into(), Value::Int64(10));
+    let id = db.insert("docs", rec)?;
+
+    // Multi-operation transaction: atomic, isolated, optimistically
+    // validated at commit (Error::Conflict => retry).
+    let mut txn = db.begin();
+    let mut patch = Record::new();
+    patch.insert("score".into(), Value::Int64(99));
+    txn.update("docs", &id, patch)?;
+    txn.commit()?;
+
+    // Snapshots: stable reads while others write.
+    let snap = db.snapshot();
+    let current = db.get("docs", &id)?.unwrap();
+    let at_snapshot = db.get_at(&snap, "docs", &id)?.unwrap();
+    assert_eq!(current["score"], at_snapshot["score"]);
+
+    // Equality lookup (uses the secondary index when one exists).
+    let hits = db.find_eq("docs", "title", &Value::Text("hello".into()))?;
+    assert_eq!(hits.len(), 1);
+    Ok(())
+}
+```
+
+### Relational and MySQL compatibility (SQL)
+
+Every table has an immutable physical ULID, while `id` is available for an
+ordinary declared SQL column. This permits direct MySQL-style primary keys:
+
+```sql
+CREATE TABLE users (
+  id int AUTO_INCREMENT PRIMARY KEY,
+  email varchar(255) NOT NULL,
+  plan enum('free', 'pro') NOT NULL DEFAULT 'free',
+  created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX ON users (email);
+
+CREATE TABLE documents (
+  id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  owner_id int NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  body longtext
+);
+
+INSERT INTO users (email) VALUES ('ana@example.com') RETURNING id;
+UPDATE accounts SET credits = credits - 1
+WHERE id = 7 AND credits >= 1;
+```
+
+The identity high-water mark is durable and advances past explicitly imported
+values. One-column foreign keys support `RESTRICT` and `CASCADE` and are
+validated at optimistic commit. `INSERT IGNORE` and `ON CONFLICT DO NOTHING`
+suppress uniqueness conflicts; global `COUNT(DISTINCT col)`, `NOW()` and
+`CURRENT_TIMESTAMP` are also supported. Python exposes DB-API-style
+`fetchone`, `fetchall` and `lastrowid`, while Rust, embedded Python and the
+sidecar can run multi-statement SQL through an explicit transaction. See the
+[SQL manual](manual.md) and [MySQL migration guide](mysql2elite.md) for limits
+and retry rules.
+
+### Vector search (ANN) in Rust
+
+Embeddings as a first-class type, with our own HNSW and metadata filters:
+
+```rust
+use elitesql_core::{Column, ColumnType, TableSchema, VectorIndexOptions, VectorSearchOptions};
+
+db.create_table(TableSchema::new(
+    "notes",
+    vec![
+        Column::new("body", ColumnType::Text).not_null(),
+        Column::new("workspace", ColumnType::Text),
+        Column::vector("embedding", 768),
+    ],
+))?;
+db.create_vector_index("notes", "embedding", VectorIndexOptions::default())?; // cosine, sync
+
+// ... insert records with Value::Vector(...) ...
+
+let mut filter = elitesql_core::Record::new();
+filter.insert("workspace".into(), Value::Text("acme".into()));
+let hits = db.search_vector(
+    "notes", "embedding", &query_embedding, 20,
+    &VectorSearchOptions { filter: Some(filter), ..Default::default() },
+)?;
+for hit in hits {
+    println!("{} (dist {:.3})", hit.id, hit.distance);
+}
+```
+
+Vectors are ordinary typed columns, so replacing an embedding is a single SQL
+update; the vector index follows the committed record automatically:
+
+```sql
+UPDATE notes
+SET embedding = '[0.12, -0.04, 0.87, ...]'
+WHERE id = 'note-42';
+```
+
+The replacement vector must have the column's declared dimension (768 above).
+
+The current 100K-vector synthetic benchmark (dim 64) obtains recall@10 of
+0.994 at `ef_search=128` and 0.998 at 256 (1.0 at 512), with mean search
+intervals of about 0.42 ms and 0.77 ms respectively. An `Async` mode is available so commits do not
+wait for indexing, plus a `quantized` (int8) option for roughly 4x smaller
+vector payloads. See [benchmark.md](benchmark.md) for the measured memory,
+latency, and quality trade-offs.
+
+### Full-text and hybrid in Rust
+
+```rust
+db.create_text_index("notes", "body")?;                    // BM25
+let hits = db.search_text("notes", "body", "query", 10, None)?;
+let hits = db.search_hybrid("notes", &HybridQuery {        // RRF: text + vector
+    text: Some(("body", "query")),
+    vector: Some(("emb", &embedding)),
+    top_k: 10,
+    ..Default::default()
+})?;
+```
+
+### SQL from Rust
+
+The same engine exposes a deliberately small SQL dialect — full reference with examples in [manual.md](manual.md), and a migration guide for people arriving from MySQL in [mysql2elite.md](mysql2elite.md):
+
+```rust
+use elitesql_core::{QueryOutput, Record, Value};
+
+db.query("CREATE TABLE users (name text NOT NULL, email text, age int, since date)")?;
+db.query("CREATE UNIQUE INDEX ON users (email)")?;
+db.query("INSERT INTO users (name, email, age, since) VALUES ('ana', 'ana@x.com', 30, '2026-08-07')")?;
+
+if let QueryOutput::Rows { columns, rows } = db.query(
+    "SELECT u.name, o.amount FROM users u \
+     JOIN orders o ON o.user_id = u.id \
+     WHERE u.email = 'ana@x.com' ORDER BY o.amount DESC LIMIT 10",
+)? {
+    // ...
+}
+
+// Aggregates with GROUP BY/HAVING and date-range filters:
+db.query(
+    "SELECT age, count(*) AS n FROM users \
+     WHERE since >= '2026-01-01' GROUP BY age HAVING count(*) > 1 ORDER BY n DESC",
+)?;
+
+// Parameters are parsed and bound as typed values, never interpolated.
+db.query_params(
+    "SELECT name FROM users WHERE email = %s LIMIT ?",
+    &[Value::Text("ana@x.com".into()), Value::Int64(10)],
+)?;
+
+let mut params = Record::new();
+params.insert("email".into(), Value::Text("ana@x.com".into()));
+params.insert("limit".into(), Value::Int64(10));
+db.query_named_params(
+    "SELECT name FROM users WHERE email = %(email)s LIMIT %(limit)s",
+    &params,
+)?;
+```
+
 
 ## License
 

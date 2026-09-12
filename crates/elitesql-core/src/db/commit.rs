@@ -50,10 +50,24 @@ pub(super) fn finish_or_wait_wal_sync(
 
     let result = match outcome {
         WalAppendOutcome::Complete => Ok(()),
-        WalAppendOutcome::SyncFailed(error) => Err(error.to_string()),
+        WalAppendOutcome::SyncFailed(error) => {
+            fence_after_wal_sync_failure(shared, &error);
+            Err(error.to_string())
+        }
     };
     group.complete(result.clone());
     result
+}
+
+/// After a failed WAL barrier the kernel may already have discarded the dirty
+/// pages of the framed records; a later successful sync would then acknowledge
+/// a commit that depends on lost bytes. Fence every further write until the
+/// database is reopened and the chain re-validated.
+pub(super) fn fence_after_wal_sync_failure(shared: &Shared, error: &std::io::Error) {
+    fence_writes(
+        shared,
+        format!("WAL sync failed; the durability of the last commit group is unknown: {error}"),
+    );
 }
 
 pub(super) fn elapsed_nanos(duration: Duration) -> u64 {
@@ -717,7 +731,10 @@ pub(super) fn finish_coordinated_insert_batch(
         .fetch_add(count, AtomicOrdering::Relaxed);
 
     let sync_error = match sync_outcome {
-        Some((WalAppendOutcome::SyncFailed(error), _)) => Some(error.to_string()),
+        Some((WalAppendOutcome::SyncFailed(error), _)) => {
+            fence_after_wal_sync_failure(shared, &error);
+            Some(error.to_string())
+        }
         _ => None,
     };
     Some(
@@ -1281,24 +1298,35 @@ pub(super) fn validate_unique(st: &State, staged: &[PreparedTable]) -> Result<()
                         });
                     }
                 }
-                if let Some(index) = st.secondary.get(&(table.name.clone(), def.column.clone())) {
-                    for holder in index.ids(&key)? {
-                        // A holder also written by this transaction is judged
-                        // by its staged value (covered by staged_new above).
-                        if holder != change.id
-                            && !staged_keys.contains(&(table.name.as_str(), holder.as_str()))
-                        {
-                            return Err(Error::UniqueViolation {
-                                table: table.name.clone(),
-                                column: def.column.clone(),
-                            });
-                        }
+                // A declared unique index that the state does not hold can
+                // never authorize a write: absence is corruption, not "no
+                // holders".
+                let index = st
+                    .secondary
+                    .get(&(table.name.clone(), def.column.clone()))
+                    .ok_or_else(|| missing_unique_index(&table.name, &def.column))?;
+                for holder in index.ids(&key)? {
+                    // A holder also written by this transaction is judged
+                    // by its staged value (covered by staged_new above).
+                    if holder != change.id
+                        && !staged_keys.contains(&(table.name.as_str(), holder.as_str()))
+                    {
+                        return Err(Error::UniqueViolation {
+                            table: table.name.clone(),
+                            column: def.column.clone(),
+                        });
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+pub(super) fn missing_unique_index(table: &str, column: &str) -> Error {
+    Error::Corrupt(format!(
+        "unique index {table}.{column} is declared by the catalog but not loaded; reopen the database to rebuild derived indexes"
+    ))
 }
 
 pub(super) fn prepared_change<'a>(

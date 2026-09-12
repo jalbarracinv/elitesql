@@ -41,9 +41,14 @@ pub(super) fn literal_to_value(lit: &Literal, ty: ColumnType, col: &str) -> Resu
             Error::Sql(format!("invalid time literal for '{col}': expected 'HH:MM:SS[.ffffff]'"))
         })?,
         (Literal::Int(n), ColumnType::Date) => {
-            let d = i32::try_from(*n).map_err(|_| {
-                Error::Sql(format!("date literal out of range for '{col}'"))
-            })?;
+            let d = i32::try_from(*n)
+                .ok()
+                .filter(|days| crate::value::date_days_in_range(*days))
+                .ok_or_else(|| {
+                    Error::Sql(format!(
+                        "date literal out of range for '{col}': expected a day count within years 1..9999"
+                    ))
+                })?;
             Value::Date(d)
         }
         (Literal::Int(n), ColumnType::Time) => {
@@ -80,20 +85,26 @@ pub(super) fn bound_value_for_column(value: &Value, ty: ColumnType, col: &str) -
     let converted = match (value, ty) {
         (Value::Int64(value), ColumnType::Float64) => Some(Value::Float64(*value as f64)),
         (Value::Int64(value), ColumnType::Timestamp) => Some(Value::Timestamp(*value)),
-        (Value::Int64(value), ColumnType::Date) => {
-            Some(Value::Date(i32::try_from(*value).map_err(|_| {
-                Error::Sql(format!("date parameter out of range for '{col}'"))
-            })?))
-        }
+        (Value::Int64(value), ColumnType::Date) => Some(Value::Date(
+            i32::try_from(*value)
+                .ok()
+                .filter(|days| crate::value::date_days_in_range(*days))
+                .ok_or_else(|| {
+                    Error::Sql(format!(
+                        "date parameter out of range for '{col}': expected a day count within years 1..9999"
+                    ))
+                })?,
+        )),
         (Value::Int64(value), ColumnType::Time) if (0..86_400_000_000).contains(value) => {
             Some(Value::Time(*value))
         }
         (Value::Text(value), ColumnType::Timestamp) => Value::parse_timestamp(value),
         (Value::Text(value), ColumnType::Date) => Value::parse_date(value),
         (Value::Text(value), ColumnType::Time) => Value::parse_time(value),
-        (Value::Text(value), ColumnType::Json) => {
-            Some(Value::Json(serde_json::Value::String(value.clone())))
-        }
+        // Same rule as a string literal: text is valid for json only if it
+        // parses as JSON. A bound parameter must not store a different shape
+        // than the literal spelling of the same statement.
+        (Value::Text(value), ColumnType::Json) => serde_json::from_str(value).ok().map(Value::Json),
         (Value::Bool(value), ColumnType::Json) => Some(Value::Json((*value).into())),
         (Value::Int64(value), ColumnType::Json) => Some(Value::Json((*value).into())),
         (Value::Float64(value), ColumnType::Json) => {
@@ -171,6 +182,14 @@ pub(super) fn exact_float_integer(float: f64) -> Option<i64> {
         .then_some(integer)
 }
 
+fn zero_canonical(x: f64) -> f64 {
+    if x == 0.0 {
+        0.0
+    } else {
+        x
+    }
+}
+
 pub(super) fn compare_numeric(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Int64(a) | Value::Timestamp(a), Value::Int64(b) | Value::Timestamp(b)) => {
@@ -182,7 +201,10 @@ pub(super) fn compare_numeric(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Float64(a), Value::Int64(b) | Value::Timestamp(b)) => {
             Some(compare_integer_float(*b, *a).reverse())
         }
-        (Value::Float64(a), Value::Float64(b)) => Some(a.total_cmp(b)),
+        // total_cmp separates the zeros; SQL `=` must not.
+        (Value::Float64(a), Value::Float64(b)) => {
+            Some(zero_canonical(*a).total_cmp(&zero_canonical(*b)))
+        }
         _ => None,
     }
 }

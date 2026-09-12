@@ -847,3 +847,327 @@ fn adding_an_identity_to_an_empty_table_preserves_uniqueness() {
         vec![vec![Value::Int64(1)]]
     );
 }
+
+// --- 2026-09-12 review (R01–R18) ---------------------------------------------
+
+fn write_intent(path: &std::path::Path, json: &str) {
+    std::fs::write(path.join("ddl.json"), json).unwrap();
+}
+
+#[test]
+fn recovery_of_a_pending_add_column_keeps_every_derived_index_enforced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let db = Db::create(&path).unwrap();
+    db.query("CREATE TABLE users(email text NOT NULL, bio text)")
+        .unwrap();
+    db.query("CREATE UNIQUE INDEX ON users(email)").unwrap();
+    db.create_text_index("users", "bio").unwrap();
+    db.query("INSERT INTO users(email,bio) VALUES('a@x','loves databases')")
+        .unwrap();
+    assert!(matches!(
+        db.query("INSERT INTO users(email) VALUES('a@x')"),
+        Err(Error::UniqueViolation { .. })
+    ));
+    db.checkpoint().unwrap();
+    drop(db);
+
+    // A crash between the intent and its completion.
+    write_intent(
+        &path,
+        r#"{"op":"AddColumn","table":"users","column":{"name":"plan","type":"text","nullable":true},"not_null":false}"#,
+    );
+    let db = Db::open(&path).unwrap();
+    assert!(!path.join("ddl.json").exists());
+    assert!(
+        matches!(
+            db.query("INSERT INTO users(email) VALUES('a@x')"),
+            Err(Error::UniqueViolation { .. })
+        ),
+        "the unique index must be enforced by the recovering process itself"
+    );
+    assert!(
+        db.query("INSERT IGNORE INTO users(email) VALUES('a@x')")
+            .is_ok(),
+        "INSERT IGNORE still sees the index"
+    );
+    assert_eq!(
+        db.search_text("users", "bio", "databases", 10, None)
+            .unwrap()
+            .len(),
+        1,
+        "the text index is loaded, not silently empty"
+    );
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert_eq!(rows(db.query("SELECT email FROM users").unwrap()).len(), 1);
+}
+
+fn last_wal(path: &std::path::Path) -> std::path::PathBuf {
+    let mut files: Vec<_> = std::fs::read_dir(path.join("wal"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|file| file.extension().is_some_and(|ext| ext == "wal"))
+        .collect();
+    files.sort();
+    files.pop().unwrap()
+}
+
+#[test]
+fn zero_filled_and_garbage_wal_tails_are_torn_tails_not_corruption() {
+    // A power loss can extend the WAL with zeros or a partially written
+    // block instead of the exact byte prefix a process kill leaves.
+    fn zeros(bytes: &mut Vec<u8>, cut: usize) {
+        bytes.truncate(cut);
+        bytes.extend(std::iter::repeat_n(0u8, 4096));
+    }
+    fn garbage(bytes: &mut Vec<u8>, cut: usize) {
+        bytes.truncate(cut);
+        bytes.extend((0..300u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8));
+    }
+    fn bit_rot(bytes: &mut [u8], cut: usize) {
+        let last = bytes.len() - 1;
+        bytes[cut.max(last - 3)] ^= 0x55;
+    }
+    type Tail = fn(&mut Vec<u8>, usize);
+    let cases: [(&str, Tail); 3] = [
+        ("zeros", zeros),
+        ("garbage", garbage),
+        ("bit rot inside the final record", |bytes, cut| {
+            bit_rot(bytes, cut)
+        }),
+    ];
+    for (label, tail) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = Db::create(&path).unwrap();
+        db.query("CREATE TABLE docs(body text)").unwrap();
+        db.query("INSERT INTO docs(body) VALUES('first-marker')")
+            .unwrap();
+        db.query("INSERT INTO docs(body) VALUES('second-marker')")
+            .unwrap();
+        drop(db);
+        let wal = last_wal(&path);
+        let mut bytes = std::fs::read(&wal).unwrap();
+        let second = bytes
+            .windows(b"second-marker".len())
+            .position(|window| window == b"second-marker")
+            .unwrap();
+        // Cut inside the second record's payload; its header stays intact.
+        tail(&mut bytes, second + 3);
+        std::fs::write(&wal, &bytes).unwrap();
+
+        let report = elitesql_core::check(&path).unwrap();
+        assert!(report.is_ok(), "{label}: check errors {:?}", report.errors);
+        let db = Db::open(&path).unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert_eq!(
+            rows(db.query("SELECT body FROM docs").unwrap()),
+            vec![vec![Value::Text("first-marker".into())]],
+            "{label}: the incomplete commit disappears, the earlier one stays"
+        );
+        db.query("INSERT INTO docs(body) VALUES('after')").unwrap();
+        drop(db);
+        assert_eq!(
+            rows(
+                Db::open(&path)
+                    .unwrap()
+                    .query("SELECT body FROM docs")
+                    .unwrap()
+            )
+            .len(),
+            2
+        );
+    }
+}
+
+#[test]
+fn torn_wal_before_empty_reserved_successors_is_recoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let db = Db::create(&path).unwrap();
+    db.query("CREATE TABLE docs(body text)").unwrap();
+    db.query("INSERT INTO docs(body) VALUES('kept')").unwrap();
+    db.query("INSERT INTO docs(body) VALUES('torn-marker')")
+        .unwrap();
+    drop(db);
+    let wal = last_wal(&path);
+    let mut bytes = std::fs::read(&wal).unwrap();
+    let cut = bytes
+        .windows(b"torn-marker".len())
+        .position(|window| window == b"torn-marker")
+        .unwrap();
+    bytes.truncate(cut);
+    std::fs::write(&wal, &bytes).unwrap();
+    // The empty successors a checkpoint reserves before syncing the old WAL.
+    std::fs::write(path.join("wal/000002.wal"), b"").unwrap();
+    std::fs::write(path.join("wal/000003.wal"), b"").unwrap();
+    let db = Db::open(&path).unwrap();
+    assert_eq!(rows(db.query("SELECT body FROM docs").unwrap()).len(), 1);
+}
+
+#[test]
+fn recovery_records_the_wal_extent_it_resumes_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let db = Db::create(&path).unwrap();
+    db.query("CREATE TABLE docs(body text)").unwrap();
+    db.query("INSERT INTO docs(body) VALUES('one')").unwrap();
+    drop(db);
+    // Successors created by an interrupted checkpoint, never recorded.
+    std::fs::write(path.join("wal/000002.wal"), b"").unwrap();
+    std::fs::write(path.join("wal/000003.wal"), b"").unwrap();
+    let db = Db::open(&path).unwrap();
+    db.query("INSERT INTO docs(body) VALUES('two')").unwrap();
+    drop(db);
+    // The writer resumed in 000003.wal; losing it must be detectable now.
+    std::fs::remove_file(path.join("wal/000003.wal")).unwrap();
+    assert!(
+        matches!(Db::open(&path), Err(Error::Corrupt(_))),
+        "a required successor cannot vanish into an older-looking chain"
+    );
+    assert!(!elitesql_core::check(&path).unwrap().is_ok());
+}
+
+#[test]
+fn transactional_update_works_with_a_declared_integer_primary_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("db")).unwrap();
+    db.query("CREATE TABLE users(id int AUTO_INCREMENT PRIMARY KEY, n int)")
+        .unwrap();
+    db.query("INSERT INTO users(n) VALUES(1),(2)").unwrap();
+    let mut tx = db.begin();
+    assert_eq!(
+        tx.query("UPDATE users SET n = n + 10").unwrap(),
+        QueryOutput::Affected(2)
+    );
+    tx.commit().unwrap();
+    assert_eq!(
+        rows(db.query("SELECT n FROM users ORDER BY id").unwrap()),
+        vec![vec![Value::Int64(11)], vec![Value::Int64(12)]]
+    );
+}
+
+#[test]
+fn table_names_with_control_characters_are_rejected() {
+    use elitesql_core::{Column, ColumnType, TableSchema};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let db = Db::create(&path).unwrap();
+    for name in ["\0elitesql_identity", "a\nb", "x\u{7f}"] {
+        assert!(matches!(
+            db.create_table(TableSchema::new(
+                name,
+                vec![Column::new("n", ColumnType::Int64)]
+            )),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+    drop(db);
+    Db::open(&path).unwrap();
+}
+
+#[test]
+fn float_zero_signs_and_nan_agree_across_indexes_equality_and_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("db")).unwrap();
+    db.query("CREATE TABLE m(x float64)").unwrap();
+    db.query("CREATE UNIQUE INDEX ON m(x)").unwrap();
+    db.query("INSERT INTO m(x) VALUES(0.0)").unwrap();
+    assert!(
+        matches!(
+            db.query("INSERT INTO m(x) VALUES(-0.0)"),
+            Err(Error::UniqueViolation { .. })
+        ),
+        "-0.0 equals 0.0 for the unique index"
+    );
+    assert_eq!(
+        rows(db.query("SELECT x FROM m WHERE x = -0.0").unwrap()).len(),
+        1
+    );
+    let stored = db.scan("m").unwrap();
+    assert!(matches!(stored[0].1["x"], Value::Float64(x) if x.is_sign_positive()));
+    let mut nan = record(&[("x", Value::Float64(f64::NAN))]);
+    assert!(matches!(
+        db.insert("m", nan.clone()),
+        Err(Error::SchemaViolation(_))
+    ));
+    nan.insert("x".into(), Value::Float64(-0.0));
+    let id = db
+        .insert("m", record(&[("x", Value::Float64(1.5))]))
+        .unwrap();
+    let mut tx = db.begin();
+    tx.update("m", &id, record(&[("x", Value::Float64(-0.0))]))
+        .unwrap();
+    assert!(matches!(tx.commit(), Err(Error::UniqueViolation { .. })));
+}
+
+#[test]
+fn identity_column_cannot_be_dropped_and_json_parameters_match_literals() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("db")).unwrap();
+    db.query("CREATE TABLE users(id int AUTO_INCREMENT PRIMARY KEY, doc json, d date)")
+        .unwrap();
+    assert!(matches!(
+        db.query("ALTER TABLE users DROP COLUMN id"),
+        Err(Error::SchemaViolation(_))
+    ));
+    db.query("INSERT INTO users(doc) VALUES('{\"a\":1}')")
+        .unwrap();
+    db.query_params(
+        "INSERT INTO users(doc) VALUES(?)",
+        &[Value::Text("{\"a\":1}".into())],
+    )
+    .unwrap();
+    let docs = rows(db.query("SELECT doc FROM users ORDER BY id").unwrap());
+    assert_eq!(
+        docs[0], docs[1],
+        "literal and bound text store the same JSON shape"
+    );
+    assert!(
+        db.query_params(
+            "INSERT INTO users(doc) VALUES(?)",
+            &[Value::Text("not json".into())],
+        )
+        .is_err(),
+        "text that does not parse as JSON is rejected like the literal"
+    );
+    assert!(db.query("INSERT INTO users(d) VALUES(100000000)").is_err());
+    assert!(db
+        .query_params(
+            "INSERT INTO users(d) VALUES(?)",
+            &[Value::Int64(100_000_000)]
+        )
+        .is_err());
+}
+
+#[test]
+fn read_only_open_reports_what_it_could_not_expose() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let db = Db::create(&path).unwrap();
+    db.query("CREATE TABLE docs(body text)").unwrap();
+    for i in 0..20 {
+        db.query(&format!("INSERT INTO docs(body) VALUES('row {i}')"))
+            .unwrap();
+    }
+    db.checkpoint().unwrap();
+    drop(db);
+    assert!(Db::open_read_only(&path)
+        .unwrap()
+        .recovery_warnings()
+        .is_empty());
+    let segment = path.join("segments/000001.seg");
+    let mut bytes = std::fs::read(&segment).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xff;
+    std::fs::write(&segment, &bytes).unwrap();
+    assert!(matches!(Db::open(&path), Err(Error::Corrupt(_))));
+    let db = Db::open_read_only(&path).unwrap();
+    let warnings = db.recovery_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("000001.seg")),
+        "a partial view must be announced: {warnings:?}"
+    );
+    assert!(db.scan("docs").unwrap().len() < 20);
+}

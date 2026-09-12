@@ -62,7 +62,8 @@ pub(crate) fn validate_wal_chain(
     }
     let mut expected_id = anchor;
     let mut version = watermark;
-    for (position, id) in ids.iter().copied().enumerate() {
+    let mut scans = Vec::with_capacity(ids.len());
+    for id in ids.iter().copied() {
         if id != expected_id {
             return Err(Error::Corrupt(format!(
                 "required wal {expected_id} is missing before {id}"
@@ -77,11 +78,24 @@ pub(crate) fn validate_wal_chain(
                 scan.valid_len
             )));
         }
-        if !scan.clean && position + 1 != ids.len() {
+        scans.push((id, scan));
+    }
+    for (position, (id, scan)) in scans.iter().enumerate() {
+        // A writer switch reserves empty successors before the previous WAL
+        // is synced, so a power loss can leave a torn tail followed only by
+        // empty files. A successor that already holds commits, however, means
+        // the torn record was complete when they were written: corruption.
+        if !scan.clean
+            && scans[position + 1..]
+                .iter()
+                .any(|(_, later)| !later.records.is_empty())
+        {
             return Err(Error::Corrupt(format!(
-                "wal {id}: incomplete record before a successor WAL"
+                "wal {id}: incomplete record before a successor WAL with commits"
             )));
         }
+    }
+    for (id, scan) in scans {
         for record in scan.records {
             if record.version <= version {
                 continue;
@@ -230,26 +244,28 @@ pub(crate) fn scan_wal(data: &[u8]) -> WalScan {
                 }
             }
             Err(error) => {
+                // Only a complete, checksummed record *after* the failure
+                // proves interior corruption. Without one, the damaged bytes
+                // are the tail a crash left behind: a strict prefix after a
+                // process kill, or zero-filled/partially written blocks after
+                // a power loss. Both are truncated as an incomplete final
+                // record; nothing acknowledged as durable can live there.
+                let later_valid_record = (start.saturating_add(1)..data.len().saturating_sub(15))
+                    .any(|offset| {
+                        let mut candidate = offset;
+                        parse_record(data, &mut candidate, offset)
+                            .is_ok_and(|record| record.version > previous_version.unwrap_or(0))
+                    });
+                let corruption = match error {
+                    WalParseError::Incomplete => later_valid_record
+                        .then(|| "incomplete record precedes a valid WAL record".into()),
+                    WalParseError::Corrupt(message) => later_valid_record.then_some(message),
+                };
                 return WalScan {
                     records,
                     valid_len: start as u64,
                     clean: false,
-                    corruption: match error {
-                        WalParseError::Incomplete => {
-                            // A damaged length can disguise an interior
-                            // record as an incomplete tail. A later complete
-                            // checksummed record proves this is corruption.
-                            (start.saturating_add(1)..data.len().saturating_sub(15))
-                                .any(|offset| {
-                                    let mut candidate = offset;
-                                    parse_record(data, &mut candidate, offset).is_ok_and(|record| {
-                                        record.version > previous_version.unwrap_or(0)
-                                    })
-                                })
-                                .then(|| "incomplete record precedes a valid WAL record".into())
-                        }
-                        WalParseError::Corrupt(message) => Some(message),
-                    },
+                    corruption,
                 };
             }
         }
@@ -347,6 +363,8 @@ pub(crate) struct WalWriter {
     file: File,
     pub len: u64,
     last_sync: Instant,
+    /// Bytes appended since the last successful `sync_data`.
+    unsynced: bool,
     poisoned: Option<String>,
     #[cfg(test)]
     fail_next_sync: bool,
@@ -368,6 +386,7 @@ impl WalWriter {
             file,
             len,
             last_sync: Instant::now(),
+            unsynced: false,
             poisoned: None,
             #[cfg(test)]
             fail_next_sync: false,
@@ -423,6 +442,7 @@ impl WalWriter {
             return Err(self.rollback_partial_append(start, write_error));
         }
         self.len = self.len.saturating_add(bytes.len() as u64);
+        self.unsynced = true;
         Ok(self.len)
     }
 
@@ -484,7 +504,13 @@ impl WalWriter {
             }
         }
         self.len = self.len.saturating_add(total as u64);
+        self.unsynced = true;
         Ok(self.len)
+    }
+
+    /// Whether appended records still await a durability barrier.
+    pub fn has_unsynced_appends(&self) -> bool {
+        self.unsynced
     }
 
     pub fn sync_due(&self, durability: Durability, balanced_interval_ms: u64) -> bool {
@@ -501,7 +527,7 @@ impl WalWriter {
     /// fully framed records in place and therefore has the same ambiguous
     /// outcome as the legacy per-commit path.
     pub fn sync_data(&mut self) -> WalAppendOutcome {
-        let sync_result = self.file.sync_data();
+        let sync_result = crate::durable::sync_data(&self.file);
         #[cfg(test)]
         let sync_result = if std::mem::take(&mut self.fail_next_sync) {
             Err(std::io::Error::other("injected WAL sync failure"))
@@ -511,6 +537,7 @@ impl WalWriter {
         match sync_result {
             Ok(()) => {
                 self.last_sync = Instant::now();
+                self.unsynced = false;
                 WalAppendOutcome::Complete
             }
             // The full framed record is already part of this process's WAL.

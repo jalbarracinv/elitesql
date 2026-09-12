@@ -145,6 +145,13 @@ fn days_in_month(y: i32, m: u32) -> u32 {
 
 /// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm),
 /// validating that the date actually exists. Years limited to 1..=9999.
+/// Whether a day count names a date within the supported calendar
+/// (years 1..=9999), the same bound `parse_date` enforces for strings.
+pub(crate) fn date_days_in_range(days: i32) -> bool {
+    let (year, _, _) = ymd_from_days(days);
+    (1..=9999).contains(&year)
+}
+
 pub(crate) fn days_from_ymd(year: i32, month: u32, day: u32) -> Option<i32> {
     if !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
         return None;

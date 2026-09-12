@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const { PassThrough } = require('node:stream');
-const { SidecarClient, EliteSQLError, decodeValue, encodeParam } = require('./elitesql');
+const { SidecarClient, EliteSQLError, decodeValue, encodeParam, timestampMicros, parseJsonExact } = require('./elitesql');
 
 class FakeSocket extends PassThrough {
   constructor() {
@@ -48,6 +48,29 @@ async function main() {
     assert.equal(decodeValue(JSON.parse(JSON.stringify(encodeParam(n)))), n);
   }
   assert.equal(decodeValue(9007199254740991), 9007199254740991);
+  // Non-finite floats round-trip instead of collapsing to NaN.
+  assert.equal(decodeValue({ $t: 'float64', repr: 'inf' }), Infinity);
+  assert.equal(decodeValue({ $t: 'float64', repr: '-inf' }), -Infinity);
+  assert.ok(Number.isNaN(decodeValue({ $t: 'float64', repr: 'NaN' })));
+  assert.deepEqual(encodeParam(-Infinity), { $t: 'float64', repr: '-inf' });
+  // Timestamps keep their microseconds through Date and back.
+  const stamp = decodeValue({ $t: 'timestamp', us: 1_700_000_000_123_456 });
+  assert.ok(stamp instanceof Date);
+  assert.equal(stamp.getTime(), 1_700_000_000_123);
+  assert.equal(timestampMicros(stamp), 1_700_000_000_123_456n);
+  assert.deepEqual(encodeParam(stamp), { $t: 'timestamp', us: 1_700_000_000_123_456 });
+  assert.equal(timestampMicros(new Date(1000)), 1_000_000n);
+  // JSON columns with integers beyond 2^53 stay exact.
+  const exact = decodeValue({ $t: 'json', text: '{"id": 9007199254740993, "tags": ["a", 1.5, -2], "ok": true, "n": null}' });
+  assert.equal(exact.id, 9007199254740993n);
+  assert.deepEqual(exact.tags, ['a', 1.5, -2]);
+  assert.equal(exact.ok, true);
+  assert.equal(exact.n, null);
+  assert.deepEqual(parseJsonExact('[1, "x\\"y", {"k": []}]'), [1, 'x"y', { k: [] }]);
+  assert.deepEqual(decodeValue({ $t: 'json', v: { a: 1 } }), { a: 1 });
+  assert.equal(new EliteSQLError(17, 'x').maybePublished, true);
+  assert.equal(new EliteSQLError(21, 'x').retrySafe, true);
+  assert.equal(new EliteSQLError(11, 'x').retrySafe, false);
   const socket = new FakeSocket();
   const client = new SidecarClient(socket);
   const cursor = await client.stream('SELECT n FROM docs', undefined, { batchRows: 2 });
@@ -64,7 +87,7 @@ async function main() {
     socket.requests.map((request) => request.op),
     ['query_open', 'query_next', 'query_next', 'ping'],
   );
-  client.close();
+  await client.close();
 
   const earlySocket = new FakeSocket();
   const earlyClient = new SidecarClient(earlySocket);
@@ -76,7 +99,7 @@ async function main() {
   assert.equal(earlyCursor.done, true);
   assert.equal(await earlyClient.ping(), true);
   assert.deepEqual(earlySocket.requests.map(r => r.op), ['query_open', 'query_next', 'query_close', 'ping']);
-  earlyClient.close();
+  await earlyClient.close();
   await assert.rejects(earlyClient.ping(), /closed/);
 
   // A transport that refuses further writes must hold the next request until
@@ -93,7 +116,14 @@ async function main() {
   assert.equal(await second, true);
   assert.equal(slowSocket.requests.length, 2);
   slowSocket.emit('drain');
-  slowClient.close();
+  // close() waits for an in-flight request instead of failing it: the server
+  // executes what it already received.
+  const inFlight = slowClient.ping();
+  const closing = slowClient.close();
+  await assert.rejects(slowClient.ping(), /closed/);
+  slowSocket.emit('drain');
+  assert.equal(await inFlight, true);
+  await closing;
 
   const stalledSocket = new FakeSocket();
   stalledSocket.write = () => false;

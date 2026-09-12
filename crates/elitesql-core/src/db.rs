@@ -115,6 +115,12 @@ pub struct DbOptions {
     /// Blob values at or above this size are stored out-of-line in `blobs/`
     /// (checksummed chunk files) instead of inline in segments/WAL.
     pub external_blob_threshold: usize,
+    /// Flush the drive's volatile write cache at every durability barrier
+    /// (`F_FULLFSYNC` on macOS, where plain `fsync` does not). Required for
+    /// `Safe` to survive a power loss on macOS; roughly an order of magnitude
+    /// slower per barrier, so it is opt-in as in SQLite. Process-wide once
+    /// enabled. No effect on Linux, where `fsync` already reaches the medium.
+    pub full_fsync: bool,
     /// Policy for reclaiming obsolete versions and merging excessive segment
     /// counts without application intervention.
     pub auto_compaction: AutoCompactionOptions,
@@ -336,6 +342,7 @@ impl Default for DbOptions {
             safe_group_commit_delay_us: 200,
             read_only: false,
             external_blob_threshold: 256 * 1024,
+            full_fsync: false,
             auto_compaction: AutoCompactionOptions::default(),
             memory: MemoryOptions::default(),
         }
@@ -1160,6 +1167,7 @@ fn load_primary_runs(dir: &Path, generation: u64) -> Result<PrimaryIdx> {
                 meta.file
             )));
         }
+        index.validate_pages()?;
         runs.push(PrimaryRun {
             index: Arc::new(index),
             meta,
@@ -1174,9 +1182,12 @@ fn publish_primary_run_manifest(dir: &Path, generation: u64, index: &PrimaryIdx)
 
 fn cleanup_primary_run_orphans(dir: &Path) {
     let indexes_dir = dir.join(INDEXES_DIR);
-    let keep: HashSet<_> = PrimaryRunManifest::referenced_files(&indexes_dir)
-        .into_iter()
-        .collect();
+    // An unreadable manifest must not be mistaken for an empty run set: that
+    // would sweep every live run and force a full rebuild on the next open.
+    let Some(referenced) = PrimaryRunManifest::referenced_files(&indexes_dir) else {
+        return;
+    };
+    let keep: HashSet<_> = referenced.into_iter().collect();
     let Ok(entries) = fs::read_dir(&indexes_dir) else {
         return;
     };
@@ -2232,6 +2243,25 @@ impl SegmentReader {
 type SegmentReaders = HashMap<u32, Arc<SegmentReader>>;
 
 impl State {
+    /// Whether every secondary, text and vector index declared by the catalog
+    /// has an in-memory structure. Commit validation treats a declared but
+    /// absent unique index as corruption, so writable handles must satisfy
+    /// this before serving writes.
+    fn derived_indexes_complete(&self) -> bool {
+        self.catalog.tables.iter().all(|table| {
+            table.indexes.iter().all(|def| {
+                self.secondary
+                    .contains_key(&(table.name.clone(), def.column.clone()))
+            }) && table.text_indexes.iter().all(|def| {
+                self.text
+                    .contains_key(&(table.name.clone(), def.column.clone()))
+            }) && table.vector_indexes.iter().all(|def| {
+                self.vector
+                    .contains_key(&(table.name.clone(), def.column.clone()))
+            })
+        })
+    }
+
     fn id_is_above_high_watermark(&self, table: &str, id: &str) -> bool {
         self.table_high_ids
             .get(table)
@@ -2778,6 +2808,11 @@ struct Shared {
     /// continue over the adopted generation, but no later write may extend an
     /// outcome whose crash durability is unknown.
     canonical_error: Mutex<Option<String>>,
+    /// What a tolerant (read-only) open had to skip or truncate: a missing or
+    /// damaged segment, an unreadable WAL. Empty for a healthy database.
+    recovery_warnings: Mutex<Vec<String>>,
+    /// Stops the `Balanced` sync timer on close.
+    sync_timer_stop: AtomicBool,
     /// Blob filenames made durable before their WAL record is appended.
     /// Compaction GC preserves these while commit validation runs without the
     /// global commit mutex.
@@ -3279,6 +3314,7 @@ pub struct Db {
     maintenance_thread: Option<std::thread::JoinHandle<()>>,
     checkpoint_thread: Option<std::thread::JoinHandle<()>>,
     derived_thread: Option<std::thread::JoinHandle<()>>,
+    sync_timer_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Db {
@@ -3305,9 +3341,26 @@ impl Drop for Db {
         if let Some(handle) = self.vector_thread.take() {
             let _ = handle.join();
         }
+        self.shared
+            .sync_timer_stop
+            .store(true, AtomicOrdering::Release);
+        if let Some(handle) = self.sync_timer_thread.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
         // A transaction may outlive its originating handle, so preserve the
         // normal commit -> state lock order while publishing final deltas.
-        let _commit = self.shared.commit.lock();
+        let mut commit = self.shared.commit.lock();
+        // A clean close makes every acknowledged commit durable in all
+        // modes: `Fast`/`Balanced` defer the barrier, not the promise that
+        // closing the handle leaves nothing in the page cache alone.
+        if let Some(wal) = commit.wal.as_mut() {
+            if wal.has_unsynced_appends() {
+                if let WalAppendOutcome::SyncFailed(error) = wal.sync_data() {
+                    fence_after_wal_sync_failure(&self.shared, &error);
+                }
+            }
+        }
         let _ = consolidate_derived_indexes(&self.shared);
     }
 }
@@ -3631,12 +3684,47 @@ fn finish_db(shared: Arc<Shared>) -> Db {
         }
     });
 
+    // `Balanced` promises a bounded window between an acknowledged commit and
+    // its barrier. Commits themselves only sync when a *later* commit arrives
+    // after the interval, so an idle writer needs this timer. It syncs only
+    // when appends are pending and the interval has elapsed: under steady
+    // load the commit path already keeps the writer synced and the timer
+    // finds nothing to do.
+    let sync_timer_handle =
+        (shared.opts.durability == Durability::Balanced && !shared.opts.read_only).then(|| {
+            let timer_shared = shared.clone();
+            std::thread::spawn(move || {
+                let interval =
+                    Duration::from_millis(timer_shared.opts.balanced_sync_interval_ms.max(1));
+                while !timer_shared.sync_timer_stop.load(AtomicOrdering::Acquire) {
+                    std::thread::park_timeout(interval);
+                    if timer_shared.sync_timer_stop.load(AtomicOrdering::Acquire) {
+                        break;
+                    }
+                    let mut cs = lock_commit_after_group_sync(&timer_shared);
+                    let due = cs.wal.as_ref().is_some_and(|wal| {
+                        wal.has_unsynced_appends()
+                            && wal.sync_due(
+                                Durability::Balanced,
+                                timer_shared.opts.balanced_sync_interval_ms,
+                            )
+                    });
+                    if due {
+                        if let WalAppendOutcome::SyncFailed(error) = cs.wal().sync_data() {
+                            fence_after_wal_sync_failure(&timer_shared, &error);
+                        }
+                    }
+                }
+            })
+        });
+
     Db {
         shared,
         vector_thread: Some(handle),
         maintenance_thread: Some(maintenance_handle),
         checkpoint_thread: Some(checkpoint_handle),
         derived_thread: Some(derived_handle),
+        sync_timer_thread: sync_timer_handle,
     }
 }
 
@@ -3801,6 +3889,8 @@ impl Db {
             ),
             commit_coordinator: Mutex::new(CommitCoordinatorState::default()),
             canonical_error: Mutex::new(None),
+            recovery_warnings: Mutex::new(Vec::new()),
+            sync_timer_stop: AtomicBool::new(false),
             pending_blob_publications: Mutex::new(HashSet::new()),
             ddl: Mutex::new(()),
             commit_count: AtomicU64::new(0),
@@ -3926,9 +4016,13 @@ impl Db {
     pub fn open_with(path: impl AsRef<Path>, opts: DbOptions) -> Result<Db> {
         opts.auto_compaction.validate()?;
         opts.memory.validate()?;
+        if opts.full_fsync {
+            crate::durable::enable_full_fsync();
+        }
         let memory_governor = MemoryGovernor::new(opts.memory.limits());
         let dir = path.as_ref().to_path_buf();
         let ro = opts.read_only;
+        let mut recovery_warnings: Vec<String> = Vec::new();
         if !dir.join(MARKER_FILE).exists() {
             return Err(Error::InvalidArgument(format!(
                 "not a elitesql database: {}",
@@ -4002,6 +4096,7 @@ impl Db {
                 PagedIndex::open(&path)
                     .ok()
                     .filter(|index| index.dump_version() == expected_primary_generation)
+                    .filter(|index| index.validate_pages().is_ok())
                     .map(|index| {
                         PrimaryIdx::paged_named(
                             index,
@@ -4041,7 +4136,10 @@ impl Db {
             let file = match File::open(&seg_path) {
                 Ok(file) => file,
                 Err(e) if ro => {
-                    let _ = e;
+                    recovery_warnings.push(format!(
+                        "segment {} is unreadable ({e}); its records are not exposed",
+                        segment_file_name(meta.id)
+                    ));
                     preloaded_primary_valid = false;
                     continue; // missing segment: expose what the rest holds
                 }
@@ -4117,6 +4215,11 @@ impl Db {
             }
             if !outcome.clean || outcome.valid_len != meta.len {
                 preloaded_primary_valid = false;
+                recovery_warnings.push(format!(
+                    "segment {} is damaged past offset {}; only its valid prefix is exposed",
+                    segment_file_name(meta.id),
+                    outcome.valid_len
+                ));
             }
             readers.insert(meta.id, Arc::new(SegmentReader::new(file)));
         }
@@ -4232,11 +4335,22 @@ impl Db {
             }
             let data = match fs::read(&wal_file) {
                 Ok(data) => data,
-                Err(_) if ro => Vec::new(),
+                Err(error) if ro => {
+                    recovery_warnings.push(format!(
+                        "wal {replay_wal_id} is unreadable ({error}); its commits are not exposed"
+                    ));
+                    Vec::new()
+                }
                 Err(error) => return Err(error.into()),
             };
             let scan = scan_wal(&data);
             let clean = scan.clean;
+            if !clean && ro {
+                recovery_warnings.push(format!(
+                    "wal {replay_wal_id} ends in an incomplete record at offset {}",
+                    scan.valid_len
+                ));
+            }
             if !clean && !ro {
                 let file = OpenOptions::new().write(true).open(&wal_file)?;
                 file.set_len(scan.valid_len)?;
@@ -4289,14 +4403,36 @@ impl Db {
             };
             replay_wal_id = next;
         }
+        if !ro && active_wal_id > manifest.required_wal_id {
+            // Successors reserved by an interrupted checkpoint become this
+            // handle's active writer. Record that extent before the first
+            // commit lands there, so a later loss of the file is detectable
+            // instead of looking like an older, shorter chain.
+            manifest.required_wal_id = active_wal_id;
+            if let PublishOutcome::SyncFailed(error) = manifest.publish(&dir)? {
+                return Err(Error::CommitUnknown(format!(
+                    "WAL chain extent was recorded, but syncing its directory failed: {error}"
+                )));
+            }
+        }
 
         // A DDL operation interrupted by a crash is finished below, once the
         // handle exists. Until then nothing may be pruned: the half that did
         // land may be data written under a name the catalog does not know yet.
         let blobs_dir_open = dir.join(BLOBS_DIR);
-        let (secondary, vector, text) = if pending_ddl.is_some() {
-            // Derived indexes are rebuilt by the DDL replay; building them
-            // twice would only waste the open.
+        // Only the intents that rewrite every segment rebuild the derived
+        // indexes themselves. An interrupted ADD COLUMN completes through
+        // ordinary commits, whose UNIQUE/FK validation must see every index
+        // the catalog declares; loading them here is what makes that true.
+        let ddl_rebuilds_indexes = matches!(
+            pending_ddl,
+            Some(
+                DdlIntent::RenameTable { .. }
+                    | DdlIntent::RenameColumn { .. }
+                    | DdlIntent::DropColumn { .. }
+            )
+        );
+        let (secondary, vector, text) = if ddl_rebuilds_indexes {
             (HashMap::new(), HashMap::new(), HashMap::new())
         } else {
             (
@@ -4424,6 +4560,8 @@ impl Db {
             ),
             commit_coordinator: Mutex::new(CommitCoordinatorState::default()),
             canonical_error: Mutex::new(None),
+            recovery_warnings: Mutex::new(recovery_warnings),
+            sync_timer_stop: AtomicBool::new(false),
             pending_blob_publications: Mutex::new(HashSet::new()),
             ddl: Mutex::new(()),
             commit_count: AtomicU64::new(0),
@@ -5372,11 +5510,16 @@ impl Db {
                 .catalog
                 .table(table)
                 .ok_or_else(|| Error::TableNotFound(table.into()))?;
-            if schema.column(column).is_none() {
+            let Some(dropped) = schema.column(column) else {
                 return Err(Error::ColumnNotFound {
                     table: table.into(),
                     column: column.into(),
                 });
+            };
+            if dropped.identity {
+                return Err(Error::SchemaViolation(format!(
+                    "cannot drop {table}.{column}: it is the table's identity (PRIMARY KEY) column"
+                )));
             }
             if schema
                 .foreign_keys
@@ -5600,9 +5743,40 @@ impl Db {
                 return Err(error);
             }
         }
-        self.backfill_column(table, &column.name, &column.default_value()?)?;
+        let fill = column.default_value()?;
+        self.backfill_column(table, &column.name, &fill)?;
         if not_null {
-            let mut cs = lock_commit_for_maintenance(&self.shared)?;
+            // Concurrent writers may have inserted an explicit NULL (or a row
+            // below the backfill cursor) after the last batch. Re-check under
+            // the commit mutex, which excludes further commits, and backfill
+            // again while anything is left; NOT NULL is published only over
+            // a table that satisfies it.
+            let mut attempts = 0;
+            let mut cs = loop {
+                let cs = lock_commit_for_maintenance(&self.shared)?;
+                let pending = {
+                    let st = self.shared.state.read().unwrap();
+                    Self::ids_needing_fill_in(&st, table, &column.name, 1, None)?
+                };
+                if pending.is_empty() {
+                    break cs;
+                }
+                drop(cs);
+                if fill.is_null() {
+                    return Err(Error::SchemaViolation(format!(
+                        "cannot add NOT NULL column '{}' to {table}: a row holds NULL and no default is declared",
+                        column.name
+                    )));
+                }
+                attempts += 1;
+                if attempts > BACKFILL_RETRIES {
+                    return Err(Error::Conflict(format!(
+                        "ADD COLUMN {}.{} NOT NULL: concurrent writers kept inserting NULL rows; retry",
+                        table, column.name
+                    )));
+                }
+                self.backfill_column(table, &column.name, &fill)?;
+            };
             let mut st = self.shared.state.write().unwrap();
             let mut next = st.catalog.clone();
             let schema = next
@@ -5671,6 +5845,16 @@ impl Db {
         cursor: Option<&str>,
     ) -> Result<Vec<String>> {
         let st = self.shared.state.read().unwrap();
+        Self::ids_needing_fill_in(&st, table, column, limit, cursor)
+    }
+
+    fn ids_needing_fill_in(
+        st: &State,
+        table: &str,
+        column: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Vec<String>> {
         let mut out = Vec::new();
         st.index.visit_table(table, cursor, |id, versions| {
             let Some(last) = versions.last() else {
@@ -5714,6 +5898,12 @@ impl Db {
         // Drain any batched backfill writes, then publish/remap their derived
         // deltas instead of materializing the complete primary directory.
         checkpoint_measured(&self.shared, &mut cs)?;
+        // Every index the catalog declares must exist in memory before this
+        // handle accepts writes: a missing unique index would otherwise be
+        // skipped by commit validation instead of enforced.
+        if !self.shared.state.read().unwrap().derived_indexes_complete() {
+            rebuild_derived_indexes_after_rewrite(&self.shared, true)?;
+        }
         let retained = self.shared.state.read().unwrap().index_delta_memory_bytes();
         self.shared.memory_governor.set_index_delta_bytes(retained);
         let catalog = self.shared.state.read().unwrap().catalog.clone();
@@ -6021,6 +6211,14 @@ impl Db {
     /// Block until every async-committed vector is searchable.
     pub fn wait_vector_indexing(&self) -> Result<()> {
         wait_vector_indexing_shared(&self.shared)
+    }
+
+    /// What a tolerant open had to skip. A writable open refuses damaged
+    /// canonical files, so this is only ever non-empty for a read-only handle
+    /// whose exposed state is a prefix of the committed one: check it before
+    /// treating an `--read-only` export as a complete copy.
+    pub fn recovery_warnings(&self) -> Vec<String> {
+        self.shared.recovery_warnings.lock().unwrap().clone()
     }
 
     pub fn tables(&self) -> Vec<String> {
@@ -6501,7 +6699,7 @@ impl Db {
             let segment_file = segment
                 .into_inner()
                 .map_err(|error| Error::Io(error.into_error()))?;
-            segment_file.sync_all()?;
+            crate::durable::sync_all(&segment_file)?;
             blob_sink.publish()?;
 
             let mut new_segments = old_segments.clone();
@@ -7727,7 +7925,7 @@ impl Db {
         let segment_file = segment
             .into_inner()
             .map_err(|error| Error::Io(error.into_error()))?;
-        segment_file.sync_all()?;
+        crate::durable::sync_all(&segment_file)?;
         let mut new_segments = Vec::new();
         let mut new_readers = HashMap::new();
         if segment_position == 0 {
@@ -8333,14 +8531,11 @@ impl Txn {
                         continue;
                     };
                     let key = (def.column.clone(), index_key(value));
-                    if accepted.contains(&key)
-                        || state
-                            .secondary
-                            .get(&(table.to_owned(), def.column.clone()))
-                            .map(|index| index.ids(&key.1))
-                            .transpose()?
-                            .is_some_and(|ids| !ids.is_empty())
-                    {
+                    let index = state
+                        .secondary
+                        .get(&(table.to_owned(), def.column.clone()))
+                        .ok_or_else(|| missing_unique_index(table, &def.column))?;
+                    if accepted.contains(&key) || !index.ids(&key.1)?.is_empty() {
                         return Err(Error::UniqueViolation {
                             table: table.into(),
                             column: def.column.clone(),
@@ -8431,7 +8626,7 @@ impl Txn {
                 )));
             }
             check_value(col, &value)?;
-            current.insert(name, value);
+            current.insert(name, canonical_value(value));
         }
         self.stage(table, id.to_owned(), Some(current))
     }
@@ -9194,6 +9389,7 @@ fn load_secondary_runs(dir: &Path, table: &str, column: &str, generation: u64) -
                 meta.file
             )));
         }
+        index.validate_pages()?;
         runs.push(SecRun {
             meta,
             index: Arc::new(index),
@@ -9339,12 +9535,17 @@ fn cleanup_orphan_sidx(dir: &Path, catalog: &Catalog) {
             let manifest = sidx_manifest_path(dir, &table.name, &def.column);
             expected.insert(base);
             expected.insert(manifest.clone());
-            for file in DerivedRunManifest::referenced_files(
+            let Some(files) = DerivedRunManifest::referenced_files(
                 &manifest,
                 DerivedRunKind::Secondary,
                 &table.name,
                 &def.column,
-            ) {
+            ) else {
+                // Unreadable (not absent) manifest: leave this sweep to a
+                // later publication instead of deleting live runs.
+                return;
+            };
+            for file in files {
                 expected.insert(dir.join(INDEXES_DIR).join(file));
             }
         }
@@ -9782,12 +9983,30 @@ fn publish_vector_merge(
             })
         })
     };
-    if let Some(manifest) = manifest {
-        manifest.publish(&vidx_manifest_path(&shared.dir, &plan.key.0, &plan.key.1))?;
-    }
-    let vectors_dir = shared.dir.join(VECTORS_DIR);
-    for file in &files {
-        let _ = fs::remove_file(vectors_dir.join(file));
+    // The old runs may only disappear once no on-disk manifest lists them:
+    // either the replacement manifest was published, or the index had no
+    // durable manifest to begin with. Otherwise leave them for the orphan
+    // sweep of the next publication rather than forcing a rebuild on open.
+    let durable_manifest = shared
+        .state
+        .read()
+        .unwrap()
+        .vector
+        .get(&plan.key)
+        .and_then(|index| index.durable_generation)
+        .is_some();
+    let published = match manifest {
+        Some(manifest) => {
+            manifest.publish(&vidx_manifest_path(&shared.dir, &plan.key.0, &plan.key.1))?;
+            true
+        }
+        None => !durable_manifest,
+    };
+    if published {
+        let vectors_dir = shared.dir.join(VECTORS_DIR);
+        for file in &files {
+            let _ = fs::remove_file(vectors_dir.join(file));
+        }
     }
     Ok(true)
 }
@@ -9881,7 +10100,15 @@ fn load_vector_run_set(
     }
     let mut index = VecIdx::from_mapped_runs(def, runs);
     index.durable_generation = Some(manifest.generation);
-    Some((index, first.generation, manifest.generation))
+    // A merge can stamp the oldest surviving run with its snapshot version,
+    // which exceeds the generation the manifest was republished at. Catch-up
+    // must start where the *manifest* guarantees completeness, or the commits
+    // in between would never be examined.
+    Some((
+        index,
+        first.generation.min(manifest.generation),
+        manifest.generation,
+    ))
 }
 
 /// On open: load each persisted graph if valid, catching up incrementally
@@ -10190,6 +10417,7 @@ fn load_text_runs(dir: &Path, table: &str, column: &str, generation: u64) -> Res
                 meta.file
             )));
         }
+        index.validate_pages()?;
         runs.push(TextRun {
             meta,
             index: Arc::new(index),
@@ -10376,12 +10604,17 @@ fn cleanup_orphan_tidx(dir: &Path, catalog: &Catalog) {
             let manifest = tidx_manifest_path(dir, &table.name, &def.column);
             expected.insert(base);
             expected.insert(manifest.clone());
-            for file in DerivedRunManifest::referenced_files(
+            let Some(files) = DerivedRunManifest::referenced_files(
                 &manifest,
                 DerivedRunKind::Text,
                 &table.name,
                 &def.column,
-            ) {
+            ) else {
+                // Unreadable (not absent) manifest: leave this sweep to a
+                // later publication instead of deleting live runs.
+                return;
+            };
+            for file in files {
                 expected.insert(dir.join(INDEXES_DIR).join(file));
             }
         }
@@ -10719,8 +10952,21 @@ fn read_record_kind(blobs: &Path, readers: &SegmentReaders, kind: &VKind) -> Res
 
 fn index_key(v: &Value) -> Vec<u8> {
     let mut buf = Vec::new();
-    encode_value(&mut buf, v);
+    match v {
+        // IEEE `=` treats both zeros as equal; the index key must agree.
+        Value::Float64(x) if *x == 0.0 => encode_value(&mut buf, &Value::Float64(0.0)),
+        _ => encode_value(&mut buf, v),
+    }
     buf
+}
+
+/// Storage form of a value: `-0.0` becomes `0.0` so equality, index keys and
+/// ordering agree. Everything else is stored as given.
+fn canonical_value(value: Value) -> Value {
+    match value {
+        Value::Float64(x) => Value::Float64(if x == 0.0 { 0.0 } else { x }),
+        other => other,
+    }
 }
 
 fn check_value(col: &crate::schema::Column, value: &Value) -> Result<()> {
@@ -10738,6 +10984,14 @@ fn check_value(col: &crate::schema::Column, value: &Value) -> Result<()> {
             "column '{}' expects {}, got {:?}",
             col.name, col.ty, value
         )));
+    }
+    if let Value::Float64(x) = value {
+        if x.is_nan() {
+            return Err(Error::SchemaViolation(format!(
+                "column '{}' does not accept NaN: it is not equal to itself and cannot be indexed or compared",
+                col.name
+            )));
+        }
     }
     if let Value::Vector(v) = value {
         if v.iter().any(|component| !component.is_finite()) {
@@ -10801,8 +11055,13 @@ pub(crate) fn normalize_record(schema: &TableSchema, mut record: Record) -> Resu
         }
     }
     for col in &schema.columns {
-        match record.get(&col.name) {
-            Some(value) => check_value(col, value)?,
+        match record.get_mut(&col.name) {
+            Some(value) => {
+                check_value(col, value)?;
+                if matches!(value, Value::Float64(x) if *x == 0.0) {
+                    *value = Value::Float64(0.0);
+                }
+            }
             None => {
                 // An omitted column takes its declared default, or NULL.
                 let value = col.default_value()?;
@@ -10890,7 +11149,7 @@ impl BlobSink {
         let temporary_path = self.dir.join(format!("{name}.blob.tmp"));
         let mut f = File::create(&temporary_path)?;
         f.write_all(&bytes)?;
-        f.sync_all()?;
+        crate::durable::sync_all(&f)?;
         self.staged.push((temporary_path, final_path));
         Ok(Some((name, crc)))
     }
@@ -11282,15 +11541,187 @@ mod primary_index_tests {
             Value::Int64(1)
         );
 
+        // The dirty pages of the framed record may already be gone; a later
+        // successful sync would acknowledge a commit standing on lost bytes.
+        // Writes stay fenced until the database is reopened and re-validated.
         let mut second = Record::new();
         second.insert("id".into(), Value::Text("b".into()));
         second.insert("value".into(), Value::Int64(2));
-        db.insert("docs", second).unwrap();
-        assert_eq!(db.snapshot().version(), 2);
+        assert!(matches!(
+            db.insert("docs", second),
+            Err(Error::CommitUnknown(_))
+        ));
+        assert_eq!(db.snapshot().version(), 1);
         drop(db);
 
         let reopened = Db::open(&path).unwrap();
-        assert_eq!(reopened.scan("docs").unwrap().len(), 2);
+        assert_eq!(reopened.scan("docs").unwrap().len(), 1);
+        let mut third = Record::new();
+        third.insert("id".into(), Value::Text("c".into()));
+        third.insert("value".into(), Value::Int64(3));
+        reopened.insert("docs", third).unwrap();
+    }
+
+    #[test]
+    fn balanced_syncs_an_idle_writer_within_its_interval_and_on_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("balanced.esql");
+        let db = Db::create_with(
+            &path,
+            DbOptions {
+                durability: Durability::Balanced,
+                balanced_sync_interval_ms: 40,
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::new("value", ColumnType::Int64)],
+        ))
+        .unwrap();
+        // The first commit may find a sync due (the interval started at
+        // open); the one right behind it is inside the interval and stays
+        // unsynced until the timer fires. Without the timer it would wait for
+        // the next commit, which never comes.
+        for value in [0, 1] {
+            let mut record = Record::new();
+            record.insert("value".into(), Value::Int64(value));
+            db.insert("docs", record).unwrap();
+        }
+        assert!(db.shared.commit.lock().wal().has_unsynced_appends());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while db.shared.commit.lock().wal().has_unsynced_appends() {
+            assert!(
+                Instant::now() < deadline,
+                "the idle commit was never synced"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A commit right before close is synced by the close itself.
+        let mut record = Record::new();
+        record.insert("value".into(), Value::Int64(2));
+        db.insert("docs", record).unwrap();
+        let wal = db
+            .shared
+            .dir
+            .join(WAL_DIR)
+            .join(crate::wal::wal_file_name(1));
+        drop(db);
+        // Close leaves the on-disk WAL complete: both commits parse.
+        let scan = crate::wal::scan_wal(&fs::read(wal).unwrap());
+        assert!(scan.clean);
+        assert_eq!(scan.records.len(), 3);
+    }
+
+    #[test]
+    fn vector_run_set_catch_up_starts_at_the_manifest_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.esql");
+        let db = Db::create(&path).unwrap();
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::vector("embedding", 4)],
+        ))
+        .unwrap();
+        db.create_vector_index("docs", "embedding", VectorIndexOptions::default())
+            .unwrap();
+        for i in 0..8 {
+            let mut record = Record::new();
+            record.insert(
+                "embedding".into(),
+                Value::Vector(vec![i as f32, 1.0, 0.0, 0.0]),
+            );
+            db.insert("docs", record).unwrap();
+        }
+        let committed = db.snapshot().version();
+        let def = db.table_schema("docs").unwrap().vector_indexes.remove(0);
+        drop(db);
+        // A merge stamps its run with the snapshot version and republishes the
+        // manifest at the older generation the set is known to cover. Lower
+        // the manifest generation to mimic that: catch-up must resume there.
+        let manifest_path = vidx_manifest_path(&path, "docs", "embedding");
+        let manifest = DerivedRunManifest::load_at_most(
+            &manifest_path,
+            DerivedRunKind::Vector,
+            "docs",
+            "embedding",
+            committed,
+        )
+        .unwrap();
+        assert_eq!(manifest.generation, committed);
+        let older = committed - 3;
+        DerivedRunManifest::new(
+            DerivedRunKind::Vector,
+            "docs",
+            "embedding",
+            older,
+            manifest.runs.clone(),
+            [0, 0],
+        )
+        .publish(&manifest_path)
+        .unwrap();
+        let (_, floor, ceiling) = load_vector_run_set(&path, "docs", &def, committed).unwrap();
+        assert_eq!(ceiling, older);
+        assert_eq!(
+            floor, older,
+            "a run stamped above the manifest generation must not hide the commits in between"
+        );
+    }
+
+    #[test]
+    fn orphan_sweeps_skip_an_index_whose_manifest_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphans.esql");
+        let db = Db::create(&path).unwrap();
+        db.create_table(TableSchema::new(
+            "docs",
+            vec![Column::new("value", ColumnType::Int64)],
+        ))
+        .unwrap();
+        for i in 0..3 {
+            let mut record = Record::new();
+            record.insert("value".into(), Value::Int64(i));
+            db.insert("docs", record).unwrap();
+        }
+        db.checkpoint().unwrap();
+        for i in 3..6 {
+            let mut record = Record::new();
+            record.insert("value".into(), Value::Int64(i));
+            db.insert("docs", record).unwrap();
+        }
+        db.checkpoint().unwrap();
+        drop(db);
+        let indexes = path.join(INDEXES_DIR);
+        let runs_before: Vec<_> = fs::read_dir(&indexes)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".pidx.run"))
+            .collect();
+        assert!(
+            !runs_before.is_empty(),
+            "a second checkpoint publishes an L0 run"
+        );
+        // An unreadable manifest (here: replaced by a directory, so reads fail
+        // with EISDIR) must not be mistaken for "no runs referenced".
+        let manifest = indexes.join(crate::run_manifest::PRIMARY_RUN_MANIFEST);
+        fs::remove_file(&manifest).unwrap();
+        fs::create_dir(&manifest).unwrap();
+        assert!(PrimaryRunManifest::referenced_files(&indexes).is_none());
+        cleanup_primary_run_orphans(&path);
+        for run in &runs_before {
+            assert!(
+                indexes.join(run).exists(),
+                "{run:?} survived an unreadable manifest"
+            );
+        }
+        fs::remove_dir(&manifest).unwrap();
+        assert_eq!(
+            PrimaryRunManifest::referenced_files(&indexes),
+            Some(Vec::new()),
+            "a missing manifest references nothing"
+        );
     }
 
     #[test]
@@ -11357,15 +11788,19 @@ mod primary_index_tests {
         assert_eq!(stats.wal_sync_max_group_commits, WRITERS as u64);
         assert_eq!(db.scan("docs").unwrap().len(), WRITERS);
 
+        // The failed barrier fences this handle: no later commit may be
+        // acknowledged as durable on top of records that may be lost.
         let mut durable = Record::new();
         durable.insert("id".into(), Value::Text("durable".into()));
         durable.insert("value".into(), Value::Int64(99));
-        db.insert("docs", durable).unwrap();
+        assert!(matches!(
+            db.insert("docs", durable.clone()),
+            Err(Error::CommitUnknown(_))
+        ));
         drop(db);
-        assert_eq!(
-            Db::open(&path).unwrap().scan("docs").unwrap().len(),
-            WRITERS + 1
-        );
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(reopened.scan("docs").unwrap().len(), WRITERS);
+        reopened.insert("docs", durable).unwrap();
     }
 
     #[test]

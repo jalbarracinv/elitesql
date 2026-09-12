@@ -250,7 +250,7 @@ machines writing the same directory is not the ownership model.
 | `timestamp` | string `'YYYY-MM-DD HH:MM:SS[.ffffff]'` (UTC) or integer (Unix microseconds) | `'2026-08-07 09:30:00'` |
 | `date` | string `'YYYY-MM-DD'` (days since epoch internally) | `'2026-08-07'` |
 | `time` | string `'HH:MM:SS[.ffffff]'` (microseconds since midnight) | `'09:30:00'` |
-| `json` | string containing valid JSON | `'{"tags": ["a"], "n": 3}'` |
+| `json` | string containing valid JSON (literal **and** bound text parameter are parsed the same way; a string that is not JSON is an error) | `'{"tags": ["a"], "n": 3}'` |
 | `vector(N)` | string containing a JSON array of N numbers | `'[0.12, -0.5, 0.33]'` |
 | null | `NULL` | `NULL` |
 

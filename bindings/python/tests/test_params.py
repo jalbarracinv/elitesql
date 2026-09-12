@@ -116,6 +116,76 @@ class ParameterEncodingTests(unittest.TestCase):
         ])
 
 
+class SidecarRequestIdTests(unittest.TestCase):
+    def _client_over(self, responses):
+        import io
+        import socket as _socket
+        from elitesql import SidecarClient
+
+        client = SidecarClient.__new__(SidecarClient)
+        client._lock = threading.Lock()
+        client._next_id = 0
+        client._broken = None
+        client._timeout = None
+        sent = []
+
+        class Pipe(io.BytesIO):
+            def write(self, payload):
+                sent.append(payload)
+                return len(payload)
+
+            def flush(self):
+                pass
+
+            def readline(self):
+                answer = responses.pop(0)
+                if isinstance(answer, BaseException):
+                    raise answer
+                return answer
+
+        client._file = Pipe()
+        client._sock = _socket.socket()
+        return client, sent
+
+    def test_every_request_carries_an_id_the_response_must_echo(self):
+        import json
+
+        client, sent = self._client_over([b'{"ok":true,"id":1,"result":"pong"}\n'])
+        self.assertEqual(client.ping(), True)
+        self.assertEqual(json.loads(sent[0])["id"], 1)
+
+    def test_a_late_or_foreign_response_closes_the_connection(self):
+        client, _ = self._client_over([
+            b'{"ok":true,"id":7,"result":{"inserted":["x"]}}\n',
+            b'{"ok":true,"id":2,"result":"pong"}\n',
+        ])
+        with self.assertRaises(EliteSQLError) as raised:
+            client.ping()
+        self.assertEqual(raised.exception.code, EliteSQLError.IO)
+        self.assertTrue(raised.exception.maybe_published)
+        # The stream position is unknown: nothing else may use this connection.
+        with self.assertRaises(EliteSQLError):
+            client.ping()
+
+    def test_timeout_marks_the_connection_unusable(self):
+        import socket as _socket
+
+        client, _ = self._client_over([_socket.timeout(), b'{"ok":true,"id":2,"result":"pong"}\n'])
+        with self.assertRaises(EliteSQLError) as raised:
+            client.ping()
+        self.assertEqual(raised.exception.code, EliteSQLError.IO)
+        self.assertIn("verify before retrying", str(raised.exception))
+        with self.assertRaises(EliteSQLError):
+            client.ping()
+
+    def test_retry_classification(self):
+        self.assertTrue(EliteSQLError(9, "x").retry_safe)
+        self.assertTrue(EliteSQLError(21, "x").retry_safe)
+        self.assertFalse(EliteSQLError(17, "x").retry_safe)
+        self.assertTrue(EliteSQLError(17, "x").maybe_published)
+        self.assertFalse(EliteSQLError(11, "x").maybe_published)
+
+
 @unittest.skipUnless(LIB_PATH.is_file(), f"build {LIB_PATH} first")
 class EmbeddedParameterTests(unittest.TestCase):
     def test_full_int64_range_and_identity_metadata_roundtrip(self):

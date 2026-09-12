@@ -213,11 +213,11 @@ fn read_and_decode(path: &Path) -> Result<Manifest> {
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = File::create(path)?;
     f.write_all(bytes)?;
-    f.sync_all()?;
+    crate::durable::sync_all(&f)?;
     Ok(())
 }
 
 pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)?.sync_all()?;
+    crate::durable::sync_all(&File::open(dir)?)?;
     Ok(())
 }

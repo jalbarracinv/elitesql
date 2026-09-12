@@ -16,6 +16,14 @@
 //!   <- {"ok":true,"result":...}
 //!   <- {"ok":false,"code":N,"error":"..."}
 //!
+//! A request may carry an `"id"`; the response echoes it. Clients that can
+//! time out MUST send ids and verify them: a late response would otherwise be
+//! consumed by the next request. Codes 1..=18 are the engine's
+//! (`Error::code()`); 20 is authentication and 21 is the transaction deadline
+//! (rolled back, safe to retry as a whole). Code 17 (`CommitUnknown`) and a
+//! connection lost after `commit` was sent both describe writes that MAY be
+//! published: verify before retrying, never retry blindly.
+//!
 //! Transport and trust. A Unix socket is authenticated by filesystem
 //! permissions, so its connections start trusted. A TCP port is reachable by
 //! anyone who can route to it, so it requires a shared token and every request
@@ -37,6 +45,10 @@ use serde_json::{json, Value as J};
 /// Protocol-level error code for authentication, outside the engine's range
 /// (`Error::code()` currently returns 1..=18) so clients can tell them apart.
 const AUTH_ERROR_CODE: u32 = 20;
+/// Protocol-level code for a transaction that outlived the sidecar deadline:
+/// it was rolled back and nothing it staged is published. Distinct from the
+/// engine's `InvalidArgument` (8) so a client can retry the whole unit.
+pub(crate) const TXN_EXPIRED_ERROR_CODE: u32 = 21;
 const SIDECAR_TXN_TIMEOUT: Duration = Duration::from_secs(30);
 const SIDECAR_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
@@ -611,8 +623,8 @@ fn handle_request<'db>(
         txn.take();
         let mut response = json!({
             "ok": false,
-            "code": 8,
-            "error": "transaction exceeded the 30 second sidecar deadline and was rolled back"
+            "code": TXN_EXPIRED_ERROR_CODE,
+            "error": "transaction exceeded the 30 second sidecar deadline and was rolled back; nothing it staged was published"
         });
         if let (Some(id), Some(object)) = (id, response.as_object_mut()) {
             object.insert("id".into(), id);

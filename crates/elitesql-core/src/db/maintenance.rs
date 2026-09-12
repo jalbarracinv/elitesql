@@ -392,7 +392,7 @@ pub(super) fn flush_frozen_checkpoint_inner(
     let segment_file = writer
         .into_inner()
         .map_err(|error| Error::Io(error.into_error()))?;
-    segment_file.sync_all()?;
+    crate::durable::sync_all(&segment_file)?;
     fsync_dir(&shared.dir.join(SEGMENTS_DIR))?;
 
     let mut new_segments = job.segments.clone();
@@ -573,7 +573,7 @@ pub(super) fn flush_frozen_checkpoint_inner(
     let target = target
         .into_inner()
         .map_err(|error| Error::Io(error.into_error()))?;
-    target.sync_all()?;
+    crate::durable::sync_all(&target)?;
     fs::rename(&bridge_tmp, &bridge_path)?;
     fsync_dir(&wal_dir)?;
 
