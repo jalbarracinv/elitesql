@@ -32,6 +32,12 @@ fn worker_opts() -> DbOptions {
 const TABLES: [&str; 2] = ["t", "u"];
 const COLUMNS: [&str; 2] = ["a", "b"];
 
+/// Written by the worker once the 40-record fixture is committed and
+/// checkpointed; the parent waits for it before the first kill.
+fn populated_marker(db_dir: &std::path::Path) -> std::path::PathBuf {
+    db_dir.with_extension("esql.populated")
+}
+
 fn current_table(db: &Db) -> Option<String> {
     db.tables()
         .into_iter()
@@ -69,6 +75,10 @@ fn ddl_crash_worker() {
         }
         txn.commit().unwrap();
         db.checkpoint().unwrap();
+        // Tell the parent the fixture is durable. Killing the worker before
+        // this point would leave a legitimately empty table, which is not the
+        // property under test.
+        std::fs::write(populated_marker(std::path::Path::new(&dir)), b"ok").unwrap();
     }
 
     loop {
@@ -133,6 +143,22 @@ fn kill9_during_ddl_leaves_a_consistent_schema() {
             .spawn()
             .unwrap();
 
+        // The random kill window starts once the fixture exists: on a slow
+        // runner the worker may need more than the shortest sleep to create
+        // the table and commit its 40 records.
+        let marker = populated_marker(&db_dir);
+        let fixture_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < fixture_deadline,
+                "round {round}: the worker never finished populating the fixture"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "round {round}: the worker exited before populating the fixture"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;
