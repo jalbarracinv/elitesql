@@ -7,8 +7,8 @@
 #
 # Output: bindings/python/dist/elitesql-<version>-py3-none-<platform>.whl
 # Requirements: python3 with the `build` and `wheel` packages
-# (`pip install build wheel`), and the Rust toolchain unless ELITESQL_LIB is
-# given.
+# (`pip install build wheel`; `build` fetches setuptools>=77 into an isolated
+# environment), and the Rust toolchain unless ELITESQL_LIB is given.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
@@ -44,7 +44,7 @@ cp "$ELITESQL_LIB" "$package/$lib_name"
 trap 'rm -f "$package/$lib_name"' EXIT
 
 rm -rf "$here/dist" "$here/build"
-(cd "$here" && "$python" -m build --wheel --no-isolation --outdir dist >/dev/null)
+(cd "$here" && "$python" -m build --wheel --outdir dist >/dev/null)
 pure="$(ls "$here"/dist/elitesql-*-py3-none-any.whl)"
 (cd "$here/dist" && "$python" -m wheel tags --remove --platform-tag "$ELITESQL_WHEEL_PLATFORM" "$(basename "$pure")" >/dev/null)
 rm -rf "$here/build"
