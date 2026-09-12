@@ -1,0 +1,148 @@
+name: Wheels
+# Builds platform wheels of the Python binding with `libelitesql` inside and
+# publishes them: to the GitHub Release of a `v*` tag always, and to PyPI when
+# the repository has a trusted publisher configured (see
+# bindings/python/README.md, "Releasing").
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: Upload to PyPI (requires the trusted publisher on PyPI)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+env:
+  RUST_TOOLCHAIN: 1.89.0
+jobs:
+  linux:
+    name: wheel (${{ matrix.arch }}, manylinux_2_28)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # Building inside manylinux_2_28 links against glibc 2.28, so the wheel
+    # runs on any distribution from 2018 on (Debian 10+, Ubuntu 18.10+,
+    # RHEL 8+, and NAS firmware based on them).
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build engine and wheel
+        run: |
+          /opt/python/cp312-cp312/bin/python -m pip install --quiet build wheel auditwheel
+          PYTHON=/opt/python/cp312-cp312/bin/python \
+          ELITESQL_WHEEL_PLATFORM=manylinux_2_28_${{ matrix.arch }} \
+            bash bindings/python/build_wheel.sh
+          /opt/python/cp312-cp312/bin/python -m auditwheel show bindings/python/dist/*.whl
+      - name: Smoke test from the wheel only
+        run: |
+          /opt/python/cp312-cp312/bin/python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --quiet bindings/python/dist/*.whl
+          cd /tmp && /tmp/smoke/bin/python - <<'PY'
+          import tempfile, pathlib
+          from elitesql import EliteSQL
+          d = tempfile.TemporaryDirectory()
+          with EliteSQL(pathlib.Path(d.name) / "smoke.esql") as db:
+              db.query("CREATE TABLE t (id int AUTO_INCREMENT PRIMARY KEY, name text NOT NULL)")
+              db.query("INSERT INTO t (name) VALUES (%s)", ["wheel"])
+              assert db.query("SELECT name FROM t")["rows"] == [["wheel"]]
+          print("wheel-smoke-ok")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: bindings/python/dist/*.whl
+          if-no-files-found: error
+
+  macos:
+    name: wheel (macOS arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup override set "$RUST_TOOLCHAIN"
+      - name: Build engine and wheel
+        run: |
+          python -m pip install --quiet build wheel
+          bash bindings/python/build_wheel.sh
+      - name: Smoke test from the wheel only
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --quiet bindings/python/dist/*.whl
+          cd /tmp && /tmp/smoke/bin/python - <<'PY'
+          import tempfile, pathlib
+          from elitesql import EliteSQL
+          d = tempfile.TemporaryDirectory()
+          with EliteSQL(pathlib.Path(d.name) / "smoke.esql") as db:
+              db.query("CREATE TABLE t (id int AUTO_INCREMENT PRIMARY KEY, name text NOT NULL)")
+              db.query("INSERT INTO t (name) VALUES (%s)", ["wheel"])
+              assert db.query("SELECT name FROM t")["rows"] == [["wheel"]]
+          print("wheel-smoke-ok")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos-arm64
+          path: bindings/python/dist/*.whl
+          if-no-files-found: error
+
+  release:
+    name: Attach wheels to the GitHub Release
+    needs: [linux, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --generate-notes
+          gh release upload "$tag" dist/*.whl --repo "$GITHUB_REPOSITORY" --clobber
+
+  pypi:
+    name: Publish to PyPI
+    needs: [linux, macos]
+    # Enabled by the repository variable PYPI_PUBLISH=true once the trusted
+    # publisher exists on PyPI, or explicitly from workflow_dispatch.
+    if: (startsWith(github.ref, 'refs/tags/v') && vars.PYPI_PUBLISH == 'true') || inputs.publish_pypi
+    runs-on: ubuntu-24.04
+    # Trusted publishing: PyPI must list this repository, this workflow file
+    # and the `pypi` environment as a publisher of the `elitesql` project.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true

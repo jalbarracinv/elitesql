@@ -7,3 +7,9 @@ ActualizarNAS.md
 
 # Claude Code local settings
 .claude/
+
+# Python packaging artifacts
+bindings/python/build/
+bindings/python/dist/
+*.egg-info/
+bindings/python/elitesql/libelitesql.*
