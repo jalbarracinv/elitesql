@@ -234,7 +234,14 @@ struct ResultRow {
     promotion_work: Duration,
     promotion_count: u64,
     total_load: Duration,
+    /// Point reads through each engine's cheapest key lookup: `Db::get` for
+    /// EliteSQL, a prepared `SELECT` for SQLite, which has nothing below SQL.
+    /// The two do not do the same work, so `point_reads_sql` exists beside it.
     point_reads: Duration,
+    /// Point reads through SQL on both sides, which is the like-for-like
+    /// comparison: statement lookup, binding, planning, row decode and
+    /// projection included for each engine.
+    point_reads_sql: Duration,
     full_scans: Duration,
     disk_bytes: u64,
     commit_phase_prepare: Duration,
@@ -313,10 +320,10 @@ fn title(i: usize) -> String {
 
 fn elitesql_record(i: usize) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(row_id(i)));
-    record.insert("title".into(), Value::Text(title(i)));
-    record.insert("body".into(), Value::Text(BODY.into()));
-    record.insert("score".into(), Value::Int64(i as i64));
+    record.insert("id", Value::Text(row_id(i)));
+    record.insert("title", Value::Text(title(i)));
+    record.insert("body", Value::Text(BODY.into()));
+    record.insert("score", Value::Int64(i as i64));
     record
 }
 
@@ -520,6 +527,18 @@ fn run_elitesql(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Er
     }
     let point_reads = point_started.elapsed();
 
+    // The same rows again through SQL, which is what SQLite's prepared
+    // statement below does. `Db::get` skips statement lookup, binding,
+    // planning and projection; comparing it against a `SELECT` measured our
+    // fastest path against their normal one.
+    warm_elitesql_sql(&db, ids)?;
+    let point_sql_started = Instant::now();
+    for id in ids {
+        let found = db.query_params(POINT_SQL, &[Value::Text(id.clone())])?;
+        black_box(&found);
+    }
+    let point_reads_sql = point_sql_started.elapsed();
+
     let target = Value::Int64((config.rows - 1) as i64);
     let scan_started = Instant::now();
     for _ in 0..config.full_scans {
@@ -566,6 +585,7 @@ fn run_elitesql(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Er
         promotion_count,
         total_load,
         point_reads,
+        point_reads_sql,
         full_scans,
         disk_bytes,
         commit_phase_prepare: phase_prepare,
@@ -609,6 +629,18 @@ fn validate_elitesql_row(db: &Db, i: usize) -> Result<(), Box<dyn Error>> {
 fn warm_elitesql(db: &Db, ids: &[String]) -> Result<(), Box<dyn Error>> {
     for id in ids.iter().take(1_000) {
         black_box(db.get("docs", id)?.ok_or("EliteSQL warmup read failed")?);
+    }
+    Ok(())
+}
+
+/// The columns SQLite's prepared point statement returns, so both engines
+/// decode and hand back the same three values per row.
+const POINT_SQL: &str = "SELECT title, body, score FROM docs WHERE id = ?";
+
+fn warm_elitesql_sql(db: &Db, ids: &[String]) -> Result<(), Box<dyn Error>> {
+    for id in ids.iter().take(1_000) {
+        let found = db.query_params(POINT_SQL, &[Value::Text(id.clone())])?;
+        black_box(&found);
     }
     Ok(())
 }
@@ -725,7 +757,10 @@ fn run_sqlite(config: &Config, ids: &[String]) -> Result<ResultRow, Box<dyn Erro
         promotion_work: Duration::ZERO,
         promotion_count: 0,
         total_load,
+        // SQLite has no API below SQL, so its like-for-like column is the
+        // very same prepared-statement measurement.
         point_reads,
+        point_reads_sql: point_reads,
         full_scans,
         disk_bytes,
         commit_phase_prepare: Duration::ZERO,
@@ -839,7 +874,11 @@ fn print_results(config: &Config, elitesql: &ResultRow, sqlite: &ResultRow) {
         sqlite.total_load.as_secs_f64() / elitesql.total_load.as_secs_f64()
     );
     println!(
-        "  point read: {:.3}x",
+        "  point read, SQL on both sides: {:.3}x",
+        sqlite.point_reads_sql.as_secs_f64() / elitesql.point_reads_sql.as_secs_f64()
+    );
+    println!(
+        "  point read, our Db::get against their SELECT: {:.3}x (not the same work)",
         sqlite.point_reads.as_secs_f64() / elitesql.point_reads.as_secs_f64()
     );
     println!(
@@ -885,12 +924,12 @@ fn print_single_result(config: &Config, result: &ResultRow) {
 
 fn csv(config: &Config, results: &[ResultRow]) -> String {
     let mut output = String::from(
-        "engine,rows,batch_size,point_reads,full_scans,durability,bulk_sorted,total_memory_mib,index_delta_mib,maintenance_mib,memtable_mib,record_construction_seconds,staging_seconds,commit_calls_seconds,commit_phase_prepare_seconds,commit_phase_record_encode_seconds,commit_phase_validation_seconds,commit_phase_wal_encode_seconds,commit_phase_wal_append_seconds,commit_phase_sync_wait_seconds,commit_phase_apply_seconds,commit_phase_maintenance_wait_seconds,ingest_wall_seconds,final_checkpoint_seconds,maintenance_drain_seconds,checkpoint_work_seconds,checkpoint_count,promotion_work_seconds,promotion_count,total_load_seconds,rows_per_second,point_reads_seconds,point_read_us,full_scans_seconds,full_scan_seconds,wal_appended_bytes,checkpoint_bytes_written,promotion_bytes_read,promotion_bytes_written,index_delta_peak_bytes,maintenance_peak_bytes,disk_bytes\n",
+        "engine,rows,batch_size,point_reads,full_scans,durability,bulk_sorted,total_memory_mib,index_delta_mib,maintenance_mib,memtable_mib,record_construction_seconds,staging_seconds,commit_calls_seconds,commit_phase_prepare_seconds,commit_phase_record_encode_seconds,commit_phase_validation_seconds,commit_phase_wal_encode_seconds,commit_phase_wal_append_seconds,commit_phase_sync_wait_seconds,commit_phase_apply_seconds,commit_phase_maintenance_wait_seconds,ingest_wall_seconds,final_checkpoint_seconds,maintenance_drain_seconds,checkpoint_work_seconds,checkpoint_count,promotion_work_seconds,promotion_count,total_load_seconds,rows_per_second,point_reads_seconds,point_read_us,point_read_sql_seconds,point_read_sql_us,full_scans_seconds,full_scan_seconds,wal_appended_bytes,checkpoint_bytes_written,promotion_bytes_read,promotion_bytes_written,index_delta_peak_bytes,maintenance_peak_bytes,disk_bytes\n",
     );
     let optional = |value: Option<usize>| value.map_or_else(String::new, |value| value.to_string());
     for result in results {
         output.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{:.9},{},{:.9},{:.3},{:.9},{:.3},{:.9},{:.9},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{:.9},{},{:.9},{:.3},{:.9},{:.3},{:.9},{:.3},{:.9},{:.9},{},{},{},{},{},{},{}\n",
             result.engine,
             config.rows,
             config.batch_size,
@@ -924,6 +963,8 @@ fn csv(config: &Config, results: &[ResultRow]) -> String {
             config.rows as f64 / result.total_load.as_secs_f64(),
             result.point_reads.as_secs_f64(),
             result.point_reads.as_secs_f64() * 1_000_000.0 / config.point_reads as f64,
+            result.point_reads_sql.as_secs_f64(),
+            result.point_reads_sql.as_secs_f64() * 1_000_000.0 / config.point_reads as f64,
             result.full_scans.as_secs_f64(),
             result.full_scans.as_secs_f64() / config.full_scans as f64,
             result.wal_appended_bytes,

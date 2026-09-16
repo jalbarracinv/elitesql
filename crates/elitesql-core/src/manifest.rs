@@ -94,10 +94,11 @@ impl Manifest {
         }
         let manifest: Manifest = serde_json::from_slice(body)
             .map_err(|e| Error::Corrupt(format!("manifest: invalid json: {e}")))?;
-        if manifest.format_version != FORMAT_VERSION {
+        if !crate::schema::format_version_is_readable(manifest.format_version) {
             return Err(Error::Corrupt(format!(
-                "unsupported format_version {} (expected {FORMAT_VERSION})",
-                manifest.format_version
+                "unsupported format_version {} (this engine reads {} to {FORMAT_VERSION})",
+                manifest.format_version,
+                crate::schema::MIN_READABLE_FORMAT_VERSION,
             )));
         }
         if let Some(catalog) = &manifest.catalog {

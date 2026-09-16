@@ -236,7 +236,7 @@ fn drop_index_stops_enforcing_and_still_answers_queries() {
     assert!(matches!(
         db.insert("users", {
             let mut r = Record::new();
-            r.insert("name".into(), Value::Text("ana".into()));
+            r.insert("name", Value::Text("ana".into()));
             r
         }),
         Err(Error::UniqueViolation { .. })
@@ -458,9 +458,10 @@ fn add_column_with_default_backfills_existing_records() {
         .table_schema("users")
         .unwrap()
         .columns
-        .into_iter()
+        .iter()
         .find(|c| c.name == "plan")
-        .unwrap();
+        .expect("plan column")
+        .clone();
     assert!(!col.nullable);
     drop(db);
 
@@ -692,7 +693,7 @@ fn rename_table_moves_records_and_indexes() {
     assert!(matches!(
         db.insert("people", {
             let mut r = Record::new();
-            r.insert("name".into(), Value::Text("ana".into()));
+            r.insert("name", Value::Text("ana".into()));
             r
         }),
         Err(Error::UniqueViolation { .. })
@@ -765,7 +766,7 @@ fn rename_column_carries_values_and_indexes() {
     assert!(matches!(
         db.insert("users", {
             let mut r = Record::new();
-            r.insert("full_name".into(), Value::Text("ana".into()));
+            r.insert("full_name", Value::Text("ana".into()));
             r
         }),
         Err(Error::UniqueViolation { .. })
@@ -1037,9 +1038,10 @@ fn interrupted_add_column_backfill_is_completed_on_open() {
         .table_schema("users")
         .unwrap()
         .columns
-        .into_iter()
+        .iter()
         .find(|c| c.name == "plan")
-        .unwrap();
+        .expect("plan column")
+        .clone();
     assert!(
         !col.nullable,
         "NOT NULL is applied once the backfill is done"
@@ -1063,7 +1065,7 @@ fn an_existing_ddl_intent_is_never_overwritten_by_a_new_schema_change() {
     ));
     assert_eq!(fs::read_to_string(path.join("ddl.json")).unwrap(), original);
     let mut refused = Record::new();
-    refused.insert("name".into(), Value::Text("blocked".into()));
+    refused.insert("name", Value::Text("blocked".into()));
     assert!(matches!(
         db.insert("users", refused),
         Err(Error::CommitUnknown(_))

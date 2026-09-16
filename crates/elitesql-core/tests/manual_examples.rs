@@ -66,9 +66,9 @@ fn vectors_declare_insert_and_search() {
     // The API path: the embedding arrives from a model as a Vec<f32>.
     let embedding: Vec<f32> = vec![0.09, 0.21, 0.29, 0.41];
     let mut record = Record::new();
-    record.insert("title".into(), Value::Text("guten tag".into()));
-    record.insert("lang".into(), Value::Text("de".into()));
-    record.insert("embedding".into(), Value::Vector(embedding));
+    record.insert("title", Value::Text("guten tag".into()));
+    record.insert("lang", Value::Text("de".into()));
+    record.insert("embedding", Value::Vector(embedding));
     db.insert("docs", record).unwrap();
 
     // 3. Search: closest first, and the manual's ranking.
@@ -102,7 +102,7 @@ fn vectors_declare_insert_and_search() {
 
     // 4. Filter by metadata: still up to top_k hits, only matching records.
     let mut filter = Record::new();
-    filter.insert("lang".into(), Value::Text("es".into()));
+    filter.insert("lang", Value::Text("es".into()));
     let hits = db
         .search_vector(
             "docs",

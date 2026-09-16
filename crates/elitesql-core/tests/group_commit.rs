@@ -34,8 +34,8 @@ fn concurrent_safe_commits_share_syncs_and_survive_reopen() {
         handles.push(std::thread::spawn(move || {
             let mut transaction = db.begin();
             let mut record = Record::new();
-            record.insert("id".into(), Value::Text(format!("writer-{writer:02}")));
-            record.insert("writer".into(), Value::Int64(writer as i64));
+            record.insert("id", Value::Text(format!("writer-{writer:02}")));
+            record.insert("writer", Value::Int64(writer as i64));
             transaction.insert("docs", record).unwrap();
             ready.wait();
             transaction.commit().unwrap();
@@ -104,11 +104,8 @@ fn safe_group_commits_remain_durable_across_concurrent_checkpoints() {
             ready.wait();
             for commit in 0..COMMITS_PER_WRITER {
                 let mut record = Record::new();
-                record.insert(
-                    "id".into(),
-                    Value::Text(format!("writer-{writer:02}-{commit:03}")),
-                );
-                record.insert("writer".into(), Value::Int64(writer as i64));
+                record.insert("id", Value::Text(format!("writer-{writer:02}-{commit:03}")));
+                record.insert("writer", Value::Int64(writer as i64));
                 db.insert("docs", record).unwrap();
             }
             remaining.fetch_sub(1, Ordering::Release);

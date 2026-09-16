@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use elitesql_core::{Db, Error, QueryOutput, Record, Value};
 use serde_json::json;
 
@@ -80,9 +78,9 @@ fn named_parameters_can_repeat_and_work_in_predicates_and_limit() {
     }
 
     let mut params = Record::new();
-    params.insert("floor".into(), Value::Int64(2));
-    params.insert("ceiling".into(), Value::Int64(6));
-    params.insert("limit".into(), Value::Int64(3));
+    params.insert("floor", Value::Int64(2));
+    params.insert("ceiling", Value::Int64(6));
+    params.insert("limit", Value::Int64(3));
     let selected = rows(
         db.query_named_params(
             "SELECT n FROM numbers WHERE n >= %(floor)s AND n <= %(ceiling)s AND n != %(floor)s ORDER BY n LIMIT %(limit)s",
@@ -100,8 +98,8 @@ fn named_parameters_can_repeat_and_work_in_predicates_and_limit() {
     );
 
     let mut in_params = Record::new();
-    in_params.insert("a".into(), Value::Int64(1));
-    in_params.insert("b".into(), Value::Int64(7));
+    in_params.insert("a", Value::Int64(1));
+    in_params.insert("b", Value::Int64(7));
     assert_eq!(
         rows(
             db.query_named_params(
@@ -136,8 +134,8 @@ fn parameter_shape_and_count_are_strictly_validated() {
         Err(Error::InvalidArgument(message)) if message.contains("parameter 2")
     ));
 
-    let mut named = BTreeMap::new();
-    named.insert("wrong".into(), Value::Text("x".into()));
+    let mut named = Record::new();
+    named.insert("wrong", Value::Text("x".into()));
     assert!(matches!(
         db.query_named_params("SELECT * FROM items WHERE name = %(wanted)s", &named),
         Err(Error::InvalidArgument(message)) if message.contains("wanted")

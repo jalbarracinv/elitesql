@@ -7,6 +7,17 @@ pub(super) fn shared_get_at(
     id: &str,
     max_version: u64,
 ) -> Result<Option<Record>> {
+    shared_get_at_keep(shared, table, id, max_version, None)
+}
+
+/// `shared_get_at` decoding only the columns in `keep`.
+pub(super) fn shared_get_at_keep(
+    shared: &Shared,
+    table: &str,
+    id: &str,
+    max_version: u64,
+    keep: Option<&[&str]>,
+) -> Result<Option<Record>> {
     let _admission = PointReadAdmission::enter(shared);
     let st = shared.state.read().unwrap();
     let schema = st
@@ -14,6 +25,7 @@ pub(super) fn shared_get_at(
         .table(table)
         .ok_or_else(|| Error::TableNotFound(table.into()))?;
     let implicit_id = schema.has_implicit_id();
+    let projection = RowProjection::new(Some(schema), keep);
     let entry = match st.visible_owned(table, id, max_version)? {
         Some(entry) if !entry.is_tombstone() => entry,
         _ => return Ok(None),
@@ -34,7 +46,7 @@ pub(super) fn shared_get_at(
     drop(st);
     let blobs = Some(shared.blobs.as_path());
     let mut record = match &entry.kind {
-        VKind::MemPut(payload) => decode_record(payload, blobs)?,
+        VKind::MemPut(payload) => decode_record_keep(payload, blobs, &projection)?,
         VKind::SegPut {
             payload_offset,
             payload_len,
@@ -43,12 +55,12 @@ pub(super) fn shared_get_at(
             .as_deref()
             .expect("segment reader captured above")
             .with_payload(*payload_offset, *payload_len, |bytes| {
-                decode_record(bytes, blobs)
+                decode_record_keep(bytes, blobs, &projection)
             })?,
         VKind::MemTombstone | VKind::SegTombstone => return Ok(None),
     };
     if implicit_id {
-        record.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+        record.insert(ID_COLUMN, Value::Text(id.to_owned()));
     }
     Ok(Some(record))
 }
@@ -87,6 +99,40 @@ pub(super) fn shared_scan_batch_at(
     shared_scan_batch_at_bytes(shared, table, max_version, after_id, limit, None)
 }
 
+/// Rows of the primary directory are visited in chunks, releasing the shared
+/// state lock between them: a scan batch used to hold the lock for its whole
+/// `limit`, and every committer (which needs the write lock) queued behind it
+/// while every other reader queued behind the committer. The snapshot version
+/// keeps the chunks consistent with each other.
+///
+/// The right chunk depends on whether anyone is waiting. Resuming rebuilds a
+/// cursor into every run, a binary search and a page load each, so a long
+/// chunk scans faster: 65 ns a row against 71 at a quarter of it. But a long
+/// chunk also holds the lock longer, and a committer blocks on it while
+/// holding the serialization mutex, so every other committer queues behind
+/// that. At 500 in-flight requests the short chunk cut the commit's wait for
+/// the state lock from 143 µs to 92 and the whole convoy by a third, worth
+/// nine per cent of throughput.
+///
+/// So the scan reads both numbers off the engine: with no committer queued it
+/// takes the long chunk and the faster scan, and with one waiting it shortens
+/// to give the lock back sooner. A scan that starts alone and meets a writer
+/// mid-way shortens on its next chunk.
+const SCAN_LOCK_CHUNK_ROWS: usize = 256;
+
+/// The chunk a scan falls back to while a committer is queued.
+const SCAN_LOCK_CHUNK_ROWS_CONTENDED: usize = 64;
+
+/// How many rows the next chunk should visit before giving the state lock
+/// back. See [`SCAN_LOCK_CHUNK_ROWS`].
+fn scan_lock_chunk_rows(shared: &Shared) -> usize {
+    if shared.commit_waiters.load(AtomicOrdering::Relaxed) > 0 {
+        SCAN_LOCK_CHUNK_ROWS_CONTENDED
+    } else {
+        SCAN_LOCK_CHUNK_ROWS
+    }
+}
+
 pub(super) fn shared_scan_batch_at_bytes(
     shared: &Shared,
     table: &str,
@@ -95,53 +141,183 @@ pub(super) fn shared_scan_batch_at_bytes(
     limit: usize,
     max_bytes: Option<usize>,
 ) -> Result<Vec<(String, Record)>> {
-    let st = shared.state.read().unwrap();
-    let schema = st
-        .catalog
-        .table(table)
-        .ok_or_else(|| Error::TableNotFound(table.into()))?;
-    let epoch = schema.epoch;
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let implicit_id = schema.has_implicit_id();
-    let blobs = st.blobs.clone();
-    let limit = max_bytes.map_or(limit, |bytes| limit.min((bytes / 256).max(1)));
-    let mut prepared = Vec::with_capacity(limit.min(1024));
-    st.index.visit_table(table, after_id, |id, versions| {
-        let Some(entry) = versions
-            .iter()
-            .rev()
-            .find(|entry| entry.version <= max_version && entry.version > epoch)
-        else {
-            return Ok(true);
-        };
-        if entry.is_tombstone() {
-            return Ok(true);
-        }
-        prepared.push((id.to_owned(), entry.kind.clone()));
-        if prepared.len() == limit {
-            return Ok(false);
-        }
-        Ok(true)
-    })?;
-    let mut readers = SegmentReaders::new();
-    for (_, kind) in &prepared {
-        if let VKind::SegPut { segment, .. } = kind {
-            let reader = st
-                .readers
-                .get(segment)
-                .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
-            readers.entry(*segment).or_insert_with(|| reader.clone());
-        }
-    }
-    drop(st);
+    shared_scan_batch_at_bytes_filtered(
+        shared,
+        table,
+        max_version,
+        after_id,
+        limit,
+        max_bytes,
+        None,
+        None,
+    )
+}
 
-    let mut out = Vec::with_capacity(prepared.len());
+/// One batch of a scan: the rows, the id of each row when the caller asked
+/// for them, and the cursor to resume after.
+///
+/// A SQL scan does not want the ids: it resumes after the last row of the
+/// batch and throws the rest away. Handing one `String` per row back cost an
+/// allocation per row scanned, which on a `COUNT(*)` over a published table
+/// was a quarter of what reaching the row cost at all.
+pub(crate) struct ScanBatch {
+    pub(crate) rows: Vec<Record>,
+    /// Empty unless the caller asked for ids; otherwise as long as `rows`.
+    pub(crate) ids: Vec<String>,
+    /// Id to resume strictly after, or `None` when the batch is empty.
+    pub(crate) next: Option<String>,
+}
+
+/// Up to `limit` visible rows after `after_id`, decoded from retained segment
+/// handles with the state lock released. The directory is visited in short
+/// chunks with the lock dropped between them, and an optional `ScanFilter` is
+/// evaluated on each encoded row before it counts toward `limit` or gets
+/// decoded, so a selective range scan neither holds the lock nor
+/// materializes the rows it rejects. The snapshot version keeps the chunks
+/// consistent with each other.
+///
+/// Ids are held in two byte arenas rather than one `String` per row: one for
+/// the chunk being visited under the lock, one for the rows that survived the
+/// filter. Both are reused across chunks, so a scan allocates per batch
+/// instead of per row.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn shared_scan_batch(
+    shared: &Shared,
+    table: &str,
+    max_version: u64,
+    after_id: Option<&str>,
+    limit: usize,
+    max_bytes: Option<usize>,
+    filter: Option<&ScanFilter>,
+    keep: Option<&[&str]>,
+    want_ids: bool,
+) -> Result<ScanBatch> {
+    let empty = || ScanBatch {
+        rows: Vec::new(),
+        ids: Vec::new(),
+        next: None,
+    };
+    if limit == 0 {
+        return Ok(empty());
+    }
+    let (epoch, implicit_id, blobs, filter_ordinal, projection) = {
+        let st = shared.state.read().unwrap();
+        let schema = st
+            .catalog
+            .table(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        let ordinal = filter.and_then(|filter| {
+            schema
+                .columns
+                .iter()
+                .position(|column| column.name == filter.column)
+        });
+        (
+            schema.epoch,
+            schema.has_implicit_id(),
+            st.blobs.clone(),
+            ordinal,
+            // Resolved once for the whole batch: with the column names out of
+            // the payload, deciding what to decode is no longer per row.
+            RowProjection::new(Some(schema), keep),
+        )
+    };
+    let limit = max_bytes.map_or(limit, |bytes| limit.min((bytes / 256).max(1)));
+    // Ids of the rows that passed the filter, packed end to end; `prepared`
+    // holds the span of each one.
+    let mut prepared_ids = String::new();
+    let mut prepared: Vec<(IdSpan, VKind)> = Vec::with_capacity(limit.min(1024));
+    let mut readers = SegmentReaders::default();
+    let mut cursor: Option<String> = after_id.map(str::to_owned);
+    // The id the directory walk last looked at, visible or not. It is the
+    // only id a chunk has to remember, and it is rewritten in place.
+    let mut last_visited = String::new();
+    let mut chunk_ids = String::new();
+    let mut chunk_entries: Vec<(IdSpan, VKind)> = Vec::with_capacity(SCAN_LOCK_CHUNK_ROWS);
+    loop {
+        let chunk = scan_lock_chunk_rows(shared)
+            .min(limit - prepared.len())
+            .max(1);
+        let mut visited = 0usize;
+        chunk_entries.clear();
+        chunk_ids.clear();
+        {
+            let st = shared.state.read().unwrap();
+            // A schema change mid-scan (new epoch) would make the continuation
+            // meaningless; the statement fails and the caller may retry.
+            let current = st
+                .catalog
+                .table(table)
+                .ok_or_else(|| Error::TableNotFound(table.into()))?;
+            if current.epoch != epoch {
+                return Err(Error::Conflict(format!(
+                    "schema for {table} changed during a scan"
+                )));
+            }
+            st.index
+                .visit_table(table, cursor.as_deref(), |id, versions| {
+                    visited += 1;
+                    // Every id visited is a candidate cursor, so the walk can
+                    // resume past a run of invisible or filtered rows.
+                    last_visited.clear();
+                    last_visited.push_str(id);
+                    let Some(entry) = versions
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.version <= max_version && entry.version > epoch)
+                        .filter(|entry| !entry.is_tombstone())
+                    else {
+                        return Ok(visited < chunk);
+                    };
+                    let span = push_id(&mut chunk_ids, id);
+                    chunk_entries.push((span, entry.kind.clone()));
+                    Ok(visited < chunk)
+                })?;
+            for (_, kind) in &chunk_entries {
+                if let VKind::SegPut { segment, .. } = kind {
+                    if !readers.contains_key(segment) {
+                        let reader = st
+                            .readers
+                            .get(segment)
+                            .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
+                        readers.insert(*segment, reader.clone());
+                    }
+                }
+            }
+        }
+        for (span, kind) in chunk_entries.drain(..) {
+            if let Some(filter) = filter {
+                let may_match = with_payload(&readers, &kind, |payload| {
+                    scan_filter_may_match(payload, filter, filter_ordinal, &blobs)
+                })?
+                .unwrap_or(false);
+                if !may_match {
+                    continue;
+                }
+            }
+            let span = push_id(&mut prepared_ids, span.of(&chunk_ids));
+            prepared.push((span, kind));
+            if prepared.len() >= limit {
+                break;
+            }
+        }
+        let exhausted = visited < chunk;
+        if exhausted || prepared.len() >= limit {
+            break;
+        }
+        cursor = Some(last_visited.clone());
+    }
+
+    let mut rows = Vec::with_capacity(prepared.len());
+    let mut ids = Vec::with_capacity(if want_ids { prepared.len() } else { 0 });
     let mut retained_bytes = 0usize;
-    for (id, kind) in prepared {
+    // Set when the byte budget cut the batch short: the caller must resume at
+    // the last row it actually received, not past the ones left behind.
+    let mut truncated = false;
+    for (span, kind) in &prepared {
+        let id = span.of(&prepared_ids);
         if let Some(budget) = max_bytes {
-            let fits = with_payload(&readers, &kind, |payload| {
+            let fits = with_payload(&readers, kind, |payload| {
                 let mut refs = Vec::new();
                 scan_payload_blob_refs(payload, &mut refs)?;
                 let estimate = refs.iter().fold(payload.len(), |total, reference| {
@@ -151,35 +327,101 @@ pub(super) fn shared_scan_batch_at_bytes(
             })?
             .unwrap_or(false);
             if !fits {
-                if out.is_empty() {
+                if rows.is_empty() {
                     return Err(Error::MemoryLimit(
                         "one row exceeds scan byte budget".into(),
                     ));
                 }
+                truncated = true;
                 break;
             }
         }
-        let mut record = read_record_kind(&blobs, &readers, &kind)?;
+        let mut record = read_record_kind_keep(&blobs, &readers, kind, &projection)?;
         if implicit_id {
-            record.insert(ID_COLUMN.into(), Value::Text(id.clone()));
+            record.insert(ID_COLUMN, Value::Text(id.to_owned()));
         }
         if let Some(budget) = max_bytes {
             let bytes = decoded_record_bytes(&record)
-                .saturating_add(id.capacity())
+                .saturating_add(id.len())
                 .saturating_add(64);
             if retained_bytes.saturating_add(bytes) > budget {
-                if out.is_empty() {
+                if rows.is_empty() {
                     return Err(Error::MemoryLimit(
                         "one decoded row exceeds scan byte budget".into(),
                     ));
                 }
+                truncated = true;
                 break;
             }
             retained_bytes += bytes;
         }
-        out.push((id, record));
+        if want_ids {
+            ids.push(id.to_owned());
+        }
+        rows.push(record);
     }
-    Ok(out)
+    let next = if rows.is_empty() {
+        None
+    } else if truncated {
+        // Resume at the last row handed over; the rest of `prepared` was not.
+        Some(prepared[rows.len() - 1].0.of(&prepared_ids).to_owned())
+    } else {
+        // Nothing between the last row and here can produce a visible row the
+        // caller has not seen: the walk either found no version or the filter
+        // ruled the row out, and the caller re-checks the filter anyway.
+        Some(last_visited)
+    };
+    Ok(ScanBatch { rows, ids, next })
+}
+
+/// A span of the id arena a batch packs its ids into.
+#[derive(Clone, Copy)]
+pub(crate) struct IdSpan {
+    start: u32,
+    end: u32,
+}
+
+impl IdSpan {
+    pub(crate) fn of<'a>(&self, arena: &'a str) -> &'a str {
+        &arena[self.start as usize..self.end as usize]
+    }
+}
+
+/// Append `id` to `arena` and return its span. Ids are at most 4 GiB apart in
+/// one batch by construction: a batch is bounded by `limit`.
+pub(crate) fn push_id(arena: &mut String, id: &str) -> IdSpan {
+    let start = arena.len() as u32;
+    arena.push_str(id);
+    IdSpan {
+        start,
+        end: arena.len() as u32,
+    }
+}
+
+/// `shared_scan_batch` for the callers that still want one id per row.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn shared_scan_batch_at_bytes_filtered(
+    shared: &Shared,
+    table: &str,
+    max_version: u64,
+    after_id: Option<&str>,
+    limit: usize,
+    max_bytes: Option<usize>,
+    filter: Option<&ScanFilter>,
+    keep: Option<&[&str]>,
+) -> Result<Vec<(String, Record)>> {
+    let batch = shared_scan_batch(
+        shared,
+        table,
+        max_version,
+        after_id,
+        limit,
+        max_bytes,
+        filter,
+        keep,
+        true,
+    )?;
+    Ok(batch.ids.into_iter().zip(batch.rows).collect())
 }
 
 pub(crate) fn json_heap_bytes(value: &serde_json::Value) -> usize {
@@ -202,7 +444,7 @@ pub(crate) fn decoded_record_bytes(record: &Record) -> usize {
     128 + record
         .iter()
         .map(|(name, value)| {
-            name.capacity()
+            name.len()
                 + 64
                 + std::mem::size_of::<Value>()
                 + match value {

@@ -25,6 +25,12 @@ fn worker_opts() -> DbOptions {
     }
 }
 
+/// Written by the worker once the table and its vector index exist; the
+/// parent waits for it before the first kill.
+fn populated_marker(db_dir: &Path) -> std::path::PathBuf {
+    db_dir.with_extension("esql.populated")
+}
+
 fn seq_vector(seq: i64) -> Vec<f32> {
     (0..DIM)
         .map(|j| ((seq * 31 + j as i64) % 97) as f32 / 97.0)
@@ -56,6 +62,10 @@ fn vector_crash_worker() {
         )
         .unwrap();
     }
+    // The parent's kill window opens only once this exists: on round zero the
+    // shortest sleep can otherwise land before the table is even created, and
+    // the parent then finds no database to recover.
+    std::fs::write(populated_marker(Path::new(&dir)), b"ok").unwrap();
 
     let ack_path = Path::new(&dir).join("ack.log");
     let mut seq: i64 = std::fs::read_to_string(&ack_path)
@@ -71,9 +81,9 @@ fn vector_crash_worker() {
     loop {
         seq += 1;
         let mut rec = Record::new();
-        rec.insert("id".into(), Value::Text(format!("v-{seq:08}")));
-        rec.insert("n".into(), Value::Int64(seq));
-        rec.insert("embedding".into(), Value::Vector(seq_vector(seq)));
+        rec.insert("id", Value::Text(format!("v-{seq:08}")));
+        rec.insert("n", Value::Int64(seq));
+        rec.insert("embedding", Value::Vector(seq_vector(seq)));
         db.insert("docs", rec).unwrap();
         ack.write_all(format!("{seq}\n").as_bytes()).unwrap();
         ack.sync_data().unwrap();
@@ -103,6 +113,22 @@ fn kill9_during_async_indexing_preserves_canonical_data() {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
+        // Wait for the fixture before the random kill window opens; a slow
+        // runner needs more than the shortest sleep to create the table and
+        // its vector index.
+        let marker = populated_marker(&db_dir);
+        let fixture_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < fixture_deadline,
+                "round {round}: the worker never finished populating the fixture"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "round {round}: the worker exited before populating the fixture"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;

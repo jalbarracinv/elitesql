@@ -32,13 +32,10 @@ fn build_dataset() -> (TempDir, Db) {
     let mut txn = db.begin();
     for i in 0..USERS {
         let mut r = elitesql_core::Record::new();
-        r.insert("id".into(), elitesql_core::Value::Text(format!("u-{i:06}")));
+        r.insert("id", elitesql_core::Value::Text(format!("u-{i:06}")));
+        r.insert("name", elitesql_core::Value::Text(format!("user {i}")));
         r.insert(
-            "name".into(),
-            elitesql_core::Value::Text(format!("user {i}")),
-        );
-        r.insert(
-            "email".into(),
+            "email",
             elitesql_core::Value::Text(format!("user{i}@example.com")),
         );
         txn.insert("users", r).unwrap();
@@ -53,17 +50,11 @@ fn build_dataset() -> (TempDir, Db) {
     for i in 0..ORDERS {
         let mut r = elitesql_core::Record::new();
         r.insert(
-            "user_id".into(),
+            "user_id",
             elitesql_core::Value::Text(format!("u-{:06}", i % USERS)),
         );
-        r.insert(
-            "amount".into(),
-            elitesql_core::Value::Int64((i % 997) as i64),
-        );
-        r.insert(
-            "note".into(),
-            elitesql_core::Value::Text(format!("order {i}")),
-        );
+        r.insert("amount", elitesql_core::Value::Int64((i % 997) as i64));
+        r.insert("note", elitesql_core::Value::Text(format!("order {i}")));
         txn.insert("orders", r).unwrap();
         if i % 10_000 == 9_999 {
             txn.commit().unwrap();

@@ -9,8 +9,8 @@ use tempfile::TempDir;
 
 fn doc(body: &str, ws: &str) -> Record {
     let mut r = Record::new();
-    r.insert("body".into(), Value::Text(body.into()));
-    r.insert("ws".into(), Value::Text(ws.into()));
+    r.insert("body", Value::Text(body.into()));
+    r.insert("ws", Value::Text(ws.into()));
     r
 }
 
@@ -100,7 +100,7 @@ fn text_index_tracks_updates_deletes_reopen_compaction() {
 
         // Update: old terms leave the index, new ones enter.
         let mut patch = Record::new();
-        patch.insert("body".into(), Value::Text("loro verde".into()));
+        patch.insert("body", Value::Text("loro verde".into()));
         db.update("docs", &a, patch).unwrap();
         assert!(db
             .search_text("docs", "body", "gato", 5, None)
@@ -141,7 +141,7 @@ fn text_index_tracks_updates_deletes_reopen_compaction() {
     // The reopened index is an mmap-backed base. Updates must hide its old
     // postings and publish the new terms through the mutable delta.
     let mut patch = Record::new();
-    patch.insert("body".into(), Value::Text("buho nocturno".into()));
+    patch.insert("body", Value::Text("buho nocturno".into()));
     db.update("docs", &a, patch).unwrap();
     assert!(db
         .search_text("docs", "body", "loro", 5, None)
@@ -160,7 +160,7 @@ fn text_filter_and_errors() {
     db.insert("docs", doc("informe anual", "beta")).unwrap();
 
     let mut filter = Record::new();
-    filter.insert("ws".into(), Value::Text("beta".into()));
+    filter.insert("ws", Value::Text("beta".into()));
     let hits = db
         .search_text("docs", "body", "informe", 10, Some(&filter))
         .unwrap();
@@ -189,7 +189,7 @@ fn hybrid_rrf_fuses_both_modalities() {
 
     let mk = |body: &str, emb: [f32; 4]| {
         let mut r = doc(body, "a");
-        r.insert("emb".into(), Value::Vector(emb.to_vec()));
+        r.insert("emb", Value::Vector(emb.to_vec()));
         r
     };
     // both: matches text AND is near the query vector.
@@ -293,8 +293,8 @@ fn quantized_index_keeps_recall_and_shrinks_dump() {
         for i in 0..n {
             let v = rng.vec(dim);
             let mut r = Record::new();
-            r.insert("id".into(), Value::Text(format!("q-{i:05}")));
-            r.insert("emb".into(), Value::Vector(v.clone()));
+            r.insert("id", Value::Text(format!("q-{i:05}")));
+            r.insert("emb", Value::Vector(v.clone()));
             txn.insert("v", r).unwrap();
             data.push((format!("q-{i:05}"), v));
         }
@@ -397,13 +397,13 @@ fn big_blobs_go_out_of_line_and_roundtrip() {
     let small = vec![7u8; 10];
 
     let mut r = Record::new();
-    r.insert("name".into(), Value::Text("big".into()));
-    r.insert("data".into(), Value::Blob(big.clone()));
+    r.insert("name", Value::Text("big".into()));
+    r.insert("data", Value::Blob(big.clone()));
     let big_id = db.insert("files", r).unwrap();
 
     let mut r = Record::new();
-    r.insert("name".into(), Value::Text("small".into()));
-    r.insert("data".into(), Value::Blob(small.clone()));
+    r.insert("name", Value::Text("small".into()));
+    r.insert("data", Value::Blob(small.clone()));
     let small_id = db.insert("files", r).unwrap();
 
     assert_eq!(blob_files(&dir), 1, "only the big blob is externalized");
@@ -446,15 +446,15 @@ fn blob_gc_on_compaction_and_corruption_detection() {
     let mut ids = Vec::new();
     for i in 0..4u8 {
         let mut r = Record::new();
-        r.insert("name".into(), Value::Text(format!("f{i}")));
-        r.insert("data".into(), Value::Blob(payload(i + 1)));
+        r.insert("name", Value::Text(format!("f{i}")));
+        r.insert("data", Value::Blob(payload(i + 1)));
         ids.push(db.insert("files", r).unwrap());
     }
     assert_eq!(blob_files(&dir), 4);
 
     // Update one (new chunk written) and delete another.
     let mut patch = Record::new();
-    patch.insert("data".into(), Value::Blob(payload(99)));
+    patch.insert("data", Value::Blob(payload(99)));
     db.update("files", &ids[0], patch).unwrap();
     db.delete("files", &ids[1]).unwrap();
     assert_eq!(blob_files(&dir), 5, "old chunks linger until compaction");
@@ -517,7 +517,7 @@ fn read_only_reads_and_rejects_writes() {
 
     // Every write path is rejected with ReadOnly (code 13).
     let mut rec = Record::new();
-    rec.insert("n".into(), Value::Int64(3));
+    rec.insert("n", Value::Int64(3));
     for err in [
         db.insert("t", rec).unwrap_err(),
         db.query("INSERT INTO t (n) VALUES (3)").unwrap_err(),
@@ -597,4 +597,87 @@ fn dir_bytes(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     walk(path, &mut out);
     out.sort();
     out
+}
+
+/// A search can say what each hit should carry, and a table that declares its
+/// own id keeps it.
+///
+/// A hit used to be the whole row, indexed text column included, which for a
+/// caller that ranks and then reads one field cost twelve times a point read
+/// per result. It also had the physical key written over the declared `id`,
+/// so a hit reported a ULID where the row holds an integer.
+#[test]
+fn a_text_search_returns_only_the_columns_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("cols.esql")).unwrap();
+    db.query(
+        "CREATE TABLE docs (id int AUTO_INCREMENT PRIMARY KEY, body text NOT NULL, \
+         tag text NOT NULL)",
+    )
+    .unwrap();
+    db.create_text_index("docs", "body").unwrap();
+    for body in ["rust rust rust", "a rust mention", "python only"] {
+        db.query_params(
+            "INSERT INTO docs (body, tag) VALUES (?, ?)",
+            &[Value::Text(body.into()), Value::Text("a".into())],
+        )
+        .unwrap();
+    }
+
+    let all = db.search_text("docs", "body", "rust", 10, None).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(
+        all[0].record.get("id"),
+        Some(&Value::Int64(1)),
+        "the declared id must survive, not be replaced by the physical key"
+    );
+    assert!(all[0].record.get("body").is_some());
+    assert!(all[0].record.get("tag").is_some());
+
+    let keep = ["id".to_owned()];
+    let narrow = db
+        .search_text_columns("docs", "body", "rust", 10, None, Some(&keep))
+        .unwrap();
+    assert_eq!(narrow.len(), 2);
+    for (wide, thin) in all.iter().zip(&narrow) {
+        assert_eq!(wide.id, thin.id, "the ranking must not change");
+        assert_eq!(wide.score, thin.score);
+        assert_eq!(thin.record.get("id"), wide.record.get("id"));
+        assert!(
+            thin.record.get("body").is_none(),
+            "a column left out must not be decoded"
+        );
+        assert!(thin.record.get("tag").is_none());
+    }
+
+    let none = db
+        .search_text_columns("docs", "body", "rust", 10, None, Some(&[]))
+        .unwrap();
+    assert_eq!(none.len(), 2);
+    assert_eq!(none[0].id, all[0].id);
+    assert_eq!(
+        none[0].record.len(),
+        0,
+        "no columns asked for, none decoded"
+    );
+}
+
+/// A table without a declared id still surfaces its physical key as `id`.
+#[test]
+fn a_text_hit_on_a_table_without_a_declared_id_still_carries_the_physical_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("implicit.esql")).unwrap();
+    db.query("CREATE TABLE docs (body text NOT NULL)").unwrap();
+    db.create_text_index("docs", "body").unwrap();
+    db.query_params(
+        "INSERT INTO docs (body) VALUES (?)",
+        &[Value::Text("rust".into())],
+    )
+    .unwrap();
+    let hits = db.search_text("docs", "body", "rust", 10, None).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        matches!(hits[0].record.get("id"), Some(Value::Text(text)) if *text == hits[0].id),
+        "an implicit id must travel in the hit"
+    );
 }

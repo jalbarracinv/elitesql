@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::backup::{lock_destination, parent_of, partial_path};
-use crate::db::{acquire_lock, decode_record, Db, CATALOG_FILE, SEGMENTS_DIR};
+use crate::db::{acquire_lock, decode_record_for, Db, CATALOG_FILE, SEGMENTS_DIR};
 use crate::error::{Error, Result};
 use crate::manifest::fsync_dir;
 use crate::manifest::Manifest;
@@ -190,16 +190,26 @@ pub fn salvage(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<SalvageRe
                 report.deleted_records += 1;
                 continue;
             };
-            let record = match decode_record(&payload, Some(&src.join(crate::db::BLOBS_DIR))) {
-                Ok(r) => r,
-                Err(e) => {
-                    report.skipped += 1;
-                    report
-                        .notes
-                        .push(format!("{table}/{id}: undecodable payload ({e})"));
-                    continue;
-                }
+            // A payload written at format_version 3 or later stores no column
+            // names: its table is what says which value is which.
+            let Some(schema) = catalog.table(&table) else {
+                report.skipped += 1;
+                report
+                    .notes
+                    .push(format!("{table}/{id}: no such table in the catalog"));
+                continue;
             };
+            let record =
+                match decode_record_for(schema, &payload, Some(&src.join(crate::db::BLOBS_DIR))) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        report.skipped += 1;
+                        report
+                            .notes
+                            .push(format!("{table}/{id}: undecodable payload ({e})"));
+                        continue;
+                    }
+                };
             match txn.insert_restored(&table, &id, record) {
                 Ok(_) => {
                     report.recovered_records += 1;

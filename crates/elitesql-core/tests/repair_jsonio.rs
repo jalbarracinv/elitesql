@@ -270,8 +270,8 @@ fn import_export_type_mapping() {
     assert!(jsonio::json_to_value_for_type(&serde_json::json!("nope"), T::Int64).is_err());
 
     let mut rec = Record::new();
-    rec.insert("id".into(), Value::Text("r1".into()));
-    rec.insert("day".into(), Value::parse_date("2026-08-07").unwrap());
+    rec.insert("id", Value::Text("r1".into()));
+    rec.insert("day", Value::parse_date("2026-08-07").unwrap());
     let j = jsonio::record_to_json(&rec);
     assert_eq!(j["id"], serde_json::json!("r1"));
     assert_eq!(j["day"]["$t"], serde_json::json!("date"));

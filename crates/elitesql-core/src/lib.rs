@@ -36,12 +36,12 @@
 //! // Auto-commit write, then a multi-op transaction.
 //! let id = {
 //!     let mut r = Record::new();
-//!     r.insert("title".into(), Value::Text("hello".into()));
+//!     r.insert("title", Value::Text("hello".into()));
 //!     db.insert("docs", r).unwrap()
 //! };
 //! let mut txn = db.begin();
 //! let mut patch = Record::new();
-//! patch.insert("score".into(), Value::Int64(42));
+//! patch.insert("score", Value::Int64(42));
 //! txn.update("docs", &id, patch).unwrap();
 //! txn.commit().unwrap();
 //!
@@ -63,6 +63,7 @@ pub mod jsonio;
 mod manifest;
 mod memory;
 mod paged;
+mod record;
 mod repair;
 mod run_manifest;
 mod schema;

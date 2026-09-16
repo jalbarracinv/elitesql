@@ -649,6 +649,9 @@ fn handle_request<'db>(
     }
     let mut execute = || match op {
         "ping" => Ok(json!("pong")),
+        // Engine counters since open: commit-phase timings (microseconds) and
+        // query-memory admission, for load tests and operators.
+        "stats" => Ok(stats_json(db)),
         "query" if txn.is_some() => Err(Error::InvalidArgument(
             "an explicit transaction is active; use query_in_txn or commit/rollback".into(),
         )),
@@ -844,6 +847,38 @@ fn handle_request<'db>(
     response
 }
 
+/// Cumulative engine counters as JSON (`{"op":"stats"}`). Durations are
+/// reported in microseconds so clients can diff two snapshots.
+fn stats_json(db: &Db) -> J {
+    let m = db.maintenance_stats();
+    let q = db.global_memory_stats();
+    let us = |d: std::time::Duration| d.as_micros() as u64;
+    json!({
+        "commits": m.commits,
+        "commit_time_us": us(m.commit_time),
+        "commit_lock_wait_us": us(m.commit_lock_wait_time),
+        "commit_lock_hold_us": us(m.commit_lock_hold_time),
+        "commit_prepare_us": us(m.commit_prepare_time),
+        "commit_locked_prepare_us": us(m.commit_locked_prepare_time),
+        "commit_validation_us": us(m.commit_phase_validation_time),
+        "commit_wal_append_us": us(m.commit_wal_append_time),
+        "commit_sync_wait_us": us(m.commit_phase_sync_wait_time),
+        "commit_apply_us": us(m.commit_apply_time),
+        "commit_state_write_wait_us": us(m.commit_state_write_wait_time),
+        "commit_maintenance_wait_us": us(m.commit_phase_maintenance_wait_time),
+        "wal_syncs": m.wal_syncs,
+        "wal_sync_time_us": us(m.wal_sync_time),
+        "wal_appended_bytes": m.wal_appended_bytes,
+        "grouped_commits": m.grouped_commits,
+        "coordinated_commits": m.coordinated_commits,
+        "point_read_throttles": m.point_read_throttles,
+        "checkpoints": m.checkpoints,
+        "query_in_use_bytes": q.query_in_use_bytes,
+        "query_peak_bytes": q.query_peak_bytes,
+        "query_waits": q.query_waits,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,8 +890,8 @@ mod tests {
         db.query("CREATE TABLE docs(body text)").unwrap();
         for id in ["a", "b", "c"] {
             let mut row = Record::new();
-            row.insert("id".into(), Value::Text(id.into()));
-            row.insert("body".into(), Value::Text("\\".repeat(2 * 1024 * 1024)));
+            row.insert("id", Value::Text(id.into()));
+            row.insert("body", Value::Text("\\".repeat(2 * 1024 * 1024)));
             db.insert("docs", row).unwrap();
         }
         let mut active = SidecarCursor {
@@ -891,7 +926,7 @@ mod tests {
         let db = Db::create(dir.path().join("db")).unwrap();
         db.query("CREATE TABLE docs(body text)").unwrap();
         let mut row = Record::new();
-        row.insert("body".into(), Value::Text("x".repeat(2048)));
+        row.insert("body", Value::Text("x".repeat(2048)));
         db.insert("docs", row).unwrap();
         let mut active = SidecarCursor {
             cursor: db.query_cursor("SELECT body FROM docs").unwrap(),
@@ -957,8 +992,8 @@ mod tests {
             "docs",
             (0..1_200).map(|n| {
                 let mut record = Record::new();
-                record.insert("id".into(), Value::Text(format!("row-{n:05}")));
-                record.insert("n".into(), Value::Int64(n));
+                record.insert("id", Value::Text(format!("row-{n:05}")));
+                record.insert("n", Value::Int64(n));
                 record
             }),
         )
@@ -1028,8 +1063,8 @@ mod tests {
             "docs",
             (0..MAX_BUFFERED_ROWS + 1).map(|n| {
                 let mut record = Record::new();
-                record.insert("id".into(), Value::Text(format!("row-{n:05}")));
-                record.insert("n".into(), Value::Int64(n as i64));
+                record.insert("id", Value::Text(format!("row-{n:05}")));
+                record.insert("n", Value::Int64(n as i64));
                 record
             }),
         )

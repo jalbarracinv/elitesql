@@ -1,0 +1,433 @@
+{
+ "users": 4000,
+ "transport": "sidecar",
+ "processes": 10,
+ "connections": 2000,
+ "think_s": [
+  0.0,
+  0.0
+ ],
+ "duration_s": 60.0,
+ "durability": "balanced",
+ "ops_total_window": 17107,
+ "ops_total_including_rampup": 21361,
+ "throughput_ops_s": 285.1,
+ "throughput_per_user": 0.071,
+ "read_ops_s": 196.3,
+ "write_ops_s": 88.8,
+ "latency": {
+  "count": 17107,
+  "mean_us": 6555359.0,
+  "p50_us": 6730770.0,
+  "p90_us": 10784751.0,
+  "p95_us": 13883612.1,
+  "p99_us": 17815101.0,
+  "p999_us": 19968702.5,
+  "max_us": 25027114
+ },
+ "pool_wait": {
+  "count": 17107,
+  "mean_us": 6872651.1,
+  "p50_us": 6906280.0,
+  "p90_us": 7693372.2,
+  "p95_us": 7905550.1,
+  "p99_us": 8341656.1,
+  "p999_us": 8773164.2,
+  "max_us": 8948281
+ },
+ "user_latency_p99_us": 26156757.1,
+ "success_rate_pct": 60.706,
+ "failed_ops": 6722,
+ "conflict_retries": 42,
+ "ops_that_retried": 30,
+ "conflict_retry_rate_pct": 0.175,
+ "statuses": {
+  "error:16": 6722,
+  "ok": 9987,
+  "empty_cart": 398
+ },
+ "errors": {
+  "error:16": {
+   "count": 7941,
+   "first": "[elitesql:16] memory limit exceeded: query memory admission timed out",
+   "ops": {
+    "login": 2142,
+    "session_check": 1091,
+    "order_history": 226,
+    "view_cart": 643,
+    "search_text": 114,
+    "admin_dashboard": 106,
+    "browse": 1228,
+    "product_detail": 1541,
+    "recommend": 453,
+    "update_cart_item": 212,
+    "update_profile": 69,
+    "relogin": 116
+   }
+  }
+ },
+ "reconnects": 0,
+ "connect_refusals": 20,
+ "pool_open_seconds": 0.14,
+ "consistency_violations": 0,
+ "throughput_per_second_cv": 0.437,
+ "seconds_with_zero_ops": 0,
+ "server_cpu_cores": {
+  "mean": 9.36,
+  "max": 11.03
+ },
+ "server_rss_mib": {
+  "mean": 3794.16,
+  "max": 4114.9
+ },
+ "clients_cpu_cores": {
+  "mean": 0.07,
+  "max": 0.18
+ },
+ "clients_rss_mib": {
+  "mean": 397.71,
+  "max": 433.3
+ },
+ "db_bytes_before": 88764282,
+ "db_bytes_after": 92839069,
+ "wall": {
+  "stage_seconds": 79.47,
+  "expected_seconds": 70.0
+ },
+ "per_op": [
+  {
+   "op": "add_to_cart",
+   "count": 1493,
+   "ops_per_s": 24.88,
+   "share_pct": 8.73,
+   "mean_us": 936628.3,
+   "p50_us": 841671.0,
+   "p90_us": 1768716.2,
+   "p95_us": 2195772.8,
+   "p99_us": 3055923.8,
+   "p999_us": 4372582.0,
+   "max_us": 4535329,
+   "pool_wait_p99_us": 8515373.8,
+   "retries": 0,
+   "errors": 0,
+   "business": {}
+  },
+  {
+   "op": "admin_dashboard",
+   "count": 164,
+   "ops_per_s": 2.73,
+   "share_pct": 0.96,
+   "mean_us": 12144489.2,
+   "p50_us": 10445539.5,
+   "p90_us": 18722894.4,
+   "p95_us": 22160889.2,
+   "p99_us": 24199726.2,
+   "p999_us": 24896910.6,
+   "max_us": 25027114,
+   "pool_wait_p99_us": 8081655.5,
+   "retries": 0,
+   "errors": 105,
+   "business": {
+    "error:16": 105
+   }
+  },
+  {
+   "op": "browse",
+   "count": 3138,
+   "ops_per_s": 52.3,
+   "share_pct": 18.34,
+   "mean_us": 6367961.0,
+   "p50_us": 6471815.0,
+   "p90_us": 10017618.8,
+   "p95_us": 10029819.4,
+   "p99_us": 10054949.5,
+   "p999_us": 10098172.4,
+   "max_us": 10329415,
+   "pool_wait_p99_us": 8328407.5,
+   "retries": 0,
+   "errors": 1220,
+   "business": {
+    "error:16": 1220
+   }
+  },
+  {
+   "op": "checkout",
+   "count": 580,
+   "ops_per_s": 9.67,
+   "share_pct": 3.39,
+   "mean_us": 662599.1,
+   "p50_us": 278228.0,
+   "p90_us": 1722824.2,
+   "p95_us": 2428420.7,
+   "p99_us": 4450842.7,
+   "p999_us": 5924161.4,
+   "max_us": 6119252,
+   "pool_wait_p99_us": 8354512.5,
+   "retries": 14,
+   "errors": 0,
+   "business": {
+    "empty_cart": 398
+   }
+  },
+  {
+   "op": "login",
+   "count": 1945,
+   "ops_per_s": 32.42,
+   "share_pct": 11.37,
+   "mean_us": 7267882.2,
+   "p50_us": 7846100.0,
+   "p90_us": 10027232.4,
+   "p95_us": 10042895.6,
+   "p99_us": 10808675.1,
+   "p999_us": 11379091.4,
+   "max_us": 11390958,
+   "pool_wait_p99_us": 8060543.4,
+   "retries": 0,
+   "errors": 975,
+   "business": {
+    "error:16": 975
+   }
+  },
+  {
+   "op": "order_history",
+   "count": 486,
+   "ops_per_s": 8.1,
+   "share_pct": 2.84,
+   "mean_us": 7093030.8,
+   "p50_us": 7163657.5,
+   "p90_us": 10034624.5,
+   "p95_us": 11595394.5,
+   "p99_us": 15732678.8,
+   "p999_us": 19085613.3,
+   "max_us": 19393452,
+   "pool_wait_p99_us": 8222283.5,
+   "retries": 0,
+   "errors": 220,
+   "business": {
+    "error:16": 220
+   }
+  },
+  {
+   "op": "product_detail",
+   "count": 2582,
+   "ops_per_s": 43.03,
+   "share_pct": 15.09,
+   "mean_us": 9646266.0,
+   "p50_us": 10008233.0,
+   "p90_us": 15114513.4,
+   "p95_us": 16700527.8,
+   "p99_us": 18952654.2,
+   "p999_us": 19932287.1,
+   "max_us": 20016503,
+   "pool_wait_p99_us": 8277812.2,
+   "retries": 0,
+   "errors": 1527,
+   "business": {
+    "error:16": 1527
+   }
+  },
+  {
+   "op": "recommend",
+   "count": 1034,
+   "ops_per_s": 17.23,
+   "share_pct": 6.04,
+   "mean_us": 7632844.5,
+   "p50_us": 8059586.5,
+   "p90_us": 10083836.7,
+   "p95_us": 11168566.3,
+   "p99_us": 13392287.8,
+   "p999_us": 14840163.8,
+   "max_us": 14860071,
+   "pool_wait_p99_us": 8289862.8,
+   "retries": 0,
+   "errors": 447,
+   "business": {
+    "error:16": 447
+   }
+  },
+  {
+   "op": "relogin",
+   "count": 249,
+   "ops_per_s": 4.15,
+   "share_pct": 1.46,
+   "mean_us": 8296278.7,
+   "p50_us": 9031186.0,
+   "p90_us": 12249079.6,
+   "p95_us": 14399292.0,
+   "p99_us": 17888061.6,
+   "p999_us": 18432339.4,
+   "max_us": 18530065,
+   "pool_wait_p99_us": 8203525.2,
+   "retries": 0,
+   "errors": 116,
+   "business": {
+    "error:16": 116
+   }
+  },
+  {
+   "op": "restock",
+   "count": 46,
+   "ops_per_s": 0.77,
+   "share_pct": 0.27,
+   "mean_us": 1206963.2,
+   "p50_us": 858164.5,
+   "p90_us": 2656200.0,
+   "p95_us": 3277583.5,
+   "p99_us": 3743775.9,
+   "p999_us": 4025708.2,
+   "max_us": 4057034,
+   "pool_wait_p99_us": 8524305.0,
+   "retries": 25,
+   "errors": 0,
+   "business": {}
+  },
+  {
+   "op": "search_text",
+   "count": 1258,
+   "ops_per_s": 20.97,
+   "share_pct": 7.35,
+   "mean_us": 2121284.6,
+   "p50_us": 1826819.5,
+   "p90_us": 4734907.1,
+   "p95_us": 5006246.5,
+   "p99_us": 5027101.1,
+   "p999_us": 5034612.5,
+   "max_us": 5042773,
+   "pool_wait_p99_us": 8321351.5,
+   "retries": 0,
+   "errors": 114,
+   "business": {
+    "error:16": 114
+   }
+  },
+  {
+   "op": "session_check",
+   "count": 1873,
+   "ops_per_s": 31.22,
+   "share_pct": 10.95,
+   "mean_us": 9529322.7,
+   "p50_us": 10007117.0,
+   "p90_us": 14874865.8,
+   "p95_us": 16256197.2,
+   "p99_us": 18732185.3,
+   "p999_us": 19696653.0,
+   "max_us": 20052144,
+   "pool_wait_p99_us": 8329062.6,
+   "retries": 0,
+   "errors": 1082,
+   "business": {
+    "error:16": 1082
+   }
+  },
+  {
+   "op": "signup",
+   "count": 75,
+   "ops_per_s": 1.25,
+   "share_pct": 0.44,
+   "mean_us": 531672.3,
+   "p50_us": 534413.0,
+   "p90_us": 918994.8,
+   "p95_us": 990459.5,
+   "p99_us": 1219448.6,
+   "p999_us": 1613261.1,
+   "max_us": 1657018,
+   "pool_wait_p99_us": 8278090.2,
+   "retries": 0,
+   "errors": 0,
+   "business": {}
+  },
+  {
+   "op": "update_cart_item",
+   "count": 444,
+   "ops_per_s": 7.4,
+   "share_pct": 2.6,
+   "mean_us": 8174934.4,
+   "p50_us": 8476534.5,
+   "p90_us": 13363561.2,
+   "p95_us": 15299800.7,
+   "p99_us": 18751511.8,
+   "p999_us": 19778984.4,
+   "max_us": 19862015,
+   "pool_wait_p99_us": 8475850.9,
+   "retries": 0,
+   "errors": 210,
+   "business": {
+    "error:16": 210
+   }
+  },
+  {
+   "op": "update_profile",
+   "count": 167,
+   "ops_per_s": 2.78,
+   "share_pct": 0.98,
+   "mean_us": 6601456.3,
+   "p50_us": 7141763.0,
+   "p90_us": 10018850.0,
+   "p95_us": 10033085.8,
+   "p99_us": 10057148.9,
+   "p999_us": 10080545.0,
+   "max_us": 10084074,
+   "pool_wait_p99_us": 8196367.1,
+   "retries": 0,
+   "errors": 69,
+   "business": {
+    "error:16": 69
+   }
+  },
+  {
+   "op": "view_cart",
+   "count": 1241,
+   "ops_per_s": 20.68,
+   "share_pct": 7.25,
+   "mean_us": 8369923.9,
+   "p50_us": 8770058.0,
+   "p90_us": 13193169.0,
+   "p95_us": 15530772.0,
+   "p99_us": 18438787.2,
+   "p999_us": 19848778.7,
+   "max_us": 20023866,
+   "pool_wait_p99_us": 8505478.8,
+   "retries": 0,
+   "errors": 637,
+   "business": {
+    "error:16": 637
+   }
+  },
+  {
+   "op": "write_review",
+   "count": 332,
+   "ops_per_s": 5.53,
+   "share_pct": 1.94,
+   "mean_us": 620045.5,
+   "p50_us": 551871.5,
+   "p90_us": 1106964.8,
+   "p95_us": 1429211.4,
+   "p99_us": 1953380.5,
+   "p999_us": 2370620.4,
+   "max_us": 2370627,
+   "pool_wait_p99_us": 8330106.0,
+   "retries": 3,
+   "errors": 0,
+   "business": {}
+  }
+ ],
+ "invariants": {
+  "ok": true,
+  "problems": [],
+  "row_counts": {
+   "users": 21348,
+   "sessions": 12650,
+   "products": 5000,
+   "carts": 3785,
+   "cart_items": 3503,
+   "orders": 6861,
+   "order_items": 20822,
+   "reviews": 5547,
+   "audit_log": 23662
+  },
+  "units_sold": 43690,
+  "paid_orders": 6861,
+  "seconds": 0.11,
+  "users": 4000
+ }
+}

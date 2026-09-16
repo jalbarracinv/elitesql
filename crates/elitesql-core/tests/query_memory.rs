@@ -31,7 +31,7 @@ fn top_k_keeps_only_the_best_rows_without_spilling_the_input() {
     let mut txn = db.begin();
     for n in (0..1000).rev() {
         let mut row = Record::new();
-        row.insert("n".into(), Value::Int64(n));
+        row.insert("n", Value::Int64(n));
         txn.insert("items", row).unwrap();
     }
     txn.commit().unwrap();
@@ -70,9 +70,21 @@ fn ingest_performance_profile_is_valid_and_bounded() {
 fn default_profile_matches_the_measured_vector_restart_budget() {
     let options = DbOptions::default();
     assert_eq!(options.memtable_max_bytes, 64 * 1024 * 1024);
-    assert_eq!(options.memory.total_memory_bytes, 384 * 1024 * 1024);
     assert_eq!(options.memory.index_delta_pool_bytes, 128 * 1024 * 1024);
     assert_eq!(options.memory.maintenance_pool_bytes, 128 * 1024 * 1024);
+    // The query pool bounds how many statements run at once, so it follows
+    // the cores that can run them, between 64 and 512 MiB. Everything else in
+    // the default profile is fixed, and the envelope has to hold the sum.
+    let query = options.memory.query_pool_bytes;
+    assert!(
+        (64 * 1024 * 1024..=512 * 1024 * 1024).contains(&query),
+        "query pool out of its range: {query}"
+    );
+    assert!(query >= 24 * 1024 * 1024 || query == 64 * 1024 * 1024);
+    assert_eq!(
+        options.memory.total_memory_bytes,
+        query + 128 * 1024 * 1024 + 128 * 1024 * 1024 + 8 * 1024 * 1024 + 64 * 1024 * 1024
+    );
 }
 
 #[test]
@@ -563,7 +575,7 @@ fn oversized_transaction_is_rejected_before_commit() {
         .unwrap();
     let mut transaction = db.begin();
     let mut record = Record::new();
-    record.insert("body".into(), Value::Blob(vec![7; 4096]));
+    record.insert("body", Value::Blob(vec![7; 4096]));
     assert!(matches!(
         transaction.insert("payloads", record),
         Err(Error::MemoryLimit(_))
@@ -600,7 +612,7 @@ fn vector_deltas_freeze_into_mmap_runs_under_pressure() {
             let mut vector = vec![0.0; 16];
             vector[n % 16] = 1.0;
             let mut record = Record::new();
-            record.insert("embedding".into(), Value::Vector(vector));
+            record.insert("embedding", Value::Vector(vector));
             ids.push(db.insert("vectors", record).unwrap());
         }
         let stats = db.global_memory_stats();
@@ -659,10 +671,10 @@ fn index_creation_and_primary_recovery_spill_with_a_tiny_maintenance_pool() {
             .unwrap();
         for n in 0..300 {
             let mut record = Record::new();
-            record.insert("id".into(), Value::Text(format!("d-{n:04}")));
-            record.insert("tag".into(), Value::Text(format!("g-{}", n % 7)));
+            record.insert("id", Value::Text(format!("d-{n:04}")));
+            record.insert("tag", Value::Text(format!("g-{}", n % 7)));
             record.insert(
-                "body".into(),
+                "body",
                 Value::Text(format!("bounded external index construction token {n}")),
             );
             db.insert("docs", record).unwrap();

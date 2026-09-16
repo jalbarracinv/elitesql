@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+<rect width="1080" height="480" fill="#ffffff"/>
+<text x="84" y="26" font-size="17" font-weight="600" fill="#1f2328">CPU used (cores) during the measured window</text>
+<line x1="84" y1="416.0" x2="830" y2="416.0" stroke="#eaeef2"/>
+<text x="76" y="420.0" text-anchor="end" fill="#57606a">0</text>
+<line x1="84" y1="344.8" x2="830" y2="344.8" stroke="#eaeef2"/>
+<text x="76" y="348.8" text-anchor="end" fill="#57606a">2</text>
+<line x1="84" y1="273.6" x2="830" y2="273.6" stroke="#eaeef2"/>
+<text x="76" y="277.6" text-anchor="end" fill="#57606a">4</text>
+<line x1="84" y1="202.4" x2="830" y2="202.4" stroke="#eaeef2"/>
+<text x="76" y="206.4" text-anchor="end" fill="#57606a">6</text>
+<line x1="84" y1="131.2" x2="830" y2="131.2" stroke="#eaeef2"/>
+<text x="76" y="135.2" text-anchor="end" fill="#57606a">8</text>
+<line x1="84" y1="60.0" x2="830" y2="60.0" stroke="#eaeef2"/>
+<text x="76" y="64.0" text-anchor="end" fill="#57606a">10</text>
+<line x1="84.0" y1="60" x2="84.0" y2="416" stroke="#f0f2f4"/>
+<text x="84.0" y="434" text-anchor="middle" fill="#57606a">10</text>
+<line x1="360.4" y1="60" x2="360.4" y2="416" stroke="#f0f2f4"/>
+<text x="360.4" y="434" text-anchor="middle" fill="#57606a">100</text>
+<line x1="443.6" y1="60" x2="443.6" y2="416" stroke="#f0f2f4"/>
+<text x="443.6" y="434" text-anchor="middle" fill="#57606a">200</text>
+<line x1="553.6" y1="60" x2="553.6" y2="416" stroke="#f0f2f4"/>
+<text x="553.6" y="434" text-anchor="middle" fill="#57606a">500</text>
+<line x1="636.8" y1="60" x2="636.8" y2="416" stroke="#f0f2f4"/>
+<text x="636.8" y="434" text-anchor="middle" fill="#57606a">1k</text>
+<line x1="720.0" y1="60" x2="720.0" y2="416" stroke="#f0f2f4"/>
+<text x="720.0" y="434" text-anchor="middle" fill="#57606a">2k</text>
+<line x1="768.7" y1="60" x2="768.7" y2="416" stroke="#f0f2f4"/>
+<text x="768.7" y="434" text-anchor="middle" fill="#57606a">3k</text>
+<line x1="803.2" y1="60" x2="803.2" y2="416" stroke="#f0f2f4"/>
+<text x="803.2" y="434" text-anchor="middle" fill="#57606a">4k</text>
+<line x1="830.0" y1="60" x2="830.0" y2="416" stroke="#f0f2f4"/>
+<text x="830.0" y="434" text-anchor="middle" fill="#57606a">5k</text>
+<rect x="84" y="60" width="746" height="356" fill="none" stroke="#d0d7de"/>
+<text x="457.0" y="466" text-anchor="middle" fill="#57606a">concurrent users (log)</text>
+<text x="18" y="238.0" text-anchor="middle" fill="#57606a" transform="rotate(-90 18 238.0)">cores</text>
+<path d="M84.0,268.6 L360.4,234.1 L443.6,196.7 L553.6,138.0 L636.8,173.6 L720.0,101.3 L768.7,114.1 L803.2,99.5 L830.0,95.2" fill="none" stroke="#c99700" stroke-width="2"/>
+<circle cx="84.0" cy="268.6" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized server: 10 → 4.14</title></circle>
+<circle cx="360.4" cy="234.1" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized server: 100 → 5.11</title></circle>
+<circle cx="443.6" cy="196.7" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized server: 200 → 6.16</title></circle>
+<circle cx="553.6" cy="138.0" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized server: 500 → 7.81</title></circle>
+<circle cx="636.8" cy="173.6" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized server: 1k → 6.81</title></circle>
+<circle cx="720.0" cy="101.3" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized server: 2k → 8.84</title></circle>
+<circle cx="768.7" cy="114.1" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized server: 3k → 8.48</title></circle>
+<circle cx="803.2" cy="99.5" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized server: 4k → 8.89</title></circle>
+<circle cx="830.0" cy="95.2" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized server: 5k → 9.01</title></circle>
+<line x1="848" y1="68" x2="870" y2="68" stroke="#c99700" stroke-width="2"/>
+<text x="876" y="72" fill="#1f2328">elitesql-sidecar-think0-optimized server</text>
+<path d="M84.0,387.5 L360.4,383.2 L443.6,380.0 L553.6,382.9 L636.8,393.9 L720.0,403.9 L768.7,401.8 L803.2,399.6 L830.0,402.1" fill="none" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="84.0" cy="387.5" r="3" fill="#0969da"><title>elitesql-sidecar-think0-optimized load generators: 10 → 0.8</title></circle>
+<circle cx="360.4" cy="383.2" r="3" fill="#0969da"><title>elitesql-sidecar-think0-optimized load generators: 100 → 0.92</title></circle>
+<circle cx="443.6" cy="380.0" r="3" fill="#0969da"><title>elitesql-sidecar-think0-optimized load generators: 200 → 1.01</title></circle>
+<circle cx="553.6" cy="382.9" r="3" fill="#0969da"><title>elitesql-sidecar-think0-optimized load generators: 500 → 0.93</title></circle>
+<circle cx="636.8" cy="393.9" r="3" fill="#0969da"><title>elitesql-sidecar-think0-optimized load generators: 1k → 0.62</title></circle>
+<circle cx="720.0" cy="403.9" r="3" fill="#0969da"><title>elitesql-sidecar-think0-optimized load generators: 2k → 0.34</title></circle>
+<circle cx="768.7" cy="401.8" r="3" fill="#0969da"><title>elitesql-sidecar-think0-optimized load generators: 3k → 0.4</title></circle>
+<circle cx="803.2" cy="399.6" r="3" fill="#0969da"><title>elitesql-sidecar-think0-optimized load generators: 4k → 0.46</title></circle>
+<circle cx="830.0" cy="402.1" r="3" fill="#0969da"><title>elitesql-sidecar-think0-optimized load generators: 5k → 0.39</title></circle>
+<line x1="848" y1="84" x2="870" y2="84" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="876" y="88" fill="#1f2328">elitesql-sidecar-think0-optimized load generators</text>
+<path d="M84.0,162.5 L360.4,146.2 L443.6,127.3 L553.6,130.1 L636.8,113.0 L720.0,92.4 L768.7,80.3 L803.2,82.8 L830.0,82.4" fill="none" stroke="#cf222e" stroke-width="2"/>
+<circle cx="84.0" cy="162.5" r="3" fill="#cf222e"><title>elitesql-sidecar-think0 server: 10 → 7.12</title></circle>
+<circle cx="360.4" cy="146.2" r="3" fill="#cf222e"><title>elitesql-sidecar-think0 server: 100 → 7.58</title></circle>
+<circle cx="443.6" cy="127.3" r="3" fill="#cf222e"><title>elitesql-sidecar-think0 server: 200 → 8.11</title></circle>
+<circle cx="553.6" cy="130.1" r="3" fill="#cf222e"><title>elitesql-sidecar-think0 server: 500 → 8.03</title></circle>
+<circle cx="636.8" cy="113.0" r="3" fill="#cf222e"><title>elitesql-sidecar-think0 server: 1k → 8.51</title></circle>
+<circle cx="720.0" cy="92.4" r="3" fill="#cf222e"><title>elitesql-sidecar-think0 server: 2k → 9.09</title></circle>
+<circle cx="768.7" cy="80.3" r="3" fill="#cf222e"><title>elitesql-sidecar-think0 server: 3k → 9.43</title></circle>
+<circle cx="803.2" cy="82.8" r="3" fill="#cf222e"><title>elitesql-sidecar-think0 server: 4k → 9.36</title></circle>
+<circle cx="830.0" cy="82.4" r="3" fill="#cf222e"><title>elitesql-sidecar-think0 server: 5k → 9.37</title></circle>
+<line x1="848" y1="100" x2="870" y2="100" stroke="#cf222e" stroke-width="2"/>
+<text x="876" y="104" fill="#1f2328">elitesql-sidecar-think0 server</text>
+<path d="M84.0,408.9 L360.4,410.3 L443.6,411.0 L553.6,411.4 L636.8,412.8 L720.0,414.2 L768.7,413.9 L803.2,413.5 L830.0,413.2" fill="none" stroke="#1a7f37" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="84.0" cy="408.9" r="3" fill="#1a7f37"><title>elitesql-sidecar-think0 load generators: 10 → 0.2</title></circle>
+<circle cx="360.4" cy="410.3" r="3" fill="#1a7f37"><title>elitesql-sidecar-think0 load generators: 100 → 0.16</title></circle>
+<circle cx="443.6" cy="411.0" r="3" fill="#1a7f37"><title>elitesql-sidecar-think0 load generators: 200 → 0.14</title></circle>
+<circle cx="553.6" cy="411.4" r="3" fill="#1a7f37"><title>elitesql-sidecar-think0 load generators: 500 → 0.13</title></circle>
+<circle cx="636.8" cy="412.8" r="3" fill="#1a7f37"><title>elitesql-sidecar-think0 load generators: 1k → 0.09</title></circle>
+<circle cx="720.0" cy="414.2" r="3" fill="#1a7f37"><title>elitesql-sidecar-think0 load generators: 2k → 0.05</title></circle>
+<circle cx="768.7" cy="413.9" r="3" fill="#1a7f37"><title>elitesql-sidecar-think0 load generators: 3k → 0.06</title></circle>
+<circle cx="803.2" cy="413.5" r="3" fill="#1a7f37"><title>elitesql-sidecar-think0 load generators: 4k → 0.07</title></circle>
+<circle cx="830.0" cy="413.2" r="3" fill="#1a7f37"><title>elitesql-sidecar-think0 load generators: 5k → 0.08</title></circle>
+<line x1="848" y1="116" x2="870" y2="116" stroke="#1a7f37" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="876" y="120" fill="#1f2328">elitesql-sidecar-think0 load generators</text>
+<path d="M84.0,220.2 L360.4,133.0 L443.6,87.4 L553.6,76.4 L636.8,72.8 L720.0,77.8 L768.7,78.2 L803.2,86.3 L830.0,88.1" fill="none" stroke="#8250df" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="84.0" cy="220.2" r="3" fill="#8250df"><title>sqlite-think0 load generators: 10 → 5.5</title></circle>
+<circle cx="360.4" cy="133.0" r="3" fill="#8250df"><title>sqlite-think0 load generators: 100 → 7.95</title></circle>
+<circle cx="443.6" cy="87.4" r="3" fill="#8250df"><title>sqlite-think0 load generators: 200 → 9.23</title></circle>
+<circle cx="553.6" cy="76.4" r="3" fill="#8250df"><title>sqlite-think0 load generators: 500 → 9.54</title></circle>
+<circle cx="636.8" cy="72.8" r="3" fill="#8250df"><title>sqlite-think0 load generators: 1k → 9.64</title></circle>
+<circle cx="720.0" cy="77.8" r="3" fill="#8250df"><title>sqlite-think0 load generators: 2k → 9.5</title></circle>
+<circle cx="768.7" cy="78.2" r="3" fill="#8250df"><title>sqlite-think0 load generators: 3k → 9.49</title></circle>
+<circle cx="803.2" cy="86.3" r="3" fill="#8250df"><title>sqlite-think0 load generators: 4k → 9.26</title></circle>
+<circle cx="830.0" cy="88.1" r="3" fill="#8250df"><title>sqlite-think0 load generators: 5k → 9.21</title></circle>
+<line x1="848" y1="132" x2="870" y2="132" stroke="#8250df" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="876" y="136" fill="#1f2328">sqlite-think0 load generators</text>
+</svg>

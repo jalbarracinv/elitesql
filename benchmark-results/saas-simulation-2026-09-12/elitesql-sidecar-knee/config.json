@@ -1,0 +1,48 @@
+{
+ "config": {
+  "rebuild_report": null,
+  "reverify_db": null,
+  "transport": "sidecar",
+  "levels": [
+   1,
+   2,
+   5,
+   10,
+   20,
+   50
+  ],
+  "duration": 30.0,
+  "warmup": 5.0,
+  "ramp": 2.0,
+  "think": [
+   0.0,
+   0.0
+  ],
+  "processes": 0,
+  "connections": 0,
+  "durability": "balanced",
+  "products": 5000,
+  "accounts": 20000,
+  "seed": 1,
+  "fresh_per_stage": false,
+  "keep_samples": false,
+  "out": "/Users/jalbarracin/Code/elitesql/benchmark-results/saas-simulation-2026-09-12/elitesql-sidecar-knee",
+  "db_dir": "/private/tmp/claude-503/-Users-jalbarracin-Code-elitesql/d652adf4-f2f0-4063-ae6b-cd82cb5d9b1d/scratchpad/db-knee",
+  "elitesql_bin": "/Users/jalbarracin/Code/elitesql/target/release/elitesql",
+  "compare_with": [],
+  "db_path": "/private/tmp/claude-503/-Users-jalbarracin-Code-elitesql/d652adf4-f2f0-4063-ae6b-cd82cb5d9b1d/scratchpad/db-knee/saas.esql",
+  "socket": "/var/folders/wf/3gnfq1cs66j1wjyc0ty6vfrw0000gq/T/saas-sim-90781.sock"
+ },
+ "environment": {
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "cpu_count": 10,
+  "python": "3.14.7",
+  "date": "2026-09-12T20:31:13",
+  "git_commit": "abfe3ae",
+  "hw.memsize": "17179869184",
+  "kern.num_taskthreads": "4096",
+  "hw.perflevel0.physicalcpu": "4",
+  "elitesql_version": "0.0.1"
+ }
+}

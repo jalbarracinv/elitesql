@@ -152,7 +152,7 @@ pub(super) fn publish_catalog_generation_locked(
         catalog: Some(next.clone()),
     }
     .publish(&shared.dir)?;
-    state.catalog = next;
+    state.set_catalog(next);
     Ok(publication_sync_error(shared, "catalog manifest", outcome))
 }
 
@@ -1793,7 +1793,9 @@ pub(super) fn rebuild_derived_indexes_after_rewrite(
                 version,
                 budget,
                 &st.blobs,
-                &table,
+                st.catalog
+                    .table(&table)
+                    .ok_or_else(|| Error::TableNotFound(table.clone()))?,
                 &column,
                 &st.index,
                 &st.readers,
@@ -1844,7 +1846,9 @@ pub(super) fn rebuild_derived_indexes_after_rewrite(
             version,
             budget,
             &st.blobs,
-            &table,
+            st.catalog
+                .table(&table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?,
             &column,
             &st.index,
             &st.readers,
@@ -1889,8 +1893,16 @@ pub(super) fn rebuild_derived_indexes_after_rewrite(
         .collect();
     let mut rebuilt_vector = HashMap::new();
     for (table, def) in vector_definitions {
-        let resident =
-            build_one_vector_index(&st.blobs, &table, &def, &st.index, &st.readers, budget)?;
+        let resident = build_one_vector_index(
+            &st.blobs,
+            st.catalog
+                .table(&table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?,
+            &def,
+            &st.index,
+            &st.readers,
+            budget,
+        )?;
         let path = vidx_path(&shared.dir, &table, &def.column);
         let tmp = path.with_extension("vidx.tmp");
         resident.dump_file(&tmp, &table, &def.column, &def, version)?;

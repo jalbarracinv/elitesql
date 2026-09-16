@@ -80,6 +80,33 @@ cargo run --release -p elitesql-core --example stress -- --duration 3m
 The generated database is retained under `target/stress-runs/` for inspection.
 See [stress-test.md](stress-test.md) for the workload and all options.
 
+For an application-shaped load test, `examples/saas_simulation/` runs a mini
+e-commerce SaaS (logins, catalogue, BM25 and vector search, persistent carts,
+checkout with stock, reviews, dashboard) against the engine with 10 to 5 000
+concurrent virtual users, verifying business invariants and integrity at every
+level, and records the capacity and latency curves:
+
+```bash
+python3 examples/saas_simulation/sweep.py --transport sidecar --levels 10,100,500,1000,2000,5000
+```
+
+On the 2026-09-12 reference run it serves 3 000 users with realistic think
+time (2 392 operations/s) at a 5.5 ms p99 on less than one core, and 5 000 of
+them at 3 825 operations/s on 1.7 cores. Under a closed loop, where every
+virtual user keeps one request in flight, SQLite is still ahead on this
+workload at every level: EliteSQL reaches 55-65 % of its throughput up to 200
+concurrent requests with a better tail there, and falls to 40 % at 500. The
+storage engine resolves a row in 0.23 µs, seven times faster than SQLite
+answers the whole statement, so the difference is the SQL executor, row
+materialization and the commit serialization above it;
+`cargo run --release -p elitesql-core --example statement_cost` breaks the
+statement path down layer by layer.
+
+See [examples/saas_simulation/README.md](examples/saas_simulation/README.md)
+for the workload and what it measures, and
+[benchmark-results/saas-simulation-2026-09-12/](benchmark-results/saas-simulation-2026-09-12/README.md)
+for the curves, the engine counters and the optimization pass they drove.
+
 ## Install for Python
 
 Python 3.9 or newer; Linux (x86_64, aarch64, glibc 2.28+) and macOS (Apple
@@ -209,6 +236,10 @@ for hit in hits:
     print(hit["id"], hit["distance"], hit["record"]["body"])
 
 hits = db.search_text("notes", "body", "quarterly numbers", top_k=10)
+# A hit carries the whole row by default, indexed text included. `columns`
+# narrows it, and `columns=[]` returns ids and scores alone: for a search that
+# only ranks, that is most of what each result costs.
+hits = db.search_text("notes", "body", "quarterly numbers", top_k=10, columns=["title"])
 hits = db.search_hybrid("notes", text=("body", "quarterly numbers"),
                         vector=("emb", query_embedding), top_k=10)
 ```
@@ -409,7 +440,7 @@ Int64 values beyond 2^53 arrive as `BigInt`, timestamps keep their microseconds
 | Mode | fsync | On process crash | On OS crash / power loss |
 |---|---|---|---|
 | `Safe` (default) | Every commit group, before acknowledging | Loses nothing | Loses nothing (see the macOS note) |
-| `Balanced` | Within `balanced_sync_interval_ms` (25 ms) of a commit, by the next commit or a timer | Loses nothing | May lose commits acknowledged in the last interval |
+| `Balanced` | Within `balanced_sync_interval_ms` (25 ms) of a commit, by a timer thread; commits never wait for it | Loses nothing | May lose commits acknowledged in the last interval |
 | `Fast` | Checkpoints and clean close only | Loses nothing | May lose every commit since the last checkpoint or close |
 
 In every mode a clean `close()`/drop syncs the WAL, so nothing acknowledged
@@ -418,12 +449,14 @@ torn or zero-filled WAL tail left by a power loss is truncated to the last
 complete commit; damage *followed by* a complete commit is refused as
 corruption. Atomicity holds in all modes: never half a commit.
 
-Concurrent `Safe`/`Balanced` commits share a physical WAL sync when they overlap;
-every caller still waits for that group's sync result before returning. This
-reduces sync amplification without weakening the selected durability contract.
-If a sync fails, the commit returns `CommitUnknown` (the write is visible, its
-durability is not) and further writes are fenced until the database is reopened
-and its WAL chain re-validated.
+Concurrent `Safe` commits share a physical WAL sync when they overlap; every
+caller still waits for that group's sync result before returning. `Balanced`
+commits are acknowledged as soon as they are applied: the timer thread runs the
+barrier on a duplicated file handle with the commit mutex released, so an
+fsync never stalls the commit pipeline. If a sync fails, a `Safe` commit
+returns `CommitUnknown` (the write is visible, its durability is not) and in
+every mode further writes are fenced until the database is reopened and its
+WAL chain re-validated.
 
 **macOS:** `fsync` does not flush the drive's write cache, so `Safe` survives
 a process or kernel crash but not a power loss unless you set
@@ -439,11 +472,19 @@ let db = Db::open_or_create_with("app.esql", opts)?;
 
 ## Database-wide memory budget
 
-Every open database owns one shared governor. The default 384 MiB envelope is
-partitioned into a 64 MiB concurrent-query pool, a 128 MiB mutable-index pool,
-a 128 MiB maintenance pool and an 8 MiB emergency reserve, with the remainder
-left as allocator/runtime headroom. Clean file-backed `mmap` pages and result
-values already handed to the caller are not charged.
+Every open database owns one shared governor. The envelope is partitioned into
+a concurrent-query pool, a 128 MiB mutable-index pool, a 128 MiB maintenance
+pool and an 8 MiB emergency reserve, with 64 MiB left as allocator/runtime
+headroom. Clean file-backed `mmap` pages and result values already handed to
+the caller are not charged.
+
+The query pool bounds how many statements run at once, so it follows the cores
+that can run them: 24 MiB per core, between 64 and 512 MiB. On a ten-core
+machine that is a 240 MiB pool inside a 568 MiB envelope. The pool is a ceiling
+the governor accounts against, not an allocation, and on a mixed shop workload
+it is worth 35 % of the throughput at 500 in-flight requests for 70 MiB of
+actual resident memory. `elitesql serve --memory-mib <n>` scales the whole
+profile from one number.
 Traditional SQL queries are subject to a working-memory budget too. Scans run
 in batches; `ORDER BY` and high-cardinality `GROUP BY` spill temporary sorted
 runs, while unindexed equality joins use a partitioned Grace Hash Join with a
@@ -462,8 +503,8 @@ use elitesql_core::{DbOptions, MemoryOptions};
 
 let opts = DbOptions {
     memory: MemoryOptions {
-        total_memory_bytes: 384 * 1024 * 1024,
-        query_pool_bytes: 64 * 1024 * 1024,
+        total_memory_bytes: 568 * 1024 * 1024,
+        query_pool_bytes: 240 * 1024 * 1024,
         query_working_bytes: 16 * 1024 * 1024,
         index_delta_pool_bytes: 128 * 1024 * 1024,
         maintenance_pool_bytes: 128 * 1024 * 1024,
@@ -486,9 +527,10 @@ More memory can improve sustained ingest, but the useful knobs are workload
 specific. Raise `memtable_max_bytes` and `index_delta_pool_bytes` to publish
 fewer, larger deltas, and raise `maintenance_pool_bytes` when index construction
 or compaction needs a larger bounded workspace. Increasing the query pool does
-not accelerate inserts. The 384 MiB default was measured to retain a complete
-100K x 64-dimensional HNSW graph and avoid restart catch-up on an AWS
-`t3.large`; smaller deployments can explicitly select a tighter envelope.
+not accelerate inserts. The default index and maintenance pools were measured
+to retain a complete 100K x 64-dimensional HNSW graph and avoid restart
+catch-up on an AWS `t3.large`; smaller deployments can explicitly select a
+tighter envelope with `--memory-mib`.
 
 For the larger 512 MiB ingest profile, use:
 

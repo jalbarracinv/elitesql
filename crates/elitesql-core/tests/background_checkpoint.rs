@@ -12,9 +12,9 @@ fn schema() -> TableSchema {
 
 fn record(id: &str, payload: &str, generation: i64) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(id.into()));
-    record.insert("payload".into(), Value::Text(payload.into()));
-    record.insert("generation".into(), Value::Int64(generation));
+    record.insert("id", Value::Text(id.into()));
+    record.insert("payload", Value::Text(payload.into()));
+    record.insert("generation", Value::Int64(generation));
     record
 }
 
@@ -70,8 +70,8 @@ fn indexed_frozen_memtable_stays_queryable_while_wal_tail_keeps_growing() {
         // the same key in the frozen segment.
         let mut tail = db.begin();
         let mut patch = Record::new();
-        patch.insert("payload".into(), Value::Text("newer".into()));
-        patch.insert("generation".into(), Value::Int64(1));
+        patch.insert("payload", Value::Text("newer".into()));
+        patch.insert("generation", Value::Int64(1));
         tail.update("events", "e-00042", patch).unwrap();
         for n in 3_000..3_100 {
             tail.insert("events", record(&format!("e-{n:05}"), "tail", 1))

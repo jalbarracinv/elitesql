@@ -41,7 +41,7 @@ fn open_db(path: &std::path::Path) -> Db {
 
 fn record(v: i64) -> Record {
     let mut r = Record::new();
-    r.insert("v".into(), Value::Int64(v));
+    r.insert("v", Value::Int64(v));
     r
 }
 
@@ -110,7 +110,7 @@ fn engine_matches_model_under_random_workload() {
                     if let Some(id) = pick_key(&model, &mut rng) {
                         counter += 1;
                         let mut p = Record::new();
-                        p.insert("v".into(), Value::Int64(counter));
+                        p.insert("v", Value::Int64(counter));
                         db.update("m", &id, p).unwrap();
                         model.insert(id, counter);
                     }

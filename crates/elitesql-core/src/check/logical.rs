@@ -10,7 +10,9 @@ use memmap2::MmapOptions;
 use ulid::Ulid;
 
 use super::CheckReport;
-use crate::db::{decode_record, encode_record_ordered, normalize_record, BLOBS_DIR, SEGMENTS_DIR};
+use crate::db::{
+    decode_record_for, encode_record_ordered, normalize_record, BLOBS_DIR, SEGMENTS_DIR,
+};
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
 use crate::paged::{ExternalPagedWriter, PagedIndex, PagedWriter};
@@ -159,7 +161,7 @@ pub(super) fn check_logical(
             serde_json::from_slice(key).expect("internally encoded key");
         *counts.entry(table.clone()).or_default() += 1;
         let schema = catalog.table(&table).expect("owned canonical entry");
-        let record = match decode_record(&payload[8..], Some(&blobs))
+        let record = match decode_record_for(schema, &payload[8..], Some(&blobs))
             .and_then(|record| normalize_record(schema, record))
         {
             Ok(record) => record,
@@ -215,7 +217,7 @@ pub(super) fn check_logical(
         let (table, id): (String, String) =
             serde_json::from_slice(key).expect("internally encoded key");
         let schema = catalog.table(&table).expect("owned canonical entry");
-        let Ok(record) = decode_record(&payload[8..], Some(&blobs))
+        let Ok(record) = decode_record_for(schema, &payload[8..], Some(&blobs))
             .and_then(|record| normalize_record(schema, record))
         else {
             return Ok(());
@@ -280,7 +282,10 @@ pub(super) fn check_logical(
         let (table, id): (String, String) =
             serde_json::from_slice(key).expect("internally encoded key");
         let schema = catalog.table(&table).expect("owned canonical entry");
-        let expected = normalize_record(schema, decode_record(&payload[8..], Some(&blobs))?)?;
+        let expected = normalize_record(
+            schema,
+            decode_record_for(schema, &payload[8..], Some(&blobs))?,
+        )?;
         for index in &schema.indexes {
             let value = expected.get(&index.column).unwrap_or(&Value::Null);
             if !value.is_null() && !db.secondary_contains(&table, &index.column, value, &id)? {
@@ -310,7 +315,7 @@ pub(super) fn check_logical(
         let mut agrees = false;
         live.visit_key(&row_key(table, id), |payload| {
             let schema = catalog.table(table).expect("validated catalog");
-            let record = normalize_record(schema, decode_record(&payload[8..], Some(&blobs))?)?;
+            let record = normalize_record(schema, decode_record_for(schema, &payload[8..], Some(&blobs))?)?;
             let value = record.get(column).unwrap_or(&Value::Null);
             let mut actual = Vec::new();
             encode_value(&mut actual, value);

@@ -8,10 +8,7 @@ fn rows(output: QueryOutput) -> Vec<Vec<Value>> {
 }
 
 fn record(fields: &[(&str, Value)]) -> Record {
-    fields
-        .iter()
-        .map(|(k, v)| ((*k).into(), v.clone()))
-        .collect()
+    fields.iter().map(|(k, v)| (*k, v.clone())).collect()
 }
 
 #[test]
@@ -1092,7 +1089,7 @@ fn float_zero_signs_and_nan_agree_across_indexes_equality_and_storage() {
         db.insert("m", nan.clone()),
         Err(Error::SchemaViolation(_))
     ));
-    nan.insert("x".into(), Value::Float64(-0.0));
+    nan.insert("x", Value::Float64(-0.0));
     let id = db
         .insert("m", record(&[("x", Value::Float64(1.5))]))
         .unwrap();

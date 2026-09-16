@@ -296,13 +296,13 @@ fn grouped_dataset(query_working_bytes: usize) -> (TempDir, Db) {
     let mut txn = db.begin();
     for i in 0..3_000usize {
         let mut record = Record::new();
-        record.insert("region".into(), Value::Text(format!("r{:03}", i % 700)));
+        record.insert("region", Value::Text(format!("r{:03}", i % 700)));
         if i % 11 != 0 {
-            record.insert("rep".into(), Value::Text(format!("p{:02}", i % 37)));
+            record.insert("rep", Value::Text(format!("p{:02}", i % 37)));
         }
-        record.insert("amount".into(), Value::Int64(((i * 7_919) % 1_000) as i64));
+        record.insert("amount", Value::Int64(((i * 7_919) % 1_000) as i64));
         if i % 5 != 0 {
-            record.insert("score".into(), Value::Float64((i % 13) as f64 / 2.0));
+            record.insert("score", Value::Float64((i % 13) as f64 / 2.0));
         }
         txn.insert("sales", record).unwrap();
     }

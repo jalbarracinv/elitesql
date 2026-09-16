@@ -222,9 +222,24 @@ Current limits of the server mode, so you can tell what it is not:
   `query_in_txn`, `commit` and `rollback`, or the Python
   `SidecarClient.transaction()` wrapper. Disconnect and the 30-second remote
   deadline roll the transaction back.
+- **Counters for operators**: `{"op":"stats"}` returns cumulative commit-phase
+  timings (lock wait and hold, validation, WAL append, apply, the wait for the
+  state write lock) and query-memory admission counters since the server
+  opened the database; load tests diff two snapshots.
 - **Connections are capped** (`--max-connections`, default 128) because each one
   costs a thread. Past the cap the server answers with a refusal rather than
   queueing.
+- **Pool your connections.** A thread per connection is cheap until there are
+  hundreds of them on a handful of cores. With five hundred concurrent users
+  the shop simulation ran 62 % faster, with nine times better user-visible tail
+  latency, forty per cent less CPU and no failed operations, purely by having
+  the client keep thirty-two connections open instead of five hundred. Every
+  connection pool already works this way; the server cannot do it for you,
+  because its only alternative to executing a request is refusing the client.
+- **`--memory-mib <n>`** scales the whole memory envelope from one number. The
+  default envelope already grows with the machine (see *Memory* below), and
+  raising it further mostly buys concurrency: it is the query pool that admits
+  statements.
 - **Frames are bounded.** Requests and responses are limited to 8 MiB and the
   compatibility `query` operation buffers at most 10,000 rows. Use
   `query_open/query_next/query_close`, Python `streaming_cursor()`, or Node
@@ -479,8 +494,8 @@ use elitesql_core::{Db, DbOptions, MemoryOptions};
 
 let db = Db::open_with("app.esql", DbOptions {
     memory: MemoryOptions {
-        total_memory_bytes: 384 * 1024 * 1024,
-        query_pool_bytes: 64 * 1024 * 1024,
+        total_memory_bytes: 568 * 1024 * 1024,
+        query_pool_bytes: 240 * 1024 * 1024,
         query_working_bytes: 16 * 1024 * 1024,
         index_delta_pool_bytes: 128 * 1024 * 1024,
         maintenance_pool_bytes: 128 * 1024 * 1024,
@@ -561,8 +576,16 @@ deterministic, but not linguistic.
 ## Memory and resource limits
 
 The three allocatable database-wide pools and the emergency reserve are shared
-across all clones of `Db` and all sidecar clients. A query reserves
-`query_working_bytes` from the query pool; if no permit is available it waits
+across all clones of `Db` and all sidecar clients. A statement reserves query
+memory according to what it can materialize: a key-bounded statement (a lookup
+by physical id or through a unique index, a small `INSERT`, DDL, `EXPLAIN`)
+reserves 256 KiB; a single-table statement driven by an equality on a
+non-unique column, a two-table join probed through an index, and text/vector
+searches reserve one eighth of `query_working_bytes`; scans, sorts over
+unbounded input, aggregates and hash joins reserve the whole
+`query_working_bytes`, which is also their spill threshold. Full-budget
+statements may only occupy three quarters of the pool, so a few long scans
+cannot starve point lookups. If no permit is available the statement waits
 with backpressure. Mutable primary, secondary, text and vector state is charged
 to the index-delta pool and is published/remapped when the pool fills.
 Checkpoints, index construction and compaction serialize through the
@@ -580,9 +603,19 @@ work: `memtable_max_bytes` delays automatic checkpoints,
 `index_delta_pool_bytes` permits larger mutable index deltas, and
 `maintenance_pool_bytes` gives construction/merge work a larger bounded
 workspace. Increasing `query_pool_bytes` alone does not make inserts faster.
-The default 384 MiB envelope assigns 128 MiB each to mutable indexes and
-maintenance. This retains the complete measured 100K x 64-dimensional HNSW
-graph across restart; smaller envelopes remain an explicit deployment choice.
+The default envelope assigns 128 MiB each to mutable indexes and maintenance.
+This retains the complete measured 100K x 64-dimensional HNSW graph across
+restart; smaller envelopes remain an explicit deployment choice.
+
+**The query pool scales with the machine.** What it bounds is how many
+statements run at once, so it defaults to 24 MiB per core, between 64 and
+512 MiB, and the envelope grows to hold it: 240 MiB and 568 MiB on a ten-core
+machine. It is a ceiling the governor accounts against, not an allocation —
+raising it fourfold on the shop simulation moved peak resident memory from
+149–190 MiB to 184–259 and throughput at 500 in-flight requests by 35 %,
+because statements had been queueing for a reservation before anything else.
+Below about fifty in-flight statements the larger pool is worth a few per cent
+less throughput, which is the trade the default takes.
 
 `query_admission_timeout_ms` bounds waiting for query memory (default 5000 ms).
 Unconsumed cursors hold no query reservation; buffered cursor rows retain an
@@ -921,7 +954,7 @@ for hit in db.search_vector("docs", "embedding", [0.1, 0.2, 0.3, 0.4], top_k=5):
 # 0.0 hello
 ```
 
-`search_vector(table, column, vector, top_k=10, ef_search=None, filter=None)` returns a list of `{"id", "distance", "record"}`; vectors come back as lists of floats. The Node binding and the `elitesql serve` sidecar expose the same `search_vector` / `create_vector_index` / `search_text` / `search_hybrid` operations.
+`search_vector(table, column, vector, top_k=10, ef_search=None, filter=None)` returns a list of `{"id", "distance", "record"}`; vectors come back as lists of floats. `search_text(table, column, query, top_k=10, filter=None, columns=None)` takes a `columns` list that says what each hit should carry: a hit otherwise carries the whole row, indexed text column included, which for a caller that ranks and then reads one field is most of what a result costs. `columns=[]` returns ids and scores alone. The Node binding and the `elitesql serve` sidecar expose the same `search_vector` / `create_vector_index` / `search_text` / `search_hybrid` operations.
 
 ### What SQL can and cannot do with a vector
 
@@ -999,7 +1032,7 @@ All of this fails with a clear error, never with surprise behavior:
 | `DISTINCT` | deduplicate in the app |
 | `ALTER COLUMN` / `MODIFY` (type or nullability changes) | add the new column, copy with `UPDATE`, drop the old one |
 | `ALTER TABLE ... ADD/DROP FOREIGN KEY` | declare one-column references when creating empty tables |
-| Bare `BEGIN/COMMIT` in stateless SQL | `Txn::query`, Python `transaction()`, or sidecar `query_in_txn` |
+| Bare `BEGIN/COMMIT` in stateless SQL | `Txn::query`, Python `transaction()`, or sidecar `query_in_txn`. Statements inside a transaction use the same access paths as autocommit (physical id, indexed equality) and read the transaction's snapshot with its staged writes overlaid. |
 | `UPDATE/DELETE ... RETURNING` | only `INSERT ... RETURNING` is implemented |
 | `ON DUPLICATE KEY UPDATE`, `REPLACE INTO` | `ON CONFLICT DO NOTHING`/`INSERT IGNORE` only suppress uniqueness conflicts; otherwise use a transaction |
 | `TRUNCATE TABLE` | `DELETE FROM table`, or `DROP TABLE` and recreate it |

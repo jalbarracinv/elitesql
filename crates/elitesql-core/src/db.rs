@@ -4,7 +4,9 @@ mod reads;
 use commit::*;
 use maintenance::*;
 pub(crate) use reads::json_heap_bytes;
+pub(crate) use reads::ScanBatch;
 use reads::*;
+pub(crate) use reads::{push_id, IdSpan};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -13,7 +15,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::FileExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -90,9 +92,8 @@ enum IndexKind {
     Text,
 }
 
-/// A record is a map from column name to value. On reads the implicit
-/// primary key is included under the key `"id"`.
-pub type Record = BTreeMap<String, Value>;
+pub use crate::record::Record;
+use crate::record::{build_row, NameError};
 
 /// Engine tuning options.
 #[derive(Debug, Clone)]
@@ -128,6 +129,12 @@ pub struct DbOptions {
     /// itself is owned by the caller and is not charged to this working-set
     /// budget; use a cursor/streaming API for an unbounded result set.
     pub memory: MemoryOptions,
+    /// Read statements executing at the same time inside the engine; further
+    /// callers queue outside every lock (writes are never held back: they
+    /// serialize on the commit mutex anyway). An opt-in lever for
+    /// thread-per-connection servers with far more clients than cores.
+    /// 0 (the default) = unbounded.
+    pub max_concurrent_statements: usize,
 }
 
 /// Bounded working-memory policy for query execution.
@@ -245,16 +252,38 @@ impl MemoryOptions {
     }
 }
 
+/// Default ceiling on the working memory of all concurrent statements.
+///
+/// What this pool bounds is how many statements run at once, so it scales
+/// with the cores that can run them rather than sitting at a fixed number.
+/// It is a ceiling the governor accounts against, not an allocation: on a
+/// ten-core machine, raising it fourfold moved the shop simulation's peak
+/// resident memory from 149–190 MiB to 184–259 and its throughput at 500
+/// in-flight requests by 35 %, because statements had been queueing for a
+/// reservation before they queued for anything else.
+fn default_query_pool_bytes() -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    (24 * 1024 * 1024 * cores).clamp(64 * 1024 * 1024, 512 * 1024 * 1024)
+}
+
 impl Default for MemoryOptions {
     fn default() -> Self {
+        let query_pool_bytes = default_query_pool_bytes();
+        let index_delta_pool_bytes = 128 * 1024 * 1024;
+        let maintenance_pool_bytes = 128 * 1024 * 1024;
+        let reserved_memory_bytes = 8 * 1024 * 1024;
         Self {
-            total_memory_bytes: 384 * 1024 * 1024,
-            query_pool_bytes: 64 * 1024 * 1024,
+            total_memory_bytes: query_pool_bytes
+                + index_delta_pool_bytes
+                + maintenance_pool_bytes
+                + reserved_memory_bytes
+                + 64 * 1024 * 1024,
+            query_pool_bytes,
             query_working_bytes: 16 * 1024 * 1024,
             query_admission_timeout_ms: 5_000,
-            index_delta_pool_bytes: 128 * 1024 * 1024,
-            maintenance_pool_bytes: 128 * 1024 * 1024,
-            reserved_memory_bytes: 8 * 1024 * 1024,
+            index_delta_pool_bytes,
+            maintenance_pool_bytes,
+            reserved_memory_bytes,
             scan_batch_rows: 512,
             spill_directory: None,
         }
@@ -345,6 +374,9 @@ impl Default for DbOptions {
             full_fsync: false,
             auto_compaction: AutoCompactionOptions::default(),
             memory: MemoryOptions::default(),
+            // Measured on the mini-SaaS workload: bounding readers cost 20 %
+            // at 200 users and gained 15 % at 1 000, so it stays opt-in.
+            max_concurrent_statements: 0,
         }
     }
 }
@@ -435,6 +467,9 @@ pub struct MaintenanceStats {
     pub point_read_throttles: u64,
     /// In-memory publication to primary and derived mutable indexes.
     pub commit_apply_time: Duration,
+    /// Part of `commit_apply_time` spent waiting for the state write lock
+    /// while readers drained, with the commit mutex held.
+    pub commit_state_write_wait_time: Duration,
     /// Time spent waiting for or scheduling maintenance from the commit path.
     pub commit_phase_maintenance_wait_time: Duration,
     pub checkpoints: u64,
@@ -485,6 +520,10 @@ pub struct MaintenanceStats {
     /// published by the dedicated background worker.
     pub derived_publications: u64,
     pub derived_publication_time: Duration,
+    /// Times the commit path measured the size of the derived overlays
+    /// exactly, which costs a walk of every posting they hold. It used to do
+    /// so on every commit; see `DERIVED_BYTES_SAMPLE_COMMITS`.
+    pub derived_size_walks: u64,
 }
 
 /// Where one committed record version lives.
@@ -575,35 +614,80 @@ type PrimaryDelta = HashMap<String, PrimaryTableDelta>;
 
 /// An append-oriented in-memory primary run. Monotonic ids stay contiguous;
 /// the first out-of-order id converts once to the fully general tree.
+/// Leading bytes of a record id, held beside the array they index.
+///
+/// Finding a row in the resident delta is a binary search, and probing a
+/// `String` per step is a random heap read: a profile of a category page put
+/// a third of the whole statement in that one comparison. Sixteen bytes an
+/// entry keep most probes inside the array. Shorter ids are padded with
+/// zeroes, which orders them exactly as the full strings do, and a tie falls
+/// back to the strings so the order is never an approximation.
+const ID_PREFIX_BYTES: usize = 16;
+
+type IdPrefix = [u8; ID_PREFIX_BYTES];
+
+fn id_prefix(id: &str) -> IdPrefix {
+    let mut prefix = [0u8; ID_PREFIX_BYTES];
+    let bytes = id.as_bytes();
+    let take = bytes.len().min(ID_PREFIX_BYTES);
+    prefix[..take].copy_from_slice(&bytes[..take]);
+    prefix
+}
+
 #[derive(Default)]
 struct PrimaryTableDelta {
     monotonic: Vec<(String, VersionList)>,
+    /// `prefixes[i]` is the prefix of `monotonic[i].0`.
+    prefixes: Vec<IdPrefix>,
     general: Option<BTreeMap<String, VersionList>>,
 }
 
 impl PrimaryTableDelta {
+    /// Position of `id` in `monotonic`, or where it would be inserted.
+    fn search(&self, id: &str) -> std::result::Result<usize, usize> {
+        debug_assert_eq!(self.prefixes.len(), self.monotonic.len());
+        let wanted = id_prefix(id);
+        let mut low = 0usize;
+        let mut high = self.prefixes.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let order = match self.prefixes[mid].cmp(&wanted) {
+                std::cmp::Ordering::Equal => self.monotonic[mid].0.as_str().cmp(id),
+                other => other,
+            };
+            match order {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+                std::cmp::Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(low)
+    }
+
     fn get(&self, id: &str) -> Option<&VersionList> {
         if let Some(general) = &self.general {
             return general.get(id);
         }
-        self.monotonic
-            .binary_search_by(|(candidate, _)| candidate.as_str().cmp(id))
-            .ok()
-            .map(|index| &self.monotonic[index].1)
+        self.search(id).ok().map(|index| &self.monotonic[index].1)
     }
 
     fn get_mut(&mut self, id: &str) -> Option<&mut VersionList> {
-        if let Some(general) = &mut self.general {
-            return general.get_mut(id);
+        // Resolve the position before taking any mutable borrow, so the
+        // search and the returned reference do not overlap.
+        let at = self
+            .general
+            .is_none()
+            .then(|| self.search(id).ok())
+            .flatten();
+        match at {
+            Some(at) => Some(&mut self.monotonic[at].1),
+            None => self.general.as_mut()?.get_mut(id),
         }
-        self.monotonic
-            .binary_search_by(|(candidate, _)| candidate.as_str().cmp(id))
-            .ok()
-            .map(|index| &mut self.monotonic[index].1)
     }
 
     fn make_general(&mut self) -> &mut BTreeMap<String, VersionList> {
         if self.general.is_none() {
+            self.prefixes.clear();
             self.general = Some(self.monotonic.drain(..).collect());
         }
         self.general
@@ -621,8 +705,8 @@ impl PrimaryTableDelta {
             .last_mut()
             .map(|(last, versions)| (last.as_str().cmp(id.as_str()), versions))
         {
-            None => self.monotonic.push((id, vec![entry])),
-            Some((std::cmp::Ordering::Less, _)) => {
+            None | Some((std::cmp::Ordering::Less, _)) => {
+                self.prefixes.push(id_prefix(&id));
                 self.monotonic.push((id, vec![entry]));
             }
             Some((std::cmp::Ordering::Equal, versions)) => versions.push(entry),
@@ -684,6 +768,141 @@ impl PrimaryTableDelta {
                 .iter()
                 .map(|(id, versions)| (id, versions)),
         )
+    }
+}
+
+/// The identity value stored in a row's payload, for the conversion that
+/// re-keys a table by it. `ordinal` is the identity column's position in the
+/// schema, which is what a positional payload is indexed by.
+fn payload_identity(payload: &[u8], schema: &TableSchema, ordinal: usize) -> Result<i64> {
+    let name = schema.columns[ordinal].name.as_str();
+    let wanted = [name];
+    let projection = RowProjection::new(Some(schema), Some(&wanted));
+    // An identity is an int, never out of line, so no blob directory is
+    // needed to read it.
+    let record = decode_record_keep(payload, None, &projection)?;
+    match record.get(name) {
+        Some(Value::Int64(value)) if *value >= 1 => Ok(*value),
+        other => Err(Error::Corrupt(format!(
+            "row of '{}' has no usable identity in '{name}': {other:?}",
+            schema.name
+        ))),
+    }
+}
+
+/// The physical key of a row whose table declares its own identity.
+///
+/// The key has to sort exactly as the identity does, because the primary
+/// directory is sorted by it and a scan hands rows back in that order. Zero
+/// padding to nineteen digits does that, but every comparison then reads
+/// nineteen bytes, and a sampled profile of an indexed read put `memcmp`
+/// first among named costs, ahead of the directory lookup itself.
+///
+/// So the digit count leads instead of padding: a longer number is a larger
+/// one, and two numbers of the same length compare digit by digit exactly as
+/// they compare numerically. An identity under ten million is eight bytes
+/// rather than nineteen, which also fits more entries in a page and makes the
+/// directory shallower. Identities are positive (`identity_request` rejects
+/// the rest), so no sign has to be encoded.
+pub(crate) fn identity_key(identity: i64) -> String {
+    let digits = identity.to_string();
+    let mut key = String::with_capacity(digits.len() + 1);
+    // A letter, so the marker stays one byte for all nineteen possible
+    // lengths and still orders by length.
+    key.push((b'a' + digits.len() as u8) as char);
+    key.push_str(&digits);
+    key
+}
+
+/// The identity a record asks for, if any. `None` means "generate one".
+fn identity_request(record: &Record, identity_name: &str) -> Result<Option<i64>> {
+    match record.get(identity_name) {
+        None => Ok(None),
+        Some(Value::Int64(value)) if *value >= 1 => Ok(Some(*value)),
+        Some(Value::Int64(_)) => Err(Error::SchemaViolation(format!(
+            "identity column '{identity_name}' requires a positive int"
+        ))),
+        Some(_) => Err(Error::SchemaViolation(format!(
+            "identity column '{identity_name}' requires an int"
+        ))),
+    }
+}
+
+fn key_prefix_len(table: &str) -> usize {
+    4 + table.len()
+}
+
+/// One table's slice of the primary directory. See `PrimaryIdx::table_view`.
+struct PrimaryTableView<'a> {
+    runs: &'a [PrimaryRun],
+    frozen: Option<&'a PrimaryTableDelta>,
+    active: Option<&'a PrimaryTableDelta>,
+    /// Key buffer already holding the table prefix; only the id is replaced.
+    key: &'a mut Vec<u8>,
+    prefix_len: usize,
+}
+
+impl PrimaryTableView<'_> {
+    fn newest(&mut self, id: &str, max_version: u64) -> Result<Option<VersionEntry>> {
+        // The overlays hold what was committed after the runs were published,
+        // so every version in them is newer than every version in a run. A
+        // visible version found here is therefore the answer, and the runs do
+        // not have to be traversed at all — which for a row written since the
+        // last checkpoint is the whole cost of reaching it.
+        //
+        // Version lists are kept in ascending commit order, so the newest
+        // visible entry is the first one found walking backwards.
+        let mut newest: Option<VersionEntry> = None;
+        for versions in [self.frozen, self.active]
+            .into_iter()
+            .flatten()
+            .filter_map(|delta| delta.get(id))
+        {
+            if let Some(entry) = versions
+                .iter()
+                .rev()
+                .find(|entry| entry.version <= max_version)
+            {
+                if newest
+                    .as_ref()
+                    .is_none_or(|current| entry.version > current.version)
+                {
+                    newest = Some(entry.clone());
+                }
+            }
+        }
+        if let Some(entry) = newest {
+            debug_assert!(
+                self.newest_in_runs(id, max_version)
+                    .is_ok_and(|in_runs| in_runs.is_none_or(|run| run.version < entry.version)),
+                "an overlay version must be newer than any run version of the same row"
+            );
+            return Ok(Some(entry));
+        }
+        self.newest_in_runs(id, max_version)
+    }
+
+    fn newest_in_runs(&mut self, id: &str, max_version: u64) -> Result<Option<VersionEntry>> {
+        self.key.truncate(self.prefix_len);
+        self.key.extend_from_slice(id.as_bytes());
+        let mut newest: Option<VersionEntry> = None;
+        for run in self.runs {
+            if !run.index.may_contain_key(self.key) {
+                continue;
+            }
+            run.index.visit_key(self.key, |value| {
+                let entry = decode_primary_entry(value)?;
+                if entry.version <= max_version
+                    && newest
+                        .as_ref()
+                        .is_none_or(|current| entry.version > current.version)
+                {
+                    newest = Some(entry);
+                }
+                Ok(true)
+            })?;
+        }
+        Ok(newest)
     }
 }
 
@@ -785,6 +1004,7 @@ impl PrimaryIdx {
                         .map(|(id, versions)| {
                             id.len()
                                 + 96
+                                + ID_PREFIX_BYTES
                                 + versions
                                     .iter()
                                     .map(|entry| match &entry.kind {
@@ -812,13 +1032,97 @@ impl PrimaryIdx {
         id: &str,
         max_version: u64,
     ) -> Result<Option<VersionEntry>> {
-        let key = primary_key(table, id);
+        let mut key = Vec::with_capacity(4 + table.len() + id.len());
+        self.newest_at_or_before_with(table, id, max_version, &mut key)
+    }
+
+    /// `newest_at_or_before` reusing the caller's key buffer. Resolving a
+    /// batch of ids from a secondary index calls this once per id, and the
+    /// per-call key allocation was a measurable part of it.
+    /// One table's view of the directory, resolved once for a batch of ids.
+    ///
+    /// Resolving a candidate row used to re-find the table in two hash maps
+    /// and rebuild its key prefix, per id. A batch out of a secondary index
+    /// does that hundreds of times for the same table.
+    fn table_view<'a>(&'a self, table: &str, key: &'a mut Vec<u8>) -> PrimaryTableView<'a> {
+        key.clear();
+        key.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        key.extend_from_slice(table.as_bytes());
+        PrimaryTableView {
+            runs: &self.runs,
+            frozen: self
+                .frozen
+                .as_ref()
+                .and_then(|frozen| frozen.delta.get(table)),
+            active: self.delta.get(table),
+            key,
+            prefix_len: key_prefix_len(table),
+        }
+    }
+
+    fn newest_at_or_before_with(
+        &self,
+        table: &str,
+        id: &str,
+        max_version: u64,
+        key: &mut Vec<u8>,
+    ) -> Result<Option<VersionEntry>> {
+        // The overlays hold what was committed after the runs were published,
+        // so every version in them is newer than every version in a run: one
+        // found here is the answer and the runs need not be searched at all.
+        // This is what `PrimaryTableView::newest` does, and this function was
+        // missed when that landed. A hot row, a stock counter that every
+        // checkout writes, is always answered from the overlay, and the run
+        // search it used to pay first was most of what an update cost.
+        //
+        // Version lists are kept in ascending commit order, so the newest
+        // visible entry is the first one found walking backwards.
+        let mut newest: Option<VersionEntry> = None;
+        for delta in [
+            self.frozen
+                .as_ref()
+                .and_then(|frozen| frozen.delta.get(table))
+                .and_then(|table| table.get(id)),
+            self.delta.get(table).and_then(|table| table.get(id)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(entry) = delta
+                .iter()
+                .rev()
+                .find(|entry| entry.version <= max_version)
+            {
+                if newest
+                    .as_ref()
+                    .is_none_or(|current| entry.version > current.version)
+                {
+                    newest = Some(entry.clone());
+                }
+            }
+        }
+        encode_primary_key_into(table, id, key);
+        let key = &key[..];
+        if let Some(entry) = newest {
+            debug_assert!(
+                self.newest_in_runs_at(key, max_version)
+                    .is_ok_and(|in_runs| in_runs.is_none_or(|run| run.version < entry.version)),
+                "an overlay version must be newer than any run version of the same row"
+            );
+            return Ok(Some(entry));
+        }
+        self.newest_in_runs_at(key, max_version)
+    }
+
+    /// The newest version of an encoded key at or before `max_version` that
+    /// the published runs hold.
+    fn newest_in_runs_at(&self, key: &[u8], max_version: u64) -> Result<Option<VersionEntry>> {
         let mut newest: Option<VersionEntry> = None;
         for run in &self.runs {
-            if !run.index.may_contain_key(&key) {
+            if !run.index.may_contain_key(key) {
                 continue;
             }
-            run.index.visit_key(&key, |value| {
+            run.index.visit_key(key, |value| {
                 let entry = decode_primary_entry(value)?;
                 if entry.version <= max_version
                     && newest
@@ -829,33 +1133,6 @@ impl PrimaryIdx {
                 }
                 Ok(true)
             })?;
-        }
-        if let Some(delta) = self
-            .frozen
-            .as_ref()
-            .and_then(|frozen| frozen.delta.get(table))
-            .and_then(|table| table.get(id))
-        {
-            for entry in delta {
-                if entry.version <= max_version
-                    && newest
-                        .as_ref()
-                        .is_none_or(|current| entry.version > current.version)
-                {
-                    newest = Some(entry.clone());
-                }
-            }
-        }
-        if let Some(delta) = self.delta.get(table).and_then(|table| table.get(id)) {
-            for entry in delta {
-                if entry.version <= max_version
-                    && newest
-                        .as_ref()
-                        .is_none_or(|current| entry.version > current.version)
-                {
-                    newest = Some(entry.clone());
-                }
-            }
         }
         Ok(newest)
     }
@@ -948,8 +1225,16 @@ impl PrimaryIdx {
             if after_id.is_some_and(|after| next_id.as_str() <= after) {
                 continue;
             }
-            versions.sort_unstable_by_key(|entry| entry.version);
-            versions.dedup_by_key(|entry| entry.version);
+            // After a compaction almost every row has exactly one version,
+            // and sources hand theirs over in ascending order, so the merge
+            // is only needed when they actually interleave.
+            if versions
+                .windows(2)
+                .any(|pair| pair[0].version >= pair[1].version)
+            {
+                versions.sort_unstable_by_key(|entry| entry.version);
+                versions.dedup_by_key(|entry| entry.version);
+            }
             if !visit(&next_id, &versions)? {
                 break;
             }
@@ -1041,12 +1326,14 @@ impl<'a> PrimaryTableCursor<'a> {
         let Some((key, value)) = self.cursor.next()? else {
             return Ok(None);
         };
-        let (table, id) = decode_primary_key(key)?;
-        if table != self.table {
+        let (table, id) = split_primary_key(key)?;
+        if table != self.table.as_bytes() {
             return Err(Error::Corrupt(
                 "primary index: table prefix mismatch".into(),
             ));
         }
+        let id = std::str::from_utf8(id)
+            .map_err(|_| Error::Corrupt("primary index: invalid id utf8".into()))?;
         let mut owned = self.spare_ids.pop().unwrap_or_default();
         owned.clear();
         owned.push_str(id);
@@ -1074,7 +1361,10 @@ fn encode_primary_key_into(table: &str, id: &str, key: &mut Vec<u8>) {
     key.extend_from_slice(id.as_bytes());
 }
 
-fn decode_primary_key(key: &[u8]) -> Result<(&str, &str)> {
+/// Split a primary key into its table and id halves without validating
+/// either: a scan compares the table as bytes and only the id becomes a
+/// string, so validating both once per index entry was pure overhead.
+fn split_primary_key(key: &[u8]) -> Result<(&[u8], &[u8])> {
     if key.len() < 4 {
         return Err(Error::Corrupt("primary index: truncated key".into()));
     }
@@ -1083,11 +1373,7 @@ fn decode_primary_key(key: &[u8]) -> Result<(&str, &str)> {
         .checked_add(table_len)
         .filter(|end| *end <= key.len())
         .ok_or_else(|| Error::Corrupt("primary index: invalid table length".into()))?;
-    let table = std::str::from_utf8(&key[4..table_end])
-        .map_err(|_| Error::Corrupt("primary index: invalid table utf8".into()))?;
-    let id = std::str::from_utf8(&key[table_end..])
-        .map_err(|_| Error::Corrupt("primary index: invalid id utf8".into()))?;
-    Ok((table, id))
+    Ok((&key[4..table_end], &key[table_end..]))
 }
 
 fn encode_primary_entry(entry: &VersionEntry) -> Result<Vec<u8>> {
@@ -1759,7 +2045,9 @@ fn primary_generation(committed_version: u64, segments: &[SegmentMeta], catalog:
 }
 
 const SECONDARY_FORMAT_KEY: &[u8] = &[0];
-const SECONDARY_FORMAT_VALUE: &[u8] = b"ESQLSID2";
+// Bumped when the key encoding changes: a run written under an older marker
+// fails to load and the loader rebuilds it from canonical data.
+const SECONDARY_FORMAT_VALUE: &[u8] = b"ESQLSID3";
 const SECONDARY_ENTRY_TAG: u8 = 1;
 const SECONDARY_DELETE: u8 = 0;
 const SECONDARY_ADD: u8 = 1;
@@ -1789,10 +2077,52 @@ struct FrozenSecDelta {
     removed: HashMap<Vec<u8>, BTreeSet<String>>,
 }
 
+/// Ids of one equality batch, packed end to end.
+///
+/// A category page matches hundreds of rows and every one of them used to
+/// arrive as its own `String`. Here the batch owns one growing arena and one
+/// span per id, so a wide equality allocates per batch instead of per row.
+#[derive(Default)]
+pub(crate) struct IdBatch {
+    arena: String,
+    spans: Vec<IdSpan>,
+    /// Buffer for the id currently being merged, reused on every pass.
+    scratch: String,
+}
+
+impl IdBatch {
+    fn clear(&mut self) {
+        self.arena.clear();
+        self.spans.clear();
+    }
+
+    fn push(&mut self, id: &str) {
+        let span = push_id(&mut self.arena, id);
+        self.spans.push(span);
+    }
+
+    fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.spans.iter().map(|span| span.of(&self.arena))
+    }
+
+    fn last(&self) -> Option<&str> {
+        self.spans.last().map(|span| span.of(&self.arena))
+    }
+}
+
 struct SecPairCursor<'a> {
     cursor: PagedPrefixCursor<'a>,
     prefix: Vec<u8>,
-    head: Option<(String, u64, u8)>,
+    /// Id of the head entry. It lives in a buffer the cursor refills instead
+    /// of a fresh `String` per entry: an equality on a wide key advances the
+    /// cursor once per member, and every one of those ids was allocated only
+    /// to be compared against the merge head and dropped.
+    id: String,
+    head: Option<(u64, u8)>,
 }
 
 impl<'a> SecPairCursor<'a> {
@@ -1802,14 +2132,21 @@ impl<'a> SecPairCursor<'a> {
         let mut cursor = Self {
             cursor: index.prefix_cursor_after(&prefix, after_key.as_deref()),
             prefix,
+            id: String::new(),
             head: None,
         };
         cursor.advance()?;
         Ok(cursor)
     }
 
+    /// The id the cursor sits on, or `None` once the run is exhausted.
+    fn head_id(&self) -> Option<&str> {
+        self.head.map(|_| self.id.as_str())
+    }
+
     fn advance(&mut self) -> Result<()> {
         self.head = None;
+        self.id.clear();
         let Some((key, value)) = self.cursor.next()? else {
             return Ok(());
         };
@@ -1819,7 +2156,8 @@ impl<'a> SecPairCursor<'a> {
         let id = std::str::from_utf8(id)
             .map_err(|_| Error::Corrupt("secondary index: invalid id utf8".into()))?;
         let (version, operation) = decode_secondary_operation(value)?;
-        self.head = Some((id.to_owned(), version, operation));
+        self.id.push_str(id);
+        self.head = Some((version, operation));
         Ok(())
     }
 }
@@ -1853,7 +2191,9 @@ impl SecIdx {
     }
 
     fn ids(&self, key: &[u8]) -> Result<BTreeSet<String>> {
-        Ok(self.ids_batch(key, None, usize::MAX)?.into_iter().collect())
+        let mut batch = IdBatch::default();
+        self.ids_batch_into(key, None, usize::MAX, &mut batch)?;
+        Ok(batch.iter().map(str::to_owned).collect())
     }
 
     fn contains_pair(&self, key: &[u8], id: &str) -> Result<bool> {
@@ -1863,6 +2203,13 @@ impl SecIdx {
         if self.delta.get(key).is_some_and(|ids| ids.contains(id)) {
             return Ok(true);
         }
+        self.persisted_pair(key, id)
+    }
+
+    /// Whether a published generation still offers this pair, ignoring the
+    /// mutable overlay. A pair that no generation carries needs no tombstone
+    /// when it is removed: there is nothing for one to hide.
+    fn persisted_pair(&self, key: &[u8], id: &str) -> Result<bool> {
         let mut newest = None;
         let pair = secondary_pair_key(key, id);
         for run in &self.runs {
@@ -1895,16 +2242,31 @@ impl SecIdx {
 
     /// Merge one cursor per immutable run plus the bounded mutable overlay.
     /// Versioned tombstones make the result independent of level order.
-    fn ids_batch(&self, key: &[u8], after: Option<&str>, limit: usize) -> Result<Vec<String>> {
+    /// Ids of one equality batch, packed into `out`.
+    ///
+    /// The merge compares one id at a time against the head of every run and
+    /// overlay. Handing that id out as a `String` cost an allocation for each
+    /// entry the merge looked at, including the ones a delete tombstone then
+    /// removed; `out` reuses one buffer for the comparison and one arena for
+    /// the ids that survive.
+    fn ids_batch_into(
+        &self,
+        key: &[u8],
+        after: Option<&str>,
+        limit: usize,
+        out: &mut IdBatch,
+    ) -> Result<()> {
         use std::ops::Bound::{Excluded, Unbounded};
 
+        out.clear();
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
+        let prefix = secondary_pair_prefix(key);
         let mut cursors = self
             .runs
             .iter()
-            .filter(|run| run.index.may_contain_prefix(&secondary_pair_prefix(key)))
+            .filter(|run| run.index.may_contain_prefix(&prefix))
             .map(|run| SecPairCursor::new(&run.index, key, after))
             .collect::<Result<Vec<_>>>()?;
         let mut added = self.delta.get(key).map(|ids| match after {
@@ -1927,12 +2289,8 @@ impl SecIdx {
                 None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
             })
         });
-        let mut out = Vec::with_capacity(limit.min(1024));
         loop {
-            let next_persisted = cursors
-                .iter()
-                .filter_map(|cursor| cursor.head.as_ref().map(|head| head.0.as_str()))
-                .min();
+            let next_persisted = cursors.iter().filter_map(SecPairCursor::head_id).min();
             let next_added = added
                 .as_mut()
                 .and_then(|iter| iter.peek().map(|id| id.as_str()));
@@ -1945,22 +2303,25 @@ impl SecIdx {
             let next_frozen_removed = frozen_removed
                 .as_mut()
                 .and_then(|iter| iter.peek().map(|id| id.as_str()));
-            let Some(id) = next_persisted
+            let Some(next) = next_persisted
                 .into_iter()
                 .chain(next_frozen_added)
                 .chain(next_frozen_removed)
                 .chain(next_added)
                 .chain(next_removed)
                 .min()
-                .map(str::to_owned)
             else {
                 break;
             };
+            // Copied out of the heads so they can be advanced below; the
+            // buffer is the same one on every pass.
+            out.scratch.clear();
+            out.scratch.push_str(next);
+            let id = std::mem::take(&mut out.scratch);
             let mut newest: Option<(u64, u8)> = None;
             for cursor in &mut cursors {
-                while cursor.head.as_ref().is_some_and(|head| head.0 == id) {
-                    let (_, version, operation) =
-                        cursor.head.take().expect("matching secondary head");
+                while cursor.head_id() == Some(id.as_str()) {
+                    let (version, operation) = cursor.head.take().expect("matching secondary head");
                     if newest.is_none_or(|current| (version, operation) > current) {
                         newest = Some((version, operation));
                     }
@@ -2005,14 +2366,18 @@ impl SecIdx {
                 removed.as_mut().expect("checked above").next();
                 newest = Some((u64::MAX, SECONDARY_DELETE));
             }
-            if newest.is_some_and(|(_, operation)| operation == SECONDARY_ADD) {
-                out.push(id);
-                if out.len() == limit {
-                    break;
-                }
+            let keep = newest.is_some_and(|(_, operation)| operation == SECONDARY_ADD);
+            if keep {
+                out.push(&id);
+            }
+            // Give the buffer back whether the id was kept or not, so the
+            // next pass writes into the same allocation.
+            out.scratch = id;
+            if keep && out.len() == limit {
+                break;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     fn add(&mut self, key: Vec<u8>, id: &str) {
@@ -2032,7 +2397,15 @@ impl SecIdx {
                 self.delta.remove(key);
             }
         }
-        if !self.runs.is_empty() || self.frozen.is_some() {
+        // A row written and deleted between two publications never reached a
+        // generation, so nothing has to be hidden from a later reader.
+        // Recording its removal anyway left an entry that every subsequent
+        // lookup of that key walked past: a cart emptied a few thousand times
+        // made reading it seventeen times slower with one row left in it.
+        // A read failure here keeps the old, conservative tombstone.
+        if (!self.runs.is_empty() || self.frozen.is_some())
+            && self.persisted_pair(key, id).unwrap_or(true)
+        {
             self.removed
                 .entry(key.to_vec())
                 .or_default()
@@ -2152,10 +2525,18 @@ fn validate_secondary_run(index: &PagedIndex) -> Result<()> {
 
 struct State {
     catalog: Catalog,
+    /// The catalog's table entries, shared. Resolving a statement used to
+    /// clone the whole schema out of the catalog before it could look at a
+    /// column, which on a three-column table was 130 ns of a 1.8 µs point
+    /// read and more on a wide one. Rebuilt whenever the catalog is replaced,
+    /// which happens on DDL and on open, never on a statement.
+    schemas: HashMap<String, Arc<TableSchema>>,
     committed_version: u64,
     /// Highest reserved integer identity per table. Committed values are
     /// carried in the WAL and checkpoints copy the map into the manifest.
-    identity_high_water: HashMap<String, i64>,
+    /// Atomic so a reservation is a `fetch_add` under the shared lock: taking
+    /// the exclusive lock per inserted row stalled every reader and committer.
+    identity_high_water: HashMap<String, AtomicI64>,
     /// table -> id -> versions in ascending commit order.
     index: PrimaryIdx,
     /// Greatest primary key observed in the current table epoch. Keys above
@@ -2177,6 +2558,107 @@ struct State {
     readers: SegmentReaders,
     segments: Vec<SegmentMeta>,
     next_segment_id: u32,
+    /// Ids touched by recent commits; see `ChangeLog`.
+    change_log: ChangeLog,
+}
+
+/// Ids touched by recent commits, oldest first, bounded by `CHANGE_LOG_MAX_IDS`.
+///
+/// The secondary indexes describe the *latest* committed state. A transaction
+/// reads at an older snapshot, so an indexed lookup through a transaction takes
+/// the index's ids as candidates, adds every id changed by commits after its
+/// snapshot (which may have carried the searched value at that snapshot), and
+/// re-reads each candidate at the snapshot version. When the snapshot predates
+/// what the log still holds, callers fall back to a scan.
+#[derive(Default)]
+struct ChangeLog {
+    entries: VecDeque<ChangeLogEntry>,
+    total_ids: usize,
+    /// Highest commit version whose ids were evicted or never recorded.
+    unlogged_max: u64,
+}
+
+struct ChangeLogEntry {
+    version: u64,
+    table: String,
+    ids: Vec<String>,
+}
+
+const CHANGE_LOG_MAX_IDS: usize = 200_000;
+
+/// Largest posting volume a text query copies out of the index to rank without
+/// the state lock; bigger queries rank under the lock, streaming.
+const TEXT_COLLECT_MAX_POSTINGS: usize = 32_768;
+
+/// Ids visited per state-lock hold by indexed equality batches.
+const INDEX_LOCK_CHUNK_IDS: usize = 32;
+
+/// Retain the segment handles the prepared entries live in, so their
+/// payloads can be decoded after the state lock is released.
+fn retain_segment_readers(
+    st: &State,
+    prepared: &[(IdSpan, VKind)],
+    readers: &mut SegmentReaders,
+) -> Result<()> {
+    for (_, kind) in prepared {
+        if let VKind::SegPut { segment, .. } = kind {
+            if !readers.contains_key(segment) {
+                let reader = st
+                    .readers
+                    .get(segment)
+                    .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
+                readers.insert(*segment, reader.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Query-memory reservation of a key-bounded statement (see `Db::query_admission_small_bytes`).
+const QUERY_ADMISSION_SMALL_BYTES: usize = 256 * 1024;
+
+impl ChangeLog {
+    fn push(&mut self, version: u64, table: &str, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.total_ids = self.total_ids.saturating_add(ids.len());
+        self.entries.push_back(ChangeLogEntry {
+            version,
+            table: table.to_owned(),
+            ids,
+        });
+        while self.total_ids > CHANGE_LOG_MAX_IDS {
+            let Some(oldest) = self.entries.pop_front() else {
+                break;
+            };
+            self.total_ids = self.total_ids.saturating_sub(oldest.ids.len());
+            self.unlogged_max = self.unlogged_max.max(oldest.version);
+        }
+    }
+
+    /// Record that `version` changed rows without logging their ids.
+    fn note_unlogged(&mut self, version: u64) {
+        self.unlogged_max = self.unlogged_max.max(version);
+    }
+
+    /// Ids of `table` changed by commits newer than `version`, or `None` when
+    /// some such commit is no longer (or was never) recorded.
+    fn changed_after(&self, table: &str, version: u64) -> Option<Vec<&str>> {
+        if self.unlogged_max > version {
+            return None;
+        }
+        let mut out = Vec::new();
+        for entry in self.entries.iter().rev() {
+            if entry.version <= version {
+                break;
+            }
+            if entry.table == table {
+                out.extend(entry.ids.iter().map(String::as_str));
+            }
+        }
+        Some(out)
+    }
 }
 
 /// Read handle for one immutable canonical segment. Payload reads go through
@@ -2240,7 +2722,40 @@ impl SegmentReader {
 /// retain exactly the readers they need after releasing the global state lock.
 /// Compaction may unlink an old segment meanwhile, but the open descriptor and
 /// its mapping remain valid until the last in-flight reader drops its clone.
-type SegmentReaders = HashMap<u32, Arc<SegmentReader>>;
+/// Segment handles a statement has retained. The key is a segment id, and a
+/// batched read looks one up per row, so the default SipHash showed up in a
+/// scan profile at ~5 % of the statement. A multiply-shift over four bytes is
+/// all a dense small-integer key needs.
+type SegmentReaders = HashMap<u32, Arc<SegmentReader>, BuildSegmentHasher>;
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct BuildSegmentHasher;
+
+impl std::hash::BuildHasher for BuildSegmentHasher {
+    type Hasher = SegmentHasher;
+
+    fn build_hasher(&self) -> SegmentHasher {
+        SegmentHasher(0)
+    }
+}
+
+pub(crate) struct SegmentHasher(u64);
+
+impl std::hash::Hasher for SegmentHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = u64::from(value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
 
 impl State {
     /// Whether every secondary, text and vector index declared by the catalog
@@ -2282,12 +2797,34 @@ impl State {
     }
 
     fn latest_owned(&self, table: &str, id: &str) -> Result<Option<VersionEntry>> {
+        let mut key = Vec::new();
+        self.latest_owned_with(table, id, &mut key)
+    }
+
+    /// `latest_owned` reusing the caller's key buffer.
+    /// A view of one table's directory that a batch of ids can reuse, with
+    /// the schema epoch the caller must apply.
+    fn table_view<'a>(
+        &'a self,
+        table: &str,
+        key: &'a mut Vec<u8>,
+    ) -> Option<(PrimaryTableView<'a>, u64)> {
+        let epoch = self.catalog.table(table)?.epoch;
+        Some((self.index.table_view(table, key), epoch))
+    }
+
+    fn latest_owned_with(
+        &self,
+        table: &str,
+        id: &str,
+        key: &mut Vec<u8>,
+    ) -> Result<Option<VersionEntry>> {
         let Some(schema) = self.catalog.table(table) else {
             return Ok(None);
         };
         Ok(self
             .index
-            .latest(table, id)?
+            .newest_at_or_before_with(table, id, u64::MAX, key)?
             .filter(|entry| entry.version > schema.epoch))
     }
 
@@ -2304,6 +2841,23 @@ impl State {
             .index
             .visible(table, id, max_version)?
             .filter(|entry| entry.version > schema.epoch))
+    }
+
+    /// Replace the catalog and the shared entries derived from it. Every
+    /// assignment to `catalog` must go through here.
+    fn set_catalog(&mut self, catalog: Catalog) {
+        self.schemas = catalog
+            .tables
+            .iter()
+            .map(|schema| (schema.name.clone(), Arc::new(schema.clone())))
+            .collect();
+        self.catalog = catalog;
+    }
+
+    /// The shared entry for one table, or `None` when the catalog has no such
+    /// table.
+    fn schema_arc(&self, table: &str) -> Option<Arc<TableSchema>> {
+        self.schemas.get(table).cloned()
     }
 
     fn index_delta_memory_bytes(&self) -> usize {
@@ -2360,7 +2914,7 @@ fn identity_manifest(state: &State) -> BTreeMap<String, i64> {
     state
         .identity_high_water
         .iter()
-        .map(|(table, value)| (table.clone(), *value))
+        .map(|(table, value)| (table.clone(), value.load(AtomicOrdering::Relaxed)))
         .collect()
 }
 
@@ -2451,6 +3005,53 @@ impl Drop for ActiveStateWriter<'_> {
         self.0
             .active_state_writers
             .fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Bounded number of statements executing at once (see
+/// `DbOptions::max_concurrent_statements`). Waiters park FIFO-ish on a
+/// condition variable and hold no engine lock, so a thread-per-connection
+/// server with a thousand clients keeps only a few statements inside the
+/// state lock at any time and a committer waits for at most that many readers.
+struct StatementSlots {
+    limit: usize,
+    free: ParkingMutex<usize>,
+    available: parking_lot::Condvar,
+}
+
+impl StatementSlots {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            free: ParkingMutex::new(limit),
+            available: parking_lot::Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> Option<StatementSlot<'_>> {
+        if self.limit == 0 {
+            return None;
+        }
+        let mut free = self.free.lock();
+        while *free == 0 {
+            self.available.wait(&mut free);
+        }
+        *free -= 1;
+        Some(StatementSlot { slots: self })
+    }
+}
+
+/// One execution slot; released on drop.
+pub(crate) struct StatementSlot<'a> {
+    slots: &'a StatementSlots,
+}
+
+impl Drop for StatementSlot<'_> {
+    fn drop(&mut self) {
+        let mut free = self.slots.free.lock();
+        *free += 1;
+        drop(free);
+        self.slots.available.notify_one();
     }
 }
 
@@ -2796,6 +3397,9 @@ struct Shared {
     memory_governor: Arc<MemoryGovernor>,
     /// Held for the lifetime of the Db: process-level exclusion.
     _lock_file: File,
+    /// std's queue-based lock: measured against `parking_lot::RwLock` on the
+    /// mini-SaaS workload, the adaptive spinning of the latter burned the
+    /// CPU of 1 000 oversubscribed client threads (2 900 vs 4 500 ops/s).
     state: RwLock<State>,
     /// Serializes commits, checkpoints and compaction. Writers stage in
     /// parallel without this lock and only meet here, at commit.
@@ -2836,11 +3440,15 @@ struct Shared {
     wal_appended_bytes: AtomicU64,
     commit_phase_sync_wait_nanos: AtomicU64,
     commit_apply_nanos: AtomicU64,
+    /// Time the commit path spent waiting for the state write lock (readers draining).
+    commit_state_write_wait_nanos: AtomicU64,
     commit_phase_maintenance_wait_nanos: AtomicU64,
     /// Committers currently queued for the serialization mutex. A group
     /// leader only opens a coalescing window when contention already exists,
     /// preserving single-writer latency.
-    commit_waiters: AtomicU64,
+    /// Committers queued for the serialization mutex. A scan reads it before
+    /// every chunk: see `SCAN_LOCK_CHUNK_ROWS`.
+    pub(super) commit_waiters: AtomicU64,
     wal_sync_count: AtomicU64,
     wal_sync_nanos: AtomicU64,
     wal_synced_bytes: AtomicU64,
@@ -2854,6 +3462,7 @@ struct Shared {
     /// CPU-aware admission used only while commits or identity reservations
     /// are active. Read-only workloads retain an unthrottled point-read path.
     point_read_parallelism: usize,
+    statement_slots: StatementSlots,
     active_state_writers: AtomicU64,
     /// Short-lived memory that a concurrent Safe burst was observed. Leaders
     /// consume it only after direct concurrency is no longer visible.
@@ -2896,6 +3505,11 @@ struct Shared {
     /// they are not selected again, so a mis-estimate costs one rebuild.
     vector_merge_rejected: Mutex<HashSet<String>>,
     derived_publication_count: AtomicU64,
+    /// Last sampled size of the derived overlays, and the commit version it
+    /// was taken at. See `sampled_derived_delta_bytes`.
+    derived_delta_bytes_sample: std::sync::atomic::AtomicUsize,
+    derived_delta_bytes_sampled_at: AtomicU64,
+    derived_delta_size_walks: AtomicU64,
     derived_publication_nanos: AtomicU64,
     #[cfg(test)]
     derived_test_pause_before_publish: AtomicBool,
@@ -3082,6 +3696,10 @@ impl Drop for StatementGuard<'_> {
 
 struct StagedTable {
     schema: TableSchema,
+    /// `schema` shared with the statements of this transaction, built on
+    /// first use. Every statement used to copy the whole schema before it
+    /// could resolve a column.
+    shared_schema: Option<Arc<TableSchema>>,
     /// High watermark observed when the table was first touched. IDs above it
     /// were absent from this transaction's snapshot, so monotonic inserts do
     /// not need to reacquire the shared state lock per row. Commit validation
@@ -3701,18 +4319,37 @@ fn finish_db(shared: Arc<Shared>) -> Db {
                     if timer_shared.sync_timer_stop.load(AtomicOrdering::Acquire) {
                         break;
                     }
-                    let mut cs = lock_commit_after_group_sync(&timer_shared);
-                    let due = cs.wal.as_ref().is_some_and(|wal| {
-                        wal.has_unsynced_appends()
+                    // The barrier runs on a duplicated handle with the commit
+                    // mutex released, so committers keep appending meanwhile;
+                    // the writer is reconciled afterwards.
+                    let cs = lock_commit_after_group_sync(&timer_shared);
+                    let pending = cs.wal.as_ref().and_then(|wal| {
+                        (wal.has_unsynced_appends()
                             && wal.sync_due(
                                 Durability::Balanced,
                                 timer_shared.opts.balanced_sync_interval_ms,
-                            )
+                            ))
+                        .then(|| wal.begin_unlocked_sync())
                     });
-                    if due {
-                        if let WalAppendOutcome::SyncFailed(error) = cs.wal().sync_data() {
+                    drop(cs);
+                    let Some(pending) = pending else {
+                        continue;
+                    };
+                    let pending = match pending {
+                        Ok(pending) => pending,
+                        Err(error) => {
                             fence_after_wal_sync_failure(&timer_shared, &error);
+                            continue;
                         }
+                    };
+                    match pending.sync() {
+                        Ok(()) => {
+                            let mut cs = timer_shared.commit.lock();
+                            if let Some(wal) = cs.wal.as_mut() {
+                                wal.finish_unlocked_sync(&pending);
+                            }
+                        }
+                        Err(error) => fence_after_wal_sync_failure(&timer_shared, &error),
                     }
                 }
             })
@@ -3866,6 +4503,7 @@ impl Db {
             _lock_file: lock_file,
             state: RwLock::new(State {
                 catalog: Catalog::new(),
+                schemas: HashMap::new(),
                 committed_version: 0,
                 identity_high_water: HashMap::new(),
                 index: PrimaryIdx::empty(),
@@ -3875,9 +4513,10 @@ impl Db {
                 vector: HashMap::new(),
                 text: HashMap::new(),
                 blobs: blobs_dir,
-                readers: HashMap::new(),
+                readers: SegmentReaders::default(),
                 segments: Vec::new(),
                 next_segment_id: 1,
+                change_log: ChangeLog::default(),
             }),
             commit: CommitMutex::new(
                 CommitState {
@@ -3908,6 +4547,7 @@ impl Db {
             wal_appended_bytes: AtomicU64::new(0),
             commit_phase_sync_wait_nanos: AtomicU64::new(0),
             commit_apply_nanos: AtomicU64::new(0),
+            commit_state_write_wait_nanos: AtomicU64::new(0),
             commit_phase_maintenance_wait_nanos: AtomicU64::new(0),
             commit_waiters: AtomicU64::new(0),
             wal_sync_count: AtomicU64::new(0),
@@ -3922,6 +4562,7 @@ impl Db {
             coordinated_commit_count: AtomicU64::new(0),
             point_read_parallelism: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
+            statement_slots: StatementSlots::new(opts.max_concurrent_statements),
             active_state_writers: AtomicU64::new(0),
             safe_coalesce_budget: AtomicU64::new(0),
             admitted_point_reads: AtomicU64::new(0),
@@ -3946,6 +4587,9 @@ impl Db {
             maintenance_serial: MaintenanceSerial::new(),
             vector_merge_rejected: Mutex::new(HashSet::new()),
             derived_publication_count: AtomicU64::new(0),
+            derived_delta_bytes_sample: std::sync::atomic::AtomicUsize::new(0),
+            derived_delta_bytes_sampled_at: AtomicU64::new(0),
+            derived_delta_size_walks: AtomicU64::new(0),
             derived_publication_nanos: AtomicU64::new(0),
             #[cfg(test)]
             derived_test_pause_before_publish: AtomicBool::new(false),
@@ -4130,7 +4774,7 @@ impl Db {
             None
         };
         let mut read_only_index_bytes = 0usize;
-        let mut readers = HashMap::new();
+        let mut readers = SegmentReaders::default();
         for meta in &manifest.segments {
             let seg_path = dir.join(SEGMENTS_DIR).join(segment_file_name(meta.id));
             let file = match File::open(&seg_path) {
@@ -4536,9 +5180,17 @@ impl Db {
             memory_governor,
             _lock_file: lock_file,
             state: RwLock::new(State {
+                schemas: catalog
+                    .tables
+                    .iter()
+                    .map(|schema| (schema.name.clone(), Arc::new(schema.clone())))
+                    .collect(),
                 catalog,
                 committed_version,
-                identity_high_water,
+                identity_high_water: identity_high_water
+                    .into_iter()
+                    .map(|(table, value)| (table, AtomicI64::new(value)))
+                    .collect(),
                 index: primary,
                 table_high_ids,
                 superseded_segments,
@@ -4549,6 +5201,7 @@ impl Db {
                 readers,
                 segments: manifest.segments,
                 next_segment_id,
+                change_log: ChangeLog::default(),
             }),
             commit: CommitMutex::new(
                 CommitState {
@@ -4579,6 +5232,7 @@ impl Db {
             wal_appended_bytes: AtomicU64::new(0),
             commit_phase_sync_wait_nanos: AtomicU64::new(0),
             commit_apply_nanos: AtomicU64::new(0),
+            commit_state_write_wait_nanos: AtomicU64::new(0),
             commit_phase_maintenance_wait_nanos: AtomicU64::new(0),
             commit_waiters: AtomicU64::new(0),
             wal_sync_count: AtomicU64::new(0),
@@ -4593,6 +5247,7 @@ impl Db {
             coordinated_commit_count: AtomicU64::new(0),
             point_read_parallelism: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
+            statement_slots: StatementSlots::new(opts.max_concurrent_statements),
             active_state_writers: AtomicU64::new(0),
             safe_coalesce_budget: AtomicU64::new(0),
             admitted_point_reads: AtomicU64::new(0),
@@ -4617,6 +5272,9 @@ impl Db {
             maintenance_serial: MaintenanceSerial::new(),
             vector_merge_rejected: Mutex::new(HashSet::new()),
             derived_publication_count: AtomicU64::new(0),
+            derived_delta_bytes_sample: std::sync::atomic::AtomicUsize::new(0),
+            derived_delta_bytes_sampled_at: AtomicU64::new(0),
+            derived_delta_size_walks: AtomicU64::new(0),
             derived_publication_nanos: AtomicU64::new(0),
             #[cfg(test)]
             derived_test_pause_before_publish: AtomicBool::new(false),
@@ -4680,6 +5338,18 @@ impl Db {
             DdlIntent::clear(&db.shared.dir)?;
             db.finish_ddl_recovery()?;
         }
+        // A database written before identity keying reaches a declared `id`
+        // through a unique secondary index and then the primary directory.
+        // Convert it once, here, so it gets the single hop; the conversion
+        // records its intent first, so a crash part way through is replayed
+        // by the block above on the next open.
+        if !ro && db.needs_identity_rekey() {
+            let intent = DdlIntent::RekeyByIdentity;
+            intent.write(&db.shared.dir)?;
+            db.apply_ddl(&intent)?;
+            DdlIntent::clear(&db.shared.dir)?;
+            db.finish_ddl_recovery()?;
+        }
         refresh_compaction_debt(&db.shared);
         maybe_schedule_auto_compaction(&db.shared);
         maybe_schedule_primary_compaction(&db.shared);
@@ -4687,6 +5357,16 @@ impl Db {
         maybe_schedule_secondary_compaction(&db.shared);
         maybe_schedule_text_compaction(&db.shared);
         Ok(db)
+    }
+
+    /// Whether any table still carries ULID keys while declaring its own
+    /// `id`. True only for a database written before identity keying.
+    fn needs_identity_rekey(&self) -> bool {
+        let st = self.shared.state.read().unwrap();
+        st.catalog
+            .tables
+            .iter()
+            .any(|table| !table.has_implicit_id() && !table.identity_keyed)
     }
 
     // --- schema ------------------------------------------------------------
@@ -4697,6 +5377,10 @@ impl Db {
         }
         let _ddl = self.shared.ddl.lock().unwrap();
         schema.validate()?;
+        // Tables made from here on are keyed by their declared `id`. Older
+        // ones keep the ULID keys their rows are stored under until a
+        // conversion rewrites them.
+        schema.identity_keyed = !schema.has_implicit_id();
         if let Some(identity_name) = schema
             .columns
             .iter()
@@ -4892,7 +5576,9 @@ impl Db {
             st.committed_version,
             self.shared.opts.memory.maintenance_pool_bytes,
             &st.blobs,
-            table,
+            st.catalog
+                .table(table)
+                .ok_or_else(|| Error::TableNotFound(table.into()))?,
             column,
             &st.index,
             &st.readers,
@@ -5032,10 +5718,12 @@ impl Db {
             quantized: opts.quantized,
         };
         let mut vidx = VecIdx::new(def.clone());
+        let projection = RowProjection::all(st.catalog.table(table));
         st.index.visit_table(table, None, |id, versions| {
             if let Some(last) = versions.last() {
                 if !last.is_tombstone() {
-                    let rec = read_record_kind(&st.blobs, &st.readers, &last.kind)?;
+                    let rec =
+                        read_record_kind_keep(&st.blobs, &st.readers, &last.kind, &projection)?;
                     if let Some(Value::Vector(v)) = rec.get(column) {
                         vidx.insert(id, v);
                         if vidx.delta_memory_bytes()
@@ -5148,7 +5836,9 @@ impl Db {
             version,
             self.shared.opts.memory.maintenance_pool_bytes,
             &st.blobs,
-            table,
+            st.catalog
+                .table(table)
+                .ok_or_else(|| Error::TableNotFound(table.into()))?,
             column,
             &st.index,
             &st.readers,
@@ -5676,6 +6366,7 @@ impl Db {
                 column,
                 not_null,
             } => self.apply_add_column(table, column, *not_null),
+            DdlIntent::RekeyByIdentity => self.rewrite_segments(&Rewrite::RekeyByIdentity),
         }
     }
 
@@ -5856,6 +6547,12 @@ impl Db {
         cursor: Option<&str>,
     ) -> Result<Vec<String>> {
         let mut out = Vec::new();
+        let ordinal = st.catalog.table(table).and_then(|schema| {
+            schema
+                .columns
+                .iter()
+                .position(|candidate| candidate.name == column)
+        });
         st.index.visit_table(table, cursor, |id, versions| {
             let Some(last) = versions.last() else {
                 return Ok(true);
@@ -5864,7 +6561,7 @@ impl Db {
                 return Ok(true);
             }
             let payload = payload_bytes(&st.readers, &last.kind)?.expect("put has payload");
-            if encoded_column_needs_fill(&payload, column)? {
+            if encoded_column_needs_fill(&payload, column, ordinal)? {
                 out.push(id.to_owned());
                 if out.len() == limit {
                     return Ok(false);
@@ -5924,10 +6621,31 @@ impl Db {
         top_k: usize,
         filter: Option<&Record>,
     ) -> Result<Vec<TextHit>> {
-        let _memory = self.acquire_query_memory()?;
-        self.search_text_inner(table, column, query, top_k, filter)
+        self.search_text_columns(table, column, query, top_k, filter, None)
     }
 
+    /// `search_text` decoding only `columns` of each hit.
+    ///
+    /// A hit used to carry the whole row, indexed text column included, which
+    /// for a caller that ranks by relevance and then reads one field made the
+    /// per-hit cost twelve times a point read's. `Some(&[])` returns the ids
+    /// and scores alone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_text_columns(
+        &self,
+        table: &str,
+        column: &str,
+        query: &str,
+        top_k: usize,
+        filter: Option<&Record>,
+        columns: Option<&[String]>,
+    ) -> Result<Vec<TextHit>> {
+        let _slot = self.statement_slot();
+        let _memory = self.acquire_query_memory_bytes(self.query_admission_medium_bytes())?;
+        self.search_text_inner(table, column, query, top_k, filter, columns)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn search_text_inner(
         &self,
         table: &str,
@@ -5935,6 +6653,7 @@ impl Db {
         query: &str,
         top_k: usize,
         filter: Option<&Record>,
+        columns: Option<&[String]>,
     ) -> Result<Vec<TextHit>> {
         if top_k == 0 {
             return Ok(Vec::new());
@@ -5945,7 +6664,16 @@ impl Db {
                 "text search request exceeds its per-query budget (top_k capacity {candidate_cap})"
             )));
         }
-        let st = self.shared.state.read().unwrap();
+        let _snapshot_guard: Snapshot;
+        let mut snapshots = self.shared.snapshots.lock().unwrap();
+        let mut st = self.shared.state.read().unwrap();
+        let snapshot_version = st.committed_version;
+        *snapshots.entry(snapshot_version).or_insert(0) += 1;
+        drop(snapshots);
+        _snapshot_guard = Snapshot {
+            version: snapshot_version,
+            shared: self.shared.clone(),
+        };
         let schema = st
             .catalog
             .table(table)
@@ -5967,14 +6695,19 @@ impl Db {
                     "no text index on {table}.{column}; create one with create_text_index"
                 ))
             })?;
-        let ranked = tidx.search_top_k(query, top_k, |id| {
+        // Visibility and filter check for one candidate, under the state
+        // lock. The accepted version travels back with the answer: resolving
+        // it again to decode the hit was a second full directory lookup for
+        // every row returned.
+        let accept = |st: &State, id: &str| -> Result<Option<VKind>> {
             let entry = st.latest_owned(table, id)?;
-            let Some(entry) = entry else { return Ok(false) };
+            let Some(entry) = entry else { return Ok(None) };
             if entry.is_tombstone() {
-                return Ok(false);
+                return Ok(None);
             }
             if let Some(f) = filter {
-                let rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
+                let projection = RowProjection::all(st.catalog.table(table));
+                let rec = read_record_kind_keep(&st.blobs, &st.readers, &entry.kind, &projection)?;
                 let ok = f.iter().all(|(k, want)| {
                     if k == ID_COLUMN {
                         matches!(want, Value::Text(t) if t == id)
@@ -5983,19 +6716,83 @@ impl Db {
                     }
                 });
                 if !ok {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
-            Ok(true)
-        })?;
-        let mut hits = Vec::with_capacity(ranked.len());
-        for (id, score) in ranked {
-            let entry = st
-                .index
-                .latest(table, &id)?
-                .expect("ranked ids were validated above");
-            let mut rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-            rec.insert(ID_COLUMN.into(), Value::Text(id.clone()));
+            Ok(Some(entry.kind))
+        };
+        // Copy the query's postings out and rank them with the state lock
+        // released: BM25 over every posting of a common term used to be one of
+        // the longest read sections, and every committer waited behind it.
+        // Only the surviving top candidates are validated under the lock.
+        let ranked = match tidx.collect_query(query, TEXT_COLLECT_MAX_POSTINGS)? {
+            Some(collected) => {
+                drop(st);
+                let mut candidates = collected.ranked();
+                st = self.shared.state.read().unwrap();
+                let mut ranked = Vec::with_capacity(top_k.min(candidates.len()));
+                while ranked.len() < top_k {
+                    let Some((id, score)) = candidates.next_best() else {
+                        break;
+                    };
+                    if let Some(kind) = accept(&st, id)? {
+                        // Only the handful that survives is copied out of
+                        // the query's arena.
+                        ranked.push((id.to_owned(), score, Some(kind)));
+                    }
+                }
+                ranked
+            }
+            None => tidx
+                .search_top_k(query, top_k, |id| Ok(accept(&st, id)?.is_some()))?
+                .into_iter()
+                .map(|(id, score)| (id, score, None))
+                .collect(),
+        };
+        // Decode the hits after releasing the state lock; the registered
+        // snapshot keeps their segments alive meanwhile.
+        let mut prepared = Vec::with_capacity(ranked.len());
+        let mut readers = SegmentReaders::default();
+        for (id, score, kind) in ranked {
+            let kind = match kind {
+                Some(kind) => kind,
+                None => {
+                    st.index
+                        .latest(table, &id)?
+                        .expect("ranked ids were validated above")
+                        .kind
+                }
+            };
+            if let VKind::SegPut { segment, .. } = &kind {
+                let reader = st
+                    .readers
+                    .get(segment)
+                    .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
+                readers.entry(*segment).or_insert_with(|| reader.clone());
+            }
+            prepared.push((id, score, kind));
+        }
+        let blobs = st.blobs.clone();
+        // The public list is owned for callers' convenience; the projection
+        // wants slices, which costs one conversion per search, not per hit.
+        let wanted: Option<Vec<&str>> =
+            columns.map(|names| names.iter().map(String::as_str).collect());
+        let projection = RowProjection::new(st.catalog.table(table), wanted.as_deref());
+        // Only a table that declares no id of its own surfaces the physical
+        // key as `id`. Putting it on every hit overwrote the declared column
+        // with a ULID, which is what hypothesis 41 fixed in the three other
+        // read paths and missed here.
+        let implicit_id = st
+            .catalog
+            .table(table)
+            .is_some_and(TableSchema::has_implicit_id);
+        drop(st);
+        let mut hits = Vec::with_capacity(prepared.len());
+        for (id, score, kind) in prepared {
+            let mut rec = read_record_kind_keep(&blobs, &readers, &kind, &projection)?;
+            if implicit_id {
+                rec.insert(ID_COLUMN, Value::Text(id.clone()));
+            }
             hits.push(TextHit {
                 id,
                 score,
@@ -6009,7 +6806,8 @@ impl Db {
     /// Reciprocal Rank Fusion (RRF, k=60). At least one modality is
     /// required; both columns must be indexed.
     pub fn search_hybrid(&self, table: &str, query: &HybridQuery<'_>) -> Result<Vec<HybridHit>> {
-        let _memory = self.acquire_query_memory()?;
+        let _slot = self.statement_slot();
+        let _memory = self.acquire_query_memory_bytes(self.query_admission_medium_bytes())?;
         if query.text.is_none() && query.vector.is_none() {
             return Err(Error::InvalidArgument(
                 "hybrid search needs a text query, a vector, or both".into(),
@@ -6031,7 +6829,7 @@ impl Db {
         let mut fused: BTreeMap<String, (f32, Option<Record>)> = BTreeMap::new();
         if let Some((column, text)) = query.text {
             let hits =
-                self.search_text_inner(table, column, text, fetch_k, query.filter.as_ref())?;
+                self.search_text_inner(table, column, text, fetch_k, query.filter.as_ref(), None)?;
             for (rank, hit) in hits.into_iter().enumerate() {
                 let entry = fused.entry(hit.id).or_insert((0.0, None));
                 entry.0 += 1.0 / (RRF_K + rank as f32 + 1.0);
@@ -6076,7 +6874,8 @@ impl Db {
         top_k: usize,
         opts: &VectorSearchOptions,
     ) -> Result<Vec<VectorHit>> {
-        let _memory = self.acquire_query_memory()?;
+        let _slot = self.statement_slot();
+        let _memory = self.acquire_query_memory_bytes(self.query_admission_medium_bytes())?;
         self.search_vector_inner(table, column, query, top_k, opts)
     }
 
@@ -6162,6 +6961,13 @@ impl Db {
         // Over-fetch to survive tombstones and metadata filtering, escalating
         // until enough hits pass or every backend label has been considered.
         let total = vidx.total_len();
+        let projection = RowProjection::all(st.catalog.table(table));
+        // As in `search_text_inner`: the physical key is surfaced as `id`
+        // only for a table that declares none of its own.
+        let implicit_id = st
+            .catalog
+            .table(table)
+            .is_some_and(TableSchema::has_implicit_id);
         let search_limit = total.min(candidate_cap);
         let mut fetch = top_k.saturating_mul(4).max(32).min(search_limit);
         loop {
@@ -6173,7 +6979,8 @@ impl Db {
                 if entry.is_tombstone() {
                     continue;
                 }
-                let mut rec = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
+                let mut rec =
+                    read_record_kind_keep(&st.blobs, &st.readers, &entry.kind, &projection)?;
                 if let Some(filter) = &opts.filter {
                     let ok = filter.iter().all(|(k, want)| {
                         if k == ID_COLUMN {
@@ -6186,7 +6993,9 @@ impl Db {
                         continue;
                     }
                 }
-                rec.insert(ID_COLUMN.into(), Value::Text(id.clone()));
+                if implicit_id {
+                    rec.insert(ID_COLUMN, Value::Text(id.clone()));
+                }
                 hits.push(VectorHit {
                     id: id.clone(),
                     distance: *distance,
@@ -6227,9 +7036,9 @@ impl Db {
     }
 
     /// The schema of a table, if it exists.
-    pub fn table_schema(&self, table: &str) -> Option<TableSchema> {
+    pub fn table_schema(&self, table: &str) -> Option<Arc<TableSchema>> {
         let st = self.shared.state.read().unwrap();
-        st.catalog.table(table).cloned()
+        st.schema_arc(table)
     }
 
     /// Execute one SQL statement from the deliberately small V1 dialect.
@@ -6239,8 +7048,14 @@ impl Db {
     /// UPDATE/DELETE apply their write set through a transaction, retrying a
     /// bounded number of times on optimistic conflict. Multi-row INSERTs are
     /// a single atomic commit.
+    /// Take one of the bounded execution slots (None when unbounded).
+    pub(crate) fn statement_slot(&self) -> Option<StatementSlot<'_>> {
+        self.shared.statement_slots.acquire()
+    }
+
     pub fn query(&self, sql: &str) -> Result<crate::sql::QueryOutput> {
-        let _memory = self.acquire_query_memory()?;
+        // Query memory and an execution slot are taken by the executor once
+        // the statement is parsed (see `sql::admit_statement`).
         crate::sql::execute(self, sql)
     }
 
@@ -6248,7 +7063,6 @@ impl Db {
     /// typed and are bound after parsing; they are never interpolated into the
     /// SQL string.
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<crate::sql::QueryOutput> {
-        let _memory = self.acquire_query_memory()?;
         crate::sql::execute_positional(self, sql, params)
     }
 
@@ -6258,7 +7072,6 @@ impl Db {
         sql: &str,
         params: &Record,
     ) -> Result<crate::sql::QueryOutput> {
-        let _memory = self.acquire_query_memory()?;
         crate::sql::execute_named(self, sql, params)
     }
 
@@ -6268,7 +7081,6 @@ impl Db {
         params: &[Value],
         max_rows: usize,
     ) -> Result<crate::sql::QueryOutput> {
-        let _memory = self.acquire_query_memory()?;
         crate::sql::execute_positional_bounded(self, sql, params, max_rows)
     }
 
@@ -6278,7 +7090,6 @@ impl Db {
         params: &Record,
         max_rows: usize,
     ) -> Result<crate::sql::QueryOutput> {
-        let _memory = self.acquire_query_memory()?;
         crate::sql::execute_named_bounded(self, sql, params, max_rows)
     }
 
@@ -6508,14 +7319,20 @@ impl Db {
                 .identity_high_water
                 .entry(table.clone())
                 .or_default();
-            *high = (*high)
-                .max(*value)
-                .max(*state.identity_high_water.get(table).unwrap_or(&0));
+            *high = (*high).max(*value).max(
+                state
+                    .identity_high_water
+                    .get(table)
+                    .map_or(0, |high| high.load(AtomicOrdering::Relaxed)),
+            );
         }
         let outcome = manifest.publish(&self.shared.dir)?;
         for (table, value) in manifest.identity_high_water {
-            let high = state.identity_high_water.entry(table).or_default();
-            *high = (*high).max(value);
+            state
+                .identity_high_water
+                .entry(table)
+                .or_default()
+                .fetch_max(value, AtomicOrdering::Relaxed);
         }
         if let Some(error) =
             publication_sync_error(&self.shared, "recovered identities manifest", outcome)
@@ -6799,6 +7616,7 @@ impl Db {
         {
             let mut st = self.shared.state.write().unwrap();
             st.committed_version = version;
+            st.change_log.note_unlogged(version);
             st.segments = new_segments;
             st.readers.insert(
                 next_segment_id,
@@ -6902,6 +7720,18 @@ impl Db {
         shared_get_at(&self.shared, table, id, snapshot.version)
     }
 
+    /// `get_at_unbudgeted` decoding only the columns in `keep`.
+    pub(crate) fn get_at_keep_unbudgeted(
+        &self,
+        snapshot: &Snapshot,
+        table: &str,
+        id: &str,
+        keep: Option<&[&str]>,
+    ) -> Result<Option<Record>> {
+        self.validate_snapshot_owner(snapshot)?;
+        shared_get_at_keep(&self.shared, table, id, snapshot.version, keep)
+    }
+
     /// All visible records of a table, ordered by id.
     pub fn scan(&self, table: &str) -> Result<Vec<(String, Record)>> {
         let _memory = self.acquire_query_memory()?;
@@ -6986,6 +7816,35 @@ impl Db {
         )
     }
 
+    /// `scan_batch_at_bytes_unbudgeted` decoding only the columns in `keep`.
+    pub(crate) fn scan_batch_at_bytes_keep_unbudgeted(
+        &self,
+        snapshot: &Snapshot,
+        table: &str,
+        after_id: Option<&str>,
+        limit: usize,
+        max_bytes: usize,
+        keep: Option<&[&str]>,
+    ) -> Result<ScanBatch> {
+        self.validate_snapshot_owner(snapshot)?;
+        if max_bytes == 0 || max_bytes > self.shared.opts.memory.query_working_bytes {
+            return Err(Error::InvalidArgument(
+                "scan byte budget must be positive and fit query_working_bytes".into(),
+            ));
+        }
+        reads::shared_scan_batch(
+            &self.shared,
+            table,
+            snapshot.version,
+            after_id,
+            limit,
+            Some(max_bytes),
+            None,
+            keep,
+            false,
+        )
+    }
+
     pub(crate) fn scan_batch_at_unbudgeted(
         &self,
         snapshot: &Snapshot,
@@ -6995,6 +7854,31 @@ impl Db {
     ) -> Result<Vec<(String, Record)>> {
         self.validate_snapshot_owner(snapshot)?;
         shared_scan_batch_at(&self.shared, table, snapshot.version, after_id, limit)
+    }
+
+    /// `scan_batch_at_unbudgeted` with a pushed comparison evaluated on the
+    /// encoded rows before decoding (see `ScanFilter`).
+    pub(crate) fn scan_batch_at_filtered_unbudgeted(
+        &self,
+        snapshot: &Snapshot,
+        table: &str,
+        after_id: Option<&str>,
+        limit: usize,
+        filter: Option<&ScanFilter>,
+        keep: Option<&[&str]>,
+    ) -> Result<ScanBatch> {
+        self.validate_snapshot_owner(snapshot)?;
+        reads::shared_scan_batch(
+            &self.shared,
+            table,
+            snapshot.version,
+            after_id,
+            limit,
+            None,
+            filter,
+            keep,
+            false,
+        )
     }
 
     fn validate_snapshot_owner(&self, snapshot: &Snapshot) -> Result<()> {
@@ -7015,7 +7899,7 @@ impl Db {
         column: &str,
         value: &Value,
     ) -> Result<Vec<(String, Record)>> {
-        let _memory = self.acquire_query_memory()?;
+        let _memory = self.acquire_query_memory_bytes(self.query_admission_medium_bytes())?;
         self.find_eq_unbudgeted(table, column, value)
     }
 
@@ -7059,10 +7943,18 @@ impl Db {
         if let Some(idx) = st.secondary.get(&(table.to_owned(), column.to_owned())) {
             let ids = idx.ids(&index_key(value))?;
             let blobs = st.blobs.clone();
-            let mut readers = SegmentReaders::new();
+            let implicit_id = schema.has_implicit_id();
+            let projection = RowProjection::all(st.catalog.table(table));
+            let mut readers = SegmentReaders::default();
             let mut prepared = Vec::with_capacity(ids.len());
+            let mut key_buffer = Vec::new();
+            let mut view = st.index.table_view(table, &mut key_buffer);
+            let epoch = schema.epoch;
             for id in ids {
-                if let Some(last) = st.visible_owned(table, &id, version)? {
+                if let Some(last) = view
+                    .newest(&id, version)?
+                    .filter(|entry| entry.version > epoch)
+                {
                     if !last.is_tombstone() {
                         if let VKind::SegPut { segment, .. } = &last.kind {
                             let reader = st.readers.get(segment).ok_or_else(|| {
@@ -7077,10 +7969,14 @@ impl Db {
             drop(st);
             let mut out = Vec::with_capacity(prepared.len());
             for (id, kind) in prepared {
-                let mut record = read_record_kind(&blobs, &readers, &kind)?;
-                record
-                    .entry(ID_COLUMN.into())
-                    .or_insert_with(|| Value::Text(id.clone()));
+                let mut record = read_record_kind_keep(&blobs, &readers, &kind, &projection)?;
+                // Only a table without a declared `id` needs the physical key
+                // surfaced. Putting it on a row that already has an `id`
+                // column shadows the declared value, and the insert copies the
+                // row's shared column names out of the layout they came from.
+                if implicit_id {
+                    record.insert(ID_COLUMN, Value::Text(id.clone()));
+                }
                 out.push((id, record));
             }
             out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -7115,7 +8011,7 @@ impl Db {
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Record)>> {
-        let _memory = self.acquire_query_memory()?;
+        let _memory = self.acquire_query_memory_bytes(self.query_admission_medium_bytes())?;
         self.find_eq_batch_unbudgeted(table, column, value, after_id, limit)
     }
 
@@ -7127,10 +8023,29 @@ impl Db {
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Record)>> {
-        self.find_eq_batch_version(table, column, value, after_id, limit, None)
+        let batch =
+            self.find_eq_batch_version(table, column, value, after_id, limit, None, None, true)?;
+        Ok(batch.ids.into_iter().zip(batch.rows).collect())
     }
 
-    pub(crate) fn find_eq_batch_at_unbudgeted(
+    /// `find_eq_batch_unbudgeted` decoding only the columns in `keep`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn find_eq_batch_keep_unbudgeted(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+        after_id: Option<&str>,
+        limit: usize,
+        keep: Option<&[&str]>,
+        want_ids: bool,
+    ) -> Result<ScanBatch> {
+        self.find_eq_batch_version(table, column, value, after_id, limit, None, keep, want_ids)
+    }
+
+    /// Snapshot-bound `find_eq_batch_keep_unbudgeted`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn find_eq_batch_at_keep_unbudgeted(
         &self,
         snapshot: &Snapshot,
         table: &str,
@@ -7138,7 +8053,9 @@ impl Db {
         value: &Value,
         after_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(String, Record)>> {
+        keep: Option<&[&str]>,
+        want_ids: bool,
+    ) -> Result<ScanBatch> {
         self.validate_snapshot_owner(snapshot)?;
         self.find_eq_batch_version(
             table,
@@ -7147,9 +8064,12 @@ impl Db {
             after_id,
             limit,
             Some(snapshot.version),
+            keep,
+            want_ids,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn find_eq_batch_version(
         &self,
         table: &str,
@@ -7158,8 +8078,25 @@ impl Db {
         after_id: Option<&str>,
         limit: usize,
         version: Option<u64>,
-    ) -> Result<Vec<(String, Record)>> {
-        let st = self.shared.state.read().unwrap();
+        keep: Option<&[&str]>,
+        want_ids: bool,
+    ) -> Result<ScanBatch> {
+        // Without a caller snapshot, register one at the committed version so
+        // decoding after the state lock is released cannot race segment GC
+        // (same lock order as `find_eq_unbudgeted`: snapshots, then state).
+        let _snapshot_guard: Option<Snapshot>;
+        let snapshots = version
+            .is_none()
+            .then(|| self.shared.snapshots.lock().unwrap());
+        let mut st = self.shared.state.read().unwrap();
+        _snapshot_guard = snapshots.map(|mut snapshots| {
+            let version = st.committed_version;
+            *snapshots.entry(version).or_insert(0) += 1;
+            Snapshot {
+                version,
+                shared: self.shared.clone(),
+            }
+        });
         let schema = st
             .catalog
             .table(table)
@@ -7168,80 +8105,145 @@ impl Db {
             return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
         }
         if value.is_null() || limit == 0 {
-            return Ok(Vec::new());
+            return Ok(ScanBatch {
+                rows: Vec::new(),
+                ids: Vec::new(),
+                next: None,
+            });
         }
         // Equality probes (index nested-loop joins issue one per outer row)
         // usually yield a few rows, so the output grows on demand instead of
         // reserving a full batch of `(String, Record)` slots per call.
-        let mut out = Vec::new();
+        //
+        // Only directory work runs under the shared state lock, in short
+        // chunks with the lock released between them (`INDEX_LOCK_CHUNK_IDS`):
+        // a wide equality such as a category page used to hold the lock for
+        // hundreds of lookups while every committer queued behind it. Records
+        // are decoded after the lock is released from retained segment
+        // handles. Between chunks a commit may move `committed_version`; a
+        // snapshot-bound caller then finishes through the directory walk.
         let byte_budget = version.map(|_| (self.shared.opts.memory.query_working_bytes / 2).max(1));
-        let mut retained_bytes = 0usize;
-        if let Some(index) = st
-            .secondary
-            .get(&(table.to_owned(), column.to_owned()))
-            .filter(|_| version.is_none_or(|version| version == st.committed_version))
-        {
-            let ids = index.ids_batch(&index_key(value), after_id, limit)?;
-            if ids.is_empty() {
-                return Ok(out);
-            }
-            for id in ids {
-                let Some(entry) = st.latest_owned(table, &id)? else {
-                    continue;
+        let epoch = schema.epoch;
+        let indexed_key = (table.to_owned(), column.to_owned());
+        let index_usable = |st: &State| {
+            st.secondary.contains_key(&indexed_key)
+                && version.is_none_or(|version| version == st.committed_version)
+        };
+        // Ids of the rows that are visible, packed end to end; `prepared`
+        // holds the span of each one.
+        let mut prepared_ids = String::new();
+        let mut prepared: Vec<(IdSpan, VKind)> = Vec::new();
+        let mut readers = SegmentReaders::default();
+        let mut cursor: Option<String> = after_id.map(str::to_owned);
+        let mut key_buffer: Vec<u8> = Vec::new();
+        let mut complete = false;
+        if index_usable(&st) {
+            let key = index_key(value);
+            let mut ids = IdBatch::default();
+            loop {
+                let chunk = INDEX_LOCK_CHUNK_IDS.min(limit - prepared.len());
+                let Some(index) = st.secondary.get(&indexed_key).filter(|_| index_usable(&st))
+                else {
+                    break;
                 };
-                if entry.is_tombstone() {
-                    continue;
+                index.ids_batch_into(&key, cursor.as_deref(), chunk, &mut ids)?;
+                let exhausted = ids.len() < chunk;
+                let before = prepared.len();
+                // The continuation only needs the last id the chunk visited,
+                // visible or not; cloning every id to carry it cost one
+                // allocation per matched row.
+                let last_seen = ids.last().map(str::to_owned);
+                // One view of the table for the whole chunk: the hash-map
+                // lookups and the key prefix are resolved once, not per row.
+                if let Some((mut view, table_epoch)) = st.table_view(table, &mut key_buffer) {
+                    for id in ids.iter() {
+                        let Some(entry) = view
+                            .newest(id, u64::MAX)?
+                            .filter(|entry| entry.version > table_epoch)
+                        else {
+                            continue;
+                        };
+                        if entry.is_tombstone() {
+                            continue;
+                        }
+                        let span = push_id(&mut prepared_ids, id);
+                        prepared.push((span, entry.kind));
+                    }
                 }
-                let mut record = read_record_kind(&st.blobs, &st.readers, &entry.kind)?;
-                record
-                    .entry(ID_COLUMN.into())
-                    .or_insert_with(|| Value::Text(id.clone()));
-                if !record_fits_batch(&record, &id, byte_budget, &mut retained_bytes)? {
+                if last_seen.is_some() {
+                    cursor = last_seen;
+                }
+                retain_segment_readers(&st, &prepared[before..], &mut readers)?;
+                if exhausted || prepared.len() >= limit {
+                    complete = true;
                     break;
                 }
-                out.push((id, record));
+                drop(st);
+                st = self.shared.state.read().unwrap();
             }
-            return Ok(out);
         }
-
-        // Evaluate the equality on the encoded payload and decode only the
-        // matching records; a non-matching row costs a cursor step and a
-        // column probe instead of a full record materialization.
-        let predicate = encoded_eq_predicate(&st, table, column, value);
-        st.index.visit_table(table, after_id, |id, versions| {
-            let Some(entry) = versions.iter().rev().find(|entry| {
-                entry.version > schema.epoch
-                    && version.is_none_or(|version| entry.version <= version)
-            }) else {
-                return Ok(true);
-            };
-            if entry.is_tombstone() {
-                return Ok(true);
+        if !complete && prepared.len() < limit {
+            // Evaluate the equality on the encoded payload and decode only the
+            // matching records; a non-matching row costs a cursor step and a
+            // column probe instead of a full record materialization.
+            let predicate = encoded_eq_predicate(&st, table, column, value);
+            let before = prepared.len();
+            let remaining = limit - before;
+            let mut matched_count = 0usize;
+            st.index
+                .visit_table(table, cursor.as_deref(), |id, versions| {
+                    let Some(entry) = versions.iter().rev().find(|entry| {
+                        entry.version > epoch
+                            && version.is_none_or(|version| entry.version <= version)
+                    }) else {
+                        return Ok(true);
+                    };
+                    if entry.is_tombstone() {
+                        return Ok(true);
+                    }
+                    let matched = with_payload(&st.readers, &entry.kind, |payload| {
+                        encoded_record_column_eq(payload, &predicate, &st.blobs)
+                    })?
+                    .unwrap_or(false);
+                    if !matched {
+                        return Ok(true);
+                    }
+                    let span = push_id(&mut prepared_ids, id);
+                    prepared.push((span, entry.kind.clone()));
+                    matched_count += 1;
+                    Ok(matched_count < remaining)
+                })?;
+            retain_segment_readers(&st, &prepared[before..], &mut readers)?;
+        }
+        let blobs = st.blobs.clone();
+        let implicit_id = st
+            .catalog
+            .table(table)
+            .is_some_and(TableSchema::has_implicit_id);
+        let projection = RowProjection::new(st.catalog.table(table), keep);
+        drop(st);
+        let mut rows = Vec::with_capacity(prepared.len());
+        let mut ids = Vec::with_capacity(if want_ids { prepared.len() } else { 0 });
+        let mut retained_bytes = 0usize;
+        for (span, kind) in &prepared {
+            let id = span.of(&prepared_ids);
+            let mut record = read_record_kind_keep(&blobs, &readers, kind, &projection)?;
+            if implicit_id {
+                record.insert(ID_COLUMN, Value::Text(id.to_owned()));
             }
-            let matched = with_payload(&st.readers, &entry.kind, |payload| {
-                if encoded_record_column_eq(payload, &predicate, &st.blobs)? {
-                    decode_record(payload, Some(&st.blobs)).map(Some)
-                } else {
-                    Ok(None)
-                }
-            })?
-            .flatten();
-            let Some(mut record) = matched else {
-                return Ok(true);
-            };
-            record
-                .entry(ID_COLUMN.into())
-                .or_insert_with(|| Value::Text(id.to_owned()));
             if !record_fits_batch(&record, id, byte_budget, &mut retained_bytes)? {
-                return Ok(false);
+                break;
             }
-            out.push((id.to_owned(), record));
-            if out.len() == limit {
-                return Ok(false);
+            if want_ids {
+                ids.push(id.to_owned());
             }
-            Ok(true)
-        })?;
-        Ok(out)
+            rows.push(record);
+        }
+        // The caller resumes strictly after the last row it received.
+        let next = prepared
+            .get(rows.len().wrapping_sub(1))
+            .map(|(span, _)| span.of(&prepared_ids).to_owned());
+        Ok(ScanBatch { rows, ids, next })
     }
 
     // --- maintenance -----------------------------------------------------------
@@ -7404,6 +8406,11 @@ impl Db {
             commit_apply_time: Duration::from_nanos(
                 self.shared.commit_apply_nanos.load(AtomicOrdering::Relaxed),
             ),
+            commit_state_write_wait_time: Duration::from_nanos(
+                self.shared
+                    .commit_state_write_wait_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
             commit_phase_maintenance_wait_time: Duration::from_nanos(
                 self.shared
                     .commit_phase_maintenance_wait_nanos
@@ -7527,6 +8534,10 @@ impl Db {
                     .derived_publication_nanos
                     .load(AtomicOrdering::Relaxed),
             ),
+            derived_size_walks: self
+                .shared
+                .derived_delta_size_walks
+                .load(AtomicOrdering::Relaxed),
         }
     }
 
@@ -7682,12 +8693,50 @@ impl Db {
     }
 
     pub(crate) fn acquire_query_memory(&self) -> Result<MemoryPermit> {
+        self.acquire_query_memory_bytes(self.shared.opts.memory.query_working_bytes)
+    }
+
+    /// Reserve `bytes` of query working memory (clamped to the per-query
+    /// budget), waiting up to the admission timeout. Statements that cannot
+    /// materialize more than a few rows reserve one of the small tiers below
+    /// instead of the whole budget, so a point lookup no longer occupies one of
+    /// the few operator slots a large sort or aggregate needs.
+    pub(crate) fn acquire_query_memory_bytes(&self, bytes: usize) -> Result<MemoryPermit> {
         crate::query_control::check_current()?;
-        self.shared.memory_governor.acquire_timeout(
+        let working = self.shared.opts.memory.query_working_bytes;
+        let bytes = bytes.clamp(1, working.max(1));
+        // Full-budget statements (scans, sorts, aggregates, hash joins) may not
+        // fill the whole pool: a lane stays free for the small and medium
+        // tiers, so a few analytic scans cannot starve point lookups.
+        let ceiling = if bytes >= working {
+            let capacity = self.shared.opts.memory.query_pool_bytes;
+            let lane = (capacity / 4).max(2 * self.query_admission_medium_bytes());
+            capacity.saturating_sub(lane)
+        } else {
+            usize::MAX
+        };
+        self.shared.memory_governor.acquire_timeout_below(
             MemoryPool::Query,
-            self.shared.opts.memory.query_working_bytes,
+            bytes,
+            ceiling,
             Duration::from_millis(self.shared.opts.memory.query_admission_timeout_ms),
         )
+    }
+
+    /// Reservation for key-bounded work: a physical-id or unique-index probe,
+    /// a small INSERT, DDL. Never above the per-query budget, so tiny test
+    /// configurations keep their exact accounting.
+    pub(crate) fn query_admission_small_bytes(&self) -> usize {
+        QUERY_ADMISSION_SMALL_BYTES.min(self.shared.opts.memory.query_working_bytes)
+    }
+
+    /// Reservation for work bounded by an equality on a non-unique column or
+    /// by a `top_k`: one eighth of the per-query budget.
+    pub(crate) fn query_admission_medium_bytes(&self) -> usize {
+        let working = self.shared.opts.memory.query_working_bytes;
+        (working / 8)
+            .max(self.query_admission_small_bytes())
+            .min(working)
     }
 
     /// Exclusive maintenance with the whole pool reserved; waits for both.
@@ -7854,6 +8903,20 @@ impl Db {
                 let Some(schema) = owner else { continue };
                 let epoch = schema.epoch;
                 let out_table = rw.output_table(&table);
+                // When the rewrite re-keys, the row's new key comes from the
+                // identity its payload carries. Tombstones have no payload,
+                // so they reuse the key derived from the put they follow;
+                // a tombstone with no retained put is skipped below anyway.
+                let rekey_identity = matches!(rw, Rewrite::RekeyByIdentity)
+                    .then(|| {
+                        schema
+                            .columns
+                            .iter()
+                            .position(|column| column.identity)
+                            .filter(|_| !schema.has_implicit_id())
+                    })
+                    .flatten();
+                let mut rekeyed = String::new();
                 st.index.visit_table(&table, None, |id, versions| {
                     let mut keep_versions = BTreeSet::new();
                     for &watermark in &watermarks {
@@ -7874,14 +8937,18 @@ impl Db {
                         if Some(version.version) != latest_kept && !version.is_tombstone() {
                             new_segment_superseded = true;
                         }
-                        new_high_ids
-                            .entry(out_table.clone())
-                            .and_modify(|high| {
-                                if id > high.as_str() {
-                                    *high = id.to_owned();
-                                }
-                            })
-                            .or_insert_with(|| id.to_owned());
+                        // Deferred: with a re-key the output key is only
+                        // known once the payload has been read, just below.
+                        if rekey_identity.is_none() {
+                            new_high_ids
+                                .entry(out_table.clone())
+                                .and_modify(|high| {
+                                    if id > high.as_str() {
+                                        *high = id.to_owned();
+                                    }
+                                })
+                                .or_insert_with(|| id.to_owned());
+                        }
                         let payload = if version.is_tombstone() {
                             if !have_put {
                                 continue;
@@ -7891,7 +8958,10 @@ impl Db {
                             have_put = true;
                             let bytes = payload_bytes(&st.readers, &version.kind)?
                                 .expect("put has payload");
-                            Some(transform_payload(rw, &table, bytes)?)
+                            if let Some(ordinal) = rekey_identity {
+                                rekeyed = identity_key(payload_identity(&bytes, schema, ordinal)?);
+                            }
+                            Some(transform_payload(rw, &table, schema, bytes)?)
                         };
                         if let Some(payload) = &payload {
                             blob_refs.clear();
@@ -7900,11 +8970,26 @@ impl Db {
                                 blob_refs_writer.add(blob.name.as_bytes(), b"")?;
                             }
                         }
+                        let out_id = if rekey_identity.is_some() {
+                            rekeyed.as_str()
+                        } else {
+                            id
+                        };
+                        if rekey_identity.is_some() {
+                            new_high_ids
+                                .entry(out_table.clone())
+                                .and_modify(|high| {
+                                    if out_id > high.as_str() {
+                                        *high = out_id.to_owned();
+                                    }
+                                })
+                                .or_insert_with(|| out_id.to_owned());
+                        }
                         let payload_rel = encode_entry_into(
                             &mut encoded,
                             version.version,
                             &out_table,
-                            id,
+                            out_id,
                             payload.as_deref(),
                         )?;
                         let kind = match &payload {
@@ -7918,7 +9003,7 @@ impl Db {
                         segment.write_all(&encoded)?;
                         segment_position = segment_position.saturating_add(encoded.len() as u64);
                         primary_writer.add(
-                            &primary_key(&out_table, id),
+                            &primary_key(&out_table, out_id),
                             &encode_primary_entry(&VersionEntry {
                                 version: version.version,
                                 kind,
@@ -7935,7 +9020,7 @@ impl Db {
             .map_err(|error| Error::Io(error.into_error()))?;
         crate::durable::sync_all(&segment_file)?;
         let mut new_segments = Vec::new();
-        let mut new_readers = HashMap::new();
+        let mut new_readers = SegmentReaders::default();
         if segment_position == 0 {
             fs::remove_file(&seg_path)?;
         } else {
@@ -7957,7 +9042,7 @@ impl Db {
             let st = shared.state.read().unwrap();
             st.identity_high_water
                 .iter()
-                .map(|(table, value)| (rw.output_table(table), *value))
+                .map(|(table, value)| (rw.output_table(table), value.load(AtomicOrdering::Relaxed)))
                 .collect()
         };
         let generation = primary_generation(committed_version, &new_segments, &new_catalog);
@@ -7999,8 +9084,21 @@ impl Db {
         // propagating any disposable-index error.
         {
             let mut st = shared.state.write().unwrap();
-            st.catalog = new_catalog;
-            st.identity_high_water = identity_high_water.into_iter().collect();
+            st.set_catalog(new_catalog);
+            // Identities are reserved under the state lock, not the commit
+            // mutex, so statements kept reserving while this rewrite ran.
+            // Overwriting the map with the snapshot taken above re-issued
+            // those values and the second commit failed its unique index.
+            // Keep the higher of the rewritten and the live mark per table.
+            let mut merged: HashMap<String, i64> = identity_high_water.into_iter().collect();
+            for (table, value) in std::mem::take(&mut st.identity_high_water) {
+                let high = merged.entry(rw.output_table(&table)).or_insert(0);
+                *high = (*high).max(value.load(AtomicOrdering::Relaxed));
+            }
+            st.identity_high_water = merged
+                .into_iter()
+                .map(|(table, value)| (table, AtomicI64::new(value)))
+                .collect();
             st.index = new_primary;
             st.table_high_ids = new_high_ids;
             st.superseded_segments = if new_segment_superseded && segment_position > 0 {
@@ -8248,6 +9346,7 @@ impl Txn {
                     table.to_owned(),
                     StagedTable {
                         schema,
+                        shared_schema: None,
                         snapshot_high_id,
                         operations: StagedOperations::new(),
                         next_position: 0,
@@ -8258,22 +9357,45 @@ impl Txn {
         Ok(&self.staged[table_index].1.schema)
     }
 
-    pub(crate) fn table_schema(&mut self, table: &str) -> Result<TableSchema> {
-        Ok(self.schema(table)?.clone())
+    /// The staged schema of a table, shared. A transaction stages its own
+    /// copy, so this is one allocation per table per transaction rather than
+    /// one whole schema copied per statement.
+    pub(crate) fn table_schema(&mut self, table: &str) -> Result<Arc<TableSchema>> {
+        let index = {
+            self.schema(table)?;
+            self.staged
+                .iter()
+                .position(|(name, _)| name == table)
+                .expect("schema was cached above")
+        };
+        let staged = &mut self.staged[index].1;
+        Ok(match &staged.shared_schema {
+            Some(shared) => shared.clone(),
+            None => staged
+                .shared_schema
+                .insert(Arc::new(staged.schema.clone()))
+                .clone(),
+        })
     }
 
     /// Execute one SQL statement against this transaction's snapshot and
     /// staged writes. DDL and multi-table/aggregate SELECT are deliberately
     /// excluded from the transactional SQL surface.
     pub fn query(&mut self, sql: &str) -> Result<crate::sql::QueryOutput> {
+        let shared = self.shared.clone();
+        let _slot = shared.statement_slots.acquire();
         crate::sql::execute_txn(self, sql)
     }
 
     pub fn query_params(&mut self, sql: &str, params: &[Value]) -> Result<crate::sql::QueryOutput> {
+        let shared = self.shared.clone();
+        let _slot = shared.statement_slots.acquire();
         crate::sql::execute_txn_positional(self, sql, params)
     }
 
     pub fn query_named(&mut self, sql: &str, params: &Record) -> Result<crate::sql::QueryOutput> {
+        let shared = self.shared.clone();
+        let _slot = shared.statement_slots.acquire();
         crate::sql::execute_txn_named(self, sql, params)
     }
 
@@ -8283,6 +9405,8 @@ impl Txn {
         params: &[Value],
         max_rows: usize,
     ) -> Result<crate::sql::QueryOutput> {
+        let shared = self.shared.clone();
+        let _slot = shared.statement_slots.acquire();
         crate::sql::execute_txn_positional_bounded(self, sql, params, max_rows)
     }
 
@@ -8292,6 +9416,8 @@ impl Txn {
         params: &Record,
         max_rows: usize,
     ) -> Result<crate::sql::QueryOutput> {
+        let shared = self.shared.clone();
+        let _slot = shared.statement_slots.acquire();
         crate::sql::execute_txn_named_bounded(self, sql, params, max_rows)
     }
 
@@ -8323,7 +9449,7 @@ impl Txn {
             Some(Some(rec)) => {
                 let mut rec = rec.clone();
                 if has_implicit_id {
-                    rec.insert(ID_COLUMN.into(), Value::Text(id.to_owned()));
+                    rec.insert(ID_COLUMN, Value::Text(id.to_owned()));
                 }
                 Ok(Some(rec))
             }
@@ -8344,7 +9470,7 @@ impl Txn {
                     Some(record) => {
                         let mut record = record.clone();
                         if staged.schema.has_implicit_id() {
-                            record.insert(ID_COLUMN.into(), Value::Text(id.clone()));
+                            record.insert(ID_COLUMN, Value::Text(id.clone()));
                         }
                         rows.insert(id.clone(), record);
                     }
@@ -8355,6 +9481,122 @@ impl Txn {
             }
         }
         Ok(rows.into_iter().collect())
+    }
+
+    /// Equality lookup through this transaction: the rows of `table` whose
+    /// `column` equals `value` as of the snapshot, with staged writes
+    /// overlaid, ordered by id. Returns `None` when the exact indexed path is
+    /// unavailable (no secondary index on the column, or the snapshot is older
+    /// than the change log reaches); callers then fall back to `scan`.
+    pub(crate) fn find_eq(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+    ) -> Result<Option<Vec<(String, Record)>>> {
+        if value.is_null() {
+            return Ok(Some(Vec::new()));
+        }
+        let version = self.snapshot.version;
+        let key = index_key(value);
+        let (implicit_id, prepared, blobs, readers, projection) = {
+            let st = self.shared.state.read().unwrap();
+            let schema = st
+                .catalog
+                .table(table)
+                .ok_or_else(|| Error::TableNotFound(table.into()))?;
+            if schema.column(column).is_none() {
+                return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
+            }
+            let Some(index) = st.secondary.get(&(table.to_owned(), column.to_owned())) else {
+                return Ok(None);
+            };
+            let mut candidates: BTreeSet<String> = index.ids(&key)?;
+            // An identity column never changes after insert, so no row can
+            // have carried this value at the snapshot and lost it since: the
+            // index alone is exact and the change log (which grows with the
+            // age of the snapshot) is not consulted for the hot `id = ?` case.
+            let immutable_column = schema
+                .column(column)
+                .is_some_and(|definition| definition.identity);
+            if !immutable_column {
+                let Some(changed) = st.change_log.changed_after(table, version) else {
+                    return Ok(None);
+                };
+                candidates.extend(changed.into_iter().map(str::to_owned));
+            }
+            // Decoding runs after the state lock is released, like the
+            // autocommit lookup; the transaction's registered snapshot keeps
+            // the captured segments alive meanwhile.
+            let mut readers = SegmentReaders::default();
+            let mut prepared = Vec::with_capacity(candidates.len());
+            let mut key_buffer = Vec::new();
+            let epoch = schema.epoch;
+            let mut view = st.index.table_view(table, &mut key_buffer);
+            for id in candidates {
+                let Some(entry) = view
+                    .newest(&id, version)?
+                    .filter(|entry| entry.version > epoch)
+                else {
+                    continue;
+                };
+                if entry.is_tombstone() {
+                    continue;
+                }
+                if let VKind::SegPut { segment, .. } = &entry.kind {
+                    let reader = st
+                        .readers
+                        .get(segment)
+                        .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
+                    readers.entry(*segment).or_insert_with(|| reader.clone());
+                }
+                prepared.push((id, entry.kind));
+            }
+            (
+                schema.has_implicit_id(),
+                prepared,
+                st.blobs.clone(),
+                readers,
+                RowProjection::all(Some(schema)),
+            )
+        };
+        let mut rows: BTreeMap<String, Record> = BTreeMap::new();
+        for (id, kind) in prepared {
+            let mut record = read_record_kind_keep(&blobs, &readers, &kind, &projection)?;
+            // A candidate from the index may have held another value at the
+            // snapshot, and one from the change log may never have matched.
+            if record
+                .get(column)
+                .is_none_or(|current| index_key(current) != key)
+            {
+                continue;
+            }
+            if implicit_id {
+                record.insert(ID_COLUMN, Value::Text(id.clone()));
+            }
+            rows.insert(id, record);
+        }
+        if let Some((_, staged)) = self.staged.iter().find(|(name, _)| name == table) {
+            for (id, operation) in staged.operations.iter() {
+                match &operation.operation {
+                    Some(record)
+                        if record
+                            .get(column)
+                            .is_some_and(|current| index_key(current) == key) =>
+                    {
+                        let mut record = record.clone();
+                        if staged.schema.has_implicit_id() {
+                            record.insert(ID_COLUMN, Value::Text(id.clone()));
+                        }
+                        rows.insert(id.clone(), record);
+                    }
+                    _ => {
+                        rows.remove(id);
+                    }
+                }
+            }
+        }
+        Ok(Some(rows.into_iter().collect()))
     }
 
     pub fn insert(&mut self, table: &str, record: Record) -> Result<String> {
@@ -8386,6 +9628,30 @@ impl Txn {
             .position(|(name, _)| name == table)
             .expect("schema was cached above");
         let schema = &self.staged[table_index].1.schema;
+        // A table that declares its own `id` is keyed by it. The identity is
+        // reserved before the physical key is chosen, so the key can be that
+        // identity instead of a ULID nobody asked for; reaching such a row
+        // used to be two index hops, the declared id through its unique
+        // secondary index and the ULID through the primary directory.
+        let declared_identity = if restored_id.is_none() && schema.keyed_by_identity() {
+            let identity_name = schema
+                .columns
+                .iter()
+                .find(|column| column.identity)
+                .map(|column| column.name.clone())
+                .ok_or_else(|| {
+                    Error::SchemaViolation(format!(
+                        "table '{table}' declares '{ID_COLUMN}' without making it an identity"
+                    ))
+                })?;
+            let explicit = identity_request(&record, &identity_name)?;
+            let generated = reserve_identity(&self.shared, table, explicit)?;
+            record.insert(identity_name, Value::Int64(generated));
+            Some(generated)
+        } else {
+            None
+        };
+        let schema = &self.staged[table_index].1.schema;
         let id = if let Some(id) = restored_id {
             if id.is_empty() {
                 return Err(Error::Corrupt(
@@ -8402,68 +9668,78 @@ impl Txn {
                         "restored implicit id differs from physical key".into(),
                     ));
                 }
-                record.insert(ID_COLUMN.into(), Value::Text(id.into()));
+                record.insert(ID_COLUMN, Value::Text(id.into()));
             }
             if let Ok(explicit) = Ulid::from_string(id) {
                 let mut previous = self.shared.last_generated_id.lock().unwrap();
                 *previous = (*previous).max(explicit);
             }
             id.to_owned()
+        } else if let Some(identity) = declared_identity {
+            identity_key(identity)
         } else {
-            match (schema.has_implicit_id(), record.get(ID_COLUMN)) {
-                (false, _) | (true, None) => {
-                    let mut previous = self.shared.last_generated_id.lock().unwrap();
-                    let candidate = Ulid::new();
-                    let next = if candidate > *previous {
-                        candidate
-                    } else {
-                        previous.increment().ok_or_else(|| {
-                            Error::InvalidArgument("cannot generate id: ULID overflow".into())
-                        })?
-                    };
-                    *previous = next;
-                    next.to_string()
-                }
-                (true, Some(Value::Text(s))) if !s.is_empty() => {
-                    validate_short_string("record id", s)?;
-                    if let Ok(explicit) = Ulid::from_string(s) {
+            {
+                match (schema.has_implicit_id(), record.get(ID_COLUMN)) {
+                    (true, None) => {
                         let mut previous = self.shared.last_generated_id.lock().unwrap();
-                        if explicit > *previous {
-                            *previous = explicit;
-                        }
+                        let candidate = Ulid::new();
+                        let next = if candidate > *previous {
+                            candidate
+                        } else {
+                            previous.increment().ok_or_else(|| {
+                                Error::InvalidArgument("cannot generate id: ULID overflow".into())
+                            })?
+                        };
+                        *previous = next;
+                        next.to_string()
                     }
-                    s.clone()
-                }
-                (true, Some(Value::Text(_))) => {
-                    return Err(Error::InvalidArgument("id must not be empty".into()))
-                }
-                (true, Some(_)) => {
-                    return Err(Error::SchemaViolation("id must be a text value".into()))
+                    (true, Some(Value::Text(s))) if !s.is_empty() => {
+                        validate_short_string("record id", s)?;
+                        if let Ok(explicit) = Ulid::from_string(s) {
+                            let mut previous = self.shared.last_generated_id.lock().unwrap();
+                            if explicit > *previous {
+                                *previous = explicit;
+                            }
+                        }
+                        s.clone()
+                    }
+                    (true, Some(Value::Text(_))) => {
+                        return Err(Error::InvalidArgument("id must not be empty".into()))
+                    }
+                    (true, Some(_)) => {
+                        return Err(Error::SchemaViolation("id must be a text value".into()))
+                    }
+                    // A table that declares `id` but was written before
+                    // identity keying existed still carries ULID keys.
+                    (false, _) => {
+                        let mut previous = self.shared.last_generated_id.lock().unwrap();
+                        let candidate = Ulid::new();
+                        let next = if candidate > *previous {
+                            candidate
+                        } else {
+                            previous.increment().ok_or_else(|| {
+                                Error::InvalidArgument("cannot generate id: ULID overflow".into())
+                            })?
+                        };
+                        *previous = next;
+                        next.to_string()
+                    }
                 }
             }
         };
-        let identity_name = schema
-            .columns
-            .iter()
-            .find(|column| column.identity)
-            .map(|column| column.name.clone());
-        if let Some(identity_name) = identity_name {
-            let explicit = match record.get(&identity_name) {
-                None => None,
-                Some(Value::Int64(value)) if *value >= 1 => Some(*value),
-                Some(Value::Int64(_)) => {
-                    return Err(Error::SchemaViolation(format!(
-                        "identity column '{identity_name}' requires a positive int"
-                    )))
-                }
-                Some(_) => {
-                    return Err(Error::SchemaViolation(format!(
-                        "identity column '{identity_name}' requires an int"
-                    )))
-                }
-            };
-            let generated = reserve_identity(&self.shared, table, explicit)?;
-            record.insert(identity_name, Value::Int64(generated));
+        // An identity column that is not the table's `id` still has to be
+        // reserved; the one that is was handled before the key was chosen.
+        if declared_identity.is_none() {
+            let identity_name = schema
+                .columns
+                .iter()
+                .find(|column| column.identity)
+                .map(|column| column.name.clone());
+            if let Some(identity_name) = identity_name {
+                let explicit = identity_request(&record, &identity_name)?;
+                let generated = reserve_identity(&self.shared, table, explicit)?;
+                record.insert(identity_name, Value::Int64(generated));
+            }
         }
         let normalized = normalize_record(schema, record)?;
         let staged_table = &self.staged[table_index].1;
@@ -8492,6 +9768,20 @@ impl Txn {
             }
         };
         if exists {
+            // For a table keyed by its declared identity the physical key and
+            // the identity column are the same thing, so this is the unique
+            // constraint on that column failing. Callers catch that error, and
+            // an internal keying decision must not change which one they see.
+            if let Some(identity_name) = schema
+                .keyed_by_identity()
+                .then(|| schema.columns.iter().find(|column| column.identity))
+                .flatten()
+            {
+                return Err(Error::UniqueViolation {
+                    table: table.into(),
+                    column: identity_name.name.clone(),
+                });
+            }
             return Err(Error::DuplicateId {
                 table: table.into(),
                 id,
@@ -8747,22 +10037,37 @@ impl Txn {
 }
 
 fn reserve_identity(shared: &Shared, table: &str, explicit: Option<i64>) -> Result<i64> {
-    // Identity allocation mutates publication state before commit staging.
-    // Announce that brief writer section so a saturated point-read workload
-    // cannot repeatedly reacquire the state lock ahead of the allocator.
+    // The common path reserves with one atomic under the shared lock. Only a
+    // table whose sequence has never been touched needs the exclusive lock,
+    // once, to create its counter.
+    {
+        let st = shared.state.read().unwrap();
+        if let Some(high) = st.identity_high_water.get(table) {
+            return reserve_from(high, table, explicit);
+        }
+    }
     let _active_state_writer = ActiveStateWriter::enter(shared);
     let mut st = shared.state.write().unwrap();
-    let high = st.identity_high_water.entry(table.to_owned()).or_insert(0);
+    let high = st
+        .identity_high_water
+        .entry(table.to_owned())
+        .or_insert_with(|| AtomicI64::new(0));
+    reserve_from(high, table, explicit)
+}
+
+fn reserve_from(high: &AtomicI64, table: &str, explicit: Option<i64>) -> Result<i64> {
     match explicit {
         Some(value) => {
-            *high = (*high).max(value);
+            high.fetch_max(value, AtomicOrdering::AcqRel);
             Ok(value)
         }
         None => {
-            let next = high.checked_add(1).ok_or_else(|| {
+            let previous = high.fetch_add(1, AtomicOrdering::AcqRel);
+            let next = previous.checked_add(1).ok_or_else(|| {
+                // Undo the overflowing step so the sequence stays saturated.
+                high.fetch_sub(1, AtomicOrdering::AcqRel);
                 Error::SchemaViolation(format!("identity sequence for '{table}' is exhausted"))
             })?;
-            *high = next;
             Ok(next)
         }
     }
@@ -9160,29 +10465,73 @@ fn gc_blob_files(blobs_dir: &Path, mut referenced: impl FnMut(&str) -> bool) {
 
 /// Apply a DDL rewrite to one record payload. Values are copied byte for byte,
 /// so out-of-line blob references keep pointing at the chunks they already own.
-fn transform_payload(rw: &Rewrite<'_>, table: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
-    match *rw {
+///
+/// `schema` is the table as the catalog still describes it: the catalog half
+/// of a rewrite is published after this loop, and a crash replay that finds it
+/// already published finds the payloads already rewritten too.
+fn transform_payload(
+    rw: &Rewrite<'_>,
+    table: &str,
+    schema: &TableSchema,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let rewritten = match *rw {
         Rewrite::RenameColumn { table: t, from, to } if t == table => {
-            rewrite_payload_columns(&payload, Some((from, to)), None)
+            rewrite_payload_columns(&payload, schema, Some((from, to)), None)?
         }
         Rewrite::DropColumn { table: t, column } if t == table => {
-            rewrite_payload_columns(&payload, None, Some(column))
+            rewrite_payload_columns(&payload, schema, None, Some(column))?
         }
-        _ => Ok(payload),
-    }
+        _ => payload,
+    };
+    // Every segment rewrite is also the moment a payload written before
+    // format_version 3 loses its inline column names, so a database converts
+    // as it compacts instead of in one pass at open.
+    strip_payload_names(rewritten)
 }
 
 /// Rebuild an encoded record with one field renamed and/or one field removed.
+///
+/// A payload that stores its values only has no name to rename, and the field
+/// to remove is found by its position in `schema`. When the column is no
+/// longer there the catalog half of this rewrite has already been published,
+/// so the payload has already been rewritten and is returned untouched.
 fn rewrite_payload_columns(
     payload: &[u8],
+    schema: &TableSchema,
     rename: Option<(&str, &str)>,
     remove: Option<&str>,
 ) -> Result<Vec<u8>> {
     let mut pos = 0usize;
-    let count = read_u16(payload, &mut pos)? as usize;
+    let header = read_payload_header(payload, &mut pos)?;
+    if header.positional {
+        let Some(column) = remove else {
+            return Ok(payload.to_vec());
+        };
+        let Some(ordinal) = schema
+            .columns
+            .iter()
+            .position(|candidate| candidate.name == column)
+            .filter(|ordinal| *ordinal < header.count)
+        else {
+            return Ok(payload.to_vec());
+        };
+        let mut buf = Vec::with_capacity(payload.len());
+        buf.extend_from_slice(&((header.count as u16 - 1) | POSITIONAL_MARK).to_le_bytes());
+        for current in 0..header.count {
+            let value_start = pos;
+            skip_value(payload, &mut pos, None)?;
+            if current != ordinal {
+                buf.extend_from_slice(&payload[value_start..pos]);
+            }
+        }
+        return Ok(buf);
+    }
+    let count = header.count;
     let mut fields: Vec<(&str, &[u8])> = Vec::with_capacity(count);
     for _ in 0..count {
-        let name = read_payload_name(payload, &mut pos)?;
+        let name = std::str::from_utf8(read_payload_column_name(payload, &mut pos)?)
+            .map_err(|_| Error::Corrupt("invalid utf8 in column name".into()))?;
         let value_start = pos;
         skip_value(payload, &mut pos, None)?;
         if remove == Some(name) {
@@ -9209,36 +10558,46 @@ fn rewrite_payload_columns(
     Ok(buf)
 }
 
+/// Drop the inline column names of a payload written before format_version 3.
+/// Values are already stored in schema order, so nothing but the names moves,
+/// and a payload that already has none is returned as it is.
+fn strip_payload_names(payload: Vec<u8>) -> Result<Vec<u8>> {
+    let mut pos = 0usize;
+    let header = read_payload_header(&payload, &mut pos)?;
+    if header.positional {
+        return Ok(payload);
+    }
+    if header.count > MAX_STORED_COLUMNS {
+        return Err(Error::Corrupt(format!(
+            "record payload carries {} columns, more than the {MAX_STORED_COLUMNS} supported",
+            header.count
+        )));
+    }
+    let mut buf = Vec::with_capacity(payload.len());
+    buf.extend_from_slice(&((header.count as u16) | POSITIONAL_MARK).to_le_bytes());
+    for _ in 0..header.count {
+        read_payload_column_name(&payload, &mut pos)?;
+        let value_start = pos;
+        skip_value(&payload, &mut pos, None)?;
+        buf.extend_from_slice(&payload[value_start..pos]);
+    }
+    if pos != payload.len() {
+        return Err(Error::Corrupt("trailing bytes in record payload".into()));
+    }
+    Ok(buf)
+}
+
 /// Whether an encoded record has no value for a column: either the field is
 /// absent (written before the column existed) or it holds NULL. Only the value
 /// tag is read, so nothing large is decoded.
-fn encoded_column_needs_fill(payload: &[u8], column: &str) -> Result<bool> {
-    let mut pos = 0usize;
-    let count = read_u16(payload, &mut pos)? as usize;
-    for _ in 0..count {
-        let name = read_payload_name(payload, &mut pos)?;
-        if name == column {
-            let tag = *payload
-                .get(pos)
-                .ok_or_else(|| Error::Corrupt("unexpected end of record".into()))?;
-            return Ok(tag == TAG_NULL);
-        }
-        skip_value(payload, &mut pos, None)?;
-    }
-    Ok(true)
-}
-
-/// Read one length-prefixed column name from a record payload.
-fn read_payload_name<'p>(payload: &'p [u8], pos: &mut usize) -> Result<&'p str> {
-    let name_len = read_u16(payload, pos)? as usize;
-    let end = pos
-        .checked_add(name_len)
-        .filter(|end| *end <= payload.len())
+fn encoded_column_needs_fill(payload: &[u8], column: &str, ordinal: Option<usize>) -> Result<bool> {
+    let Some(pos) = encoded_column_offset(payload, column, ordinal)? else {
+        return Ok(true);
+    };
+    let tag = *payload
+        .get(pos)
         .ok_or_else(|| Error::Corrupt("unexpected end of record".into()))?;
-    let name = std::str::from_utf8(&payload[*pos..end])
-        .map_err(|_| Error::Corrupt("invalid utf8 in column name".into()))?;
-    *pos = end;
-    Ok(name)
+    Ok(tag == TAG_NULL)
 }
 
 /// Apply one committed change to the in-memory state, maintaining secondary
@@ -9270,9 +10629,24 @@ fn apply_one_owned(
     }
     let defs = &schema.indexes;
     let tdefs = &schema.text_indexes;
+    // An update that leaves an indexed column untouched (a stock counter on
+    // a row with an indexed category, a text description, an embedding)
+    // keeps its index entries: removing and re-adding them cost a tokenize
+    // or an HNSW insert per unrelated update and left tombstones behind.
+    let new_record = put.map(|(_, rec)| rec);
+    let prior_record = prior.as_ref();
+    let unchanged = |column: &str| -> bool {
+        match (prior_record, new_record) {
+            (Some(prior), Some(rec)) => prior.get(column) == rec.get(column),
+            _ => false,
+        }
+    };
     if !defs.is_empty() || !tdefs.is_empty() {
-        if let Some(prior) = prior {
+        if let Some(prior) = prior_record {
             for (def, key) in defs.iter().zip(&keys.secondary) {
+                if unchanged(&def.column) {
+                    continue;
+                }
                 if let Some(v) = prior.get(&def.column) {
                     if !v.is_null() {
                         if let Some(idx) = st.secondary.get_mut(key) {
@@ -9283,6 +10657,9 @@ fn apply_one_owned(
                 }
             }
             for (tdef, key) in tdefs.iter().zip(&keys.text) {
+                if unchanged(&tdef.column) {
+                    continue;
+                }
                 if let Some(Value::Text(old)) = prior.get(&tdef.column) {
                     if let Some(tidx) = st.text.get_mut(key) {
                         tidx.remove(id_ref, old);
@@ -9297,6 +10674,9 @@ fn apply_one_owned(
     };
     if let Some((_, rec)) = put {
         for (def, key) in defs.iter().zip(&keys.secondary) {
+            if unchanged(&def.column) {
+                continue;
+            }
             if let Some(v) = rec.get(&def.column) {
                 if !v.is_null() {
                     if let Some(idx) = st.secondary.get_mut(key) {
@@ -9306,6 +10686,9 @@ fn apply_one_owned(
             }
         }
         for (tdef, key) in tdefs.iter().zip(&keys.text) {
+            if unchanged(&tdef.column) {
+                continue;
+            }
             if let Some(Value::Text(s)) = rec.get(&tdef.column) {
                 if let Some(tidx) = st.text.get_mut(key) {
                     tidx.add(id_ref, s);
@@ -9319,6 +10702,9 @@ fn apply_one_owned(
     // Synchronous indexing borrows the vector from the staged record; only
     // asynchronous jobs need their own copy.
     for (vdef, key) in schema.vector_indexes.iter().zip(&keys.vector) {
+        if unchanged(&vdef.column) {
+            continue;
+        }
         let new_vec = put.and_then(|(_, rec)| match rec.get(&vdef.column) {
             Some(Value::Vector(v)) => Some(v),
             _ => None,
@@ -9463,7 +10849,7 @@ fn load_or_build_secondary_indexes(
                         committed_version,
                         memory.maintenance_pool_bytes,
                         blobs,
-                        &table.name,
+                        table,
                         &def.column,
                         index,
                         readers,
@@ -9509,21 +10895,23 @@ fn write_secondary_from_canonical(
     dump_version: u64,
     budget: usize,
     blobs: &Path,
-    table: &str,
+    schema: &TableSchema,
     column: &str,
     index: &PrimaryIdx,
     readers: &SegmentReaders,
 ) -> Result<()> {
     let mut writer = ExternalPagedWriter::new(target, temp_dir, dump_version, budget)?;
     writer.add(SECONDARY_FORMAT_KEY, SECONDARY_FORMAT_VALUE)?;
-    index.visit_table(table, None, |id, versions| {
+    let wanted = [column];
+    let projection = RowProjection::new(Some(schema), Some(&wanted));
+    index.visit_table(&schema.name, None, |id, versions| {
         let Some(last) = versions.last() else {
             return Ok(true);
         };
         if last.is_tombstone() {
             return Ok(true);
         }
-        let record = read_record_kind(blobs, readers, &last.kind)?;
+        let record = read_record_kind_keep(blobs, readers, &last.kind, &projection)?;
         if let Some(value) = record.get(column).filter(|value| !value.is_null()) {
             writer.add(
                 &secondary_pair_key(&index_key(value), id),
@@ -9581,27 +10969,29 @@ fn cleanup_orphan_sidx(dir: &Path, catalog: &Catalog) {
 
 fn build_one_vector_index(
     blobs: &Path,
-    table: &str,
+    schema: &TableSchema,
     def: &VectorIndexDef,
     index: &PrimaryIdx,
     readers: &SegmentReaders,
     budget: usize,
 ) -> Result<VecIdx> {
     let mut vidx = VecIdx::new(def.clone());
-    index.visit_table(table, None, |id, versions| {
+    let wanted = [def.column.as_str()];
+    let projection = RowProjection::new(Some(schema), Some(&wanted));
+    index.visit_table(&schema.name, None, |id, versions| {
         let Some(last) = versions.last() else {
             return Ok(true);
         };
         if last.is_tombstone() {
             return Ok(true);
         }
-        let rec = read_record_kind(blobs, readers, &last.kind)?;
+        let rec = read_record_kind_keep(blobs, readers, &last.kind, &projection)?;
         if let Some(Value::Vector(v)) = rec.get(&def.column) {
             vidx.insert(id, v);
             if vidx.delta_memory_bytes() > budget {
                 return Err(Error::MemoryLimit(format!(
-                    "building vector index {table}.{} exceeds the {budget}-byte maintenance pool; raise memory.maintenance_pool_bytes",
-                    def.column
+                    "building vector index {}.{} exceeds the {budget}-byte maintenance pool; raise memory.maintenance_pool_bytes",
+                    schema.name, def.column
                 )));
             }
         }
@@ -10180,7 +11570,7 @@ fn load_or_build_vector_indexes(
                             schema_epoch,
                             read_only,
                         },
-                        &table.name,
+                        table,
                         def,
                         index,
                         readers,
@@ -10192,7 +11582,7 @@ fn load_or_build_vector_indexes(
                 None => {
                     let resident = build_one_vector_index(
                         blobs,
-                        &table.name,
+                        table,
                         def,
                         index,
                         readers,
@@ -10273,7 +11663,7 @@ fn catch_up_vector_index(
     blobs: &Path,
     vidx: &mut VecIdx,
     bounds: VectorCatchUp,
-    table: &str,
+    schema: &TableSchema,
     def: &VectorIndexDef,
     index: &PrimaryIdx,
     readers: &SegmentReaders,
@@ -10287,6 +11677,9 @@ fn catch_up_vector_index(
         schema_epoch,
         read_only,
     } = bounds;
+    let table = schema.name.as_str();
+    let wanted = [def.column.as_str()];
+    let projection = RowProjection::new(Some(schema), Some(&wanted));
     let mut liveness = vidx.begin_liveness();
     let mut flushed = false;
     index.visit_table(table, None, |id, versions| {
@@ -10313,7 +11706,7 @@ fn catch_up_vector_index(
             vidx.remove(id);
             return Ok(true);
         }
-        let rec = read_record_kind(blobs, readers, &last.kind)?;
+        let rec = read_record_kind_keep(blobs, readers, &last.kind, &projection)?;
         match rec.get(&def.column) {
             Some(Value::Vector(v)) => vidx.insert(id, v),
             _ => vidx.remove(id),
@@ -10477,7 +11870,7 @@ fn load_or_build_text_indexes(
                     key,
                     build_one_text_index(
                         blobs,
-                        &table.name,
+                        table,
                         &def.column,
                         index,
                         readers,
@@ -10498,7 +11891,7 @@ fn load_or_build_text_indexes(
                 committed_version,
                 memory.maintenance_pool_bytes,
                 blobs,
-                &table.name,
+                table,
                 &def.column,
                 index,
                 readers,
@@ -10540,26 +11933,29 @@ fn load_or_build_text_indexes(
 
 fn build_one_text_index(
     blobs: &Path,
-    table: &str,
+    schema: &TableSchema,
     column: &str,
     index: &PrimaryIdx,
     readers: &SegmentReaders,
     budget: usize,
 ) -> Result<TextIdx> {
     let mut out = TextIdx::new();
-    index.visit_table(table, None, |id, versions| {
+    let wanted = [column];
+    let projection = RowProjection::new(Some(schema), Some(&wanted));
+    index.visit_table(&schema.name, None, |id, versions| {
         let Some(last) = versions.last() else {
             return Ok(true);
         };
         if last.is_tombstone() {
             return Ok(true);
         }
-        let record = read_record_kind(blobs, readers, &last.kind)?;
+        let record = read_record_kind_keep(blobs, readers, &last.kind, &projection)?;
         if let Some(Value::Text(text)) = record.get(column) {
             out.add(id, text);
             if out.delta_memory_bytes() > budget {
                 return Err(Error::MemoryLimit(format!(
-                    "read-only text-index recovery for {table}.{column} exceeds memory.index_delta_pool_bytes ({budget}); open writable once to rebuild its mmap index"
+                    "read-only text-index recovery for {}.{column} exceeds memory.index_delta_pool_bytes ({budget}); open writable once to rebuild its mmap index",
+                    schema.name
                 )));
             }
         }
@@ -10575,23 +11971,25 @@ fn write_text_from_canonical(
     dump_version: u64,
     budget: usize,
     blobs: &Path,
-    table: &str,
+    schema: &TableSchema,
     column: &str,
     index: &PrimaryIdx,
     readers: &SegmentReaders,
 ) -> Result<(u64, u64)> {
     let mut writer = ExternalPagedWriter::new(target, temp_dir, dump_version, budget)?;
     TextIdx::write_format(&mut writer)?;
+    let wanted = [column];
+    let projection = RowProjection::new(Some(schema), Some(&wanted));
     let mut doc_count = 0u64;
     let mut total_len = 0u64;
-    index.visit_table(table, None, |id, versions| {
+    index.visit_table(&schema.name, None, |id, versions| {
         let Some(last) = versions.last() else {
             return Ok(true);
         };
         if last.is_tombstone() {
             return Ok(true);
         }
-        let record = read_record_kind(blobs, readers, &last.kind)?;
+        let record = read_record_kind_keep(blobs, readers, &last.kind, &projection)?;
         if let Some(Value::Text(text)) = record.get(column) {
             if let Some(len) = TextIdx::write_document(&mut writer, id, text, dump_version)? {
                 doc_count += 1;
@@ -10688,11 +12086,13 @@ fn find_eq_via_primary_index(
     value: &Value,
     out: &mut Vec<(String, Record)>,
 ) -> Result<()> {
-    let epoch = st
+    let schema = st
         .catalog
         .table(table)
-        .ok_or_else(|| Error::TableNotFound(table.into()))?
-        .epoch;
+        .ok_or_else(|| Error::TableNotFound(table.into()))?;
+    let epoch = schema.epoch;
+    let implicit_id = schema.has_implicit_id();
+    let projection = RowProjection::all(Some(schema));
     st.index.visit_table(table, None, |id, versions| {
         let Some(last) = versions.iter().rev().find(|entry| entry.version > epoch) else {
             return Ok(true);
@@ -10700,11 +12100,12 @@ fn find_eq_via_primary_index(
         if last.is_tombstone() {
             return Ok(true);
         }
-        let rec = read_record_kind(&st.blobs, &st.readers, &last.kind)?;
+        let rec = read_record_kind_keep(&st.blobs, &st.readers, &last.kind, &projection)?;
         if rec.get(column) == Some(value) {
             let mut rec = rec;
-            rec.entry(ID_COLUMN.into())
-                .or_insert_with(|| Value::Text(id.to_owned()));
+            if implicit_id {
+                rec.insert(ID_COLUMN, Value::Text(id.to_owned()));
+            }
             out.push((id.to_owned(), rec));
         }
         Ok(true)
@@ -10724,8 +12125,16 @@ fn find_eq_streaming(
     out: &mut Vec<(String, Record)>,
 ) -> Result<()> {
     let predicate = encoded_eq_predicate(st, table, column, value);
+    // Only a table without a declared `id` needs the physical key surfaced;
+    // adding it to a row that already has an `id` column would shadow the
+    // declared value and copy the row's shared column names.
+    let implicit_id = st
+        .catalog
+        .table(table)
+        .is_some_and(TableSchema::has_implicit_id);
+    let projection = RowProjection::all(st.catalog.table(table));
     for meta in &st.segments {
-        scan_segment_for_eq(st, meta, table, &predicate, out)?;
+        scan_segment_for_eq(st, meta, table, &predicate, &projection, implicit_id, out)?;
     }
 
     // Segment entries have already been visited above. Only the bounded
@@ -10760,14 +12169,126 @@ fn find_eq_streaming(
                 continue;
             };
             if encoded_record_column_eq(payload, &predicate, &st.blobs)? {
-                let mut rec = decode_record(payload, Some(&st.blobs))?;
-                rec.entry(ID_COLUMN.into())
-                    .or_insert_with(|| Value::Text(id.to_owned()));
+                let mut rec = decode_record_keep(payload, Some(&st.blobs), &projection)?;
+                if implicit_id {
+                    rec.insert(ID_COLUMN, Value::Text(id.to_owned()));
+                }
                 out.push((id.to_owned(), rec));
             }
         }
     }
     Ok(())
+}
+
+/// Comparison operators a scan can evaluate on encoded payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanCmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// One `column <op> literal` conjunct pushed into a scan and evaluated on the
+/// encoded payload before the row is decoded. Only numeric comparisons
+/// (int/timestamp against int/timestamp, float against float) are decided
+/// here; anything else, including NULL handling by type, answers "maybe" and
+/// the decoded evaluation keeps the final word. A scan over a wide table with
+/// a selective range predicate otherwise materialized every row.
+#[derive(Clone, Debug)]
+pub(crate) struct ScanFilter {
+    pub(crate) column: String,
+    pub(crate) op: ScanCmp,
+    pub(crate) value: Value,
+}
+
+impl ScanFilter {
+    fn decide(&self, current: &Value) -> Option<bool> {
+        use std::cmp::Ordering;
+        let ordering = match (current, &self.value) {
+            (Value::Int64(a) | Value::Timestamp(a), Value::Int64(b) | Value::Timestamp(b)) => {
+                a.cmp(b)
+            }
+            (Value::Float64(a), Value::Float64(b)) => {
+                let zero = |x: f64| if x == 0.0 { 0.0 } else { x };
+                zero(*a).total_cmp(&zero(*b))
+            }
+            (Value::Null, _) => return Some(false),
+            _ => return None,
+        };
+        Some(match self.op {
+            ScanCmp::Eq => ordering == Ordering::Equal,
+            ScanCmp::Ne => ordering != Ordering::Equal,
+            ScanCmp::Lt => ordering == Ordering::Less,
+            ScanCmp::Le => ordering != Ordering::Greater,
+            ScanCmp::Gt => ordering == Ordering::Greater,
+            ScanCmp::Ge => ordering != Ordering::Less,
+        })
+    }
+}
+
+/// Position of `column`'s encoded value inside a payload, trying the schema
+/// ordinal first and falling back to a name match for older layouts.
+fn encoded_column_offset(
+    payload: &[u8],
+    column: &str,
+    ordinal: Option<usize>,
+) -> Result<Option<usize>> {
+    let mut pos = 0usize;
+    let header = read_payload_header(payload, &mut pos)?;
+    if header.positional {
+        // Values only: the storage position is the schema ordinal. A column
+        // the schema does not declare cannot be in the payload either.
+        let Some(ordinal) = ordinal.filter(|ordinal| *ordinal < header.count) else {
+            return Ok(None);
+        };
+        for _ in 0..ordinal {
+            skip_value(payload, &mut pos, None)?;
+        }
+        return Ok(Some(pos));
+    }
+    if let Some(ordinal) = ordinal.filter(|ordinal| *ordinal < header.count) {
+        for current in 0..=ordinal {
+            let name = read_payload_column_name(payload, &mut pos)?;
+            if current == ordinal {
+                if name == column.as_bytes() {
+                    return Ok(Some(pos));
+                }
+                break;
+            }
+            skip_value(payload, &mut pos, None)?;
+        }
+    }
+    // Schemas can evolve while older payloads remain visible. If the ordinal
+    // is absent or the encoded name does not agree, retain the name-based path
+    // for correctness instead of assuming every record has the latest layout.
+    let mut pos = 0usize;
+    let header = read_payload_header(payload, &mut pos)?;
+    for _ in 0..header.count {
+        let name = read_payload_column_name(payload, &mut pos)?;
+        if name == column.as_bytes() {
+            return Ok(Some(pos));
+        }
+        skip_value(payload, &mut pos, None)?;
+    }
+    Ok(None)
+}
+
+/// `false` only when the encoded row certainly fails the filter.
+pub(super) fn scan_filter_may_match(
+    payload: &[u8],
+    filter: &ScanFilter,
+    ordinal: Option<usize>,
+    blobs: &Path,
+) -> Result<bool> {
+    let Some(mut pos) = encoded_column_offset(payload, &filter.column, ordinal)? else {
+        // A column the payload lacks reads as NULL: no comparison is true.
+        return Ok(false);
+    };
+    let current = decode_value(payload, &mut pos, Some(blobs))?;
+    Ok(filter.decide(&current).unwrap_or(true))
 }
 
 struct EncodedEqPredicate<'a> {
@@ -10803,6 +12324,8 @@ fn scan_segment_for_eq(
     meta: &SegmentMeta,
     wanted_table: &str,
     predicate: &EncodedEqPredicate<'_>,
+    projection: &RowProjection<'_>,
+    implicit_id: bool,
     out: &mut Vec<(String, Record)>,
 ) -> Result<()> {
     let table_epoch = st
@@ -10867,9 +12390,10 @@ fn scan_segment_for_eq(
         if current && encoded_record_column_eq(payload, predicate, &st.blobs)? {
             let id = std::str::from_utf8(id_bytes)
                 .map_err(|_| Error::Corrupt("invalid utf8 in segment record id".into()))?;
-            let mut rec = decode_record(payload, Some(&st.blobs))?;
-            rec.entry(ID_COLUMN.into())
-                .or_insert_with(|| Value::Text(id.to_owned()));
+            let mut rec = decode_record_keep(payload, Some(&st.blobs), projection)?;
+            if implicit_id {
+                rec.insert(ID_COLUMN, Value::Text(id.to_owned()));
+            }
             out.push((id.to_owned(), rec));
         }
 
@@ -10906,53 +12430,72 @@ fn encoded_record_column_eq(
     predicate: &EncodedEqPredicate<'_>,
     blobs: &Path,
 ) -> Result<bool> {
-    if let Some(ordinal) = predicate.ordinal {
-        let mut pos = 0usize;
-        let count = read_u16(payload, &mut pos)? as usize;
-        if ordinal < count {
-            for current in 0..=ordinal {
-                let name_len = read_u16(payload, &mut pos)? as usize;
-                let end = pos
-                    .checked_add(name_len)
-                    .filter(|end| *end <= payload.len())
-                    .ok_or_else(|| Error::Corrupt("unexpected end of record".into()))?;
-                let name = &payload[pos..end];
-                pos = end;
-                if current == ordinal {
-                    if name == predicate.column.as_bytes() {
-                        return encoded_value_eq(payload, &mut pos, predicate.value, Some(blobs));
-                    }
-                    break;
-                }
-                skip_value(payload, &mut pos, None)?;
-            }
-        }
-    }
-
-    // Schemas can evolve while older payloads remain visible. If the ordinal
-    // is absent or the encoded name does not agree, retain the name-based path
-    // for correctness instead of assuming every record has the latest layout.
-    let mut pos = 0usize;
-    let count = read_u16(payload, &mut pos)? as usize;
-    for _ in 0..count {
-        let name_len = read_u16(payload, &mut pos)? as usize;
-        let end = pos
-            .checked_add(name_len)
-            .filter(|end| *end <= payload.len())
-            .ok_or_else(|| Error::Corrupt("unexpected end of record".into()))?;
-        let name = std::str::from_utf8(&payload[pos..end])
-            .map_err(|_| Error::Corrupt("invalid utf8 in column name".into()))?;
-        pos = end;
-        if name == predicate.column {
-            return encoded_value_eq(payload, &mut pos, predicate.value, Some(blobs));
-        }
-        skip_value(payload, &mut pos, None)?;
-    }
-    Ok(false)
+    // A column the payload lacks never compares equal, exactly as before:
+    // this decides index maintenance, not SQL semantics.
+    let Some(mut pos) = encoded_column_offset(payload, predicate.column, predicate.ordinal)? else {
+        return Ok(false);
+    };
+    encoded_value_eq(payload, &mut pos, predicate.value, Some(blobs))
 }
 
-fn read_record_kind(blobs: &Path, readers: &SegmentReaders, kind: &VKind) -> Result<Record> {
-    match with_payload(readers, kind, |bytes| decode_record(bytes, Some(blobs)))? {
+fn read_record_kind(
+    blobs: &Path,
+    readers: &SegmentReaders,
+    kind: &VKind,
+    schema: &TableSchema,
+) -> Result<Record> {
+    read_record_kind_keep(blobs, readers, kind, &RowProjection::all(Some(schema)))
+}
+
+/// The columns of `schema` that some derived index reads.
+fn indexed_columns(schema: &TableSchema) -> Vec<&str> {
+    let mut columns: Vec<&str> = Vec::new();
+    let names = schema
+        .indexes
+        .iter()
+        .map(|def| def.column.as_str())
+        .chain(schema.text_indexes.iter().map(|def| def.column.as_str()))
+        .chain(schema.vector_indexes.iter().map(|def| def.column.as_str()));
+    for name in names {
+        if !columns.contains(&name) {
+            columns.push(name);
+        }
+    }
+    columns
+}
+
+/// The version a write supersedes, decoded only as far as the derived indexes
+/// need it.
+///
+/// A commit reads the row it replaces to decide which index keys to drop and
+/// which columns did not change. It used to decode the whole row for that: on
+/// a product catalogue, `UPDATE products SET stock = ...` decoded the
+/// description and the embedding vector, neither of which the answer depends
+/// on, and both of which are the largest columns in the row.
+fn read_prior_for_indexes(
+    blobs: &Path,
+    readers: &SegmentReaders,
+    kind: &VKind,
+    schema: &TableSchema,
+) -> Result<Record> {
+    let wanted = indexed_columns(schema);
+    read_record_kind_keep(
+        blobs,
+        readers,
+        kind,
+        &RowProjection::new(Some(schema), Some(&wanted)),
+    )
+}
+
+fn read_record_kind_keep(
+    blobs: &Path,
+    readers: &SegmentReaders,
+    kind: &VKind,
+    projection: &RowProjection<'_>,
+) -> Result<Record> {
+    match with_payload(readers, kind, |bytes| {
+        decode_record_keep(bytes, Some(blobs), projection)
+    })? {
         Some(record) => Ok(record),
         None => Err(Error::Corrupt("attempted to read a tombstone".into())),
     }
@@ -10960,11 +12503,7 @@ fn read_record_kind(blobs: &Path, readers: &SegmentReaders, kind: &VKind) -> Res
 
 fn index_key(v: &Value) -> Vec<u8> {
     let mut buf = Vec::new();
-    match v {
-        // IEEE `=` treats both zeros as equal; the index key must agree.
-        Value::Float64(x) if *x == 0.0 => encode_value(&mut buf, &Value::Float64(0.0)),
-        _ => encode_value(&mut buf, v),
-    }
+    crate::value::encode_index_value(&mut buf, v);
     buf
 }
 
@@ -11062,13 +12601,20 @@ pub(crate) fn normalize_record(schema: &TableSchema, mut record: Record) -> Resu
             return Err(Error::SchemaViolation(format!("unknown column '{name}'")));
         }
     }
+    // The result is built in schema order against the table's shared column
+    // names. Filling an omitted column with `insert` instead would allocate
+    // its name and copy the row's names out of the layout they came from, and
+    // a row that is not in schema order makes the encoder search for every
+    // column by name rather than take them by position.
+    let mut values = Vec::with_capacity(schema.columns.len());
     for col in &schema.columns {
-        match record.get_mut(&col.name) {
-            Some(value) => {
-                check_value(col, value)?;
-                if matches!(value, Value::Float64(x) if *x == 0.0) {
-                    *value = Value::Float64(0.0);
+        match record.remove(&col.name) {
+            Some(mut value) => {
+                check_value(col, &value)?;
+                if matches!(value, Value::Float64(x) if x == 0.0) {
+                    value = Value::Float64(0.0);
                 }
+                values.push(value);
             }
             None => {
                 // An omitted column takes its declared default, or NULL.
@@ -11079,11 +12625,11 @@ pub(crate) fn normalize_record(schema: &TableSchema, mut record: Record) -> Resu
                         col.name
                     )));
                 }
-                record.insert(col.name.clone(), value);
+                values.push(value);
             }
         }
     }
-    Ok(record)
+    Ok(Record::from_layout(schema.shared_layout(), values))
 }
 
 // Record payload layout: u16 field count, then per field a u16-length-prefixed
@@ -11185,17 +12731,76 @@ impl Drop for BlobSink {
     }
 }
 
+/// Leading word of a record payload.
+///
+/// A payload written at format_version 3 or later stores its values only, in
+/// schema order, and the reader takes the column names from the catalog. One
+/// written before it repeats every column name inline, ahead of its value: an
+/// eight-column row stored its names on every version, and a projected read
+/// compared each of them against the wanted list, which a profile of a full
+/// scan put at 17 % of the whole statement. The high bit of the leading count
+/// tells the two apart, so both forms stay readable and a database converts
+/// as its rows are rewritten.
+const POSITIONAL_MARK: u16 = 0x8000;
+
+/// Columns a table may store. Below the mark, so no legacy count can be
+/// mistaken for a positional payload.
+pub(crate) const MAX_STORED_COLUMNS: usize = (POSITIONAL_MARK - 1) as usize;
+
+struct PayloadHeader {
+    count: usize,
+    positional: bool,
+}
+
+fn read_payload_header(buf: &[u8], pos: &mut usize) -> Result<PayloadHeader> {
+    let word = read_u16(buf, pos)?;
+    Ok(PayloadHeader {
+        count: usize::from(word & !POSITIONAL_MARK),
+        positional: word & POSITIONAL_MARK != 0,
+    })
+}
+
+/// Step over the inline column name a legacy payload stores before its value.
+fn read_payload_column_name<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
+    let name_len = usize::from(read_u16(buf, pos)?);
+    let end = pos
+        .checked_add(name_len)
+        .ok_or_else(|| Error::Corrupt("length overflow".into()))?;
+    let name = buf
+        .get(*pos..end)
+        .ok_or_else(|| Error::Corrupt("unexpected end of record".into()))?;
+    *pos = end;
+    Ok(name)
+}
+
 pub(crate) fn encode_record_ordered(
     schema: &TableSchema,
     record: &Record,
     sink: Option<&mut BlobSink>,
 ) -> Result<Vec<u8>> {
     // Size the payload up front: the encoding is a fixed function of the
-    // column names and values, so one exact reservation replaces the chain of
-    // doubling reallocations that otherwise dominates encoding time.
+    // values, so one exact reservation replaces the chain of doubling
+    // reallocations that otherwise dominates encoding time.
     let mut buf = Vec::with_capacity(encoded_record_len_hint(schema, record));
     encode_record_ordered_into(&mut buf, schema, record, sink)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by the migration test so a database can be filled in the pre-3
+    /// payload form, which is the only way to produce one now.
+    static WRITE_NAMED_PAYLOADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn writing_named_payloads() -> bool {
+    WRITE_NAMED_PAYLOADS.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn writing_named_payloads() -> bool {
+    false
 }
 
 /// Append one canonical record to a transaction-owned payload arena.
@@ -11203,18 +12808,52 @@ pub(crate) fn encode_record_ordered_into(
     buf: &mut Vec<u8>,
     schema: &TableSchema,
     record: &Record,
-    mut sink: Option<&mut BlobSink>,
+    sink: Option<&mut BlobSink>,
 ) -> Result<()> {
-    let column_count = u16::try_from(schema.columns.len())
-        .map_err(|_| Error::InvalidArgument("record has more than 65535 stored columns".into()))?;
-    buf.extend_from_slice(&column_count.to_le_bytes());
-    for col in &schema.columns {
-        let name_len = u16::try_from(col.name.len()).map_err(|_| {
-            Error::InvalidArgument("column name exceeds the 65535-byte storage limit".into())
-        })?;
-        buf.extend_from_slice(&name_len.to_le_bytes());
-        buf.extend_from_slice(col.name.as_bytes());
-        let value = record.get(&col.name).unwrap_or(&Value::Null);
+    encode_record_ordered_as(buf, schema, record, sink, writing_named_payloads())
+}
+
+/// `encode_record_ordered_into`, optionally in the pre-3 named form. Only the
+/// migration test writes the old form; everything else writes values only.
+pub(crate) fn encode_record_ordered_as(
+    buf: &mut Vec<u8>,
+    schema: &TableSchema,
+    record: &Record,
+    mut sink: Option<&mut BlobSink>,
+    named: bool,
+) -> Result<()> {
+    if schema.columns.len() > MAX_STORED_COLUMNS {
+        return Err(Error::InvalidArgument(format!(
+            "table {} has more than {MAX_STORED_COLUMNS} stored columns",
+            schema.name
+        )));
+    }
+    let column_count = schema.columns.len() as u16;
+    let header = if named {
+        column_count
+    } else {
+        column_count | POSITIONAL_MARK
+    };
+    buf.extend_from_slice(&header.to_le_bytes());
+    // A record read from this table, or built in schema order, already holds
+    // exactly the columns the encoder wants in the order it wants them. Then
+    // the values are taken by position instead of searching the record once
+    // per column, which is what a row read and written back pays otherwise.
+    let positional = record
+        .matches_layout(schema.columns.iter().map(|column| column.name.as_str()))
+        .then(|| record.value_slice());
+    for (position, col) in schema.columns.iter().enumerate() {
+        if named {
+            let name_len = u16::try_from(col.name.len()).map_err(|_| {
+                Error::InvalidArgument("column name exceeds the 65535-byte storage limit".into())
+            })?;
+            buf.extend_from_slice(&name_len.to_le_bytes());
+            buf.extend_from_slice(col.name.as_bytes());
+        }
+        let value = match positional {
+            Some(values) => &values[position],
+            None => record.get(&col.name).unwrap_or(&Value::Null),
+        };
         match (value, sink.as_deref_mut()) {
             (Value::Blob(content), Some(sink)) => match sink.maybe_externalize(content)? {
                 Some((name, crc)) => encode_blob_ref(buf, &name, content.len() as u64, crc)?,
@@ -11233,7 +12872,6 @@ pub(crate) fn encode_record_ordered_into(
 fn encoded_record_len_hint(schema: &TableSchema, record: &Record) -> usize {
     let mut total = 2usize;
     for col in &schema.columns {
-        total += 2 + col.name.len();
         total += match record.get(&col.name).unwrap_or(&Value::Null) {
             Value::Null => 1,
             Value::Bool(_) => 2,
@@ -11248,52 +12886,237 @@ fn encoded_record_len_hint(schema: &TableSchema, record: &Record) -> usize {
     total
 }
 
-pub(crate) fn decode_record(buf: &[u8], blobs: Option<&Path>) -> Result<Record> {
-    let mut pos = 0usize;
-    let count = read_u16(buf, &mut pos)? as usize;
-    let mut record = Record::new();
-    for _ in 0..count {
-        let name_len = read_u16(buf, &mut pos)? as usize;
-        let end = pos
-            .checked_add(name_len)
-            .ok_or_else(|| Error::Corrupt("length overflow".into()))?;
-        let name_bytes = buf
-            .get(pos..end)
-            .ok_or_else(|| Error::Corrupt("unexpected end of record".into()))?;
-        pos = end;
-        let name = std::str::from_utf8(name_bytes)
-            .map_err(|_| Error::Corrupt("invalid utf8 in column name".into()))?
-            .to_owned();
-        let value = decode_value(buf, &mut pos, blobs)?;
-        match record.entry(name) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(value);
-            }
-            std::collections::btree_map::Entry::Occupied(entry) => {
-                return Err(Error::Corrupt(format!(
-                    "duplicate column '{}' in record payload",
-                    entry.key()
-                )));
-            }
+/// The columns a read materializes, resolved once against the table's schema
+/// instead of once per row.
+///
+/// This is what the named payload made impossible. A positional payload has
+/// no names to match, so the decision "keep or skip position `i`" is taken
+/// here, for the whole batch, and the shared column names of the rows it
+/// produces are resolved here too. The plan is owned, so a batch can resolve
+/// it under the state lock and decode after releasing it.
+pub(crate) struct RowProjection<'a> {
+    /// Wanted names, for payloads written before format_version 3.
+    keep: Option<&'a [&'a str]>,
+    plan: Option<PositionalPlan>,
+}
+
+/// Which storage positions a projection keeps. Tables are narrower than 64
+/// columns in practice, and then the mask costs no allocation at all.
+enum KeptMask {
+    Bits(u64),
+    Many(Vec<bool>),
+}
+
+impl KeptMask {
+    #[inline]
+    fn keeps(&self, position: usize) -> bool {
+        match self {
+            KeptMask::Bits(bits) => bits & (1u64 << position) != 0,
+            KeptMask::Many(kept) => kept[position],
         }
     }
-    if pos != buf.len() {
+}
+
+struct PositionalPlan {
+    kept: KeptMask,
+    /// Names of the kept columns, in storage order, shared by every row.
+    layout: Arc<[Box<str>]>,
+    /// One past the last kept position: the payload's tail is dead weight.
+    stop_after: usize,
+    /// Columns the table declares; a payload may not exceed it.
+    columns: usize,
+}
+
+impl<'a> RowProjection<'a> {
+    /// Every column of `schema`.
+    pub(crate) fn all(schema: Option<&TableSchema>) -> Self {
+        Self::new(schema, None)
+    }
+
+    pub(crate) fn new(schema: Option<&TableSchema>, keep: Option<&'a [&'a str]>) -> Self {
+        let plan = schema.map(|schema| {
+            let keeps =
+                |column: &Column| keep.is_none_or(|keep| keep.contains(&column.name.as_str()));
+            let columns = schema.columns.len();
+            let kept = if columns <= 64 {
+                let mut bits = 0u64;
+                for (position, column) in schema.columns.iter().enumerate() {
+                    if keeps(column) {
+                        bits |= 1u64 << position;
+                    }
+                }
+                KeptMask::Bits(bits)
+            } else {
+                KeptMask::Many(schema.columns.iter().map(keeps).collect())
+            };
+            let stop_after = (0..columns)
+                .rev()
+                .find(|position| kept.keeps(*position))
+                .map_or(0, |at| at + 1);
+            let layout = crate::record::layout_for(
+                schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| kept.keeps(*position))
+                    .map(|(_, column)| column.name.as_str()),
+            );
+            PositionalPlan {
+                kept,
+                layout,
+                stop_after,
+                columns,
+            }
+        });
+        RowProjection { keep, plan }
+    }
+
+    /// True when the projection asked for no column at all (`SELECT count(*)`).
+    fn wants_nothing(&self) -> bool {
+        self.keep.is_some_and(<[&str]>::is_empty)
+    }
+}
+
+/// Decode a whole record of a known table. Payloads written at
+/// format_version 3 or later store no column names, so the table is what says
+/// which value is which.
+pub(crate) fn decode_record_for(
+    schema: &TableSchema,
+    buf: &[u8],
+    blobs: Option<&Path>,
+) -> Result<Record> {
+    decode_record_keep(buf, blobs, &RowProjection::all(Some(schema)))
+}
+
+/// Decode a whole record whose table is unknown. Only payloads written before
+/// format_version 3, which name their own columns, can be read this way.
+#[cfg(test)]
+pub(crate) fn decode_record(buf: &[u8], blobs: Option<&Path>) -> Result<Record> {
+    decode_record_keep(buf, blobs, &RowProjection::all(None))
+}
+
+/// Decode a record keeping only the columns the projection asked for. Skipped
+/// values are stepped over without allocating, so a scan or probe that needs
+/// two columns of a wide row does not materialize its text and vector
+/// columns.
+pub(crate) fn decode_record_keep(
+    buf: &[u8],
+    blobs: Option<&Path>,
+    projection: &RowProjection<'_>,
+) -> Result<Record> {
+    // A projection that needs no column at all (`SELECT count(*)`) does not
+    // have to look at the payload: every byte of it would be skipped.
+    if projection.wants_nothing() {
+        return Ok(Record::new());
+    }
+    let mut pos = 0usize;
+    let header = read_payload_header(buf, &mut pos)?;
+    if header.positional {
+        return decode_positional(buf, pos, header.count, blobs, projection);
+    }
+    decode_named(buf, pos, header.count, blobs, projection.keep)
+}
+
+/// A payload that stores values only. The column at storage position `i` is
+/// the schema's column `i`; a row written before an `ADD COLUMN` is simply
+/// shorter, and columns are only ever appended, so the prefix still lines up.
+fn decode_positional(
+    buf: &[u8],
+    mut pos: usize,
+    count: usize,
+    blobs: Option<&Path>,
+    projection: &RowProjection<'_>,
+) -> Result<Record> {
+    let Some(plan) = projection.plan.as_ref() else {
+        return Err(Error::Corrupt(
+            "a record payload without column names was decoded without its table schema".into(),
+        ));
+    };
+    if count > plan.columns {
+        return Err(Error::Corrupt(format!(
+            "a record payload carries {count} columns, more than the {} its table declares",
+            plan.columns
+        )));
+    }
+    let stop_after = plan.stop_after.min(count);
+    let mut values = Vec::with_capacity(plan.layout.len().min(stop_after));
+    for position in 0..stop_after {
+        if plan.kept.keeps(position) {
+            values.push(decode_value(buf, &mut pos, blobs)?);
+        } else {
+            skip_value(buf, &mut pos, None)?;
+        }
+    }
+    if stop_after == count && pos != buf.len() {
         return Err(Error::Corrupt("trailing bytes in record payload".into()));
     }
-    Ok(record)
+    if values.len() == plan.layout.len() {
+        return Ok(Record::from_layout(plan.layout.clone(), values));
+    }
+    // Short row: the table has columns this version predates. Kept positions
+    // keep their order, so its names are the first ones of the layout.
+    Ok(Record::from_layout(
+        Arc::from(&plan.layout[..values.len()]),
+        values,
+    ))
+}
+
+/// A payload written before format_version 3, with every column name inline.
+fn decode_named(
+    buf: &[u8],
+    start: usize,
+    count: usize,
+    blobs: Option<&Path>,
+    keep: Option<&[&str]>,
+) -> Result<Record> {
+    build_row(|matcher| {
+        let mut pos = start;
+        let wanted = keep.map_or(count, <[&str]>::len);
+        let mut remaining = wanted;
+        let mut values = Vec::with_capacity(count.min(wanted));
+        for _ in 0..count {
+            let name_bytes = read_payload_column_name(buf, &mut pos)?;
+            // Compare the stored name as bytes: validating the UTF-8 of every
+            // column of a wide row, only to skip most of them, was a
+            // measurable part of a projected read.
+            if keep.is_some_and(|keep| !keep.iter().any(|wanted| wanted.as_bytes() == name_bytes)) {
+                skip_value(buf, &mut pos, None)?;
+                continue;
+            }
+            matcher.observe(name_bytes).map_err(|why| match why {
+                NameError::Duplicate => Error::Corrupt(format!(
+                    "duplicate column '{}' in record payload",
+                    String::from_utf8_lossy(name_bytes)
+                )),
+                NameError::InvalidUtf8 => Error::Corrupt("invalid utf8 in column name".into()),
+            })?;
+            values.push(decode_value(buf, &mut pos, blobs)?);
+            // Payloads are written in schema order, so once every projected
+            // column has been taken the rest of the row is dead weight: for a
+            // page of products that is the description and the embedding.
+            remaining -= 1;
+            if remaining == 0 && keep.is_some() {
+                return Ok(values);
+            }
+        }
+        // Reached only when the walk consumed the payload, so it still
+        // catches a record whose framing does not add up.
+        if pos != buf.len() {
+            return Err(Error::Corrupt("trailing bytes in record payload".into()));
+        }
+        Ok(values)
+    })
 }
 
 /// Collect the out-of-line blob references inside an encoded record payload
 /// without materializing any values (compaction GC and check()).
 pub(crate) fn scan_payload_blob_refs(buf: &[u8], out: &mut Vec<BlobRef>) -> Result<()> {
     let mut pos = 0usize;
-    let count = read_u16(buf, &mut pos)? as usize;
-    for _ in 0..count {
-        let name_len = read_u16(buf, &mut pos)? as usize;
-        pos = pos
-            .checked_add(name_len)
-            .filter(|&p| p <= buf.len())
-            .ok_or_else(|| Error::Corrupt("unexpected end of record".into()))?;
+    let header = read_payload_header(buf, &mut pos)?;
+    for _ in 0..header.count {
+        if !header.positional {
+            read_payload_column_name(buf, &mut pos)?;
+        }
         skip_value(buf, &mut pos, Some(out))?;
     }
     Ok(())
@@ -11410,7 +13233,7 @@ mod primary_index_tests {
         let mut raw_ids = BTreeSet::new();
         base.scan(|key, _| {
             raw_entries += 1;
-            raw_ids.insert(decode_primary_key(key)?.1.to_owned());
+            raw_ids.insert(String::from_utf8(split_primary_key(key)?.1.to_vec()).expect("id utf8"));
             Ok(())
         })
         .unwrap();
@@ -11485,8 +13308,8 @@ mod primary_index_tests {
         let writer_db = db.clone();
         let writer = std::thread::spawn(move || {
             let mut record = Record::new();
-            record.insert("id".into(), Value::Text("blob".into()));
-            record.insert("payload".into(), Value::Blob(vec![7; 4 * 1024]));
+            record.insert("id", Value::Text("blob".into()));
+            record.insert("payload", Value::Blob(vec![7; 4 * 1024]));
             writer_db.insert("docs", record)
         });
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -11537,8 +13360,8 @@ mod primary_index_tests {
         db.shared.commit.lock().wal().fail_next_sync_for_test();
 
         let mut first = Record::new();
-        first.insert("id".into(), Value::Text("a".into()));
-        first.insert("value".into(), Value::Int64(1));
+        first.insert("id", Value::Text("a".into()));
+        first.insert("value", Value::Int64(1));
         assert!(matches!(
             db.insert("docs", first),
             Err(Error::CommitUnknown(_))
@@ -11553,8 +13376,8 @@ mod primary_index_tests {
         // successful sync would acknowledge a commit standing on lost bytes.
         // Writes stay fenced until the database is reopened and re-validated.
         let mut second = Record::new();
-        second.insert("id".into(), Value::Text("b".into()));
-        second.insert("value".into(), Value::Int64(2));
+        second.insert("id", Value::Text("b".into()));
+        second.insert("value", Value::Int64(2));
         assert!(matches!(
             db.insert("docs", second),
             Err(Error::CommitUnknown(_))
@@ -11565,8 +13388,8 @@ mod primary_index_tests {
         let reopened = Db::open(&path).unwrap();
         assert_eq!(reopened.scan("docs").unwrap().len(), 1);
         let mut third = Record::new();
-        third.insert("id".into(), Value::Text("c".into()));
-        third.insert("value".into(), Value::Int64(3));
+        third.insert("id", Value::Text("c".into()));
+        third.insert("value", Value::Int64(3));
         reopened.insert("docs", third).unwrap();
     }
 
@@ -11594,7 +13417,7 @@ mod primary_index_tests {
         // the next commit, which never comes.
         for value in [0, 1] {
             let mut record = Record::new();
-            record.insert("value".into(), Value::Int64(value));
+            record.insert("value", Value::Int64(value));
             db.insert("docs", record).unwrap();
         }
         assert!(db.shared.commit.lock().wal().has_unsynced_appends());
@@ -11608,7 +13431,7 @@ mod primary_index_tests {
         }
         // A commit right before close is synced by the close itself.
         let mut record = Record::new();
-        record.insert("value".into(), Value::Int64(2));
+        record.insert("value", Value::Int64(2));
         db.insert("docs", record).unwrap();
         let wal = db
             .shared
@@ -11636,14 +13459,11 @@ mod primary_index_tests {
             .unwrap();
         for i in 0..8 {
             let mut record = Record::new();
-            record.insert(
-                "embedding".into(),
-                Value::Vector(vec![i as f32, 1.0, 0.0, 0.0]),
-            );
+            record.insert("embedding", Value::Vector(vec![i as f32, 1.0, 0.0, 0.0]));
             db.insert("docs", record).unwrap();
         }
         let committed = db.snapshot().version();
-        let def = db.table_schema("docs").unwrap().vector_indexes.remove(0);
+        let def = db.table_schema("docs").unwrap().vector_indexes[0].clone();
         drop(db);
         // A merge stamps its run with the snapshot version and republishes the
         // manifest at the older generation the set is known to cover. Lower
@@ -11689,13 +13509,13 @@ mod primary_index_tests {
         .unwrap();
         for i in 0..3 {
             let mut record = Record::new();
-            record.insert("value".into(), Value::Int64(i));
+            record.insert("value", Value::Int64(i));
             db.insert("docs", record).unwrap();
         }
         db.checkpoint().unwrap();
         for i in 3..6 {
             let mut record = Record::new();
-            record.insert("value".into(), Value::Int64(i));
+            record.insert("value", Value::Int64(i));
             db.insert("docs", record).unwrap();
         }
         db.checkpoint().unwrap();
@@ -11768,8 +13588,8 @@ mod primary_index_tests {
                 let ready = ready.clone();
                 std::thread::spawn(move || {
                     let mut record = Record::new();
-                    record.insert("id".into(), Value::Text(format!("writer-{writer}")));
-                    record.insert("value".into(), Value::Int64(writer as i64));
+                    record.insert("id", Value::Text(format!("writer-{writer}")));
+                    record.insert("value", Value::Int64(writer as i64));
                     let mut transaction = db.begin();
                     transaction.insert("docs", record).unwrap();
                     ready.wait();
@@ -11799,8 +13619,8 @@ mod primary_index_tests {
         // The failed barrier fences this handle: no later commit may be
         // acknowledged as durable on top of records that may be lost.
         let mut durable = Record::new();
-        durable.insert("id".into(), Value::Text("durable".into()));
-        durable.insert("value".into(), Value::Int64(99));
+        durable.insert("id", Value::Text("durable".into()));
+        durable.insert("value", Value::Int64(99));
         assert!(matches!(
             db.insert("docs", durable.clone()),
             Err(Error::CommitUnknown(_))
@@ -11822,8 +13642,8 @@ mod primary_index_tests {
         ))
         .unwrap();
         let mut record = Record::new();
-        record.insert("id".into(), Value::Text("a".into()));
-        record.insert("value".into(), Value::Int64(1));
+        record.insert("id", Value::Text("a".into()));
+        record.insert("value", Value::Int64(1));
         db.insert("docs", record).unwrap();
 
         db.shared
@@ -11841,7 +13661,7 @@ mod primary_index_tests {
         );
 
         let mut refused = Record::new();
-        refused.insert("value".into(), Value::Int64(2));
+        refused.insert("value", Value::Int64(2));
         assert!(matches!(
             db.insert("docs", refused),
             Err(Error::CommitUnknown(_))
@@ -11854,7 +13674,7 @@ mod primary_index_tests {
             Value::Int64(1)
         );
         let mut accepted = Record::new();
-        accepted.insert("value".into(), Value::Int64(3));
+        accepted.insert("value", Value::Int64(3));
         reopened.insert("docs", accepted).unwrap();
     }
 
@@ -11869,8 +13689,8 @@ mod primary_index_tests {
         ))
         .unwrap();
         let mut record = Record::new();
-        record.insert("id".into(), Value::Text("a".into()));
-        record.insert("value".into(), Value::Int64(1));
+        record.insert("id", Value::Text("a".into()));
+        record.insert("value", Value::Int64(1));
         db.insert("docs", record).unwrap();
 
         db.shared
@@ -11941,8 +13761,8 @@ mod primary_index_tests {
         )
         .unwrap();
         let mut record = Record::new();
-        record.insert("id".into(), Value::Text("victim".into()));
-        record.insert("embedding".into(), Value::Vector(vec![1.0, 0.0]));
+        record.insert("id", Value::Text("victim".into()));
+        record.insert("embedding", Value::Vector(vec![1.0, 0.0]));
         db.insert("docs", record).unwrap();
         db.wait_vector_indexing().unwrap();
         let stale_version = db.snapshot().version();
@@ -12001,10 +13821,10 @@ mod primary_index_tests {
         let mut transaction = db.begin();
         for n in 0..100 {
             let mut record = Record::new();
-            record.insert("id".into(), Value::Text(format!("doc-{n:03}")));
-            record.insert("tag".into(), Value::Text("old".into()));
-            record.insert("body".into(), Value::Text("frozen searchable text".into()));
-            record.insert("embedding".into(), Value::Vector(vec![1.0, 0.0]));
+            record.insert("id", Value::Text(format!("doc-{n:03}")));
+            record.insert("tag", Value::Text("old".into()));
+            record.insert("body", Value::Text("frozen searchable text".into()));
+            record.insert("embedding", Value::Vector(vec![1.0, 0.0]));
             transaction.insert("docs", record).unwrap();
         }
         transaction.commit().unwrap();
@@ -12036,9 +13856,9 @@ mod primary_index_tests {
         db.shared.commit.lock().memtable_bytes = db.shared.opts.memtable_max_bytes;
 
         let mut patch = Record::new();
-        patch.insert("tag".into(), Value::Text("new".into()));
-        patch.insert("body".into(), Value::Text("fresh generation token".into()));
-        patch.insert("embedding".into(), Value::Vector(vec![0.0, 1.0]));
+        patch.insert("tag", Value::Text("new".into()));
+        patch.insert("body", Value::Text("fresh generation token".into()));
+        patch.insert("embedding", Value::Vector(vec![0.0, 1.0]));
         db.update("docs", "doc-000", patch).unwrap();
         db.delete("docs", "doc-001").unwrap();
 
@@ -12163,8 +13983,8 @@ mod primary_index_tests {
         ))
         .unwrap();
         let mut first = Record::new();
-        first.insert("id".into(), Value::Text("before".into()));
-        first.insert("value".into(), Value::Int64(1));
+        first.insert("id", Value::Text("before".into()));
+        first.insert("value", Value::Int64(1));
         db.insert("docs", first).unwrap();
 
         db.shared
@@ -12192,8 +14012,8 @@ mod primary_index_tests {
         // The worker owns only the primary publication mutex here. This Safe
         // commit must complete and sync its active successor WAL independently.
         let mut tail = Record::new();
-        tail.insert("id".into(), Value::Text("during".into()));
-        tail.insert("value".into(), Value::Int64(2));
+        tail.insert("id", Value::Text("during".into()));
+        tail.insert("value", Value::Int64(2));
         db.insert("docs", tail).unwrap();
 
         // Snapshot the durable files at the exact crash boundary: the old
@@ -12247,10 +14067,10 @@ mod primary_index_tests {
             .unwrap();
 
         let mut record = Record::new();
-        record.insert("id".into(), Value::Text("doc".into()));
-        record.insert("tag".into(), Value::Text("old".into()));
-        record.insert("body".into(), Value::Text("old body".into()));
-        record.insert("embedding".into(), Value::Vector(vec![1.0, 0.0]));
+        record.insert("id", Value::Text("doc".into()));
+        record.insert("tag", Value::Text("old".into()));
+        record.insert("body", Value::Text("old body".into()));
+        record.insert("embedding", Value::Vector(vec![1.0, 0.0]));
         db.insert("docs", record).unwrap();
 
         let frozen_generation = {
@@ -12279,9 +14099,9 @@ mod primary_index_tests {
         };
 
         let mut patch = Record::new();
-        patch.insert("tag".into(), Value::Text("new".into()));
-        patch.insert("body".into(), Value::Text("new body".into()));
-        patch.insert("embedding".into(), Value::Vector(vec![0.0, 1.0]));
+        patch.insert("tag", Value::Text("new".into()));
+        patch.insert("body", Value::Text("new body".into()));
+        patch.insert("embedding", Value::Vector(vec![0.0, 1.0]));
         db.update("docs", "doc", patch).unwrap();
 
         if spill.is_dir() {
@@ -12360,8 +14180,8 @@ mod primary_index_tests {
         db.query("CREATE INDEX ON docs (tag)").unwrap();
 
         let mut first = Record::new();
-        first.insert("id".into(), Value::Text("a".into()));
-        first.insert("tag".into(), Value::Text("kept".into()));
+        first.insert("id", Value::Text("a".into()));
+        first.insert("tag", Value::Text("kept".into()));
         db.insert("docs", first).unwrap();
         db.shared
             .derived_test_fail_before_manifest_rename
@@ -12380,8 +14200,8 @@ mod primary_index_tests {
 
         db.checkpoint().unwrap();
         let mut second = Record::new();
-        second.insert("id".into(), Value::Text("b".into()));
-        second.insert("tag".into(), Value::Text("kept".into()));
+        second.insert("id", Value::Text("b".into()));
+        second.insert("tag", Value::Text("kept".into()));
         db.insert("docs", second).unwrap();
         db.shared
             .derived_test_fail_after_manifest_rename
@@ -12512,9 +14332,9 @@ mod primary_index_tests {
         let insert_batch = |db: &Db, from: usize| {
             for n in from..from + 40 {
                 let mut record = Record::new();
-                record.insert("id".into(), Value::Text(format!("d{n:03}")));
-                record.insert("n".into(), Value::Int64(n as i64));
-                record.insert("embedding".into(), Value::Vector(vector_for(n)));
+                record.insert("id", Value::Text(format!("d{n:03}")));
+                record.insert("n", Value::Int64(n as i64));
+                record.insert("embedding", Value::Vector(vector_for(n)));
                 db.insert("docs", record).unwrap();
             }
         };
@@ -12568,7 +14388,7 @@ mod primary_index_tests {
         assert!(db.delete("docs", "d003").unwrap());
         let far = vec![7.0; 8];
         let mut patch = Record::new();
-        patch.insert("embedding".into(), Value::Vector(far.clone()));
+        patch.insert("embedding", Value::Vector(far.clone()));
         db.update("docs", "d045", patch).unwrap();
 
         let built = build_vector_merge(&db.shared, &plan).unwrap();
@@ -12658,5 +14478,689 @@ mod primary_index_tests {
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         waiter.join().unwrap();
         assert_eq!(shared.memory_governor.stats().maintenance_in_use_bytes, 0);
+    }
+}
+
+/// A database written before format_version 3 keeps its column names inside
+/// every payload. This engine reads both forms and converts as it rewrites,
+/// so these tests fill a database in the old form, reopen it, and compare it
+/// row by row.
+#[cfg(test)]
+mod payload_migration_tests {
+    use super::*;
+    use crate::QueryOutput;
+
+    fn legacy<T>(body: impl FnOnce() -> T) -> T {
+        WRITE_NAMED_PAYLOADS.with(|flag| flag.set(true));
+        let out = body();
+        WRITE_NAMED_PAYLOADS.with(|flag| flag.set(false));
+        out
+    }
+
+    /// Every column type the engine stores, so nothing converts by accident.
+    fn seed_schema(db: &Db) {
+        db.query(
+            "CREATE TABLE things (\
+                 id int AUTO_INCREMENT PRIMARY KEY, \
+                 label text NOT NULL, \
+                 body text, \
+                 count int64, \
+                 ratio float64, \
+                 flag bool, \
+                 payload blob, \
+                 happened timestamp, \
+                 day date, \
+                 clock time, \
+                 metadata json, \
+                 embedding vector(3))",
+        )
+        .expect("ddl");
+        db.query("CREATE INDEX ON things (label)").expect("index");
+        db.create_text_index("things", "body").expect("text index");
+    }
+
+    fn row_params(n: i64) -> Vec<Value> {
+        vec![
+            Value::Text(format!("label-{}", n % 37)),
+            Value::Text(format!("the quick brown fox number {n} jumps")),
+            Value::Int64(n * 3),
+            Value::Float64(n as f64 / 7.0),
+            Value::Bool(n % 2 == 0),
+            Value::Blob(vec![(n % 251) as u8; 1 + (n % 5) as usize]),
+            Value::Timestamp(1_700_000_000_000_000 + n),
+            Value::Date(20_000 + (n % 500) as i32),
+            Value::Time((n % 86_400) * 1_000_000),
+            Value::Json(serde_json::json!({ "n": n, "tag": format!("t{n}") })),
+            Value::Vector(vec![n as f32, -(n as f32), 0.5]),
+        ]
+    }
+
+    const INSERT: &str = "INSERT INTO things \
+         (label, body, count, ratio, flag, payload, happened, day, clock, metadata, embedding) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    fn snapshot(db: &Db) -> Vec<(String, Record)> {
+        let mut rows = db.scan("things").expect("scan");
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    }
+
+    #[test]
+    fn a_database_written_before_positional_payloads_reads_and_converts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.esql");
+
+        let expected = legacy(|| {
+            let db = Db::create(&path).expect("create");
+            seed_schema(&db);
+            let mut txn = db.begin();
+            for n in 0..400 {
+                txn.query_params(INSERT, &row_params(n)).expect("insert");
+            }
+            txn.commit().expect("commit");
+            // Updates and deletes, so versions of both forms coexist per row.
+            db.query("UPDATE things SET count = count + 1 WHERE flag = true")
+                .expect("update");
+            db.query("DELETE FROM things WHERE count < 30")
+                .expect("delete");
+            db.checkpoint().expect("checkpoint");
+            let expected = snapshot(&db);
+            assert!(expected.len() > 300, "seeded {} rows", expected.len());
+            expected
+        });
+
+        // Reopened by an engine that writes the new form: the old payloads
+        // must still read back value for value.
+        let db = Db::open(&path).expect("reopen");
+        assert_eq!(snapshot(&db), expected, "rows changed on reopen");
+        let db = checked(db, &path);
+
+        // New writes are positional while the seeded rows are not, so both
+        // forms are live in the same table at the same time: the state an
+        // interrupted conversion leaves behind.
+        let mut txn = db.begin();
+        for n in 1000..1100 {
+            txn.query_params(INSERT, &row_params(n)).expect("insert");
+        }
+        txn.commit().expect("commit");
+        db.query("UPDATE things SET ratio = 1.5 WHERE label = 'label-3'")
+            .expect("update");
+        let mixed = snapshot(&db);
+        assert!(mixed.len() > expected.len());
+        let db = checked(db, &path);
+
+        // Indexes built over the old payloads still resolve.
+        let found = db
+            .query_params(
+                "SELECT count FROM things WHERE label = ? ORDER BY count",
+                &[Value::Text("label-5".into())],
+            )
+            .expect("indexed read");
+        let QueryOutput::Rows { rows, .. } = found else {
+            panic!("expected rows")
+        };
+        assert!(!rows.is_empty(), "the secondary index lost its rows");
+
+        // Compaction is what converts: after it no payload carries names.
+        db.compact().expect("compact");
+        assert_eq!(snapshot(&db), mixed, "compaction changed the rows");
+        assert_eq!(
+            named_payloads_left(&db),
+            0,
+            "compaction left payloads in the pre-3 form"
+        );
+        let reopened = checked(db, &path);
+        assert_eq!(snapshot(&reopened), mixed);
+    }
+
+    /// `check` wants the database closed, so close it, check, and reopen.
+    fn checked(db: Db, path: &Path) -> Db {
+        drop(db);
+        let report = crate::check(path).expect("check");
+        assert!(report.errors.is_empty(), "check: {:?}", report.errors);
+        Db::open(path).expect("reopen after check")
+    }
+
+    /// How many visible payloads still store their column names.
+    fn named_payloads_left(db: &Db) -> usize {
+        let st = db.shared.state.read().unwrap();
+        let mut left = 0usize;
+        st.index
+            .visit_table("things", None, |_id, versions| {
+                for version in versions {
+                    if let Some(payload) = payload_bytes(&st.readers, &version.kind)? {
+                        let mut pos = 0usize;
+                        if !read_payload_header(&payload, &mut pos)?.positional {
+                            left += 1;
+                        }
+                    }
+                }
+                Ok(true)
+            })
+            .expect("visit");
+        left
+    }
+
+    /// What the conversion buys on disk, for a row of the shape this suite
+    /// seeds: exactly the bytes the names took, on every version of every row.
+    #[test]
+    fn dropping_the_names_shrinks_a_payload_by_their_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("size.esql")).expect("create");
+        seed_schema(&db);
+        db.query_params(INSERT, &row_params(1)).expect("insert");
+        let schema = {
+            let st = db.shared.state.read().unwrap();
+            st.catalog.table("things").expect("seeded").clone()
+        };
+        let record = db.scan("things").expect("scan").remove(0).1;
+        let record = normalize_record(&schema, record).expect("normalize");
+        let mut positional = Vec::new();
+        encode_record_ordered_as(&mut positional, &schema, &record, None, false).expect("encode");
+        let mut named = Vec::new();
+        encode_record_ordered_as(&mut named, &schema, &record, None, true).expect("encode named");
+        let names: usize = schema
+            .columns
+            .iter()
+            .map(|column| 2 + column.name.len())
+            .sum();
+        assert_eq!(named.len() - positional.len(), names);
+        assert!(
+            positional.len() * 4 < named.len() * 3,
+            "expected at least a quarter off: {} vs {}",
+            positional.len(),
+            named.len()
+        );
+    }
+
+    #[test]
+    fn a_manifest_from_the_previous_format_version_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.esql");
+        {
+            let db = Db::create(&path).expect("create");
+            db.query("CREATE TABLE t (n int64 NOT NULL)").expect("ddl");
+            db.query_params("INSERT INTO t (n) VALUES (?)", &[Value::Int64(7)])
+                .expect("insert");
+            db.checkpoint().expect("checkpoint");
+        }
+        assert!(crate::schema::format_version_is_readable(2));
+        assert!(!crate::schema::format_version_is_readable(1));
+        assert!(!crate::schema::format_version_is_readable(
+            FORMAT_VERSION + 1
+        ));
+        let db = Db::open(&path).expect("reopen");
+        assert_eq!(db.scan("t").expect("scan").len(), 1);
+    }
+
+    #[test]
+    fn dropping_a_column_of_a_positional_payload_keeps_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drop.esql");
+        let db = Db::create(&path).expect("create");
+        db.query("CREATE TABLE t (a int64 NOT NULL, b text NOT NULL, c float64 NOT NULL)")
+            .expect("ddl");
+        for n in 0..50i64 {
+            db.query_params(
+                "INSERT INTO t (a, b, c) VALUES (?, ?, ?)",
+                &[
+                    Value::Int64(n),
+                    Value::Text(format!("b{n}")),
+                    Value::Float64(n as f64),
+                ],
+            )
+            .expect("insert");
+        }
+        db.query("ALTER TABLE t DROP COLUMN b").expect("drop");
+        let rows = db.scan("t").expect("scan");
+        assert_eq!(rows.len(), 50);
+        for (_, record) in &rows {
+            assert!(record.get("b").is_none(), "dropped column came back");
+            let Some(Value::Int64(a)) = record.get("a") else {
+                panic!("lost a")
+            };
+            assert_eq!(record.get("c"), Some(&Value::Float64(*a as f64)));
+        }
+        checked(db, &path);
+    }
+
+    #[test]
+    fn adding_a_column_leaves_older_positional_rows_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("add.esql");
+        let db = Db::create(&path).expect("create");
+        db.query("CREATE TABLE t (a int64 NOT NULL, b text NOT NULL)")
+            .expect("ddl");
+        for n in 0..20i64 {
+            db.query_params(
+                "INSERT INTO t (a, b) VALUES (?, ?)",
+                &[Value::Int64(n), Value::Text(format!("b{n}"))],
+            )
+            .expect("insert");
+        }
+        db.query("ALTER TABLE t ADD COLUMN c int64").expect("add");
+        for (_, record) in db.scan("t").expect("scan") {
+            // Rows written before the column read it as absent, which the
+            // SQL layer surfaces as NULL.
+            assert!(record.get("c").is_none_or(Value::is_null));
+            assert!(
+                record.get("b").is_some(),
+                "lost a column before the new one"
+            );
+        }
+        db.query_params(
+            "INSERT INTO t (a, b, c) VALUES (?, ?, ?)",
+            &[
+                Value::Int64(99),
+                Value::Text("last".into()),
+                Value::Int64(5),
+            ],
+        )
+        .expect("insert wide");
+        let QueryOutput::Rows { rows, .. } = db
+            .query("SELECT b FROM t WHERE c = 5")
+            .expect("select by new column")
+        else {
+            panic!("expected rows")
+        };
+        assert_eq!(rows, vec![vec![Value::Text("last".into())]]);
+        checked(db, &path);
+    }
+}
+
+/// A projection that leaves out a declared `id` must not have the physical row
+/// key put on it.
+///
+/// The engine surfaces its physical key as `id` for tables that declare none.
+/// Three read paths decided that by asking the decoded row whether it already
+/// had an `id`, which is false whenever a projection simply left the column
+/// out. Those rows then carried the ULID under `id` — invisible through SQL,
+/// which projects the columns the caller asked for, but the insert copied the
+/// row's shared column names out of the layout they came from, and a matched
+/// row went from three or four allocations to ten or eleven.
+#[cfg(test)]
+mod identity_rekey_tests {
+    use super::*;
+    use crate::QueryOutput;
+    use std::collections::BTreeMap;
+
+    /// Rewrite the database's catalog so no table claims identity keying,
+    /// which is what a catalog written before the flag existed looks like.
+    /// Published through the normal manifest path, so the result is a
+    /// database an older engine could have produced.
+    fn make_it_look_old(path: &Path) {
+        let (manifest, _) = Manifest::load(path).unwrap();
+        let mut catalog = manifest.catalog.clone().expect("seeded catalog");
+        assert!(
+            catalog.tables.iter().any(|table| table.identity_keyed),
+            "the seeded database should have been identity keyed"
+        );
+        for table in catalog.tables.iter_mut() {
+            table.identity_keyed = false;
+        }
+        Manifest {
+            catalog: Some(catalog.clone()),
+            ..manifest
+        }
+        .publish(path)
+        .unwrap();
+        catalog.save(&path.join(CATALOG_FILE)).unwrap();
+    }
+
+    fn rows_by_id(db: &Db) -> BTreeMap<i64, (String, i64)> {
+        let QueryOutput::Rows { rows, .. } = db
+            .query("SELECT id, label, bucket FROM items ORDER BY id")
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        rows.into_iter()
+            .map(|row| match (&row[0], &row[1], &row[2]) {
+                (Value::Int64(id), Value::Text(label), Value::Int64(bucket)) => {
+                    (*id, (label.clone(), *bucket))
+                }
+                other => panic!("unexpected row {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_old_database_converts_itself_and_keeps_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.esql");
+        let mut expected = BTreeMap::new();
+        {
+            let db = Db::create(&path).unwrap();
+            db.query(
+                "CREATE TABLE items (id int AUTO_INCREMENT PRIMARY KEY, \
+                 label text NOT NULL, bucket int NOT NULL)",
+            )
+            .unwrap();
+            db.query("CREATE INDEX ON items (bucket)").unwrap();
+            for n in 1..=40i64 {
+                db.query_params(
+                    "INSERT INTO items (label, bucket) VALUES (?, ?)",
+                    &[Value::Text(format!("label {n}")), Value::Int64(n % 7)],
+                )
+                .unwrap();
+                expected.insert(n, (format!("label {n}"), n % 7));
+            }
+            // A delete and an update, so the conversion meets tombstones and
+            // several versions of one row.
+            db.query("DELETE FROM items WHERE id = 3").unwrap();
+            expected.remove(&3);
+            db.query("UPDATE items SET label = 'changed' WHERE id = 5")
+                .unwrap();
+            expected.insert(5, ("changed".to_owned(), 5));
+            db.checkpoint().unwrap();
+        }
+        make_it_look_old(&path);
+
+        // Opening converts. Every row survives, value for value.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(rows_by_id(&db), expected, "a row changed during conversion");
+
+        // The physical key is the declared identity now, so a scan is ordered
+        // by it.
+        let scanned: Vec<String> = db
+            .scan("items")
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(scanned.len(), expected.len());
+        assert_eq_il(&scanned);
+
+        // The secondary index on another column survived its rebuild.
+        let QueryOutput::Rows { rows, .. } = db
+            .query_params("SELECT id FROM items WHERE bucket = ?", &[Value::Int64(2)])
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert!(!rows.is_empty(), "the derived index lost its rows");
+
+        // Writing continues where the identity left off.
+        db.query_params(
+            "INSERT INTO items (label, bucket) VALUES (?, ?)",
+            &[Value::Text("after".into()), Value::Int64(1)],
+        )
+        .unwrap();
+        let after = rows_by_id(&db);
+        assert_eq!(after.len(), expected.len() + 1);
+        assert_eq!(
+            after.keys().next_back(),
+            Some(&41),
+            "the identity high water mark did not survive the conversion"
+        );
+
+        // Reopening does not convert again.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(rows_by_id(&db), after);
+        drop(db);
+        assert!(crate::check(&path).is_ok());
+    }
+
+    fn assert_eq_il(scanned: &[String]) {
+        assert_eq!(scanned[0], identity_key(1));
+        assert!(scanned.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// The two states a `kill -9` can leave the conversion in. Both are
+    /// replayed by `open` through the same `ddl.json` record the DDL
+    /// statements use, so each step has to be idempotent.
+    #[test]
+    fn a_conversion_interrupted_after_recording_its_intent_finishes_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interrupted.esql");
+        let mut expected = BTreeMap::new();
+        {
+            let db = Db::create(&path).unwrap();
+            db.query(
+                "CREATE TABLE items (id int AUTO_INCREMENT PRIMARY KEY, \
+                 label text NOT NULL, bucket int NOT NULL)",
+            )
+            .unwrap();
+            for n in 1..=12i64 {
+                db.query_params(
+                    "INSERT INTO items (label, bucket) VALUES (?, ?)",
+                    &[Value::Text(format!("label {n}")), Value::Int64(n % 3)],
+                )
+                .unwrap();
+                expected.insert(n, (format!("label {n}"), n % 3));
+            }
+            db.checkpoint().unwrap();
+        }
+        make_it_look_old(&path);
+        // Killed right after the intent was recorded and before any data
+        // moved: the record is on disk, the rows are still ULID keyed.
+        DdlIntent::RekeyByIdentity.write(&path).unwrap();
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(rows_by_id(&db), expected, "a row was lost mid-conversion");
+        assert!(
+            DdlIntent::load(&path).unwrap().is_none(),
+            "the record should be cleared once the conversion completed"
+        );
+        assert_eq_il(
+            &db.scan("items")
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+        );
+        drop(db);
+        assert!(crate::check(&path).is_ok());
+    }
+
+    #[test]
+    fn a_conversion_interrupted_before_clearing_its_intent_replays_harmlessly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replayed.esql");
+        let mut expected = BTreeMap::new();
+        {
+            let db = Db::create(&path).unwrap();
+            db.query(
+                "CREATE TABLE items (id int AUTO_INCREMENT PRIMARY KEY, \
+                 label text NOT NULL, bucket int NOT NULL)",
+            )
+            .unwrap();
+            for n in 1..=12i64 {
+                db.query_params(
+                    "INSERT INTO items (label, bucket) VALUES (?, ?)",
+                    &[Value::Text(format!("label {n}")), Value::Int64(n % 3)],
+                )
+                .unwrap();
+                expected.insert(n, (format!("label {n}"), n % 3));
+            }
+            db.checkpoint().unwrap();
+        }
+        // Killed after the data was converted and before the record was
+        // cleared: the replay re-keys rows that are already keyed, which must
+        // land on the same keys and the same rows.
+        DdlIntent::RekeyByIdentity.write(&path).unwrap();
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(rows_by_id(&db), expected, "the replay changed a row");
+        assert!(DdlIntent::load(&path).unwrap().is_none());
+        assert_eq_il(
+            &db.scan("items")
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+        );
+        drop(db);
+        assert!(crate::check(&path).is_ok());
+    }
+
+    #[test]
+    fn a_database_already_keyed_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.esql");
+        let db = Db::create(&path).unwrap();
+        db.query("CREATE TABLE items (id int AUTO_INCREMENT PRIMARY KEY, label text NOT NULL)")
+            .unwrap();
+        db.query_params(
+            "INSERT INTO items (label) VALUES (?)",
+            &[Value::Text("one".into())],
+        )
+        .unwrap();
+        let before = db.scan("items").unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.scan("items").unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod identity_keying_tests {
+    use super::*;
+    use crate::QueryOutput;
+
+    #[test]
+    fn a_declared_id_becomes_the_row_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("keyed.esql")).unwrap();
+        db.query("CREATE TABLE p (id int AUTO_INCREMENT PRIMARY KEY, note text NOT NULL)")
+            .unwrap();
+        for note in ["one", "two", "three"] {
+            db.query_params(
+                "INSERT INTO p (note) VALUES (?)",
+                &[Value::Text(note.into())],
+            )
+            .unwrap();
+        }
+        let rows = db.scan("p").unwrap();
+        assert_eq!(rows.len(), 3);
+        // The physical key is the identity, zero padded so it sorts like one.
+        assert_eq!(rows[0].0, identity_key(1));
+        assert_eq!(rows[1].0, identity_key(2));
+        assert_eq!(rows[2].0, identity_key(3));
+        assert_eq!(rows[0].1.get("note"), Some(&Value::Text("one".into())));
+
+        // And the row is reachable by its declared id, which is now one hop.
+        let QueryOutput::Rows { rows, .. } = db
+            .query_params("SELECT note FROM p WHERE id = ?", &[Value::Int64(2)])
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Text("two".into()));
+    }
+
+    #[test]
+    fn a_scan_of_a_keyed_table_is_ordered_by_the_declared_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("order.esql")).unwrap();
+        db.query("CREATE TABLE p (id int AUTO_INCREMENT PRIMARY KEY, n int NOT NULL)")
+            .unwrap();
+        // Explicit ids out of order: the scan must still hand them back in
+        // identity order, which is what the padded key buys.
+        for id in [30i64, 4, 17, 200] {
+            db.query_params(
+                "INSERT INTO p (id, n) VALUES (?, ?)",
+                &[Value::Int64(id), Value::Int64(id * 2)],
+            )
+            .unwrap();
+        }
+        let seen: Vec<i64> = db
+            .scan("p")
+            .unwrap()
+            .into_iter()
+            .map(|(_, record)| match record.get("id") {
+                Some(Value::Int64(value)) => *value,
+                other => panic!("unexpected id {other:?}"),
+            })
+            .collect();
+        assert_eq!(seen, vec![4, 17, 30, 200]);
+    }
+
+    /// A catalog written before identity keying existed must keep the keying
+    /// its rows are actually stored under, which is what the absent field
+    /// defaulting to false means.
+    #[test]
+    fn a_catalog_without_the_flag_is_not_identity_keyed() {
+        let json = r#"{"name":"p","columns":[
+            {"name":"id","type":"int64","identity":true},
+            {"name":"note","type":"text"}]}"#;
+        let schema: TableSchema = serde_json::from_str(json).unwrap();
+        assert!(!schema.has_implicit_id(), "the table declares its own id");
+        assert!(
+            !schema.identity_keyed,
+            "an older catalog must not claim identity keying"
+        );
+        assert!(!schema.keyed_by_identity());
+    }
+}
+
+#[cfg(test)]
+mod projected_id_tests {
+    use super::*;
+
+    fn seeded() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("ids.esql")).unwrap();
+        db.query(
+            "CREATE TABLE p (id int AUTO_INCREMENT PRIMARY KEY, bucket int NOT NULL, \
+             note text NOT NULL)",
+        )
+        .unwrap();
+        db.query("CREATE INDEX ON p (bucket)").unwrap();
+        for n in 0..40i64 {
+            db.query_params(
+                "INSERT INTO p (bucket, note) VALUES (?, ?)",
+                &[Value::Int64(7), Value::Text(format!("note {n}"))],
+            )
+            .unwrap();
+        }
+        (dir, db)
+    }
+
+    #[test]
+    fn an_indexed_batch_leaves_a_projection_without_its_declared_id_alone() {
+        let (_dir, db) = seeded();
+        let keep = ["note"];
+        let batch = db
+            .find_eq_batch_keep_unbudgeted(
+                "p",
+                "bucket",
+                &Value::Int64(7),
+                None,
+                64,
+                Some(&keep),
+                true,
+            )
+            .unwrap();
+        assert_eq!(batch.rows.len(), 40);
+        for record in &batch.rows {
+            assert!(
+                record.get(ID_COLUMN).is_none(),
+                "the physical key was put on a row that declares its own id: {:?}",
+                record.get(ID_COLUMN)
+            );
+            assert!(record.get("note").is_some());
+        }
+    }
+
+    #[test]
+    fn a_table_without_a_declared_id_still_gets_the_physical_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("implicit.esql")).unwrap();
+        db.query("CREATE TABLE q (n int64 NOT NULL)").unwrap();
+        db.query("CREATE INDEX ON q (n)").unwrap();
+        db.query_params("INSERT INTO q (n) VALUES (?)", &[Value::Int64(5)])
+            .unwrap();
+        let keep = ["n"];
+        let batch = db
+            .find_eq_batch_keep_unbudgeted("q", "n", &Value::Int64(5), None, 64, Some(&keep), true)
+            .unwrap();
+        assert_eq!(batch.rows.len(), 1);
+        assert!(
+            matches!(batch.rows[0].get(ID_COLUMN), Some(Value::Text(text)) if *text == batch.ids[0]),
+            "an implicit id must still travel in the row"
+        );
     }
 }

@@ -163,20 +163,17 @@ fn base_id(row: usize) -> String {
 
 fn base_record(row: usize) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(base_id(row)));
-    record.insert("value".into(), Value::Int64(row as i64));
-    record.insert("body".into(), Value::Text(BODY.into()));
+    record.insert("id", Value::Text(base_id(row)));
+    record.insert("value", Value::Int64(row as i64));
+    record.insert("body", Value::Text(BODY.into()));
     record
 }
 
 fn write_record(writer: usize, row: usize) -> Record {
     let mut record = Record::new();
-    record.insert(
-        "id".into(),
-        Value::Text(format!("write-{writer:04}-{row:08}")),
-    );
-    record.insert("value".into(), Value::Int64(row as i64));
-    record.insert("body".into(), Value::Text(BODY.into()));
+    record.insert("id", Value::Text(format!("write-{writer:04}-{row:08}")));
+    record.insert("value", Value::Int64(row as i64));
+    record.insert("body", Value::Text(BODY.into()));
     record
 }
 

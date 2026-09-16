@@ -69,8 +69,8 @@ fn ddl_crash_worker() {
         let mut txn = db.begin();
         for n in 0..RECORDS {
             let mut rec = Record::new();
-            rec.insert("id".into(), Value::Text(format!("R-{n:04}")));
-            rec.insert("a".into(), Value::Int64(n));
+            rec.insert("id", Value::Text(format!("R-{n:04}")));
+            rec.insert("a", Value::Int64(n));
             txn.insert("t", rec).unwrap();
         }
         txn.commit().unwrap();
@@ -232,7 +232,7 @@ fn kill9_during_ddl_leaves_a_consistent_schema() {
 
         // 6. Writes still work on whatever state we recovered into.
         let mut rec = Record::new();
-        rec.insert("id".into(), Value::Text(format!("probe-{round}")));
+        rec.insert("id", Value::Text(format!("probe-{round}")));
         rec.insert(column.to_owned(), Value::Int64(-1));
         db.insert(table, rec).unwrap();
         db.delete(table, &format!("probe-{round}")).unwrap();

@@ -5,9 +5,9 @@ use elitesql_core::{Column, ColumnType, Db, DbOptions, Record, TableSchema, Valu
 
 fn record(id: &str, group: &str, value: i64) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(id.into()));
-    record.insert("group".into(), Value::Text(group.into()));
-    record.insert("value".into(), Value::Int64(value));
+    record.insert("id", Value::Text(id.into()));
+    record.insert("group", Value::Text(group.into()));
+    record.insert("value", Value::Int64(value));
     record
 }
 
@@ -62,7 +62,7 @@ fn equality_deltas_promote_without_resurrecting_old_pairs() {
         if batch > 0 {
             let moved = format!("id-{:03}-000", batch - 1);
             let mut patch = Record::new();
-            patch.insert("group".into(), Value::Text("moved".into()));
+            patch.insert("group", Value::Text("moved".into()));
             txn.update("items", &moved, patch).unwrap();
             let deleted = format!("id-{:03}-001", batch - 1);
             txn.delete("items", &deleted).unwrap();
@@ -148,4 +148,81 @@ fn missing_secondary_level_is_rebuilt_from_canonical_data() {
         indexed_ids(&reopened, "hot"),
         canonical_ids(&reopened, "hot")
     );
+}
+
+/// A row created and deleted between two publications never reaches a run, so
+/// its removal needs no tombstone. Recording one anyway made every later
+/// lookup of that key walk the whole history of it: with a single row left in
+/// the group, three thousand create/delete cycles took one lookup from 8 us to
+/// 132 us, and nothing bounded that growth.
+///
+/// The guard is a ratio measured inside one run of this test, not an absolute
+/// time, so it reports the shape of the cost rather than the speed of the
+/// machine: flat is about 1x, and the defect it replaces was above 6x here.
+#[test]
+fn churn_on_one_key_does_not_accumulate_tombstones() {
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("churn.esql")).unwrap();
+    db.query(
+        "CREATE TABLE items (id int AUTO_INCREMENT PRIMARY KEY, grp int NOT NULL, v int NOT NULL)",
+    )
+    .unwrap();
+    db.query("CREATE INDEX ON items (grp)").unwrap();
+    db.query("INSERT INTO items (grp, v) VALUES (1, 0)")
+        .unwrap();
+    // Publish a generation: only then does a removal consider a tombstone.
+    db.checkpoint().unwrap();
+
+    let live = |db: &Db| db.find_eq("items", "grp", &Value::Int64(1)).unwrap().len();
+    let lookup_cost = |db: &Db| {
+        let started = Instant::now();
+        for _ in 0..200 {
+            assert_eq!(live(db), 1);
+        }
+        started.elapsed()
+    };
+
+    let churn = |db: &Db, cycles: usize| {
+        for _ in 0..cycles {
+            let inserted = db
+                .query("INSERT INTO items (grp, v) VALUES (1, 1) RETURNING id")
+                .unwrap();
+            let elitesql_core::QueryOutput::Rows { rows, .. } = inserted else {
+                panic!("RETURNING yields rows")
+            };
+            db.query_params("DELETE FROM items WHERE id = ?", &[rows[0][0].clone()])
+                .unwrap();
+        }
+    };
+
+    churn(&db, 250);
+    let early = lookup_cost(&db);
+    churn(&db, 2_750);
+    let late = lookup_cost(&db);
+    assert_eq!(live(&db), 1, "the churn left exactly the seeded row");
+    assert!(
+        late < early * 4,
+        "lookup cost grew with the churn: {early:?} after 250 cycles, {late:?} after 3000"
+    );
+
+    // A removal that does hide a published row is still recorded.
+    db.query("INSERT INTO items (grp, v) VALUES (9, 9)")
+        .unwrap();
+    db.checkpoint().unwrap();
+    let published = db.find_eq("items", "grp", &Value::Int64(9)).unwrap();
+    assert_eq!(published.len(), 1);
+    db.query_params(
+        "DELETE FROM items WHERE id = ?",
+        &[published[0].1["id"].clone()],
+    )
+    .unwrap();
+    assert!(
+        db.find_eq("items", "grp", &Value::Int64(9))
+            .unwrap()
+            .is_empty(),
+        "deleting a published row must still hide it"
+    );
+    assert_eq!(live(&db), 1, "the other group is untouched");
 }

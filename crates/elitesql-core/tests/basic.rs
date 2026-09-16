@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
 
 use elitesql_core::{Column, ColumnType, Db, Error, Record, TableSchema, Value};
@@ -28,8 +27,8 @@ fn new_db() -> (TempDir, Db) {
 
 fn record(title: &str, score: i64) -> Record {
     let mut r = Record::new();
-    r.insert("title".into(), Value::Text(title.into()));
-    r.insert("score".into(), Value::Int64(score));
+    r.insert("title", Value::Text(title.into()));
+    r.insert("score", Value::Int64(score));
     r
 }
 
@@ -37,14 +36,14 @@ fn record(title: &str, score: i64) -> Record {
 fn roundtrip_all_types() {
     let (_dir, db) = new_db();
     let mut r = Record::new();
-    r.insert("title".into(), Value::Text("hello world".into()));
-    r.insert("score".into(), Value::Int64(-7));
-    r.insert("rating".into(), Value::Float64(4.5));
-    r.insert("active".into(), Value::Bool(true));
-    r.insert("payload".into(), Value::Blob(vec![0, 1, 2, 255]));
-    r.insert("created".into(), Value::Timestamp(1_722_000_000_000_000));
+    r.insert("title", Value::Text("hello world".into()));
+    r.insert("score", Value::Int64(-7));
+    r.insert("rating", Value::Float64(4.5));
+    r.insert("active", Value::Bool(true));
+    r.insert("payload", Value::Blob(vec![0, 1, 2, 255]));
+    r.insert("created", Value::Timestamp(1_722_000_000_000_000));
     r.insert(
-        "meta".into(),
+        "meta",
         Value::Json(serde_json::json!({"tags": ["a", "b"], "n": 3})),
     );
 
@@ -92,11 +91,11 @@ fn generated_ids_are_ulids_and_unique() {
 fn explicit_id_duplicate_and_reinsert_after_delete() {
     let (_dir, db) = new_db();
     let mut r = record("first", 1);
-    r.insert("id".into(), Value::Text("doc-1".into()));
+    r.insert("id", Value::Text("doc-1".into()));
     assert_eq!(db.insert("docs", r).unwrap(), "doc-1");
 
     let mut dup = record("second", 2);
-    dup.insert("id".into(), Value::Text("doc-1".into()));
+    dup.insert("id", Value::Text("doc-1".into()));
     assert!(matches!(
         db.insert("docs", dup),
         Err(Error::DuplicateId { .. })
@@ -106,7 +105,7 @@ fn explicit_id_duplicate_and_reinsert_after_delete() {
     assert!(db.get("docs", "doc-1").unwrap().is_none());
 
     let mut again = record("third", 3);
-    again.insert("id".into(), Value::Text("doc-1".into()));
+    again.insert("id", Value::Text("doc-1".into()));
     db.insert("docs", again).unwrap();
     let read = db.get("docs", "doc-1").unwrap().unwrap();
     assert_eq!(read["title"], Value::Text("third".into()));
@@ -120,7 +119,7 @@ fn update_patches_and_snapshots_see_old_versions() {
     let snap = db.snapshot();
 
     let mut patch = Record::new();
-    patch.insert("score".into(), Value::Int64(99));
+    patch.insert("score", Value::Int64(99));
     db.update("docs", &id, patch).unwrap();
 
     let now = db.get("docs", &id).unwrap().unwrap();
@@ -243,7 +242,7 @@ fn reopen_rebuilds_state() {
         }
         db.delete("docs", &ids[0]).unwrap();
         let mut patch = Record::new();
-        patch.insert("score".into(), Value::Int64(1000));
+        patch.insert("score", Value::Int64(1000));
         db.update("docs", &ids[1], patch).unwrap();
     }
 
@@ -273,14 +272,14 @@ fn schema_validation_errors() {
     let (_dir, db) = new_db();
 
     let mut unknown = record("x", 1);
-    unknown.insert("nope".into(), Value::Bool(true));
+    unknown.insert("nope", Value::Bool(true));
     assert!(matches!(
         db.insert("docs", unknown),
         Err(Error::SchemaViolation(_))
     ));
 
     let mut wrong_type = Record::new();
-    wrong_type.insert("title".into(), Value::Int64(5));
+    wrong_type.insert("title", Value::Int64(5));
     assert!(matches!(
         db.insert("docs", wrong_type),
         Err(Error::SchemaViolation(_))
@@ -355,9 +354,22 @@ fn second_process_is_locked_out() {
 }
 
 #[test]
-fn record_map_with_btreemap_alias() {
-    let r: Record = BTreeMap::new();
+fn record_starts_empty_and_round_trips_columns() {
+    let mut r = Record::new();
     assert!(r.is_empty());
+    assert_eq!(r.len(), 0);
+    assert_eq!(r.insert("title", Value::Text("hello".into())), None);
+    assert_eq!(r.insert("score", Value::Int64(7)), None);
+    assert_eq!(r.len(), 2);
+    assert_eq!(r.get("title"), Some(&Value::Text("hello".into())));
+    assert_eq!(r.get("score"), Some(&Value::Int64(7)));
+    assert_eq!(r.get("absent"), None);
+    // Replacing a column reports the value it displaced and keeps the width.
+    assert_eq!(r.insert("score", Value::Int64(9)), Some(Value::Int64(7)));
+    assert_eq!(r.len(), 2);
+    assert_eq!(r.remove("score"), Some(Value::Int64(9)));
+    assert_eq!(r.len(), 1);
+    assert!(!r.contains_key("score"));
 }
 
 #[test]
@@ -370,13 +382,13 @@ fn durable_string_length_boundaries_are_checked_before_commit() {
 
         let boundary_id = "x".repeat(u16::MAX as usize);
         let mut at_boundary = record("largest valid id", 1);
-        at_boundary.insert("id".into(), Value::Text(boundary_id.clone()));
+        at_boundary.insert("id", Value::Text(boundary_id.clone()));
         assert_eq!(db.insert("docs", at_boundary).unwrap(), boundary_id);
         db.checkpoint().unwrap();
 
         let too_long_id = "y".repeat(u16::MAX as usize + 1);
         let mut too_long = record("must be rejected", 2);
-        too_long.insert("id".into(), Value::Text(too_long_id));
+        too_long.insert("id", Value::Text(too_long_id));
         assert!(matches!(
             db.insert("docs", too_long),
             Err(Error::InvalidArgument(_))
@@ -431,14 +443,14 @@ fn core_rejects_nonfinite_vectors_and_out_of_range_times() {
     .unwrap();
 
     let mut bad_vector = Record::new();
-    bad_vector.insert("embedding".into(), Value::Vector(vec![f32::INFINITY, 0.0]));
+    bad_vector.insert("embedding", Value::Vector(vec![f32::INFINITY, 0.0]));
     assert!(matches!(
         db.insert("measurements", bad_vector),
         Err(Error::SchemaViolation(_))
     ));
 
     let mut bad_time = Record::new();
-    bad_time.insert("at".into(), Value::Time(-1));
+    bad_time.insert("at", Value::Time(-1));
     assert!(matches!(
         db.insert("measurements", bad_time),
         Err(Error::SchemaViolation(_))

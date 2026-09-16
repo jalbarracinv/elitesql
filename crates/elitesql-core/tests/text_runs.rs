@@ -5,8 +5,8 @@ use elitesql_core::{Column, ColumnType, Db, DbOptions, Record, TableSchema, Valu
 
 fn record(id: &str, body: &str) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(id.into()));
-    record.insert("body".into(), Value::Text(body.into()));
+    record.insert("id", Value::Text(id.into()));
+    record.insert("body", Value::Text(body.into()));
     record
 }
 
@@ -66,7 +66,7 @@ fn bm25_deltas_promote_without_resurrecting_postings() {
         if batch > 0 {
             let moved = format!("id-{:03}-000", batch - 1);
             let mut patch = Record::new();
-            patch.insert("body".into(), Value::Text("gamma common".into()));
+            patch.insert("body", Value::Text("gamma common".into()));
             txn.update("docs", &moved, patch).unwrap();
             let deleted = format!("id-{:03}-001", batch - 1);
             txn.delete("docs", &deleted).unwrap();

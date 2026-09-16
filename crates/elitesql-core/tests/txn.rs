@@ -20,8 +20,8 @@ fn new_db() -> (TempDir, Db) {
 
 fn record(title: &str, score: i64) -> Record {
     let mut r = Record::new();
-    r.insert("title".into(), Value::Text(title.into()));
-    r.insert("score".into(), Value::Int64(score));
+    r.insert("title", Value::Text(title.into()));
+    r.insert("score", Value::Int64(score));
     r
 }
 
@@ -61,12 +61,12 @@ fn txn_preserves_out_of_order_and_replaced_staged_operations() {
     let mut txn = db.begin();
     for (id, score) in [("z", 3), ("a", 1), ("m", 2)] {
         let mut row = record(id, score);
-        row.insert("id".into(), Value::Text(id.into()));
+        row.insert("id", Value::Text(id.into()));
         txn.insert("docs", row).unwrap();
     }
 
     let mut patch = Record::new();
-    patch.insert("score".into(), Value::Int64(20));
+    patch.insert("score", Value::Int64(20));
     txn.update("docs", "m", patch).unwrap();
     assert!(txn.delete("docs", "z").unwrap());
     txn.commit().unwrap();
@@ -105,8 +105,8 @@ fn txn_interns_multiple_tables_without_crossing_staged_rows() {
         ("alpha", "a"),
     ] {
         let mut row = Record::new();
-        row.insert("id".into(), Value::Text(id.into()));
-        row.insert("title".into(), Value::Text(format!("{table}-{id}")));
+        row.insert("id", Value::Text(id.into()));
+        row.insert("title", Value::Text(format!("{table}-{id}")));
         txn.insert(table, row).unwrap();
     }
     txn.commit().unwrap();
@@ -132,7 +132,7 @@ fn txn_reads_from_stable_snapshot() {
     let txn = db.begin();
     // A commit from "another writer" lands after the txn began.
     let mut patch = Record::new();
-    patch.insert("score".into(), Value::Int64(2));
+    patch.insert("score", Value::Int64(2));
     db.update("docs", &id, patch).unwrap();
 
     // The txn still sees the snapshot version.
@@ -210,11 +210,11 @@ fn concurrent_update_same_record_conflicts() {
     let mut t2 = db.begin();
 
     let mut p1 = Record::new();
-    p1.insert("score".into(), Value::Int64(1));
+    p1.insert("score", Value::Int64(1));
     t1.update("docs", &id, p1).unwrap();
 
     let mut p2 = Record::new();
-    p2.insert("score".into(), Value::Int64(2));
+    p2.insert("score", Value::Int64(2));
     t2.update("docs", &id, p2).unwrap();
 
     t1.commit().unwrap();
@@ -226,7 +226,7 @@ fn concurrent_update_same_record_conflicts() {
     // The retry pattern: begin again, reapply, commit.
     let mut t3 = db.begin();
     let mut p3 = Record::new();
-    p3.insert("score".into(), Value::Int64(3));
+    p3.insert("score", Value::Int64(3));
     t3.update("docs", &id, p3).unwrap();
     t3.commit().unwrap();
     assert_eq!(
@@ -242,11 +242,11 @@ fn concurrent_insert_same_id_conflicts() {
     let mut t2 = db.begin();
 
     let mut r1 = record("one", 1);
-    r1.insert("id".into(), Value::Text("same".into()));
+    r1.insert("id", Value::Text("same".into()));
     t1.insert("docs", r1).unwrap();
 
     let mut r2 = record("two", 2);
-    r2.insert("id".into(), Value::Text("same".into()));
+    r2.insert("id", Value::Text("same".into()));
     t2.insert("docs", r2).unwrap();
 
     t1.commit().unwrap();
@@ -266,7 +266,7 @@ fn concurrent_delete_vs_update_conflicts() {
     let mut t2 = db.begin();
     assert!(t1.delete("docs", &id).unwrap());
     let mut p = Record::new();
-    p.insert("score".into(), Value::Int64(9));
+    p.insert("score", Value::Int64(9));
     t2.update("docs", &id, p).unwrap();
 
     t1.commit().unwrap();
@@ -283,10 +283,10 @@ fn non_conflicting_txns_both_commit() {
     let mut t1 = db.begin();
     let mut t2 = db.begin();
     let mut pa = Record::new();
-    pa.insert("score".into(), Value::Int64(10));
+    pa.insert("score", Value::Int64(10));
     t1.update("docs", &a, pa).unwrap();
     let mut pb = Record::new();
-    pb.insert("score".into(), Value::Int64(20));
+    pb.insert("score", Value::Int64(20));
     t2.update("docs", &b, pb).unwrap();
 
     let v1 = t1.commit().unwrap();
@@ -329,11 +329,11 @@ fn unique_index_rejects_duplicates_at_commit() {
     db.create_index("docs", "email", true).unwrap();
 
     let mut r1 = record("ana", 1);
-    r1.insert("email".into(), Value::Text("ana@example.com".into()));
+    r1.insert("email", Value::Text("ana@example.com".into()));
     db.insert("docs", r1).unwrap();
 
     let mut r2 = record("impostor", 2);
-    r2.insert("email".into(), Value::Text("ana@example.com".into()));
+    r2.insert("email", Value::Text("ana@example.com".into()));
     assert!(matches!(
         db.insert("docs", r2),
         Err(Error::UniqueViolation { .. })
@@ -352,10 +352,10 @@ fn unique_index_concurrent_txns() {
     let mut t1 = db.begin();
     let mut t2 = db.begin();
     let mut r1 = record("first", 1);
-    r1.insert("email".into(), Value::Text("x@example.com".into()));
+    r1.insert("email", Value::Text("x@example.com".into()));
     t1.insert("docs", r1).unwrap();
     let mut r2 = record("second", 2);
-    r2.insert("email".into(), Value::Text("x@example.com".into()));
+    r2.insert("email", Value::Text("x@example.com".into()));
     t2.insert("docs", r2).unwrap();
 
     t1.commit().unwrap();
@@ -368,17 +368,17 @@ fn unique_value_can_move_between_records_in_one_txn() {
     db.create_index("docs", "email", true).unwrap();
 
     let mut r1 = record("holder", 1);
-    r1.insert("email".into(), Value::Text("shared@example.com".into()));
+    r1.insert("email", Value::Text("shared@example.com".into()));
     let holder = db.insert("docs", r1).unwrap();
     let other = db.insert("docs", record("other", 2)).unwrap();
 
     // One txn frees the value and assigns it to another record.
     let mut txn = db.begin();
     let mut free = Record::new();
-    free.insert("email".into(), Value::Null);
+    free.insert("email", Value::Null);
     txn.update("docs", &holder, free).unwrap();
     let mut take = Record::new();
-    take.insert("email".into(), Value::Text("shared@example.com".into()));
+    take.insert("email", Value::Text("shared@example.com".into()));
     txn.update("docs", &other, take).unwrap();
     txn.commit().unwrap();
 
@@ -393,10 +393,10 @@ fn unique_value_can_move_between_records_in_one_txn() {
 fn create_unique_index_fails_on_existing_duplicates() {
     let (_dir, db) = new_db();
     let mut r1 = record("a", 1);
-    r1.insert("email".into(), Value::Text("dup@example.com".into()));
+    r1.insert("email", Value::Text("dup@example.com".into()));
     db.insert("docs", r1).unwrap();
     let mut r2 = record("b", 2);
-    r2.insert("email".into(), Value::Text("dup@example.com".into()));
+    r2.insert("email", Value::Text("dup@example.com".into()));
     db.insert("docs", r2).unwrap();
 
     assert!(matches!(
@@ -416,10 +416,7 @@ fn find_eq_with_and_without_index() {
     let (_dir, db) = new_db();
     for i in 0..20 {
         let mut r = record(&format!("t{i}"), i % 4);
-        r.insert(
-            "email".into(),
-            Value::Text(format!("u{}@example.com", i % 4)),
-        );
+        r.insert("email", Value::Text(format!("u{}@example.com", i % 4)));
         db.insert("docs", r).unwrap();
     }
     // Without an index: full scan path.
@@ -434,7 +431,7 @@ fn find_eq_with_and_without_index() {
     // Index stays correct across updates and deletes.
     let (moved_id, _) = hits[0].clone();
     let mut patch = Record::new();
-    patch.insert("email".into(), Value::Text("moved@example.com".into()));
+    patch.insert("email", Value::Text("moved@example.com".into()));
     db.update("docs", &moved_id, patch).unwrap();
     let hits = db
         .find_eq("docs", "email", &Value::Text("u2@example.com".into()))
@@ -473,7 +470,7 @@ fn unindexed_find_eq_streams_latest_versions_across_storage_layers() {
         ("d", "stable segment match", 7),
     ] {
         let mut rec = record(title, score);
-        rec.insert("id".into(), Value::Text(id.into()));
+        rec.insert("id", Value::Text(id.into()));
         db.insert("docs", rec).unwrap();
     }
     assert_eq!(db.maintenance_stats().checkpoints, 0);
@@ -481,14 +478,14 @@ fn unindexed_find_eq_streams_latest_versions_across_storage_layers() {
     assert_eq!(db.maintenance_stats().checkpoints, 1);
 
     let mut patch = Record::new();
-    patch.insert("score".into(), Value::Int64(0));
+    patch.insert("score", Value::Int64(0));
     db.update("docs", "a", patch).unwrap();
     let mut patch = Record::new();
-    patch.insert("score".into(), Value::Int64(7));
+    patch.insert("score", Value::Int64(7));
     db.update("docs", "b", patch).unwrap();
     db.delete("docs", "c").unwrap();
     let mut rec = record("new memtable match", 7);
-    rec.insert("id".into(), Value::Text("e".into()));
+    rec.insert("id", Value::Text("e".into()));
     db.insert("docs", rec).unwrap();
 
     let assert_hits = |db: &Db| {
@@ -530,12 +527,12 @@ fn unindexed_find_eq_ignores_older_versions_in_the_same_segment() {
     .unwrap();
 
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text("changing".into()));
-    record.insert("score".into(), Value::Int64(1));
+    record.insert("id", Value::Text("changing".into()));
+    record.insert("score", Value::Int64(1));
     db.insert("docs", record).unwrap();
     for score in [2, 3, 4] {
         let mut patch = Record::new();
-        patch.insert("score".into(), Value::Int64(score));
+        patch.insert("score", Value::Int64(score));
         db.update("docs", "changing", patch).unwrap();
     }
     db.checkpoint().unwrap();
@@ -567,15 +564,15 @@ fn secondary_index_survives_reopen() {
         .unwrap();
         db.create_index("docs", "email", true).unwrap();
         let mut r = Record::new();
-        r.insert("title".into(), Value::Text("ana".into()));
-        r.insert("email".into(), Value::Text("ana@example.com".into()));
+        r.insert("title", Value::Text("ana".into()));
+        r.insert("email", Value::Text("ana@example.com".into()));
         db.insert("docs", r).unwrap();
     }
     let db = Db::open(&path).unwrap();
     // Uniqueness still enforced after reopen (index rebuilt from data).
     let mut dup = Record::new();
-    dup.insert("title".into(), Value::Text("clone".into()));
-    dup.insert("email".into(), Value::Text("ana@example.com".into()));
+    dup.insert("title", Value::Text("clone".into()));
+    dup.insert("email", Value::Text("ana@example.com".into()));
     assert!(matches!(
         db.insert("docs", dup),
         Err(Error::UniqueViolation { .. })
@@ -613,7 +610,7 @@ fn paged_secondary_index_merges_updates_and_pages_hot_keys() {
         db.create_index("docs", "tag", false).unwrap();
         for _ in 0..200 {
             let mut record = Record::new();
-            record.insert("tag".into(), Value::Text("hot".into()));
+            record.insert("tag", Value::Text("hot".into()));
             original_ids.push(db.insert("docs", record).unwrap());
         }
     }
@@ -625,11 +622,11 @@ fn paged_secondary_index_merges_updates_and_pages_hot_keys() {
 
     let db = Db::open(&path).unwrap();
     let mut patch = Record::new();
-    patch.insert("tag".into(), Value::Text("cold".into()));
+    patch.insert("tag", Value::Text("cold".into()));
     db.update("docs", &original_ids[25], patch).unwrap();
     db.delete("docs", &original_ids[50]).unwrap();
     let mut added = Record::new();
-    added.insert("tag".into(), Value::Text("hot".into()));
+    added.insert("tag", Value::Text("hot".into()));
     let added_id = db.insert("docs", added).unwrap();
 
     let mut seen = Vec::new();

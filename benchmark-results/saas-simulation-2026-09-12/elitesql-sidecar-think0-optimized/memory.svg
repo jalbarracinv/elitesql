@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+<rect width="1080" height="480" fill="#ffffff"/>
+<text x="84" y="26" font-size="17" font-weight="600" fill="#1f2328">Server peak RSS</text>
+<line x1="84" y1="416.0" x2="830" y2="416.0" stroke="#eaeef2"/>
+<text x="76" y="420.0" text-anchor="end" fill="#57606a">0</text>
+<line x1="84" y1="327.0" x2="830" y2="327.0" stroke="#eaeef2"/>
+<text x="76" y="331.0" text-anchor="end" fill="#57606a">200</text>
+<line x1="84" y1="238.0" x2="830" y2="238.0" stroke="#eaeef2"/>
+<text x="76" y="242.0" text-anchor="end" fill="#57606a">400</text>
+<line x1="84" y1="149.0" x2="830" y2="149.0" stroke="#eaeef2"/>
+<text x="76" y="153.0" text-anchor="end" fill="#57606a">600</text>
+<line x1="84" y1="60.0" x2="830" y2="60.0" stroke="#eaeef2"/>
+<text x="76" y="64.0" text-anchor="end" fill="#57606a">800</text>
+<line x1="84.0" y1="60" x2="84.0" y2="416" stroke="#f0f2f4"/>
+<text x="84.0" y="434" text-anchor="middle" fill="#57606a">10</text>
+<line x1="360.4" y1="60" x2="360.4" y2="416" stroke="#f0f2f4"/>
+<text x="360.4" y="434" text-anchor="middle" fill="#57606a">100</text>
+<line x1="443.6" y1="60" x2="443.6" y2="416" stroke="#f0f2f4"/>
+<text x="443.6" y="434" text-anchor="middle" fill="#57606a">200</text>
+<line x1="553.6" y1="60" x2="553.6" y2="416" stroke="#f0f2f4"/>
+<text x="553.6" y="434" text-anchor="middle" fill="#57606a">500</text>
+<line x1="636.8" y1="60" x2="636.8" y2="416" stroke="#f0f2f4"/>
+<text x="636.8" y="434" text-anchor="middle" fill="#57606a">1k</text>
+<line x1="720.0" y1="60" x2="720.0" y2="416" stroke="#f0f2f4"/>
+<text x="720.0" y="434" text-anchor="middle" fill="#57606a">2k</text>
+<line x1="768.7" y1="60" x2="768.7" y2="416" stroke="#f0f2f4"/>
+<text x="768.7" y="434" text-anchor="middle" fill="#57606a">3k</text>
+<line x1="803.2" y1="60" x2="803.2" y2="416" stroke="#f0f2f4"/>
+<text x="803.2" y="434" text-anchor="middle" fill="#57606a">4k</text>
+<line x1="830.0" y1="60" x2="830.0" y2="416" stroke="#f0f2f4"/>
+<text x="830.0" y="434" text-anchor="middle" fill="#57606a">5k</text>
+<rect x="84" y="60" width="746" height="356" fill="none" stroke="#d0d7de"/>
+<text x="457.0" y="466" text-anchor="middle" fill="#57606a">concurrent users (log)</text>
+<text x="18" y="238.0" text-anchor="middle" fill="#57606a" transform="rotate(-90 18 238.0)">MiB</text>
+<path d="M84.0,269.6 L360.4,177.4 L443.6,176.5 L553.6,123.5 L636.8,157.5 L720.0,161.8 L768.7,53.9 L803.2,74.5 L830.0,68.5" fill="none" stroke="#c99700" stroke-width="2"/>
+<circle cx="84.0" cy="269.6" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 10 → 328.9</title></circle>
+<circle cx="360.4" cy="177.4" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 100 → 536.2</title></circle>
+<circle cx="443.6" cy="176.5" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 200 → 538.2</title></circle>
+<circle cx="553.6" cy="123.5" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 500 → 657.4</title></circle>
+<circle cx="636.8" cy="157.5" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 1k → 581</title></circle>
+<circle cx="720.0" cy="161.8" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 2k → 571.2</title></circle>
+<circle cx="768.7" cy="53.9" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 3k → 813.8</title></circle>
+<circle cx="803.2" cy="74.5" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 4k → 767.4</title></circle>
+<circle cx="830.0" cy="68.5" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 5k → 781</title></circle>
+<line x1="848" y1="68" x2="870" y2="68" stroke="#c99700" stroke-width="2"/>
+<text x="876" y="72" fill="#1f2328">elitesql-sidecar-think0-optimized</text>
+</svg>

@@ -70,12 +70,12 @@ fn crash_worker() {
         seq += 1;
         let mut txn = db.begin();
         let mut rec = Record::new();
-        rec.insert("id".into(), Value::Text(format!("L-{seq:08}")));
-        rec.insert("n".into(), Value::Int64(seq));
+        rec.insert("id", Value::Text(format!("L-{seq:08}")));
+        rec.insert("n", Value::Int64(seq));
         txn.insert("left", rec).unwrap();
         let mut rec = Record::new();
-        rec.insert("id".into(), Value::Text(format!("R-{seq:08}")));
-        rec.insert("n".into(), Value::Int64(seq));
+        rec.insert("id", Value::Text(format!("R-{seq:08}")));
+        rec.insert("n", Value::Int64(seq));
         txn.insert("right", rec).unwrap();
         txn.commit().unwrap();
         // Only after the commit is acknowledged: record it durably.

@@ -17,15 +17,15 @@ fn schema() -> TableSchema {
 
 fn record(id: &str, generation: i64) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(id.into()));
-    record.insert("body".into(), Value::Text("x".repeat(512)));
-    record.insert("generation".into(), Value::Int64(generation));
+    record.insert("id", Value::Text(id.into()));
+    record.insert("body", Value::Text("x".repeat(512)));
+    record.insert("generation", Value::Int64(generation));
     record
 }
 
 fn update(generation: i64) -> Record {
     let mut patch = Record::new();
-    patch.insert("generation".into(), Value::Int64(generation));
+    patch.insert("generation", Value::Int64(generation));
     patch
 }
 

@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+<rect width="1080" height="480" fill="#ffffff"/>
+<text x="84" y="26" font-size="17" font-weight="600" fill="#1f2328">Operation latency vs concurrent users</text>
+<text x="84" y="44" fill="#57606a">database call only; p50 dashed, p99 solid</text>
+<line x1="84" y1="416.0" x2="830" y2="416.0" stroke="#eaeef2"/>
+<text x="76" y="420.0" text-anchor="end" fill="#57606a">0.1</text>
+<line x1="84" y1="344.8" x2="830" y2="344.8" stroke="#eaeef2"/>
+<text x="76" y="348.8" text-anchor="end" fill="#57606a">1</text>
+<line x1="84" y1="273.6" x2="830" y2="273.6" stroke="#eaeef2"/>
+<text x="76" y="277.6" text-anchor="end" fill="#57606a">10</text>
+<line x1="84" y1="202.4" x2="830" y2="202.4" stroke="#eaeef2"/>
+<text x="76" y="206.4" text-anchor="end" fill="#57606a">100</text>
+<line x1="84" y1="131.2" x2="830" y2="131.2" stroke="#eaeef2"/>
+<text x="76" y="135.2" text-anchor="end" fill="#57606a">1k</text>
+<line x1="84" y1="60.0" x2="830" y2="60.0" stroke="#eaeef2"/>
+<text x="76" y="64.0" text-anchor="end" fill="#57606a">10k</text>
+<line x1="84.0" y1="60" x2="84.0" y2="416" stroke="#f0f2f4"/>
+<text x="84.0" y="434" text-anchor="middle" fill="#57606a">10</text>
+<line x1="360.4" y1="60" x2="360.4" y2="416" stroke="#f0f2f4"/>
+<text x="360.4" y="434" text-anchor="middle" fill="#57606a">100</text>
+<line x1="443.6" y1="60" x2="443.6" y2="416" stroke="#f0f2f4"/>
+<text x="443.6" y="434" text-anchor="middle" fill="#57606a">200</text>
+<line x1="553.6" y1="60" x2="553.6" y2="416" stroke="#f0f2f4"/>
+<text x="553.6" y="434" text-anchor="middle" fill="#57606a">500</text>
+<line x1="636.8" y1="60" x2="636.8" y2="416" stroke="#f0f2f4"/>
+<text x="636.8" y="434" text-anchor="middle" fill="#57606a">1k</text>
+<line x1="720.0" y1="60" x2="720.0" y2="416" stroke="#f0f2f4"/>
+<text x="720.0" y="434" text-anchor="middle" fill="#57606a">2k</text>
+<line x1="768.7" y1="60" x2="768.7" y2="416" stroke="#f0f2f4"/>
+<text x="768.7" y="434" text-anchor="middle" fill="#57606a">3k</text>
+<line x1="803.2" y1="60" x2="803.2" y2="416" stroke="#f0f2f4"/>
+<text x="803.2" y="434" text-anchor="middle" fill="#57606a">4k</text>
+<line x1="830.0" y1="60" x2="830.0" y2="416" stroke="#f0f2f4"/>
+<text x="830.0" y="434" text-anchor="middle" fill="#57606a">5k</text>
+<rect x="84" y="60" width="746" height="356" fill="none" stroke="#d0d7de"/>
+<text x="457.0" y="466" text-anchor="middle" fill="#57606a">concurrent users (log)</text>
+<text x="18" y="238.0" text-anchor="middle" fill="#57606a" transform="rotate(-90 18 238.0)">latency ms (log)</text>
+<path d="M84.0,280.5 L360.4,180.5 L443.6,149.0 L553.6,120.2 L636.8,100.1 L720.0,80.6 L768.7,80.0 L803.2,78.9 L830.0,78.2" fill="none" stroke="#c99700" stroke-width="2"/>
+<circle cx="84.0" cy="280.5" r="3" fill="#c99700"><title>sqlite-think0 p99: 10 → 8.008</title></circle>
+<circle cx="360.4" cy="180.5" r="3" fill="#c99700"><title>sqlite-think0 p99: 100 → 203.155</title></circle>
+<circle cx="443.6" cy="149.0" r="3" fill="#c99700"><title>sqlite-think0 p99: 200 → 562.227</title></circle>
+<circle cx="553.6" cy="120.2" r="3" fill="#c99700"><title>sqlite-think0 p99: 500 → 1426.88</title></circle>
+<circle cx="636.8" cy="100.1" r="3" fill="#c99700"><title>sqlite-think0 p99: 1k → 2734.73</title></circle>
+<circle cx="720.0" cy="80.6" r="3" fill="#c99700"><title>sqlite-think0 p99: 2k → 5139.75</title></circle>
+<circle cx="768.7" cy="80.0" r="3" fill="#c99700"><title>sqlite-think0 p99: 3k → 5244.24</title></circle>
+<circle cx="803.2" cy="78.9" r="3" fill="#c99700"><title>sqlite-think0 p99: 4k → 5432.38</title></circle>
+<circle cx="830.0" cy="78.2" r="3" fill="#c99700"><title>sqlite-think0 p99: 5k → 5554.7</title></circle>
+<line x1="848" y1="68" x2="870" y2="68" stroke="#c99700" stroke-width="2"/>
+<text x="876" y="72" fill="#1f2328">sqlite-think0 p99</text>
+<path d="M84.0,392.3 L360.4,349.6 L443.6,336.0 L553.6,332.9 L636.8,332.3 L720.0,330.7 L768.7,328.0 L803.2,326.1 L830.0,324.9" fill="none" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="84.0" cy="392.3" r="3" fill="#0969da"><title>sqlite-think0 p50: 10 → 0.215</title></circle>
+<circle cx="360.4" cy="349.6" r="3" fill="#0969da"><title>sqlite-think0 p50: 100 → 0.856</title></circle>
+<circle cx="443.6" cy="336.0" r="3" fill="#0969da"><title>sqlite-think0 p50: 200 → 1.329</title></circle>
+<circle cx="553.6" cy="332.9" r="3" fill="#0969da"><title>sqlite-think0 p50: 500 → 1.47</title></circle>
+<circle cx="636.8" cy="332.3" r="3" fill="#0969da"><title>sqlite-think0 p50: 1k → 1.497</title></circle>
+<circle cx="720.0" cy="330.7" r="3" fill="#0969da"><title>sqlite-think0 p50: 2k → 1.579</title></circle>
+<circle cx="768.7" cy="328.0" r="3" fill="#0969da"><title>sqlite-think0 p50: 3k → 1.722</title></circle>
+<circle cx="803.2" cy="326.1" r="3" fill="#0969da"><title>sqlite-think0 p50: 4k → 1.833</title></circle>
+<circle cx="830.0" cy="324.9" r="3" fill="#0969da"><title>sqlite-think0 p50: 5k → 1.903</title></circle>
+<line x1="848" y1="84" x2="870" y2="84" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="876" y="88" fill="#1f2328">sqlite-think0 p50</text>
+</svg>

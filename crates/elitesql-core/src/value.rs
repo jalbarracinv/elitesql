@@ -330,6 +330,91 @@ pub(crate) fn read_blob_file(dir: &std::path::Path, r: &BlobRef) -> Result<Vec<u
     Ok(content.to_vec())
 }
 
+/// Storage form of an indexed value, ordered so that comparing two keys byte
+/// by byte gives the order of the values they came from.
+///
+/// [`encode_value`] cannot be used for this: it writes integers and floats
+/// little-endian, so 2 becomes `02 00 …` and 256 becomes `00 01 …` and a run
+/// sorted by those bytes is not sorted by value. That is why nothing can walk
+/// a secondary index in value order today, and why an access path that
+/// satisfies `ORDER BY` needs this first.
+///
+/// Integers lead with their sign bit flipped and run big-endian; floats use
+/// the usual total-order transform, which also gives `-0.0` and `0.0` the
+/// same key and puts NaN at one end; text and blobs are written raw with
+/// `00` escaped as `00 FF` and closed by `00 00`, so a composite key can hold
+/// several of them without the end of one being mistaken for the start of the
+/// next. Types the engine never orders (JSON, vectors) keep the general
+/// encoding: only equality is asked of them.
+pub(crate) fn encode_index_value(buf: &mut Vec<u8>, v: &Value) {
+    match v {
+        Value::Int64(n) => {
+            buf.push(TAG_INT64);
+            buf.extend_from_slice(&order_preserving_int(*n));
+        }
+        Value::Timestamp(n) => {
+            buf.push(TAG_TIMESTAMP);
+            buf.extend_from_slice(&order_preserving_int(*n));
+        }
+        Value::Time(n) => {
+            buf.push(TAG_TIME);
+            buf.extend_from_slice(&order_preserving_int(*n));
+        }
+        Value::Date(n) => {
+            buf.push(TAG_DATE);
+            buf.extend_from_slice(&order_preserving_int(i64::from(*n)));
+        }
+        Value::Float64(x) => {
+            buf.push(TAG_FLOAT64);
+            // `-0.0` and `0.0` are equal, so they must share a key.
+            let x = if *x == 0.0 { 0.0 } else { *x };
+            buf.extend_from_slice(&order_preserving_float(x));
+        }
+        Value::Text(s) => {
+            buf.push(TAG_TEXT);
+            push_ordered_bytes(buf, s.as_bytes());
+        }
+        Value::Blob(b) => {
+            buf.push(TAG_BLOB);
+            push_ordered_bytes(buf, b);
+        }
+        other => encode_value(buf, other),
+    }
+}
+
+/// Big-endian with the sign bit flipped, so the byte order is the numeric
+/// order across negatives and positives alike.
+fn order_preserving_int(n: i64) -> [u8; 8] {
+    ((n as u64) ^ (1u64 << 63)).to_be_bytes()
+}
+
+/// The standard total order on IEEE doubles: a negative number has every bit
+/// flipped, a non-negative one only its sign bit set.
+fn order_preserving_float(x: f64) -> [u8; 8] {
+    let bits = x.to_bits();
+    let ordered = if bits & (1u64 << 63) != 0 {
+        !bits
+    } else {
+        bits | (1u64 << 63)
+    };
+    ordered.to_be_bytes()
+}
+
+/// Raw bytes, `00` escaped as `00 FF`, closed by `00 00`. The terminator
+/// sorts below every escaped byte, so a shorter string sorts before a longer
+/// one that starts with it, and a composite key cannot mistake the end of one
+/// component for the start of the next.
+fn push_ordered_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    for byte in bytes {
+        buf.push(*byte);
+        if *byte == 0 {
+            buf.push(0xFF);
+        }
+    }
+    buf.push(0);
+    buf.push(0);
+}
+
 pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Null => buf.push(TAG_NULL),
@@ -593,4 +678,137 @@ pub(crate) fn read_len_prefixed<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'
         .ok_or_else(|| Error::Corrupt("unexpected end of data".into()))?;
     *pos = end;
     Ok(slice)
+}
+
+#[cfg(test)]
+mod index_key_order_tests {
+    use super::*;
+
+    fn key(v: &Value) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_index_value(&mut buf, v);
+        buf
+    }
+
+    /// The property the whole ordered-access path will rest on: sorting the
+    /// keys sorts the values.
+    fn assert_orders(values: Vec<Value>) {
+        for pair in values.windows(2) {
+            let (smaller, larger) = (&pair[0], &pair[1]);
+            assert!(
+                key(smaller) < key(larger),
+                "{smaller:?} should key below {larger:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn integers_key_in_numeric_order_across_the_sign() {
+        assert_orders(
+            [
+                i64::MIN,
+                -1_000_000,
+                -256,
+                -2,
+                -1,
+                0,
+                1,
+                2,
+                255,
+                256,
+                1_000_000,
+                i64::MAX,
+            ]
+            .into_iter()
+            .map(Value::Int64)
+            .collect(),
+        );
+    }
+
+    #[test]
+    fn the_old_encoding_did_not_order_and_this_one_does() {
+        // The exact case that blocks an ordered walk: little-endian put 256
+        // before 2.
+        let (two, two_five_six) = (Value::Int64(2), Value::Int64(256));
+        let mut old_two = Vec::new();
+        let mut old_256 = Vec::new();
+        encode_value(&mut old_two, &two);
+        encode_value(&mut old_256, &two_five_six);
+        assert!(old_256 < old_two, "the general encoding orders by value?");
+        assert!(key(&two) < key(&two_five_six));
+    }
+
+    #[test]
+    fn floats_key_in_numeric_order_and_both_zeros_share_a_key() {
+        assert_orders(
+            [
+                f64::NEG_INFINITY,
+                -1e9,
+                -1.5,
+                -0.5,
+                0.0,
+                0.5,
+                1.5,
+                1e9,
+                f64::INFINITY,
+            ]
+            .into_iter()
+            .map(Value::Float64)
+            .collect(),
+        );
+        assert_eq!(key(&Value::Float64(-0.0)), key(&Value::Float64(0.0)));
+    }
+
+    #[test]
+    fn timestamps_dates_and_times_key_in_order() {
+        assert_orders(
+            [-1, 0, 1, 1_700_000_000_000]
+                .into_iter()
+                .map(Value::Timestamp)
+                .collect(),
+        );
+        assert_orders([-5i32, 0, 19_000].into_iter().map(Value::Date).collect());
+        assert_orders([0i64, 1, 86_399_000].into_iter().map(Value::Time).collect());
+    }
+
+    #[test]
+    fn text_keys_in_byte_order_and_a_prefix_sorts_first() {
+        assert_orders(
+            ["", "a", "ab", "abc", "b", "ba", "z"]
+                .into_iter()
+                .map(|s| Value::Text(s.to_owned()))
+                .collect(),
+        );
+    }
+
+    /// The terminator has to survive a NUL inside the value, or a composite
+    /// key could mistake the end of one column for the start of the next.
+    #[test]
+    fn an_embedded_nul_does_not_end_a_text_key() {
+        let with_nul = Value::Text("a\u{0}b".to_owned());
+        let plain = Value::Text("a".to_owned());
+        assert_ne!(key(&with_nul), key(&plain));
+        assert!(
+            key(&plain) < key(&with_nul),
+            "\"a\" is a prefix of \"a\\0b\""
+        );
+        // Two values that differ only after their NUL keep different keys.
+        assert_ne!(key(&with_nul), key(&Value::Text("a\u{0}c".to_owned())));
+        assert!(key(&with_nul) < key(&Value::Text("a\u{0}c".to_owned())));
+    }
+
+    #[test]
+    fn equal_values_always_share_a_key() {
+        for value in [
+            Value::Null,
+            Value::Bool(true),
+            Value::Int64(-7),
+            Value::Float64(2.5),
+            Value::Text("hola".into()),
+            Value::Blob(vec![0, 1, 0]),
+            Value::Timestamp(42),
+        ] {
+            assert_eq!(key(&value), key(&value.clone()));
+        }
+    }
 }

@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+<rect width="1080" height="480" fill="#ffffff"/>
+<text x="84" y="26" font-size="17" font-weight="600" fill="#1f2328">Per-second throughput and p99 — 5 users (elitesql-sidecar-knee)</text>
+<line x1="84" y1="416.0" x2="830" y2="416.0" stroke="#eaeef2"/>
+<text x="76" y="420.0" text-anchor="end" fill="#57606a">0</text>
+<line x1="84" y1="356.7" x2="830" y2="356.7" stroke="#eaeef2"/>
+<text x="76" y="360.7" text-anchor="end" fill="#57606a">200</text>
+<line x1="84" y1="297.3" x2="830" y2="297.3" stroke="#eaeef2"/>
+<text x="76" y="301.3" text-anchor="end" fill="#57606a">400</text>
+<line x1="84" y1="238.0" x2="830" y2="238.0" stroke="#eaeef2"/>
+<text x="76" y="242.0" text-anchor="end" fill="#57606a">600</text>
+<line x1="84" y1="178.7" x2="830" y2="178.7" stroke="#eaeef2"/>
+<text x="76" y="182.7" text-anchor="end" fill="#57606a">800</text>
+<line x1="84" y1="119.3" x2="830" y2="119.3" stroke="#eaeef2"/>
+<text x="76" y="123.3" text-anchor="end" fill="#57606a">1k</text>
+<line x1="84" y1="60.0" x2="830" y2="60.0" stroke="#eaeef2"/>
+<text x="76" y="64.0" text-anchor="end" fill="#57606a">1,200</text>
+<line x1="84.0" y1="60" x2="84.0" y2="416" stroke="#f0f2f4"/>
+<text x="84.0" y="434" text-anchor="middle" fill="#57606a">0</text>
+<line x1="212.6" y1="60" x2="212.6" y2="416" stroke="#f0f2f4"/>
+<text x="212.6" y="434" text-anchor="middle" fill="#57606a">5</text>
+<line x1="341.2" y1="60" x2="341.2" y2="416" stroke="#f0f2f4"/>
+<text x="341.2" y="434" text-anchor="middle" fill="#57606a">10</text>
+<line x1="469.9" y1="60" x2="469.9" y2="416" stroke="#f0f2f4"/>
+<text x="469.9" y="434" text-anchor="middle" fill="#57606a">15</text>
+<line x1="598.5" y1="60" x2="598.5" y2="416" stroke="#f0f2f4"/>
+<text x="598.5" y="434" text-anchor="middle" fill="#57606a">20</text>
+<line x1="727.1" y1="60" x2="727.1" y2="416" stroke="#f0f2f4"/>
+<text x="727.1" y="434" text-anchor="middle" fill="#57606a">25</text>
+<line x1="855.7" y1="60" x2="855.7" y2="416" stroke="#f0f2f4"/>
+<text x="855.7" y="434" text-anchor="middle" fill="#57606a">30</text>
+<rect x="84" y="60" width="746" height="356" fill="none" stroke="#d0d7de"/>
+<text x="457.0" y="466" text-anchor="middle" fill="#57606a">second of the measured window</text>
+<text x="18" y="238.0" text-anchor="middle" fill="#57606a" transform="rotate(-90 18 238.0)">ops/s · ms</text>
+<path d="M84.0,80.8 L109.7,117.0 L135.4,146.6 L161.2,116.7 L186.9,133.9 L212.6,131.5 L238.3,133.0 L264.1,136.5 L289.8,144.3 L315.5,138.0 L341.2,117.0 L367.0,114.9 L392.7,143.7 L418.4,112.8 L444.1,103.6 L469.9,117.8 L495.6,129.1 L521.3,127.3 L547.0,111.9 L572.8,129.4 L598.5,153.4 L624.2,139.8 L649.9,160.9 L675.7,122.9 L701.4,110.1 L727.1,132.7 L752.8,129.4 L778.6,113.4 L804.3,119.9 L830.0,154.3" fill="none" stroke="#c99700" stroke-width="2"/>
+<circle cx="84.0" cy="80.8" r="3" fill="#c99700"><title>ops/s: 0 → 1130</title></circle>
+<circle cx="109.7" cy="117.0" r="3" fill="#c99700"><title>ops/s: 1 → 1008</title></circle>
+<circle cx="135.4" cy="146.6" r="3" fill="#c99700"><title>ops/s: 2 → 908</title></circle>
+<circle cx="161.2" cy="116.7" r="3" fill="#c99700"><title>ops/s: 3 → 1009</title></circle>
+<circle cx="186.9" cy="133.9" r="3" fill="#c99700"><title>ops/s: 4 → 951</title></circle>
+<circle cx="212.6" cy="131.5" r="3" fill="#c99700"><title>ops/s: 5 → 959</title></circle>
+<circle cx="238.3" cy="133.0" r="3" fill="#c99700"><title>ops/s: 6 → 954</title></circle>
+<circle cx="264.1" cy="136.5" r="3" fill="#c99700"><title>ops/s: 7 → 942</title></circle>
+<circle cx="289.8" cy="144.3" r="3" fill="#c99700"><title>ops/s: 8 → 916</title></circle>
+<circle cx="315.5" cy="138.0" r="3" fill="#c99700"><title>ops/s: 9 → 937</title></circle>
+<circle cx="341.2" cy="117.0" r="3" fill="#c99700"><title>ops/s: 10 → 1008</title></circle>
+<circle cx="367.0" cy="114.9" r="3" fill="#c99700"><title>ops/s: 11 → 1015</title></circle>
+<circle cx="392.7" cy="143.7" r="3" fill="#c99700"><title>ops/s: 12 → 918</title></circle>
+<circle cx="418.4" cy="112.8" r="3" fill="#c99700"><title>ops/s: 13 → 1022</title></circle>
+<circle cx="444.1" cy="103.6" r="3" fill="#c99700"><title>ops/s: 14 → 1053</title></circle>
+<circle cx="469.9" cy="117.8" r="3" fill="#c99700"><title>ops/s: 15 → 1005</title></circle>
+<circle cx="495.6" cy="129.1" r="3" fill="#c99700"><title>ops/s: 16 → 967</title></circle>
+<circle cx="521.3" cy="127.3" r="3" fill="#c99700"><title>ops/s: 17 → 973</title></circle>
+<circle cx="547.0" cy="111.9" r="3" fill="#c99700"><title>ops/s: 18 → 1025</title></circle>
+<circle cx="572.8" cy="129.4" r="3" fill="#c99700"><title>ops/s: 19 → 966</title></circle>
+<circle cx="598.5" cy="153.4" r="3" fill="#c99700"><title>ops/s: 20 → 885</title></circle>
+<circle cx="624.2" cy="139.8" r="3" fill="#c99700"><title>ops/s: 21 → 931</title></circle>
+<circle cx="649.9" cy="160.9" r="3" fill="#c99700"><title>ops/s: 22 → 860</title></circle>
+<circle cx="675.7" cy="122.9" r="3" fill="#c99700"><title>ops/s: 23 → 988</title></circle>
+<circle cx="701.4" cy="110.1" r="3" fill="#c99700"><title>ops/s: 24 → 1031</title></circle>
+<circle cx="727.1" cy="132.7" r="3" fill="#c99700"><title>ops/s: 25 → 955</title></circle>
+<circle cx="752.8" cy="129.4" r="3" fill="#c99700"><title>ops/s: 26 → 966</title></circle>
+<circle cx="778.6" cy="113.4" r="3" fill="#c99700"><title>ops/s: 27 → 1020</title></circle>
+<circle cx="804.3" cy="119.9" r="3" fill="#c99700"><title>ops/s: 28 → 998</title></circle>
+<circle cx="830.0" cy="154.3" r="3" fill="#c99700"><title>ops/s: 29 → 882</title></circle>
+<line x1="848" y1="68" x2="870" y2="68" stroke="#c99700" stroke-width="2"/>
+<text x="876" y="72" fill="#1f2328">ops/s</text>
+<path d="M84.0,398.4 L109.7,398.1 L135.4,396.5 L161.2,396.1 L186.9,392.3 L212.6,395.7 L238.3,393.9 L264.1,393.9 L289.8,396.2 L315.5,397.0 L341.2,397.4 L367.0,396.0 L392.7,396.7 L418.4,396.8 L444.1,395.4 L469.9,396.8 L495.6,395.0 L521.3,396.7 L547.0,397.3 L572.8,396.8 L598.5,392.8 L624.2,396.5 L649.9,396.2 L675.7,395.7 L701.4,400.6 L727.1,394.3 L752.8,395.1 L778.6,397.2 L804.3,394.2 L830.0,395.6" fill="none" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="84.0" cy="398.4" r="3" fill="#0969da"><title>p99 ms: 0 → 59.393</title></circle>
+<circle cx="109.7" cy="398.1" r="3" fill="#0969da"><title>p99 ms: 1 → 60.339</title></circle>
+<circle cx="135.4" cy="396.5" r="3" fill="#0969da"><title>p99 ms: 2 → 65.675</title></circle>
+<circle cx="161.2" cy="396.1" r="3" fill="#0969da"><title>p99 ms: 3 → 67.151</title></circle>
+<circle cx="186.9" cy="392.3" r="3" fill="#0969da"><title>p99 ms: 4 → 79.987</title></circle>
+<circle cx="212.6" cy="395.7" r="3" fill="#0969da"><title>p99 ms: 5 → 68.287</title></circle>
+<circle cx="238.3" cy="393.9" r="3" fill="#0969da"><title>p99 ms: 6 → 74.43</title></circle>
+<circle cx="264.1" cy="393.9" r="3" fill="#0969da"><title>p99 ms: 7 → 74.326</title></circle>
+<circle cx="289.8" cy="396.2" r="3" fill="#0969da"><title>p99 ms: 8 → 66.821</title></circle>
+<circle cx="315.5" cy="397.0" r="3" fill="#0969da"><title>p99 ms: 9 → 64.051</title></circle>
+<circle cx="341.2" cy="397.4" r="3" fill="#0969da"><title>p99 ms: 10 → 62.61</title></circle>
+<circle cx="367.0" cy="396.0" r="3" fill="#0969da"><title>p99 ms: 11 → 67.547</title></circle>
+<circle cx="392.7" cy="396.7" r="3" fill="#0969da"><title>p99 ms: 12 → 65.193</title></circle>
+<circle cx="418.4" cy="396.8" r="3" fill="#0969da"><title>p99 ms: 13 → 64.852</title></circle>
+<circle cx="444.1" cy="395.4" r="3" fill="#0969da"><title>p99 ms: 14 → 69.501</title></circle>
+<circle cx="469.9" cy="396.8" r="3" fill="#0969da"><title>p99 ms: 15 → 64.886</title></circle>
+<circle cx="495.6" cy="395.0" r="3" fill="#0969da"><title>p99 ms: 16 → 70.618</title></circle>
+<circle cx="521.3" cy="396.7" r="3" fill="#0969da"><title>p99 ms: 17 → 65.202</title></circle>
+<circle cx="547.0" cy="397.3" r="3" fill="#0969da"><title>p99 ms: 18 → 62.925</title></circle>
+<circle cx="572.8" cy="396.8" r="3" fill="#0969da"><title>p99 ms: 19 → 64.611</title></circle>
+<circle cx="598.5" cy="392.8" r="3" fill="#0969da"><title>p99 ms: 20 → 78.332</title></circle>
+<circle cx="624.2" cy="396.5" r="3" fill="#0969da"><title>p99 ms: 21 → 65.731</title></circle>
+<circle cx="649.9" cy="396.2" r="3" fill="#0969da"><title>p99 ms: 22 → 66.712</title></circle>
+<circle cx="675.7" cy="395.7" r="3" fill="#0969da"><title>p99 ms: 23 → 68.35</title></circle>
+<circle cx="701.4" cy="400.6" r="3" fill="#0969da"><title>p99 ms: 24 → 51.979</title></circle>
+<circle cx="727.1" cy="394.3" r="3" fill="#0969da"><title>p99 ms: 25 → 73.086</title></circle>
+<circle cx="752.8" cy="395.1" r="3" fill="#0969da"><title>p99 ms: 26 → 70.281</title></circle>
+<circle cx="778.6" cy="397.2" r="3" fill="#0969da"><title>p99 ms: 27 → 63.215</title></circle>
+<circle cx="804.3" cy="394.2" r="3" fill="#0969da"><title>p99 ms: 28 → 73.426</title></circle>
+<circle cx="830.0" cy="395.6" r="3" fill="#0969da"><title>p99 ms: 29 → 68.908</title></circle>
+<line x1="848" y1="84" x2="870" y2="84" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="876" y="88" fill="#1f2328">p99 ms</text>
+</svg>

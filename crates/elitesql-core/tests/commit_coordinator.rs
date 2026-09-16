@@ -6,8 +6,8 @@ use elitesql_core::{
 
 fn record(id: String, writer: usize) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(id));
-    record.insert("writer".into(), Value::Int64(writer as i64));
+    record.insert("id", Value::Text(id));
+    record.insert("writer", Value::Int64(writer as i64));
     record
 }
 

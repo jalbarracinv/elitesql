@@ -120,7 +120,7 @@ fn rollback_may_leave_a_gap_but_never_reuses_in_process() {
 
     let mut tx = db.begin();
     let mut record = Record::new();
-    record.insert("title".into(), Value::Text("rolled back".into()));
+    record.insert("title", Value::Text("rolled back".into()));
     let id = tx.insert("docs", record).unwrap();
     assert_eq!(
         tx.get("docs", &id).unwrap().unwrap()["doc_id"],

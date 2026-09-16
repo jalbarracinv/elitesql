@@ -417,9 +417,17 @@ class SidecarClient {
     return this._call({ op: 'create_text_index', table, column });
   }
 
-  async searchText(table, column, query, { topK = 10, filter } = {}) {
+  /**
+   * Rank rows of `table` by BM25 over `column`.
+   *
+   * `columns` narrows what each hit carries; `[]` returns ids and scores
+   * alone. A hit otherwise carries the whole row, indexed text included,
+   * which is most of what a search costs per result.
+   */
+  async searchText(table, column, query, { topK = 10, filter, columns } = {}) {
     const request = { op: 'search_text', table, column, query, top_k: topK };
     if (filter !== undefined) request.filter = filter;
+    if (columns !== undefined) request.columns = columns;
     const { hits } = await this._call(request);
     return hits.map((h) => ({ ...h, record: decodeRecord(h.record) }));
   }

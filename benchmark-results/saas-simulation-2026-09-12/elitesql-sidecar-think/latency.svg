@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+<rect width="1080" height="480" fill="#ffffff"/>
+<text x="84" y="26" font-size="17" font-weight="600" fill="#1f2328">Operation latency vs concurrent users</text>
+<text x="84" y="44" fill="#57606a">database call only; p50 dashed, p99 solid</text>
+<line x1="84" y1="416.0" x2="830" y2="416.0" stroke="#eaeef2"/>
+<text x="76" y="420.0" text-anchor="end" fill="#57606a">0.1</text>
+<line x1="84" y1="356.7" x2="830" y2="356.7" stroke="#eaeef2"/>
+<text x="76" y="360.7" text-anchor="end" fill="#57606a">1</text>
+<line x1="84" y1="297.3" x2="830" y2="297.3" stroke="#eaeef2"/>
+<text x="76" y="301.3" text-anchor="end" fill="#57606a">10</text>
+<line x1="84" y1="238.0" x2="830" y2="238.0" stroke="#eaeef2"/>
+<text x="76" y="242.0" text-anchor="end" fill="#57606a">100</text>
+<line x1="84" y1="178.7" x2="830" y2="178.7" stroke="#eaeef2"/>
+<text x="76" y="182.7" text-anchor="end" fill="#57606a">1k</text>
+<line x1="84" y1="119.3" x2="830" y2="119.3" stroke="#eaeef2"/>
+<text x="76" y="123.3" text-anchor="end" fill="#57606a">10k</text>
+<line x1="84" y1="60.0" x2="830" y2="60.0" stroke="#eaeef2"/>
+<text x="76" y="64.0" text-anchor="end" fill="#57606a">100k</text>
+<line x1="84.0" y1="60" x2="84.0" y2="416" stroke="#f0f2f4"/>
+<text x="84.0" y="434" text-anchor="middle" fill="#57606a">100</text>
+<line x1="390.9" y1="60" x2="390.9" y2="416" stroke="#f0f2f4"/>
+<text x="390.9" y="434" text-anchor="middle" fill="#57606a">500</text>
+<line x1="523.1" y1="60" x2="523.1" y2="416" stroke="#f0f2f4"/>
+<text x="523.1" y="434" text-anchor="middle" fill="#57606a">1k</text>
+<line x1="655.3" y1="60" x2="655.3" y2="416" stroke="#f0f2f4"/>
+<text x="655.3" y="434" text-anchor="middle" fill="#57606a">2k</text>
+<line x1="732.6" y1="60" x2="732.6" y2="416" stroke="#f0f2f4"/>
+<text x="732.6" y="434" text-anchor="middle" fill="#57606a">3k</text>
+<line x1="830.0" y1="60" x2="830.0" y2="416" stroke="#f0f2f4"/>
+<text x="830.0" y="434" text-anchor="middle" fill="#57606a">5k</text>
+<rect x="84" y="60" width="746" height="356" fill="none" stroke="#d0d7de"/>
+<text x="457.0" y="466" text-anchor="middle" fill="#57606a">concurrent users (log)</text>
+<text x="18" y="238.0" text-anchor="middle" fill="#57606a" transform="rotate(-90 18 238.0)">latency ms (log)</text>
+<path d="M84.0,256.3 L390.9,264.1 L523.1,253.8 L655.3,117.2 L732.6,106.0 L830.0,104.8" fill="none" stroke="#c99700" stroke-width="2"/>
+<circle cx="84.0" cy="256.3" r="3" fill="#c99700"><title>elitesql-sidecar-think p99: 100 → 49.17</title></circle>
+<circle cx="390.9" cy="264.1" r="3" fill="#c99700"><title>elitesql-sidecar-think p99: 500 → 36.386</title></circle>
+<circle cx="523.1" cy="253.8" r="3" fill="#c99700"><title>elitesql-sidecar-think p99: 1k → 54.237</title></circle>
+<circle cx="655.3" cy="117.2" r="3" fill="#c99700"><title>elitesql-sidecar-think p99: 2k → 10859</title></circle>
+<circle cx="732.6" cy="106.0" r="3" fill="#c99700"><title>elitesql-sidecar-think p99: 3k → 16805.5</title></circle>
+<circle cx="830.0" cy="104.8" r="3" fill="#c99700"><title>elitesql-sidecar-think p99: 5k → 17596.6</title></circle>
+<line x1="848" y1="68" x2="870" y2="68" stroke="#c99700" stroke-width="2"/>
+<text x="876" y="72" fill="#1f2328">elitesql-sidecar-think p99</text>
+<path d="M84.0,355.2 L390.9,366.2 L523.1,361.6 L655.3,159.9 L732.6,133.8 L830.0,130.7" fill="none" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="84.0" cy="355.2" r="3" fill="#0969da"><title>elitesql-sidecar-think p50: 100 → 1.058</title></circle>
+<circle cx="390.9" cy="366.2" r="3" fill="#0969da"><title>elitesql-sidecar-think p50: 500 → 0.69</title></circle>
+<circle cx="523.1" cy="361.6" r="3" fill="#0969da"><title>elitesql-sidecar-think p50: 1k → 0.826</title></circle>
+<circle cx="655.3" cy="159.9" r="3" fill="#0969da"><title>elitesql-sidecar-think p50: 2k → 2072.66</title></circle>
+<circle cx="732.6" cy="133.8" r="3" fill="#0969da"><title>elitesql-sidecar-think p50: 3k → 5699.94</title></circle>
+<circle cx="830.0" cy="130.7" r="3" fill="#0969da"><title>elitesql-sidecar-think p50: 5k → 6425.95</title></circle>
+<line x1="848" y1="84" x2="870" y2="84" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="876" y="88" fill="#1f2328">elitesql-sidecar-think p50</text>
+</svg>

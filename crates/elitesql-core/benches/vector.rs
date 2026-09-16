@@ -126,9 +126,9 @@ fn build() -> (TempDir, Db, Vec<Vec<f32>>) {
     for i in 0..N {
         let v = gen.vec();
         let mut r = Record::new();
-        r.insert("id".into(), Value::Text(format!("d-{i:06}")));
-        r.insert("n".into(), Value::Int64(i as i64));
-        r.insert("embedding".into(), Value::Vector(v.clone()));
+        r.insert("id", Value::Text(format!("d-{i:06}")));
+        r.insert("n", Value::Int64(i as i64));
+        r.insert("embedding", Value::Vector(v.clone()));
         txn.insert("docs", r).unwrap();
         vectors.push(v);
         if i % 10_000 == 9_999 {

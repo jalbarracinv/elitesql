@@ -8,8 +8,8 @@ fn insert_batch(db: &Db, batch: usize, rows: usize) {
     for row in 0..rows {
         let id = format!("id-{batch:03}-{row:04}");
         let mut record = Record::new();
-        record.insert("id".into(), Value::Text(id));
-        record.insert("value".into(), Value::Int64((batch * rows + row) as i64));
+        record.insert("id", Value::Text(id));
+        record.insert("value", Value::Int64((batch * rows + row) as i64));
         txn.insert("items", record).unwrap();
     }
     txn.commit().unwrap();

@@ -375,6 +375,21 @@ pub(crate) enum WalAppendOutcome {
     SyncFailed(std::io::Error),
 }
 
+/// A WAL barrier in flight outside the commit mutex (see
+/// `WalWriter::begin_unlocked_sync`).
+pub(crate) struct UnlockedSync {
+    id: u32,
+    len: u64,
+    file: File,
+}
+
+impl UnlockedSync {
+    /// Run the barrier on the duplicated handle.
+    pub fn sync(&self) -> std::io::Result<()> {
+        crate::durable::sync_data(&self.file)
+    }
+}
+
 impl WalWriter {
     /// Open (creating if missing) the WAL file with the given id for appends.
     pub fn open(dir: &Path, id: u32) -> Result<WalWriter> {
@@ -511,6 +526,29 @@ impl WalWriter {
     /// Whether appended records still await a durability barrier.
     pub fn has_unsynced_appends(&self) -> bool {
         self.unsynced
+    }
+
+    /// Start a barrier that will run without the commit mutex: a duplicate
+    /// handle of the current file plus the id and length it covers. Appends
+    /// may continue meanwhile; `finish_unlocked_sync` reconciles afterwards.
+    pub fn begin_unlocked_sync(&self) -> std::io::Result<UnlockedSync> {
+        Ok(UnlockedSync {
+            id: self.id,
+            len: self.len,
+            file: self.file.try_clone()?,
+        })
+    }
+
+    /// Record the outcome of an unlocked barrier. Bytes appended after the
+    /// barrier started stay marked unsynced; a rotated writer is untouched.
+    pub fn finish_unlocked_sync(&mut self, sync: &UnlockedSync) {
+        if self.id != sync.id {
+            return;
+        }
+        self.last_sync = Instant::now();
+        if self.len == sync.len {
+            self.unsynced = false;
+        }
     }
 
     pub fn sync_due(&self, durability: Durability, balanced_interval_ms: u64) -> bool {

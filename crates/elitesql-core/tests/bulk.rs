@@ -14,9 +14,9 @@ fn schema() -> TableSchema {
 
 fn record(i: usize) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(format!("row-{i:08}")));
-    record.insert("title".into(), Value::Text(format!("document {i}")));
-    record.insert("score".into(), Value::Int64(i as i64));
+    record.insert("id", Value::Text(format!("row-{i:08}")));
+    record.insert("title", Value::Text(format!("document {i}")));
+    record.insert("score", Value::Int64(i as i64));
     record
 }
 
@@ -104,7 +104,7 @@ fn a_large_scan_yields_the_state_lock_to_a_concurrent_writer() {
         "docs",
         (0..ROWS).map(|i| {
             let mut row = record(i);
-            row.insert("title".into(), Value::Text(body.clone()));
+            row.insert("title", Value::Text(body.clone()));
             row
         }),
     )

@@ -50,9 +50,9 @@ fn new_db(dim: usize) -> (TempDir, Db) {
 
 fn doc(title: &str, workspace: &str, embedding: Vec<f32>) -> Record {
     let mut r = Record::new();
-    r.insert("title".into(), Value::Text(title.into()));
-    r.insert("workspace".into(), Value::Text(workspace.into()));
-    r.insert("embedding".into(), Value::Vector(embedding));
+    r.insert("title", Value::Text(title.into()));
+    r.insert("workspace", Value::Text(workspace.into()));
+    r.insert("embedding", Value::Vector(embedding));
     r
 }
 
@@ -92,7 +92,7 @@ fn knn_recall_vs_brute_force() {
     for i in 0..n {
         let v = rng.vec(dim);
         let mut r = doc(&format!("doc {i}"), "w", v.clone());
-        r.insert("id".into(), Value::Text(format!("d-{i:05}")));
+        r.insert("id", Value::Text(format!("d-{i:05}")));
         txn.insert("docs", r).unwrap();
         vectors.push((format!("d-{i:05}"), v));
     }
@@ -146,7 +146,7 @@ fn metadata_filter_restricts_results() {
     }
     let q = rng.vec(dim);
     let mut filter = Record::new();
-    filter.insert("workspace".into(), Value::Text("alpha".into()));
+    filter.insert("workspace", Value::Text("alpha".into()));
     let opts = VectorSearchOptions {
         filter: Some(filter),
         ..Default::default()
@@ -182,10 +182,7 @@ fn updates_and_deletes_are_reflected() {
 
     // Update: move "far" onto the query; it should win (or tie) now.
     let mut patch = Record::new();
-    patch.insert(
-        "embedding".into(),
-        Value::Vector(vec![1.0, 0.001, 0.0, 0.0]),
-    );
+    patch.insert("embedding", Value::Vector(vec![1.0, 0.001, 0.0, 0.0]));
     db.update("docs", &far, patch).unwrap();
     let hits = db.search_vector("docs", "embedding", &q, 2, &opts).unwrap();
     assert_eq!(hits.len(), 2, "both docs are close now");
@@ -201,7 +198,7 @@ fn updates_and_deletes_are_reflected() {
 
     // Setting the vector to NULL removes it from the index.
     let mut clear = Record::new();
-    clear.insert("embedding".into(), Value::Null);
+    clear.insert("embedding", Value::Null);
     db.update("docs", &far, clear).unwrap();
     let hits = db.search_vector("docs", "embedding", &q, 5, &opts).unwrap();
     assert!(hits.is_empty());
@@ -267,7 +264,7 @@ fn compaction_rebuilds_dropping_tombstones() {
     // Churn: update half, delete a quarter.
     for id in ids.iter().take(50) {
         let mut p = Record::new();
-        p.insert("embedding".into(), Value::Vector(rng.vec(dim)));
+        p.insert("embedding", Value::Vector(rng.vec(dim)));
         db.update("docs", id, p).unwrap();
     }
     for id in ids.iter().skip(50).take(25) {

@@ -76,29 +76,47 @@ impl MemoryGovernor {
     }
 
     pub(crate) fn acquire(self: &Arc<Self>, pool: MemoryPool, bytes: usize) -> MemoryPermit {
-        self.acquire_with_deadline(pool, bytes, None)
+        self.acquire_with_deadline(pool, bytes, usize::MAX, None)
             .expect("validated maintenance reservation")
     }
 
+    /// Wait up to `timeout` for `bytes` of `pool` (no ceiling; see below).
+    #[cfg(test)]
     pub(crate) fn acquire_timeout(
         self: &Arc<Self>,
         pool: MemoryPool,
         bytes: usize,
         timeout: Duration,
     ) -> Result<MemoryPermit> {
+        self.acquire_timeout_below(pool, bytes, usize::MAX, timeout)
+    }
+
+    /// Wait up to `timeout` for `bytes` of `pool`; the grant may not push the
+    /// pool's usage above `ceiling`. Full-budget statements use it to leave a lane of the
+    /// query pool to small key-bounded statements, which otherwise queued
+    /// behind a handful of long scans holding the whole pool.
+    pub(crate) fn acquire_timeout_below(
+        self: &Arc<Self>,
+        pool: MemoryPool,
+        bytes: usize,
+        ceiling: usize,
+        timeout: Duration,
+    ) -> Result<MemoryPermit> {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             Error::InvalidArgument("query admission timeout is out of range".into())
         })?;
-        self.acquire_with_deadline(pool, bytes, Some(deadline))
+        self.acquire_with_deadline(pool, bytes, ceiling, Some(deadline))
     }
 
     fn acquire_with_deadline(
         self: &Arc<Self>,
         pool: MemoryPool,
         bytes: usize,
+        ceiling: usize,
         deadline: Option<Instant>,
     ) -> Result<MemoryPermit> {
-        let capacity = self.capacity(pool);
+        // A request may always be granted into an empty pool.
+        let capacity = self.capacity(pool).min(ceiling.max(bytes));
         let control = matches!(pool, MemoryPool::Query)
             .then(crate::QueryControl::current)
             .flatten();
@@ -275,6 +293,10 @@ pub(crate) struct MemoryPermit {
 }
 
 impl MemoryPermit {
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub(crate) fn shrink_to(&mut self, bytes: usize) {
         assert!(bytes <= self.bytes);
         self.governor.release(self.pool, self.bytes - bytes);

@@ -13,3 +13,6 @@ bindings/python/build/
 bindings/python/dist/
 *.egg-info/
 bindings/python/elitesql/libelitesql.*
+
+# Mini-SaaS simulation runs (results are copied to benchmark-results/ when kept)
+examples/saas_simulation/results/

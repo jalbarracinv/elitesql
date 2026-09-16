@@ -128,10 +128,10 @@ const BODY: &str = "A deterministic payload used by both engines for scalable be
 
 fn record(i: usize) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(format!("row-{i:010}")));
-    record.insert("title".into(), Value::Text(format!("document number {i}")));
-    record.insert("body".into(), Value::Text(BODY.into()));
-    record.insert("score".into(), Value::Int64(i as i64));
+    record.insert("id", Value::Text(format!("row-{i:010}")));
+    record.insert("title", Value::Text(format!("document number {i}")));
+    record.insert("body", Value::Text(BODY.into()));
+    record.insert("score", Value::Int64(i as i64));
     record
 }
 

@@ -217,6 +217,12 @@ def _take_string(lib: ctypes.CDLL, ptr: ctypes.c_void_p) -> str:
         lib.elitesql_free_string(ptr)
 
 
+# `json.dumps(obj, separators=...)` constructs a fresh `JSONEncoder` on every
+# call because any keyword argument bypasses the module's cached encoder. The
+# hot path builds one encoder here instead; the output is byte-identical.
+_encode_json = json.JSONEncoder(separators=(",", ":")).encode
+
+
 # --- value decoding ---------------------------------------------------------
 
 _EPOCH_DATE = _dt.date(1970, 1, 1)
@@ -256,8 +262,13 @@ def _decode_result(result: Any) -> Any:
         result["identity"]["values"] = [_decode_value(v) for v in result["identity"]["values"]]
         result["lastrowid"] = _decode_value(result["lastrowid"])
     if isinstance(result, dict) and "rows" in result and "columns" in result:
-        result = dict(result)
-        result["rows"] = [[_decode_value(c) for c in row] for row in result["rows"]]
+        rows = result["rows"]
+        # Only tagged values (dates, blobs, vectors, JSON, big integers)
+        # arrive as objects. A result of plain scalars is already what the
+        # caller gets, so it is returned without rebuilding every row.
+        if any(cell.__class__ is dict for row in rows for cell in row):
+            result = dict(result)
+            result["rows"] = [[_decode_value(c) for c in row] for row in rows]
     return result
 
 
@@ -325,12 +336,29 @@ def _encode_param(value: Any) -> Any:
     raise TypeError(f"unsupported EliteSQL parameter type: {type(value).__name__}")
 
 
+def _is_json_native(value: Any) -> bool:
+    """True when `_encode_param` would return `value` unchanged."""
+    if value is None or value.__class__ is bool or value.__class__ is str:
+        return True
+    if value.__class__ is int:
+        return -(2 ** 63) <= value < 2 ** 63
+    if value.__class__ is float:
+        return math.isfinite(value)
+    return False
+
+
 def _encode_params(params: Any) -> list[Any] | dict[str, Any]:
     if isinstance(params, dict):
         if not all(isinstance(key, str) for key in params):
             raise TypeError("named SQL parameter keys must be strings")
+        if all(_is_json_native(value) for value in params.values()):
+            return params
         return {key: _encode_param(value) for key, value in params.items()}
     if isinstance(params, (list, tuple)):
+        # Plain numbers, strings, booleans and NULLs are already the wire
+        # form: encode them straight from the caller's sequence.
+        if all(_is_json_native(value) for value in params):
+            return params
         return [_encode_param(value) for value in params]
     raise TypeError("SQL params must be a sequence or mapping")
 
@@ -389,21 +417,34 @@ class EliteSQL:
         except Exception:
             pass
 
-    @contextmanager
-    def _lease(self):
-        """Keep the native handle alive for one concurrent FFI call."""
+    def _acquire(self) -> ctypes.c_void_p:
+        """Reserve the native handle for one concurrent FFI call.
+
+        Every reservation must be matched by `_release`. `query` calls this
+        pair directly: the equivalent `with self._lease()` costs a generator
+        plus the context-manager protocol on a path where the FFI call itself
+        takes a few microseconds.
+        """
         with self._lifecycle:
             if self._handle is None or self._closing:
                 raise EliteSQLError(8, "database is closed")
             self._active_calls += 1
-            handle = self._handle
+            return self._handle
+
+    def _release(self) -> None:
+        with self._lifecycle:
+            self._active_calls -= 1
+            if self._active_calls == 0:
+                self._lifecycle.notify_all()
+
+    @contextmanager
+    def _lease(self):
+        """Keep the native handle alive for one concurrent FFI call."""
+        handle = self._acquire()
         try:
             yield handle
         finally:
-            with self._lifecycle:
-                self._active_calls -= 1
-                if self._active_calls == 0:
-                    self._lifecycle.notify_all()
+            self._release()
 
     # -- operations
     def query(self, sql: str, params: Any = None) -> Any:
@@ -415,16 +456,20 @@ class EliteSQL:
         for ``%(name)s`` placeholders. Values are bound, never interpolated.
         """
         out = ctypes.c_void_p()
-        with self._lease() as handle:
+        lib = self._lib
+        handle = self._acquire()
+        try:
             if params is None:
-                status = self._lib.elitesql_query(handle, sql.encode(), ctypes.byref(out))
+                status = lib.elitesql_query(handle, sql.encode(), ctypes.byref(out))
             else:
-                encoded = json.dumps(_encode_params(params), separators=(",", ":")).encode()
-                status = self._lib.elitesql_query_params(
+                encoded = _encode_json(_encode_params(params)).encode()
+                status = lib.elitesql_query_params(
                     handle, sql.encode(), encoded, ctypes.byref(out)
                 )
-        _raise_if(self._lib, status)
-        return _decode_result(json.loads(_take_string(self._lib, out)))
+        finally:
+            self._release()
+        _raise_if(lib, status)
+        return _decode_result(json.loads(_take_string(lib, out)))
 
     def cursor(self) -> "Cursor":
         return Cursor(self)
@@ -471,12 +516,21 @@ class EliteSQL:
         _raise_if(self._lib, status)
 
     def search_text(self, table: str, column: str, query: str, top_k: int = 10,
-                    filter: Optional[dict] = None) -> list[dict]:
+                    filter: Optional[dict] = None,
+                    columns: Optional[list[str]] = None) -> list[dict]:
+        """Rank rows of ``table`` by BM25 over ``column``.
+
+        ``columns`` narrows what each hit carries; ``[]`` returns ids and
+        scores alone. A hit otherwise carries the whole row, indexed text
+        included, which is most of what a search costs per result.
+        """
         params: dict[str, Any] = {
             "table": table, "column": column, "query": query, "top_k": top_k,
         }
         if filter is not None:
             params["filter"] = filter
+        if columns is not None:
+            params["columns"] = list(columns)
         out = ctypes.c_void_p()
         with self._lease() as handle:
             status = self._lib.elitesql_search_text(
@@ -647,7 +701,7 @@ class Transaction:
         if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
             raise TypeError("transaction record must be a mapping with string keys")
         encoded = {key: _encode_param(item) for key, item in value.items()}
-        return json.dumps(encoded, separators=(",", ":")).encode()
+        return _encode_json(encoded).encode()
 
     def insert(self, table: str, record: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -973,13 +1027,17 @@ class SidecarClient:
         self._call({"op": "create_text_index", "table": table, "column": column})
 
     def search_text(self, table: str, column: str, query: str, top_k: int = 10,
-                    filter: Optional[dict] = None) -> list[dict]:
+                    filter: Optional[dict] = None,
+                    columns: Optional[list[str]] = None) -> list[dict]:
+        """See ``EliteSQL.search_text``; ``columns`` narrows each hit."""
         request: dict[str, Any] = {
             "op": "search_text", "table": table, "column": column,
             "query": query, "top_k": top_k,
         }
         if filter is not None:
             request["filter"] = filter
+        if columns is not None:
+            request["columns"] = list(columns)
         hits = self._call(request)["hits"]
         for h in hits:
             h["record"] = _decode_record(h["record"])

@@ -134,6 +134,34 @@ Only the still-relevant direct-load rows are retained from this older run. Elite
 
 The raw historical bulk processes remain linked by [their run manifest](benchmark-results/refresh-2026-09-11/jobs.json). Their filesystem caches were not evicted.
 
+**The point column above does not compare the same work, and the section below replaces it.** EliteSQL's side called `Db::get`, the storage primitive: no statement lookup, no binding, no planning, no projection, and a direct physical key, because this table declares no `id` of its own. SQLite's side ran a prepared `SELECT` that seeks a `TEXT PRIMARY KEY` and extracts three columns. The scan column is not affected: neither engine has an index on `score`, so both traverse the table.
+
+## Point reads with SQL on both sides (2026-09-13)
+
+[The scale harness](crates/elitesql-core/benches/scale_vs_sqlite.rs) now also times EliteSQL through `db.query_params("SELECT title, body, score FROM docs WHERE id = ?")`, which is the statement SQLite's prepared reader already runs. Both engines therefore pay statement lookup, binding, planning, row decode and projection. One process per row count, 100 000 point reads per engine, Fast durability, same machine and same deterministic rows as the rest of this document; the 1M row was measured three times to bound its variation.
+
+| Rows | Load | SQL on both sides | `Db::get` against their `SELECT` |
+| --- | --- | ---: | ---: |
+| 10k | transactions | **0.71×** | 1.75× |
+| 100k | transactions | **1.34×** | 3.14× |
+| 1m | transactions | **1.11–1.18×** | 1.91–2.36× |
+| 1m | bulk | **1.30×** | 2.53× |
+
+Above 1 means EliteSQL is faster. Two things follow. The comparison is
+**scale-dependent**: EliteSQL's per-statement cost is fixed and SQLite's key
+seek grows with the table, so SQLite wins on a small table and EliteSQL wins
+from about a hundred thousand rows up. And the primitive-against-SQL column
+overstates EliteSQL by roughly a factor of two at every size, enough to invert
+the answer at 10k, where it reports 1.75× in EliteSQL's favour for a case
+EliteSQL loses. Its agreement with the fair column at 1M is a coincidence, not
+a validation.
+
+These figures describe one indexed lookup on a three-column table. They are
+not a claim about operational read mixes: the mini-SaaS simulation, which
+reads through secondary, text and vector indexes with joins and ordering and
+goes through the Python binding, puts a weighted operation at 2.37× SQLite's.
+See [its report](benchmark-results/saas-simulation-2026-09-12/README.md).
+
 ## Small-transaction microbenchmarks (pre-optimization run)
 
 The sustained 1M-row transaction table formerly in this section was superseded and removed; current 1K- and 10K-row transaction results are reported at the top. The following Criterion microbenchmarks are retained only as a historical characterization of smaller API calls.

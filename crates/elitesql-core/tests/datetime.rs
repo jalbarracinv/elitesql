@@ -173,9 +173,9 @@ fn sql_roundtrip_and_comparisons() {
 fn api_roundtrip_and_ordering() {
     let (_d, db) = new_db();
     let mut rec = Record::new();
-    rec.insert("name".into(), Value::Text("api".into()));
-    rec.insert("day".into(), Value::parse_date("2025-12-31").unwrap());
-    rec.insert("at".into(), Value::time_from_hms_micro(8, 0, 0, 0).unwrap());
+    rec.insert("name", Value::Text("api".into()));
+    rec.insert("day", Value::parse_date("2025-12-31").unwrap());
+    rec.insert("at", Value::time_from_hms_micro(8, 0, 0, 0).unwrap());
     let id = db.insert("events", rec).unwrap();
     let back = db.get("events", &id).unwrap().unwrap();
     assert_eq!(back["day"], Value::parse_date("2025-12-31").unwrap());
@@ -208,8 +208,8 @@ fn invalid_literals_are_rejected() {
     assert!(err.to_string().contains("out of range"), "{err}");
     // Type mismatch through the API.
     let mut rec = Record::new();
-    rec.insert("name".into(), Value::Text("bad".into()));
-    rec.insert("day".into(), Value::Text("2026-08-07".into()));
+    rec.insert("name", Value::Text("bad".into()));
+    rec.insert("day", Value::Text("2026-08-07".into()));
     assert!(matches!(
         db.insert("events", rec),
         Err(Error::SchemaViolation(_))

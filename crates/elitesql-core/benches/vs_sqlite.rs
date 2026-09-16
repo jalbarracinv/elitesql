@@ -53,15 +53,15 @@ fn elitesql_new() -> (TempDir, Db) {
 
 fn elitesql_record(i: usize) -> Record {
     let mut r = Record::new();
-    r.insert("title".into(), Value::Text(format!("document number {i}")));
-    r.insert("body".into(), Value::Text(BODY.into()));
-    r.insert("score".into(), Value::Int64(i as i64));
+    r.insert("title", Value::Text(format!("document number {i}")));
+    r.insert("body", Value::Text(BODY.into()));
+    r.insert("score", Value::Int64(i as i64));
     r
 }
 
 fn elitesql_record_with_id(i: usize) -> Record {
     let mut record = elitesql_record(i);
-    record.insert("id".into(), Value::Text(format!("row-{i:08}")));
+    record.insert("id", Value::Text(format!("row-{i:08}")));
     record
 }
 

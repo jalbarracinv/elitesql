@@ -12,8 +12,8 @@ fn schema() -> TableSchema {
 
 fn record(title: &str, score: i64) -> Record {
     let mut r = Record::new();
-    r.insert("title".into(), Value::Text(title.into()));
-    r.insert("score".into(), Value::Int64(score));
+    r.insert("title", Value::Text(title.into()));
+    r.insert("score", Value::Int64(score));
     r
 }
 
@@ -53,13 +53,13 @@ fn compaction_preserves_live_snapshot_versions() {
     }
     for id in &ids {
         let mut p = Record::new();
-        p.insert("score".into(), Value::Int64(2));
+        p.insert("score", Value::Int64(2));
         db.update("docs", id, p).unwrap();
     }
     let snap_v2 = db.snapshot();
     for id in &ids {
         let mut p = Record::new();
-        p.insert("score".into(), Value::Int64(3));
+        p.insert("score", Value::Int64(3));
         db.update("docs", id, p).unwrap();
     }
 
@@ -114,7 +114,7 @@ fn compaction_purges_deleted_records_and_shrinks_disk() {
     for round in 0..3 {
         for id in &ids {
             let mut p = Record::new();
-            p.insert("score".into(), Value::Int64(round));
+            p.insert("score", Value::Int64(round));
             db.update("docs", id, p).unwrap();
         }
     }

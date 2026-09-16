@@ -64,9 +64,9 @@ fn main() {
         let mut transaction = db.begin();
         for n in first..(first + 1000).min(count) {
             let mut row = Record::new();
-            row.insert("id".into(), Value::Text(format!("r{n:08}")));
-            row.insert("n".into(), Value::Int64(n as i64));
-            row.insert("payload".into(), Value::Text("review fixture".into()));
+            row.insert("id", Value::Text(format!("r{n:08}")));
+            row.insert("n", Value::Int64(n as i64));
+            row.insert("payload", Value::Text("review fixture".into()));
             transaction.insert("items", row).unwrap();
         }
         transaction.commit().unwrap();
@@ -159,7 +159,7 @@ fn main() {
         for n in 0..200 {
             let begin = Instant::now();
             let mut row = Record::new();
-            row.insert("n".into(), Value::Int64(n));
+            row.insert("n", Value::Int64(n));
             db.insert(profile, row).unwrap();
             samples.push(begin.elapsed().as_nanos() as u64);
         }

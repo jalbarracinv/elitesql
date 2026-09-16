@@ -210,9 +210,20 @@ pub fn check(path: impl AsRef<Path>) -> Result<CheckReport> {
             }
             for ch in rec.changes {
                 if let Some(payload) = ch.payload {
-                    if let Err(error) =
-                        crate::db::decode_record(&payload, Some(&dir.join(crate::db::BLOBS_DIR)))
-                    {
+                    // A payload written at format_version 3 or later stores no
+                    // column names, so only its table says what it holds.
+                    let Some(schema) = manifest
+                        .catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.table(&ch.table))
+                    else {
+                        continue;
+                    };
+                    if let Err(error) = crate::db::decode_record_for(
+                        schema,
+                        &payload,
+                        Some(&dir.join(crate::db::BLOBS_DIR)),
+                    ) {
                         report.errors.push(format!(
                             "wal {id}: bad payload for {}/{}: {error}",
                             ch.table, ch.id

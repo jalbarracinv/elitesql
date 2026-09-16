@@ -2,12 +2,14 @@
 //! mutable delta. Data pages are shared with the other derived indexes.
 
 use std::cmp::Ordering;
+use std::cmp::Reverse;
 use std::collections::{btree_map, BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::db::{push_id, IdSpan};
 use crate::error::{Error, Result};
 use crate::paged::{ExternalPagedWriter, PagedIndex, PagedPrefixCursor};
 use crate::run_manifest::DerivedRunMeta;
@@ -217,6 +219,56 @@ impl TextIdx {
     /// Exact BM25 top-k with memory proportional to query terms plus `limit`,
     /// not to the number of matching documents. Posting streams are merged by
     /// document id so each score can be finalized and discarded immediately.
+    /// One pass per query term: every visible posting (runs, frozen and
+    /// mutable deltas merged) is copied out so that scoring and ranking can
+    /// run after the caller releases the state lock. Returns `None` when the
+    /// query touches more than `max_postings` postings; the caller then uses
+    /// the streaming `search_top_k` under the lock instead. Scores are
+    /// bit-identical to `search_top_k`: same df, idf and summation order.
+    pub(crate) fn collect_query(
+        &self,
+        query: &str,
+        max_postings: usize,
+    ) -> Result<Option<CollectedQuery>> {
+        let n = self.doc_count() as f32;
+        let mut terms = tokenize(query);
+        terms.sort_unstable();
+        terms.dedup();
+        let mut collected = CollectedQuery {
+            terms: Vec::new(),
+            arena: String::new(),
+            avg_len: if n == 0.0 {
+                1.0
+            } else {
+                self.total_len() as f32 / n
+            },
+        };
+        if n == 0.0 {
+            return Ok(Some(collected));
+        }
+        let mut total = 0usize;
+        for term in &terms {
+            let mut stream = TermStream::new(self, term)?;
+            let mut postings = Vec::new();
+            while let Some(posting) = stream.next_into(&mut collected.arena)? {
+                total += 1;
+                if total > max_postings {
+                    return Ok(None);
+                }
+                postings.push(posting);
+            }
+            if postings.is_empty() {
+                continue;
+            }
+            let df = postings.len() as f32;
+            collected.terms.push(CollectedTerm {
+                idf: (1.0 + (n - df + 0.5) / (df + 0.5)).ln(),
+                postings,
+            });
+        }
+        Ok(Some(collected))
+    }
+
     pub fn search_top_k(
         &self,
         query: &str,
@@ -270,16 +322,22 @@ impl TextIdx {
                     *head = stream.next()?;
                 }
             }
-            if !accept(&id)? {
-                continue;
-            }
+            // Validate lazily: `accept` (a visibility lookup, held under the
+            // shared state lock by the caller) runs only for candidates that
+            // would enter the top-k, not for every posting of every term.
             let candidate = Ranked { id, score };
             if best.len() < limit {
+                if !accept(&candidate.id)? {
+                    continue;
+                }
                 best.push(candidate);
             } else if best
                 .peek()
                 .is_some_and(|worst| candidate.better_than(worst))
             {
+                if !accept(&candidate.id)? {
+                    continue;
+                }
                 best.pop();
                 best.push(candidate);
             }
@@ -479,15 +537,37 @@ struct TermStream<'a> {
     index: &'a TextIdx,
     persisted: Vec<TextPostingCursor<'a>>,
     delta: Option<btree_map::Iter<'a, String, u32>>,
-    delta_head: Option<Posting>,
+    delta_head: Option<PostingRef<'a>>,
     frozen_delta: Option<btree_map::Iter<'a, String, u32>>,
-    frozen_head: Option<Posting>,
+    frozen_head: Option<PostingRef<'a>>,
+    /// The id being merged, held across the point where the heads have to be
+    /// advanced. One buffer for the whole stream instead of a `String` per
+    /// posting: a common term has one posting per document that holds it.
+    scratch: String,
+}
+
+/// A posting whose id is still borrowed from the overlay that holds it.
+struct PostingRef<'a> {
+    id: &'a str,
+    tf: u32,
+    dl: u32,
+}
+
+/// A posting whose id lives in the arena its batch was collected into.
+struct PostingAt {
+    id: IdSpan,
+    tf: u32,
+    dl: u32,
 }
 
 struct TextPostingCursor<'a> {
     cursor: PagedPrefixCursor<'a>,
     prefix: Vec<u8>,
-    head: Option<(String, u64, u8, u32, u32)>,
+    /// Id of the head posting, in a buffer the cursor refills. A common term
+    /// has a posting per document that holds it, and every one of those ids
+    /// was allocated only to be compared against the merge head and dropped.
+    id: String,
+    head: Option<(u64, u8, u32, u32)>,
 }
 
 impl<'a> TextPostingCursor<'a> {
@@ -496,14 +576,21 @@ impl<'a> TextPostingCursor<'a> {
         let mut cursor = Self {
             cursor: index.prefix_cursor(&prefix),
             prefix,
+            id: String::new(),
             head: None,
         };
         cursor.advance()?;
         Ok(cursor)
     }
 
+    /// The id the cursor sits on, or `None` once the run is exhausted.
+    fn head_id(&self) -> Option<&str> {
+        self.head.map(|_| self.id.as_str())
+    }
+
     fn advance(&mut self) -> Result<()> {
         self.head = None;
+        self.id.clear();
         let Some((key, value)) = self.cursor.next()? else {
             return Ok(());
         };
@@ -513,7 +600,8 @@ impl<'a> TextPostingCursor<'a> {
         let id = std::str::from_utf8(id)
             .map_err(|_| Error::Corrupt("text index: invalid id utf8".into()))?;
         let (version, operation, tf, dl) = parse_posting_value(value)?;
-        self.head = Some((id.to_owned(), version, operation, tf, dl));
+        self.id.push_str(id);
+        self.head = Some((version, operation, tf, dl));
         Ok(())
     }
 }
@@ -535,34 +623,40 @@ impl<'a> TermStream<'a> {
                 .as_ref()
                 .and_then(|frozen| frozen.postings.get(term).map(BTreeMap::iter)),
             frozen_head: None,
+            scratch: String::new(),
         };
         stream.advance_frozen();
         stream.advance_delta();
         Ok(stream)
     }
 
-    fn next(&mut self) -> Result<Option<Posting>> {
+    /// The next visible posting of the term, with its id appended to `arena`.
+    fn next_into(&mut self, arena: &mut String) -> Result<Option<PostingAt>> {
         loop {
             let next_persisted = self
                 .persisted
                 .iter()
-                .filter_map(|cursor| cursor.head.as_ref().map(|head| head.0.as_str()))
+                .filter_map(TextPostingCursor::head_id)
                 .min();
-            let next_delta = self.delta_head.as_ref().map(|posting| posting.id.as_str());
-            let next_frozen = self.frozen_head.as_ref().map(|posting| posting.id.as_str());
-            let Some(id) = next_persisted
+            let next_delta = self.delta_head.as_ref().map(|posting| posting.id);
+            let next_frozen = self.frozen_head.as_ref().map(|posting| posting.id);
+            let Some(found) = next_persisted
                 .into_iter()
                 .chain(next_frozen)
                 .chain(next_delta)
                 .min()
-                .map(str::to_owned)
             else {
                 return Ok(None);
             };
+            // Copied out so the heads can be advanced below; the buffer is
+            // the same one on every pass.
+            self.scratch.clear();
+            self.scratch.push_str(found);
+            let id = std::mem::take(&mut self.scratch);
             let mut newest: Option<(u64, u8, u32, u32)> = None;
             for cursor in &mut self.persisted {
-                while cursor.head.as_ref().is_some_and(|head| head.0 == id) {
-                    let (_, version, operation, tf, dl) =
+                while cursor.head_id() == Some(id.as_str()) {
+                    let (version, operation, tf, dl) =
                         cursor.head.take().expect("matching posting head");
                     if newest.is_none_or(|current| (version, operation, tf, dl) > current) {
                         newest = Some((version, operation, tf, dl));
@@ -573,7 +667,7 @@ impl<'a> TermStream<'a> {
             if self
                 .frozen_head
                 .as_ref()
-                .is_some_and(|posting| posting.id == id)
+                .is_some_and(|posting| posting.id == id.as_str())
             {
                 let posting = self.frozen_head.take().expect("matching frozen posting");
                 let generation = self
@@ -601,7 +695,7 @@ impl<'a> TermStream<'a> {
             if self
                 .delta_head
                 .as_ref()
-                .is_some_and(|posting| posting.id == id)
+                .is_some_and(|posting| posting.id == id.as_str())
             {
                 let posting = self.delta_head.take().expect("matching delta posting");
                 newest = Some((u64::MAX, ADD, posting.tf, posting.dl));
@@ -609,13 +703,29 @@ impl<'a> TermStream<'a> {
             } else if self.index.removed.contains(&id) {
                 newest = Some((u64::MAX, DELETE, 0, 0));
             }
+            // Give the buffer back whether the posting survives or not.
+            self.scratch = id;
             let Some((_, operation, tf, dl)) = newest else {
                 continue;
             };
             if operation == ADD {
-                return Ok(Some(Posting { id, tf, dl }));
+                let id = push_id(arena, &self.scratch);
+                return Ok(Some(PostingAt { id, tf, dl }));
             }
         }
+    }
+
+    /// `next_into` for the fallback ranking path, which wants owned ids.
+    fn next(&mut self) -> Result<Option<Posting>> {
+        let mut arena = String::new();
+        let Some(posting) = self.next_into(&mut arena)? else {
+            return Ok(None);
+        };
+        Ok(Some(Posting {
+            id: posting.id.of(&arena).to_owned(),
+            tf: posting.tf,
+            dl: posting.dl,
+        }))
     }
 
     fn advance_delta(&mut self) {
@@ -623,8 +733,8 @@ impl<'a> TermStream<'a> {
             .delta
             .as_mut()
             .and_then(Iterator::next)
-            .map(|(id, &tf)| Posting {
-                id: id.clone(),
+            .map(|(id, &tf)| PostingRef {
+                id,
                 tf,
                 dl: *self.index.doc_len.get(id).unwrap_or(&1),
             });
@@ -635,8 +745,8 @@ impl<'a> TermStream<'a> {
             .frozen_delta
             .as_mut()
             .and_then(Iterator::next)
-            .map(|(id, &tf)| Posting {
-                id: id.clone(),
+            .map(|(id, &tf)| PostingRef {
+                id,
                 tf,
                 dl: self
                     .index
@@ -646,6 +756,145 @@ impl<'a> TermStream<'a> {
                     .copied()
                     .unwrap_or(1),
             });
+    }
+}
+
+/// Postings of one query term copied out of the index (see `collect_query`).
+pub(crate) struct CollectedTerm {
+    idf: f32,
+    postings: Vec<PostingAt>,
+}
+
+pub(crate) struct CollectedQuery {
+    terms: Vec<CollectedTerm>,
+    /// Ids of every posting of every term, packed end to end. A common term
+    /// has a posting per document that holds it, and each of those ids used
+    /// to be its own `String` on the way to the score accumulator.
+    arena: String,
+    avg_len: f32,
+}
+
+impl CollectedQuery {
+    /// Every candidate with its BM25 score, best first (score descending,
+    /// then id ascending), the order `search_top_k` produces.
+    ///
+    /// The candidates borrow their ids from this query's arena, so only the
+    /// handful the caller takes is ever copied.
+    pub(crate) fn ranked(&self) -> RankedCandidates<'_> {
+        let mut scores: HashMap<&str, f32, BuildScoreHasher> = HashMap::default();
+        for term in &self.terms {
+            for posting in &term.postings {
+                *scores.entry(posting.id.of(&self.arena)).or_insert(0.0) +=
+                    term.idf * bm25_norm(posting.tf, posting.dl, self.avg_len);
+            }
+        }
+        // The caller wants the best handful, not the whole ranking: a term
+        // that matches a tenth of the table used to be sorted in full to
+        // return ten rows. Heapifying is linear and each row taken costs one
+        // sift, so the ranking beyond what is consumed is never paid for.
+        RankedCandidates {
+            heap: scores
+                .into_iter()
+                .map(|(id, score)| Reverse(RankedRef { id, score }))
+                .collect(),
+        }
+    }
+}
+
+/// Hasher for the per-query score accumulator.
+///
+/// The keys are the engine's own record ids, never attacker-chosen material
+/// that reaches a long-lived table, so the default SipHash buys nothing here
+/// and costs a measurable share of a text query. This is the multiply-xor
+/// hash rustc uses for the same reason.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct BuildScoreHasher;
+
+impl std::hash::BuildHasher for BuildScoreHasher {
+    type Hasher = ScoreHasher;
+
+    fn build_hasher(&self) -> ScoreHasher {
+        ScoreHasher(0)
+    }
+}
+
+pub(crate) struct ScoreHasher(u64);
+
+impl ScoreHasher {
+    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::SEED);
+    }
+}
+
+impl std::hash::Hasher for ScoreHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().expect("eight bytes")));
+        }
+        let tail = chunks.remainder();
+        if !tail.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..tail.len()].copy_from_slice(tail);
+            self.add(u64::from_le_bytes(buf));
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Scored documents handed out best first.
+pub(crate) struct RankedCandidates<'a> {
+    heap: BinaryHeap<Reverse<RankedRef<'a>>>,
+}
+
+impl<'a> RankedCandidates<'a> {
+    pub(crate) fn len(&self) -> usize {
+        self.heap.len()
+    }
+
+    /// The best remaining candidate: highest score, ties broken by the
+    /// smaller id, which is the order a full sort produced.
+    pub(crate) fn next_best(&mut self) -> Option<(&'a str, f32)> {
+        self.heap.pop().map(|Reverse(best)| (best.id, best.score))
+    }
+}
+
+/// A scored candidate whose id is borrowed from its query's arena.
+struct RankedRef<'a> {
+    id: &'a str,
+    score: f32,
+}
+
+impl PartialEq for RankedRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits() && self.id == other.id
+    }
+}
+
+impl Eq for RankedRef<'_> {}
+
+impl PartialOrd for RankedRef<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The same inverted order as `Ranked`: a better candidate compares *less*,
+/// so a `BinaryHeap<Reverse<_>>` of these pops the best first.
+impl Ord for RankedRef<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.id.cmp(other.id))
     }
 }
 

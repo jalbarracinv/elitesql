@@ -47,6 +47,10 @@ pub(crate) enum DdlIntent {
         /// `NOT NULL` is applied only after every record has been backfilled.
         not_null: bool,
     },
+    /// Re-key every table that declares its own `id` so the row's physical
+    /// key is that identity. Converts a database written before identity
+    /// keying existed; see `Rewrite::RekeyByIdentity`.
+    RekeyByIdentity,
 }
 
 impl DdlIntent {
@@ -95,6 +99,9 @@ impl DdlIntent {
             DdlIntent::AddColumn { table, column, .. } => {
                 format!("ALTER TABLE {table} ADD COLUMN {}", column.name)
             }
+            DdlIntent::RekeyByIdentity => {
+                "re-key tables that declare their own id by that identity".to_owned()
+            }
         }
     }
 }
@@ -118,6 +125,16 @@ pub(crate) enum Rewrite<'a> {
         table: &'a str,
         column: &'a str,
     },
+    /// Give every table that declares its own `id` a physical key equal to
+    /// that identity, and mark it as keyed that way.
+    ///
+    /// This is the conversion for databases written before hypothesis 60:
+    /// their rows carry ULID keys and reach a declared id through a unique
+    /// secondary index. It runs through the same rewrite as the DDL
+    /// statements, so its `ddl.json` record makes a crash mid-rewrite
+    /// resumable, and the derived indexes, which key rows by the physical id,
+    /// are rebuilt afterwards like any other DDL.
+    RekeyByIdentity,
 }
 
 impl Rewrite<'_> {
@@ -169,6 +186,11 @@ impl Rewrite<'_> {
                 t.indexes.retain(|d| d.column != column);
                 t.vector_indexes.retain(|d| d.column != column);
                 t.text_indexes.retain(|d| d.column != column);
+            }
+            Rewrite::RekeyByIdentity => {
+                for table in catalog.tables.iter_mut() {
+                    table.identity_keyed = !table.has_implicit_id();
+                }
             }
         }
     }

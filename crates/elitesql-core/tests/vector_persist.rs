@@ -41,8 +41,8 @@ fn schema() -> TableSchema {
 
 fn doc(title: &str, embedding: Vec<f32>) -> Record {
     let mut r = Record::new();
-    r.insert("title".into(), Value::Text(title.into()));
-    r.insert("embedding".into(), Value::Vector(embedding));
+    r.insert("title", Value::Text(title.into()));
+    r.insert("embedding", Value::Vector(embedding));
     r
 }
 
@@ -138,7 +138,7 @@ fn stale_dump_catches_up_with_newer_commits() {
         }
         let mut patch = Record::new();
         patch.insert(
-            "embedding".into(),
+            "embedding",
             Value::Vector(near.iter().map(|x| x * 0.9).collect()),
         );
         db.update("docs", &ids[40], patch).unwrap();
@@ -394,12 +394,12 @@ fn changes_between_durable_runs_are_replayed_exactly() {
         }
         for id in &ids[10..20] {
             let mut patch = Record::new();
-            patch.insert("embedding".into(), Value::Null);
+            patch.insert("embedding", Value::Null);
             db.update("docs", id, patch).unwrap();
         }
         for id in &ids[20..30] {
             let mut patch = Record::new();
-            patch.insert("embedding".into(), Value::Vector(far.clone()));
+            patch.insert("embedding", Value::Vector(far.clone()));
             db.update("docs", id, patch).unwrap();
         }
     }
@@ -576,7 +576,7 @@ fn background_merges_bound_the_run_count_and_keep_results() {
         }
         for (id, v) in vectors.iter_mut().take(50) {
             let mut patch = Record::new();
-            patch.insert("embedding".into(), Value::Vector(far.clone()));
+            patch.insert("embedding", Value::Vector(far.clone()));
             db.update("docs", id, patch).unwrap();
             *v = far.clone();
         }

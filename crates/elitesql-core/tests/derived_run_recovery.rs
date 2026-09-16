@@ -21,9 +21,9 @@ fn corrupt_secondary_and_text_manifests_rebuild_from_canonical_data() {
         let mut txn = db.begin();
         for row in 0..100 {
             let mut record = Record::new();
-            record.insert("id".into(), Value::Text(format!("id-{row:03}")));
-            record.insert("group".into(), Value::Text("hot".into()));
-            record.insert("body".into(), Value::Text("alpha common".into()));
+            record.insert("id", Value::Text(format!("id-{row:03}")));
+            record.insert("group", Value::Text("hot".into()));
+            record.insert("body", Value::Text("alpha common".into()));
             txn.insert("docs", record).unwrap();
         }
         txn.commit().unwrap();

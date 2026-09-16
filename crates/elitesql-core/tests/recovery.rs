@@ -18,8 +18,8 @@ fn schema() -> TableSchema {
 
 fn record(title: &str, score: i64) -> Record {
     let mut r = Record::new();
-    r.insert("title".into(), Value::Text(title.into()));
-    r.insert("score".into(), Value::Int64(score));
+    r.insert("title", Value::Text(title.into()));
+    r.insert("score", Value::Int64(score));
     r
 }
 
@@ -162,13 +162,13 @@ fn corrupt_manifest_falls_back_to_prev() {
         db.create_table(schema()).unwrap();
         for i in 0..5 {
             let mut r = record(&format!("set A {i}"), i);
-            r.insert("id".into(), Value::Text(format!("a-{i}")));
+            r.insert("id", Value::Text(format!("a-{i}")));
             db.insert("docs", r).unwrap();
         }
         db.checkpoint().unwrap(); // manifest M1: set A in segments
         for i in 0..5 {
             let mut r = record(&format!("set B {i}"), i);
-            r.insert("id".into(), Value::Text(format!("b-{i}")));
+            r.insert("id", Value::Text(format!("b-{i}")));
             db.insert("docs", r).unwrap();
         }
         db.checkpoint().unwrap(); // manifest M2: A+B; fallback is refreshed to M2
@@ -213,7 +213,7 @@ fn manifest_fallback_keeps_acknowledged_catalog_generation() {
         let db = Db::create(&path).unwrap();
         db.create_table(schema()).unwrap();
         let mut first = record("one", 1);
-        first.insert("id".into(), Value::Text("one".into()));
+        first.insert("id", Value::Text("one".into()));
         db.insert("docs", first).unwrap();
         db.add_column("docs", Column::new("tag", ColumnType::Text))
             .unwrap();
@@ -236,7 +236,7 @@ fn manifest_fallback_keeps_acknowledged_catalog_generation() {
         .iter()
         .any(|column| column.name == "tag"));
     let mut duplicate = record("one", 2);
-    duplicate.insert("id".into(), Value::Text("two".into()));
+    duplicate.insert("id", Value::Text("two".into()));
     assert!(matches!(
         db.insert("docs", duplicate),
         Err(Error::UniqueViolation { .. })
@@ -262,12 +262,12 @@ fn manifest_fallback_after_compaction_keeps_external_blobs() {
         ))
         .unwrap();
         let mut original = Record::new();
-        original.insert("id".into(), Value::Text("file".into()));
-        original.insert("data".into(), Value::Blob(vec![1; 4096]));
+        original.insert("id", Value::Text("file".into()));
+        original.insert("data", Value::Blob(vec![1; 4096]));
         db.insert("files", original).unwrap();
         db.checkpoint().unwrap();
         let mut patch = Record::new();
-        patch.insert("data".into(), Value::Blob(vec![2; 8192]));
+        patch.insert("data", Value::Blob(vec![2; 8192]));
         db.update("files", "file", patch).unwrap();
         db.compact().unwrap();
     }

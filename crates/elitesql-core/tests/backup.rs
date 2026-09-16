@@ -13,9 +13,9 @@ use tempfile::TempDir;
 
 fn note(body: &str, n: i64, emb: [f32; 4]) -> Record {
     let mut r = Record::new();
-    r.insert("body".into(), Value::Text(body.into()));
-    r.insert("n".into(), Value::Int64(n));
-    r.insert("emb".into(), Value::Vector(emb.to_vec()));
+    r.insert("body", Value::Text(body.into()));
+    r.insert("n", Value::Int64(n));
+    r.insert("emb", Value::Vector(emb.to_vec()));
     r
 }
 
@@ -62,10 +62,10 @@ fn populated_db() -> (TempDir, Db) {
     )
     .unwrap();
     let mut rec = Record::new();
-    rec.insert("data".into(), Value::Blob(vec![7u8; 4096])); // out-of-line
+    rec.insert("data", Value::Blob(vec![7u8; 4096])); // out-of-line
     db.insert("files", rec).unwrap();
     let mut rec = Record::new();
-    rec.insert("data".into(), Value::Blob(vec![9u8; 16])); // inline
+    rec.insert("data", Value::Blob(vec![9u8; 16])); // inline
     db.insert("files", rec).unwrap();
     (dir, db)
 }
@@ -131,7 +131,7 @@ fn backup_is_snapshot_consistent_under_concurrent_writers() {
     let mut initial = Vec::new();
     for i in 0..200 {
         let mut r = Record::new();
-        r.insert("seq".into(), Value::Int64(i));
+        r.insert("seq", Value::Int64(i));
         initial.push(db.insert("events", r).unwrap());
     }
 
@@ -144,7 +144,7 @@ fn backup_is_snapshot_consistent_under_concurrent_writers() {
                 let mut i = 0i64;
                 while !stop.load(Ordering::Relaxed) {
                     let mut r = Record::new();
-                    r.insert("seq".into(), Value::Int64(1_000 * (w + 1) + i));
+                    r.insert("seq", Value::Int64(1_000 * (w + 1) + i));
                     db.insert("events", r).unwrap();
                     i += 1;
                 }

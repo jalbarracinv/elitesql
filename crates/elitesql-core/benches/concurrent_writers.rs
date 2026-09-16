@@ -309,14 +309,14 @@ fn row_id(writer: usize, sequence: usize) -> String {
 
 fn record(writer: usize, sequence: usize) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(row_id(writer, sequence)));
+    record.insert("id", Value::Text(row_id(writer, sequence)));
     record.insert(
-        "title".into(),
+        "title",
         Value::Text(format!("writer {writer} row {sequence}")),
     );
-    record.insert("writer".into(), Value::Int64(writer as i64));
-    record.insert("sequence".into(), Value::Int64(sequence as i64));
-    record.insert("body".into(), Value::Text(BODY.into()));
+    record.insert("writer", Value::Int64(writer as i64));
+    record.insert("sequence", Value::Int64(sequence as i64));
+    record.insert("body", Value::Text(BODY.into()));
     record
 }
 

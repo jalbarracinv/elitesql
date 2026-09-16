@@ -45,12 +45,34 @@ pub(super) fn table_driver_at(
         if value.is_null() {
             return (TableDriver::Empty, Some(position));
         }
-        if column == ID_COLUMN && table.schema.has_implicit_id() {
-            match value {
-                Value::Text(id) => best = Some((0, TableDriver::Id(id.clone()), position)),
-                _ => return (TableDriver::Empty, Some(position)),
+        if column == ID_COLUMN {
+            // Either form of `id` addresses the primary directory directly.
+            // A declared identity is the row's physical key, so reaching it
+            // no longer goes through the unique secondary index that used to
+            // translate one into the other.
+            if table.schema.has_implicit_id() {
+                match value {
+                    Value::Text(id) => best = Some((0, TableDriver::Id(id.clone()), position)),
+                    _ => return (TableDriver::Empty, Some(position)),
+                }
+                continue;
             }
-            continue;
+            if table.schema.keyed_by_identity() {
+                match value {
+                    Value::Int64(identity) if *identity >= 1 => {
+                        best = Some((
+                            0,
+                            TableDriver::Id(crate::db::identity_key(*identity)),
+                            position,
+                        ))
+                    }
+                    Value::Int64(_) => return (TableDriver::Empty, Some(position)),
+                    _ => {}
+                }
+                if best.is_some() {
+                    continue;
+                }
+            }
         }
         let ty = table.schema.column(column).expect("resolved column").ty;
         if let Some(value) = coerce_for_lookup(value, ty) {
@@ -74,6 +96,22 @@ pub(super) fn table_driver_at(
     }
     best.map(|(_, driver, position)| (driver, Some(position)))
         .unwrap_or((TableDriver::Scan, None))
+}
+
+/// True when the access path can return at most one row: a physical-id
+/// lookup, or an equality on a column with a unique index. Callers then fetch
+/// a single row and stop, instead of asking for a whole batch and issuing a
+/// second lookup to discover the table has no more matches.
+pub(super) fn driver_yields_at_most_one_row(table: &TableCtx, driver: &TableDriver) -> bool {
+    match driver {
+        TableDriver::Empty | TableDriver::Id(_) => true,
+        TableDriver::Equality(column, _) => table
+            .schema
+            .indexes
+            .iter()
+            .any(|index| index.unique && index.column == *column),
+        TableDriver::Scan => false,
+    }
 }
 
 pub(super) fn has_secondary_index(table: &TableCtx, column: &str) -> bool {

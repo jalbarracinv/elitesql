@@ -178,9 +178,9 @@ fn run(args: Args) -> Result<(), String> {
         let mut transaction = db.begin();
         for row in inserted..end {
             let mut record = Record::new();
-            record.insert("id".into(), Value::Text(format!("d-{row:06}")));
-            record.insert("n".into(), Value::Int64(row as i64));
-            record.insert("embedding".into(), Value::Vector(generator.vector()));
+            record.insert("id", Value::Text(format!("d-{row:06}")));
+            record.insert("n", Value::Int64(row as i64));
+            record.insert("embedding", Value::Vector(generator.vector()));
             transaction
                 .insert("docs", record)
                 .map_err(|error| error.to_string())?;

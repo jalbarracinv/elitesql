@@ -32,6 +32,34 @@ impl<'a> SpillSorter<'a> {
         })
     }
 
+    /// Whether a row with these sort keys can still reach the output.
+    ///
+    /// A bounded sort keeps `keep` rows and discards the rest, but the caller
+    /// had already projected every one of them: `browse` materialises 339
+    /// rows, values and all, to return twenty. Rows arrive in increasing
+    /// sequence and `compare_sorted_rows` breaks key ties by it, so a later
+    /// row whose keys merely tie the worst kept one loses anyway; comparing
+    /// keys alone is therefore exact, not conservative.
+    pub(super) fn may_keep(&self, keys: &[Value]) -> bool {
+        let Some(keep) = self.keep else {
+            return true;
+        };
+        if keep == 0 {
+            return false;
+        }
+        if self.buffer.len() < keep || !self.runs.0.is_empty() {
+            return true;
+        }
+        let worst = &self.buffer[0];
+        for ((candidate, kept), spec) in keys.iter().zip(&worst.keys).zip(&self.specs) {
+            let ord = sort_cmp(candidate, kept, spec.collation);
+            if ord != Ordering::Equal {
+                return if spec.desc { ord.reverse() } else { ord } == Ordering::Less;
+            }
+        }
+        false
+    }
+
     pub(super) fn push(&mut self, row: SortedOutputRow) -> Result<()> {
         crate::query_control::check_current()?;
         if self.keep == Some(0) {

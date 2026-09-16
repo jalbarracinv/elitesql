@@ -9,7 +9,7 @@ fn text_id(record: &Record) -> String {
 
 fn insert_parent(db: &Db, table: &str, label: &str) -> (String, i64) {
     let mut row = Record::new();
-    row.insert("label".into(), Value::Text(label.into()));
+    row.insert("label", Value::Text(label.into()));
     let id = db.insert(table, row).unwrap();
     let record = db.get(table, &id).unwrap().unwrap();
     let Value::Int64(public_id) = record["public_id"] else {
@@ -36,13 +36,13 @@ fn inline_foreign_key_rejects_orphans_and_allows_same_transaction_parent() {
 
     let mut tx = db.begin();
     let mut account = Record::new();
-    account.insert("label".into(), Value::Text("same transaction".into()));
+    account.insert("label", Value::Text("same transaction".into()));
     let account_id = tx.insert("accounts", account).unwrap();
     let account = tx.get("accounts", &account_id).unwrap().unwrap();
     let public_id = account["public_id"].clone();
     let mut doc = Record::new();
-    doc.insert("account_id".into(), public_id);
-    doc.insert("title".into(), Value::Text("valid".into()));
+    doc.insert("account_id", public_id);
+    doc.insert("title", Value::Text("valid".into()));
     tx.insert("docs", doc).unwrap();
     tx.commit().unwrap();
     assert_eq!(db.scan("docs").unwrap().len(), 1);

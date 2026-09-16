@@ -253,9 +253,9 @@ fn base_id(row: usize) -> String {
 
 fn base_record(row: usize) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(base_id(row)));
-    record.insert("value".into(), Value::Int64(row as i64));
-    record.insert("body".into(), Value::Text(BODY.into()));
+    record.insert("id", Value::Text(base_id(row)));
+    record.insert("value", Value::Int64(row as i64));
+    record.insert("body", Value::Text(BODY.into()));
     record
 }
 
@@ -265,23 +265,23 @@ fn work_id(writer: usize, row: usize) -> String {
 
 fn work_record(writer: usize, row: usize) -> Record {
     let mut record = Record::new();
-    record.insert("id".into(), Value::Text(work_id(writer, row)));
-    record.insert("writer".into(), Value::Int64(writer as i64));
-    record.insert("value".into(), Value::Int64(row as i64));
-    record.insert("body".into(), Value::Text(BODY.into()));
+    record.insert("id", Value::Text(work_id(writer, row)));
+    record.insert("writer", Value::Int64(writer as i64));
+    record.insert("value", Value::Int64(row as i64));
+    record.insert("body", Value::Text(BODY.into()));
     record
 }
 
 fn derived_record(writer: usize, row: usize) -> Record {
     let mut record = work_record(writer, row);
     record.insert(
-        "body".into(),
+        "body",
         Value::Text(format!("derived searchable writer {writer} row {row}")),
     );
     let mut vector = vec![0.0f32; VECTOR_DIM];
     vector[writer % VECTOR_DIM] = 1.0;
     vector[(row + 3) % VECTOR_DIM] += 0.25;
-    record.insert("embedding".into(), Value::Vector(vector));
+    record.insert("embedding", Value::Vector(vector));
     record
 }
 
@@ -371,8 +371,8 @@ fn create_workload_fixture(
             .map_err(|error| error.to_string())?;
             let parents = (0..writers).map(|writer| {
                 let mut record = Record::new();
-                record.insert("id".into(), Value::Text(format!("parent-{writer:04}")));
-                record.insert("writer".into(), Value::Int64(writer as i64));
+                record.insert("id", Value::Text(format!("parent-{writer:04}")));
+                record.insert("writer", Value::Int64(writer as i64));
                 record
             });
             db.bulk_insert_sorted("parents", parents)
@@ -576,7 +576,7 @@ fn run(
                             }
                             Workload::Update => {
                                 let mut patch = Record::new();
-                                patch.insert("value".into(), Value::Int64(-(row as i64) - 1));
+                                patch.insert("value", Value::Int64(-(row as i64) - 1));
                                 transaction
                                     .update("work", &work_id(writer, row), patch)
                                     .map_err(|error| error.to_string())?;
@@ -591,22 +591,22 @@ fn run(
                             }
                             Workload::Identity => {
                                 let mut record = Record::new();
-                                record.insert("writer".into(), Value::Int64(writer as i64));
-                                record.insert("value".into(), Value::Int64(row as i64));
-                                record.insert("body".into(), Value::Text(BODY.into()));
+                                record.insert("writer", Value::Int64(writer as i64));
+                                record.insert("value", Value::Int64(row as i64));
+                                record.insert("body", Value::Text(BODY.into()));
                                 transaction
                                     .insert("work", record)
                                     .map_err(|error| error.to_string())?;
                             }
                             Workload::ForeignKey => {
                                 let mut record = Record::new();
-                                record.insert("id".into(), Value::Text(work_id(writer, row)));
+                                record.insert("id", Value::Text(work_id(writer, row)));
                                 record.insert(
-                                    "parent_id".into(),
+                                    "parent_id",
                                     Value::Text(format!("parent-{writer:04}")),
                                 );
-                                record.insert("writer".into(), Value::Int64(writer as i64));
-                                record.insert("value".into(), Value::Int64(row as i64));
+                                record.insert("writer", Value::Int64(writer as i64));
+                                record.insert("value", Value::Int64(row as i64));
                                 transaction
                                     .insert("work", record)
                                     .map_err(|error| error.to_string())?;

@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::collate::Collation;
-use crate::db::{Db, Record, Snapshot, Txn};
+use crate::db::{Db, Record, ScanBatch, ScanCmp, ScanFilter, Snapshot, Txn};
 use crate::error::{Error, Result};
 use crate::memory::MemoryPermit;
 use crate::schema::{TableSchema, ID_COLUMN};
@@ -86,9 +86,11 @@ pub struct QueryCursor<'db> {
     driver: TableDriver,
     batch_rows: usize,
     after_id: Option<String>,
-    batch: std::vec::IntoIter<(String, Record)>,
+    batch: std::vec::IntoIter<Record>,
     predicates: Vec<RExpr>,
     extract: Vec<(usize, String)>,
+    /// Columns the cursor decodes per row (None = whole rows).
+    keep: Option<Vec<String>>,
     columns: Vec<String>,
     offset_remaining: usize,
     limit_remaining: Option<usize>,
@@ -153,7 +155,7 @@ impl QueryCursor<'_> {
             return None;
         }
         loop {
-            if let Some((_, record)) = self.batch.next() {
+            if let Some(record) = self.batch.next() {
                 let row = vec![Some(record)];
                 match eval_all(&row, &self.predicates) {
                     Err(error) => {
@@ -175,7 +177,17 @@ impl QueryCursor<'_> {
 
             self.batch = Vec::new().into_iter();
             self._memory.take();
-            let mut memory = match self.db.acquire_query_memory() {
+            // Each batch takes an execution slot; an idle cursor holds none.
+            let _slot = self.db.statement_slot();
+            // A key-driven batch holds a handful of rows; only a scan can fill
+            // the whole working budget. Reserve accordingly and grow below if
+            // the fetched batch turns out larger.
+            let reservation = match &self.driver {
+                TableDriver::Empty | TableDriver::Id(_) => self.db.query_admission_small_bytes(),
+                TableDriver::Equality(..) => self.db.query_admission_medium_bytes(),
+                TableDriver::Scan => self.db.memory_options().query_working_bytes,
+            };
+            let mut memory = match self.db.acquire_query_memory_bytes(reservation) {
                 Ok(memory) => memory,
                 Err(error) => {
                     self.done = true;
@@ -191,31 +203,49 @@ impl QueryCursor<'_> {
                     .max(1),
                 _ => self.batch_rows,
             };
+            let empty = || ScanBatch {
+                rows: Vec::new(),
+                ids: Vec::new(),
+                next: None,
+            };
+            // One conversion per batch, not per row.
+            let keep: Option<Vec<&str>> = self
+                .keep
+                .as_ref()
+                .map(|names| names.iter().map(String::as_str).collect());
+            let keep = keep.as_deref();
             let batch = match &self.driver {
-                TableDriver::Empty => Ok(Vec::new()),
+                TableDriver::Empty => Ok(empty()),
                 TableDriver::Id(id) if self.after_id.is_none() => self
                     .db
-                    .get_at_unbudgeted(&self.snapshot, &self.table, id)
+                    .get_at_keep_unbudgeted(&self.snapshot, &self.table, id, keep)
                     .map(|record| {
                         record
-                            .map(|record| vec![(id.clone(), record)])
-                            .unwrap_or_default()
+                            .map(|record| ScanBatch {
+                                rows: vec![record],
+                                ids: Vec::new(),
+                                next: Some(id.clone()),
+                            })
+                            .unwrap_or_else(empty)
                     }),
-                TableDriver::Id(_) => Ok(Vec::new()),
-                TableDriver::Equality(column, value) => self.db.find_eq_batch_at_unbudgeted(
+                TableDriver::Id(_) => Ok(empty()),
+                TableDriver::Equality(column, value) => self.db.find_eq_batch_at_keep_unbudgeted(
                     &self.snapshot,
                     &self.table,
                     column,
                     value,
                     self.after_id.as_deref(),
                     fetch,
+                    keep,
+                    false,
                 ),
-                TableDriver::Scan => self.db.scan_batch_at_bytes_unbudgeted(
+                TableDriver::Scan => self.db.scan_batch_at_bytes_keep_unbudgeted(
                     &self.snapshot,
                     &self.table,
                     self.after_id.as_deref(),
                     fetch,
                     (self.db.memory_options().query_working_bytes / 2).max(1),
+                    keep,
                 ),
             };
             let next_batch = match batch {
@@ -225,23 +255,36 @@ impl QueryCursor<'_> {
                     return Some(Err(error));
                 }
             };
-            let Some(last_id) = next_batch.last().map(|(id, _)| id.clone()) else {
+            let Some(last_id) = next_batch.next else {
                 self.done = true;
                 return None;
             };
             let bytes = next_batch
+                .rows
                 .iter()
-                .map(|(id, record)| id.capacity() + record_heap_bytes(record))
+                .map(record_heap_bytes)
                 .sum::<usize>()
-                .saturating_add(next_batch.capacity() * size_of::<(String, Record)>());
+                .saturating_add(next_batch.rows.capacity() * size_of::<Record>());
             if bytes > self.db.memory_options().query_working_bytes {
                 self.done = true;
                 return Some(Err(Error::MemoryLimit("cursor batch exceeds query working memory; lower scan_batch_rows or raise query_working_bytes".into())));
             }
-            memory.shrink_to(bytes);
+            if bytes > memory.bytes() {
+                // The batch outgrew its tier: account for what it really holds.
+                drop(memory);
+                memory = match self.db.acquire_query_memory_bytes(bytes) {
+                    Ok(memory) => memory,
+                    Err(error) => {
+                        self.done = true;
+                        return Some(Err(error));
+                    }
+                };
+            } else {
+                memory.shrink_to(bytes);
+            }
             self._memory = Some(memory);
             self.after_id = Some(last_id);
-            self.batch = next_batch.into_iter();
+            self.batch = next_batch.rows.into_iter();
         }
     }
 }
@@ -337,6 +380,140 @@ pub(crate) fn execute_named_bounded(
     execute_statement(db, statement, statement_timestamp)
 }
 
+/// How much query working memory one autocommit statement reserves.
+///
+/// The per-query budget (`memory.query_working_bytes`) is the spill threshold
+/// of sorts, aggregates and joins, so those reserve it whole. A statement whose
+/// rows are bounded by a key (physical id or unique-index probe), a small
+/// INSERT, DDL and EXPLAIN cannot accumulate more than a few records and take
+/// the small tier; single-table statements driven by an equality on a
+/// non-unique column take the medium tier. Without this, a point lookup held
+/// one of the four 16 MiB operator slots of the default pool and concurrency
+/// collapsed long before the CPU was busy.
+enum AdmissionTier {
+    Small,
+    Medium,
+    Full,
+}
+
+fn admit(db: &Db, tier: AdmissionTier) -> Result<MemoryPermit> {
+    let bytes = match tier {
+        AdmissionTier::Small => db.query_admission_small_bytes(),
+        AdmissionTier::Medium => db.query_admission_medium_bytes(),
+        AdmissionTier::Full => db.memory_options().query_working_bytes,
+    };
+    db.acquire_query_memory_bytes(bytes)
+}
+
+fn admit_statement(db: &Db, statement: &Statement) -> Result<MemoryPermit> {
+    admit(db, statement_tier(db, statement))
+}
+
+/// Tier of a SELECT whose plan is already resolved. Resolving costs a schema
+/// clone and one pass over the WHERE clause, so the executor resolves once and
+/// both admission and execution read that result.
+fn resolved_select_tier(stmt: &SelectStmt, resolved: &ResolvedQuery) -> AdmissionTier {
+    let ResolvedQuery {
+        tables,
+        pushdown,
+        is_aggregate,
+        ..
+    } = resolved;
+    if *is_aggregate || stmt.having.is_some() {
+        return AdmissionTier::Full;
+    }
+    match tables.len() {
+        1 => single_table_driver_tier(&tables[0], &pushdown[0]),
+        2 => {
+            let join = &stmt.joins[0];
+            let (Ok(left), Ok(right)) = (
+                resolve_col(tables, &join.on.0),
+                resolve_col(tables, &join.on.1),
+            ) else {
+                return AdmissionTier::Full;
+            };
+            let new_col = match (left, right) {
+                ((1, column), (0, _)) | ((0, _), (1, column)) => column,
+                _ => return AdmissionTier::Full,
+            };
+            if !join_uses_index_loop(join.kind, &tables[1], &new_col) {
+                return AdmissionTier::Full;
+            }
+            match single_table_driver_tier(&tables[0], &pushdown[0]) {
+                AdmissionTier::Full => AdmissionTier::Full,
+                _ => AdmissionTier::Medium,
+            }
+        }
+        _ => AdmissionTier::Full,
+    }
+}
+
+/// Tier implied by the access path a table's pushed-down predicates select.
+fn single_table_driver_tier(table: &TableCtx, pushdown: &[RExpr]) -> AdmissionTier {
+    match table_driver(table, 0, pushdown) {
+        TableDriver::Empty | TableDriver::Id(_) => AdmissionTier::Small,
+        TableDriver::Equality(column, _) => {
+            if table
+                .schema
+                .indexes
+                .iter()
+                .any(|index| index.unique && index.column == column)
+            {
+                AdmissionTier::Small
+            } else {
+                AdmissionTier::Medium
+            }
+        }
+        TableDriver::Scan => AdmissionTier::Full,
+    }
+}
+
+const SMALL_INSERT_ROWS: usize = 64;
+
+/// Tier of a single-table write, whose executor resolves its own predicates
+/// after the commit path has been entered. The extra schema clone here is
+/// small next to the commit it precedes.
+fn single_table_tier(
+    db: &Db,
+    table: &str,
+    alias: Option<&str>,
+    where_clause: Option<&Expr>,
+) -> AdmissionTier {
+    // Unknown tables and unresolvable predicates fail later with their own
+    // error; reserving the full budget meanwhile is the conservative choice.
+    let Some(schema) = db.table_schema(table) else {
+        return AdmissionTier::Full;
+    };
+    let ctx = TableCtx {
+        schema,
+        label: alias.unwrap_or(table).to_owned(),
+    };
+    let Ok(conjuncts) = resolve_where(std::slice::from_ref(&ctx), where_clause) else {
+        return AdmissionTier::Full;
+    };
+    single_table_driver_tier(&ctx, &conjuncts)
+}
+
+fn statement_tier(db: &Db, statement: &Statement) -> AdmissionTier {
+    match statement {
+        Statement::Insert { rows, .. } if rows.len() <= SMALL_INSERT_ROWS => AdmissionTier::Small,
+        Statement::Insert { .. } => AdmissionTier::Full,
+        Statement::Update {
+            table,
+            where_clause,
+            ..
+        }
+        | Statement::Delete {
+            table,
+            where_clause,
+        } => single_table_tier(db, table, None, where_clause.as_ref()),
+        // SELECT is admitted from its resolved plan (`resolved_select_tier`).
+        Statement::Select(_) => AdmissionTier::Full,
+        // DDL is accounted by the maintenance pool; EXPLAIN reads no rows.
+        _ => AdmissionTier::Small,
+    }
+}
+
 fn cap_select_rows(statement: &mut Statement, max_rows: usize) {
     let Statement::Select(select) = statement else {
         return;
@@ -421,6 +598,15 @@ fn execute_statement(
     statement: Statement,
     statement_timestamp: i64,
 ) -> Result<QueryOutput> {
+    // A SELECT resolves its plan once and admits from it; everything else
+    // derives its tier from the statement alone.
+    if let Statement::Select(stmt) = &statement {
+        let _slot = db.statement_slot();
+        let resolved = resolve_query(db, stmt)?;
+        let _memory = admit(db, resolved_select_tier(stmt, &resolved))?;
+        return exec_select_resolved(db, stmt, resolved);
+    }
+    let _memory = admit_statement(db, &statement)?;
     match statement {
         Statement::CreateTable { name, columns } => {
             let mut cols = Vec::with_capacity(columns.len());
@@ -612,7 +798,8 @@ fn execute_cursor_with<'db>(
     sql: &str,
     params: SuppliedParams<'_>,
 ) -> Result<QueryCursor<'db>> {
-    let _memory_permit = db.acquire_query_memory()?;
+    // Memory is reserved per batch by `next_batch`, sized by the access path;
+    // parsing and planning hold no query permit.
     let statement_timestamp = current_timestamp_micros()?;
     let mut statement = parser::parse_cached(sql)?;
     bind_statement(&mut statement, params, statement_timestamp)?;
@@ -658,7 +845,12 @@ fn execute_cursor_with<'db>(
     if let Some(expr) = &stmt.where_clause {
         collect_conjuncts(resolve_expr(&tables, expr)?, &mut predicates);
     }
-    let (columns, extract) = projection_plan(&tables, &stmt.projection)?;
+    let (columns, extract) = owned_projection_plan(&tables, &stmt.projection)?;
+    // The cursor outlives the statement its plan came from, so it is the one
+    // caller that has to own the names; taken here, before the statement and
+    // the predicates are moved into it.
+    let keep: Option<Vec<String>> = needed_columns(&tables, 0, &stmt, &[&predicates], &[])
+        .map(|names| names.into_iter().map(str::to_owned).collect());
     let memory = db.memory_options();
     let batch_rows = memory
         .scan_batch_rows
@@ -674,6 +866,7 @@ fn execute_cursor_with<'db>(
         batch: Vec::new().into_iter(),
         predicates,
         extract,
+        keep,
         columns,
         offset_remaining: limit_to_usize(stmt.offset.as_ref()).unwrap_or(0),
         limit_remaining: limit_to_usize(stmt.limit.as_ref()),
@@ -880,7 +1073,7 @@ impl Binder<'_> {
                 let unused: Vec<_> = values
                     .keys()
                     .filter(|name| !self.named_used.contains(*name))
-                    .cloned()
+                    .map(str::to_owned)
                     .collect();
                 if unused.is_empty() {
                     Ok(())
@@ -973,16 +1166,30 @@ enum RExpr {
 }
 
 struct TableCtx {
-    schema: TableSchema,
+    /// Shared with the catalog: resolving a statement must not copy a table's
+    /// whole definition before it can look at a column.
+    schema: Arc<TableSchema>,
     label: String,
 }
 
 fn resolve_col(tables: &[TableCtx], cref: &ColumnRef) -> Result<(usize, String)> {
+    let (index, name) = resolve_col_ref(tables, cref)?;
+    Ok((index, name.to_owned()))
+}
+
+/// `resolve_col` without copying the name.
+///
+/// The name is already in the parsed statement, which outlives the statement's
+/// execution, so a plan that only reads it can borrow. Copying it here, again
+/// into the projection and again into the column list a reader needs cost
+/// three allocations per projected column on every execution of a statement
+/// whose parse was already cached.
+fn resolve_col_ref<'a>(tables: &[TableCtx], cref: &'a ColumnRef) -> Result<(usize, &'a str)> {
     if let Some(q) = &cref.table {
         for (i, t) in tables.iter().enumerate() {
             if t.label.eq_ignore_ascii_case(q) || t.schema.name.eq_ignore_ascii_case(q) {
                 check_col(&t.schema, &cref.column)?;
-                return Ok((i, cref.column.clone()));
+                return Ok((i, cref.column.as_str()));
             }
         }
         return Err(Error::Sql(format!("unknown table or alias '{q}'")));
@@ -1000,7 +1207,7 @@ fn resolve_col(tables: &[TableCtx], cref: &ColumnRef) -> Result<(usize, String)>
         }
     }
     match found {
-        Some(i) => Ok((i, cref.column.clone())),
+        Some(i) => Ok((i, cref.column.as_str())),
         None => Err(Error::Sql(format!("unknown column '{}'", cref.column))),
     }
 }
@@ -1264,6 +1471,100 @@ fn collect_conjuncts(e: RExpr, out: &mut Vec<RExpr>) {
     }
 }
 
+/// Columns of table `ti` that a resolved predicate reads.
+fn columns_referenced<'a>(e: &'a RExpr, ti: usize, out: &mut Vec<&'a str>) {
+    let mut add = |name: &'a str| {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    };
+    match e {
+        RExpr::Cmp { left, right, .. } => {
+            for rv in [left, right] {
+                if let RVal::Col(index, name) = rv {
+                    if *index == ti {
+                        add(name);
+                    }
+                }
+            }
+        }
+        RExpr::IsNull { col, .. } | RExpr::InList { col, .. } => {
+            if col.0 == ti {
+                add(col.1.as_str());
+            }
+        }
+        RExpr::And(a, b) | RExpr::Or(a, b) => {
+            columns_referenced(a, ti, out);
+            columns_referenced(b, ti, out);
+        }
+        RExpr::Not(inner) => columns_referenced(inner, ti, out),
+    }
+}
+
+/// The columns of table `ti` a SELECT reads (projection, predicates, ORDER
+/// BY, GROUP BY, aggregate arguments), or `None` when it needs whole rows
+/// (`SELECT *`, HAVING). Rows are then decoded with only these columns, so a
+/// page of a wide table skips its text and vector payloads.
+/// Which columns of table `ti` a statement actually reads, or `None` when it
+/// needs them all.
+///
+/// The names are borrowed from the parsed statement and the shared schema,
+/// both of which outlive the statement's execution. Copying them here cost an
+/// allocation per referenced column on every execution.
+fn needed_columns<'a>(
+    tables: &'a [TableCtx],
+    ti: usize,
+    stmt: &'a SelectStmt,
+    conjunct_sets: &[&'a [RExpr]],
+    extra: &[&'a str],
+) -> Option<Vec<&'a str>> {
+    if stmt.having.is_some() {
+        return None;
+    }
+    let mut out: Vec<&'a str> = Vec::new();
+    let add = |name: &'a str, out: &mut Vec<&'a str>| {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    };
+    for item in &stmt.projection {
+        match item {
+            SelectItem::Star => return None,
+            SelectItem::Column { col, .. } => match resolve_col_ref(tables, col) {
+                Ok((index, name)) if index == ti => add(name, &mut out),
+                Ok(_) => {}
+                Err(_) => return None,
+            },
+            SelectItem::Aggregate { arg: Some(col), .. } => match resolve_col_ref(tables, col) {
+                Ok((index, name)) if index == ti => add(name, &mut out),
+                Ok(_) => {}
+                Err(_) => return None,
+            },
+            SelectItem::Aggregate { arg: None, .. } => {}
+        }
+    }
+    for col in stmt
+        .group_by
+        .iter()
+        .chain(stmt.order_by.iter().map(|key| &key.column))
+    {
+        match resolve_col_ref(tables, col) {
+            Ok((index, name)) if index == ti => add(name, &mut out),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    for conjuncts in conjunct_sets {
+        for conjunct in *conjuncts {
+            columns_referenced(conjunct, ti, &mut out);
+        }
+    }
+    for name in extra {
+        add(name, &mut out);
+    }
+    Some(out)
+}
+
 fn tables_referenced(e: &RExpr, out: &mut Vec<usize>) {
     match e {
         RExpr::Cmp { left, right, .. } => {
@@ -1339,7 +1640,7 @@ fn fetch_table(db: &Db, ctx: &TableCtx, ti: usize, conjuncts: &[RExpr]) -> Resul
     // Apply every conjunct (re-checking the driving one is harmless).
     let mut out = Vec::with_capacity(rows.len());
     for (id, mut r) in rows {
-        r.insert(PHYSICAL_ROW_ID.into(), Value::Text(id));
+        r.insert(PHYSICAL_ROW_ID, Value::Text(id));
         let row: ExecRow = single_row(ti, r);
         if eval_all(&row, conjuncts)? {
             out.push(take_single(row, ti));
@@ -1466,7 +1767,7 @@ fn record_heap_bytes(record: &Record) -> usize {
     size_of::<Record>()
         + record
             .iter()
-            .map(|(name, value)| name.capacity() + value_heap_bytes(value))
+            .map(|(name, value)| name.len() + value_heap_bytes(value))
             .sum::<usize>()
 }
 
@@ -1610,7 +1911,14 @@ impl SpillFrameReader {
     }
 }
 
-type ProjectionPlan = (Vec<String>, Vec<(usize, String)>);
+/// Output column names, and where each projected value comes from.
+///
+/// The second half borrows its names: for `SELECT a, b` they live in the
+/// parsed statement, for `SELECT *` in the table's shared schema, and both
+/// outlive a statement's execution. Only [`QueryCursor`], which outlives the
+/// statement that built it, needs the owning form.
+type ProjectionPlan<'a> = (Vec<String>, Vec<(usize, &'a str)>);
+type OwnedProjectionPlan = (Vec<String>, Vec<(usize, String)>);
 
 fn implicit_id_and_declared_columns(schema: &TableSchema) -> Vec<String> {
     let mut columns =
@@ -1622,7 +1930,25 @@ fn implicit_id_and_declared_columns(schema: &TableSchema) -> Vec<String> {
     columns
 }
 
-fn projection_plan(tables: &[TableCtx], projection: &[SelectItem]) -> Result<ProjectionPlan> {
+/// `projection_plan` for a caller that keeps the plan past the statement.
+fn owned_projection_plan(
+    tables: &[TableCtx],
+    projection: &[SelectItem],
+) -> Result<OwnedProjectionPlan> {
+    let (columns, extract) = projection_plan(tables, projection)?;
+    Ok((
+        columns,
+        extract
+            .into_iter()
+            .map(|(ti, name)| (ti, name.to_owned()))
+            .collect(),
+    ))
+}
+
+fn projection_plan<'a>(
+    tables: &'a [TableCtx],
+    projection: &'a [SelectItem],
+) -> Result<ProjectionPlan<'a>> {
     let single = tables.len() == 1;
     let mut columns = Vec::new();
     let mut extract = Vec::new();
@@ -1637,17 +1963,17 @@ fn projection_plan(tables: &[TableCtx], projection: &[SelectItem]) -> Result<Pro
                     };
                     if table.schema.has_implicit_id() {
                         columns.push(format!("{prefix}id"));
-                        extract.push((ti, "id".into()));
+                        extract.push((ti, ID_COLUMN));
                     }
                     for column in &table.schema.columns {
                         columns.push(format!("{prefix}{}", column.name));
-                        extract.push((ti, column.name.clone()));
+                        extract.push((ti, column.name.as_str()));
                     }
                 }
             }
             SelectItem::Column { col, alias } => {
-                let (ti, name) = resolve_col(tables, col)?;
-                columns.push(alias.clone().unwrap_or_else(|| name.clone()));
+                let (ti, name) = resolve_col_ref(tables, col)?;
+                columns.push(alias.clone().unwrap_or_else(|| name.to_owned()));
                 extract.push((ti, name));
             }
             SelectItem::Aggregate { .. } => {
@@ -1660,13 +1986,95 @@ fn projection_plan(tables: &[TableCtx], projection: &[SelectItem]) -> Result<Pro
     Ok((columns, extract))
 }
 
-fn project_row(row: &ExecRow, extract: &[(usize, String)]) -> Vec<Value> {
+fn project_row(row: &ExecRow, extract: &[(usize, impl AsRef<str>)]) -> Vec<Value> {
     extract
         .iter()
-        .map(|(ti, col)| col_value(row, *ti, col))
+        .map(|(ti, col)| col_value(row, *ti, col.as_ref()))
         .collect()
 }
 
+/// `project_row` for a row the caller is about to drop: the values move out
+/// instead of being cloned. Only valid when no column is projected twice,
+/// which `extract_projects_each_column_once` decides once per statement.
+fn project_row_owned(row: &mut ExecRow, extract: &[(usize, impl AsRef<str>)]) -> Vec<Value> {
+    extract
+        .iter()
+        .map(|(ti, col)| {
+            row.get_mut(*ti)
+                .and_then(|record| record.as_mut())
+                .and_then(|record| record.take(col.as_ref()))
+                .unwrap_or(Value::Null)
+        })
+        .collect()
+}
+
+/// Whether every `(table, column)` in the projection appears once. A column
+/// projected twice (`SELECT name, name`) would see NULL the second time if
+/// the first emission had moved the value out.
+fn extract_projects_each_column_once(extract: &[(usize, impl AsRef<str>)]) -> bool {
+    extract.iter().enumerate().all(|(at, entry)| {
+        !extract[..at]
+            .iter()
+            .any(|earlier| earlier.0 == entry.0 && earlier.1.as_ref() == entry.1.as_ref())
+    })
+}
+
+/// The first `column <op> literal` conjunct a scan can decide on encoded rows
+/// (numeric column against a numeric literal); see `ScanFilter`. Every
+/// conjunct is still evaluated on the decoded row afterwards.
+fn scan_filter_from(table: &TableCtx, ti: usize, predicates: &[RExpr]) -> Option<ScanFilter> {
+    for predicate in predicates {
+        let RExpr::Cmp { left, op, right } = predicate else {
+            continue;
+        };
+        let (column, value, flipped) = match (left, right) {
+            (RVal::Col(index, column), RVal::Val(value)) if *index == ti => (column, value, false),
+            (RVal::Val(value), RVal::Col(index, column)) if *index == ti => (column, value, true),
+            _ => continue,
+        };
+        let numeric_column = matches!(
+            table.schema.column(column).map(|c| c.ty),
+            Some(ColumnType::Int64 | ColumnType::Float64 | ColumnType::Timestamp)
+        );
+        let numeric_value = matches!(
+            value,
+            Value::Int64(_) | Value::Float64(_) | Value::Timestamp(_)
+        );
+        if !numeric_column || !numeric_value {
+            continue;
+        }
+        let op = match (op, flipped) {
+            (CmpOp::Eq, _) => ScanCmp::Eq,
+            (CmpOp::Neq, _) => ScanCmp::Ne,
+            (CmpOp::Lt, false) | (CmpOp::Gt, true) => ScanCmp::Lt,
+            (CmpOp::Le, false) | (CmpOp::Ge, true) => ScanCmp::Le,
+            (CmpOp::Gt, false) | (CmpOp::Lt, true) => ScanCmp::Gt,
+            (CmpOp::Ge, false) | (CmpOp::Le, true) => ScanCmp::Ge,
+        };
+        return Some(ScanFilter {
+            column: column.clone(),
+            op,
+            value: value.clone(),
+        });
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+/// An empty batch: no rows, no ids, and no cursor to resume from.
+fn empty_batch() -> ScanBatch {
+    ScanBatch {
+        rows: Vec::new(),
+        ids: Vec::new(),
+        next: None,
+    }
+}
+
+/// One batch of rows for the driven table, with the cursor to resume after.
+/// The rows do not carry their ids: a SELECT resumes past the last of them
+/// and reads none of the others, so allocating one `String` per row bought
+/// nothing (see `reads::ScanBatch`).
+#[allow(clippy::too_many_arguments)]
 fn driven_batch(
     db: &Db,
     snapshot: &Snapshot,
@@ -1674,24 +2082,46 @@ fn driven_batch(
     driver: &TableDriver,
     after_id: Option<&str>,
     limit: usize,
-) -> Result<Vec<(String, Record)>> {
+    filter: Option<&ScanFilter>,
+    keep: Option<&[&str]>,
+) -> Result<ScanBatch> {
+    let empty = || ScanBatch {
+        rows: Vec::new(),
+        ids: Vec::new(),
+        next: None,
+    };
     match driver {
-        TableDriver::Empty => Ok(Vec::new()),
+        TableDriver::Empty => Ok(empty()),
         TableDriver::Id(id) => {
             if id.is_empty() || after_id.is_some() {
-                return Ok(Vec::new());
+                return Ok(empty());
             }
             Ok(db
-                .get_at_unbudgeted(snapshot, &table.schema.name, id)?
-                .map(|record| vec![(id.clone(), record)])
-                .unwrap_or_default())
+                .get_at_keep_unbudgeted(snapshot, &table.schema.name, id, keep)?
+                .map(|record| ScanBatch {
+                    rows: vec![record],
+                    ids: Vec::new(),
+                    next: Some(id.clone()),
+                })
+                .unwrap_or_else(empty))
         }
-        TableDriver::Equality(column, value) => {
-            db.find_eq_batch_unbudgeted(&table.schema.name, column, value, after_id, limit)
-        }
-        TableDriver::Scan => {
-            db.scan_batch_at_unbudgeted(snapshot, &table.schema.name, after_id, limit)
-        }
+        TableDriver::Equality(column, value) => db.find_eq_batch_keep_unbudgeted(
+            &table.schema.name,
+            column,
+            value,
+            after_id,
+            limit,
+            keep,
+            false,
+        ),
+        TableDriver::Scan => db.scan_batch_at_filtered_unbudgeted(
+            snapshot,
+            &table.schema.name,
+            after_id,
+            limit,
+            filter,
+            keep,
+        ),
     }
 }
 
@@ -1752,37 +2182,65 @@ fn exec_single_table_select(
     // pending, a bounded query needs at most `offset + limit` rows in total.
     // The last batch is trimmed to that remainder instead of decoding a full
     // batch and discarding most of it; the predicates are still re-checked.
+    let scan_filter = scan_filter_from(&tables[0], 0, pushed);
+    let keep = needed_columns(tables, 0, stmt, &[pushed, residual], &[]);
     let driver_is_exact = residual.is_empty()
         && (pushed.is_empty()
             || (pushed.len() == 1 && matches!(driver, TableDriver::Equality(..))));
     let needed_total = limit.map(|n| offset.saturating_add(n));
+    let single_row = driver_yields_at_most_one_row(&tables[0], &driver);
+    // Each row of this loop is projected once and dropped, so the projection
+    // can move its values out rather than copy them.
+    let consume = extract_projects_each_column_once(&extract);
     let mut row: ExecRow = vec![None];
 
     loop {
         let fetch = match needed_total {
+            _ if single_row => 1,
             Some(total) if driver_is_exact && sorter.is_none() => batch_rows
                 .min(total.saturating_sub(skipped + out.len()))
                 .max(1),
             _ => batch_rows,
         };
-        let batch = driven_batch(db, &snapshot, &tables[0], &driver, cursor.as_deref(), fetch)?;
-        let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
+        let batch = driven_batch(
+            db,
+            &snapshot,
+            &tables[0],
+            &driver,
+            cursor.as_deref(),
+            fetch,
+            scan_filter.as_ref(),
+            keep.as_deref(),
+        )?;
+        let Some(next) = batch.next else {
             break;
         };
-        cursor = Some(last_id);
-        for (_, record) in batch {
+        cursor = Some(next);
+        for record in batch.rows {
             row[0] = Some(record);
             if !eval_all(&row, pushed)? || !eval_all(&row, residual)? {
                 continue;
             }
             if let Some(sorter) = sorter.as_mut() {
-                let keys = order_keys
+                // The sort keys are read before the projection moves anything.
+                let keys: Vec<Value> = order_keys
                     .iter()
                     .map(|((ti, col), _)| col_value(&row, *ti, col))
                     .collect();
+                // A bounded sort discards most of what a wide match produces,
+                // so ask before paying to materialise the row.
+                if !sorter.may_keep(&keys) {
+                    sequence = sequence.saturating_add(1);
+                    continue;
+                }
+                let values = if consume {
+                    project_row_owned(&mut row, &extract)
+                } else {
+                    project_row(&row, &extract)
+                };
                 sorter.push(SortedOutputRow {
                     keys,
-                    values: project_row(&row, &extract),
+                    values,
                     sequence,
                 })?;
                 sequence = sequence.saturating_add(1);
@@ -1792,10 +2250,19 @@ fn exec_single_table_select(
                 skipped += 1;
                 continue;
             }
-            out.push(project_row(&row, &extract));
+            out.push(if consume {
+                project_row_owned(&mut row, &extract)
+            } else {
+                project_row(&row, &extract)
+            });
             if limit.is_some_and(|n| out.len() == n) {
                 return Ok(QueryOutput::Rows { columns, rows: out });
             }
+        }
+        // A unique key cannot have more matches, so the loop does not ask
+        // again just to receive an empty batch.
+        if single_row {
+            break;
         }
     }
 
@@ -1811,10 +2278,11 @@ fn visit_single_table_rows(
     table: &TableCtx,
     pushed: &[RExpr],
     residual: &[RExpr],
+    keep: Option<&[&str]>,
     mut visit: impl FnMut(&ExecRow) -> Result<()>,
 ) -> Result<()> {
     let snapshot = db.snapshot();
-    visit_single_table_rows_at(db, &snapshot, table, pushed, residual, |row| {
+    visit_single_table_rows_at(db, &snapshot, table, pushed, residual, keep, |row| {
         visit(row).map(|()| true)
     })
 }
@@ -1828,6 +2296,7 @@ fn visit_single_table_rows_at(
     table: &TableCtx,
     pushed: &[RExpr],
     residual: &[RExpr],
+    keep: Option<&[&str]>,
     mut visit: impl FnMut(&ExecRow) -> Result<bool>,
 ) -> Result<()> {
     let memory = db.memory_options();
@@ -1835,19 +2304,34 @@ fn visit_single_table_rows_at(
         .scan_batch_rows
         .min((memory.query_working_bytes / 1024).max(1));
     let driver = table_driver(table, 0, pushed);
+    let filter = scan_filter_from(table, 0, pushed);
+    let single_row = driver_yields_at_most_one_row(table, &driver);
     let mut cursor: Option<String> = None;
     let mut row: ExecRow = vec![None];
     loop {
-        let batch = driven_batch(db, snapshot, table, &driver, cursor.as_deref(), batch_rows)?;
-        let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
+        let batch = driven_batch(
+            db,
+            snapshot,
+            table,
+            &driver,
+            cursor.as_deref(),
+            if single_row { 1 } else { batch_rows },
+            filter.as_ref(),
+            keep,
+        )?;
+        let Some(next) = batch.next else {
             return Ok(());
         };
-        cursor = Some(last_id);
-        for (_, record) in batch {
+        cursor = Some(next);
+        let last_batch = single_row;
+        for record in batch.rows {
             row[0] = Some(record);
             if eval_all(&row, pushed)? && eval_all(&row, residual)? && !visit(&row)? {
                 return Ok(());
             }
+        }
+        if last_batch {
+            return Ok(());
         }
     }
 }
@@ -1857,6 +2341,7 @@ fn visit_table_records(
     table: &TableCtx,
     ti: usize,
     predicates: &[RExpr],
+    keep: Option<&[&str]>,
     mut visit: impl FnMut(Record) -> Result<()>,
 ) -> Result<()> {
     let memory = db.memory_options();
@@ -1865,18 +2350,32 @@ fn visit_table_records(
         .min((memory.query_working_bytes / 1024).max(1));
     let snapshot = db.snapshot();
     let driver = table_driver(table, ti, predicates);
+    let filter = scan_filter_from(table, ti, predicates);
+    let at_most_one = driver_yields_at_most_one_row(table, &driver);
     let mut cursor: Option<String> = None;
     loop {
-        let batch = driven_batch(db, &snapshot, table, &driver, cursor.as_deref(), batch_rows)?;
-        let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
+        let batch = driven_batch(
+            db,
+            &snapshot,
+            table,
+            &driver,
+            cursor.as_deref(),
+            if at_most_one { 1 } else { batch_rows },
+            filter.as_ref(),
+            keep,
+        )?;
+        let Some(next) = batch.next else {
             return Ok(());
         };
-        cursor = Some(last_id);
-        for (_, record) in batch {
+        cursor = Some(next);
+        for record in batch.rows {
             let row = single_row(ti, record);
             if eval_all(&row, predicates)? {
                 visit(take_single(row, ti))?;
             }
+        }
+        if at_most_one {
+            return Ok(());
         }
     }
 }
@@ -1943,6 +2442,19 @@ fn exec_single_indexed_join_select(
         .min((memory.query_working_bytes / 1024).max(1));
     let snapshot = db.snapshot();
     let left_driver = table_driver(&tables[0], 0, &pushdown[0]);
+    let left_filter = scan_filter_from(&tables[0], 0, &pushdown[0]);
+    let left_single_row = driver_yields_at_most_one_row(&tables[0], &left_driver);
+    // A probe through a unique index (or the physical id) matches at most one
+    // row, so the loop below fetches one and stops instead of asking for a
+    // batch and then issuing a second lookup to find the page empty.
+    let probe_single_row = (fresh.1 == ID_COLUMN && tables[1].schema.has_implicit_id())
+        || tables[1]
+            .schema
+            .indexes
+            .iter()
+            .any(|index| index.unique && index.column == fresh.1);
+    let left_keep = needed_columns(tables, 0, stmt, &[&pushdown[0], residual], &[&existing.1]);
+    let right_keep = needed_columns(tables, 1, stmt, &[&pushdown[1], residual], &[&fresh.1]);
     let mut left_cursor: Option<String> = None;
     let mut output = Vec::new();
     let mut skipped = 0usize;
@@ -1956,13 +2468,15 @@ fn exec_single_indexed_join_select(
             &tables[0],
             &left_driver,
             left_cursor.as_deref(),
-            batch_rows,
+            if left_single_row { 1 } else { batch_rows },
+            left_filter.as_ref(),
+            left_keep.as_deref(),
         )?;
-        let Some(last_id) = batch.last().map(|(id, _)| id.clone()) else {
+        let Some(next) = batch.next else {
             break;
         };
-        left_cursor = Some(last_id);
-        for (_, left_record) in batch {
+        left_cursor = Some(next);
+        for left_record in batch.rows {
             let mut left_row = vec![Some(left_record)];
             if !eval_all(&left_row, &pushdown[0])? {
                 continue;
@@ -1972,16 +2486,25 @@ fn exec_single_indexed_join_select(
             let mut right_cursor: Option<String> = None;
             loop {
                 let matches = if key.is_null() {
-                    Vec::new()
+                    empty_batch()
                 } else if fresh.1 == ID_COLUMN && tables[1].schema.has_implicit_id() {
                     if right_cursor.is_some() {
-                        Vec::new()
+                        empty_batch()
                     } else if let Value::Text(id) = &key {
-                        db.get_at_unbudgeted(&snapshot, &tables[1].schema.name, id)?
-                            .map(|record| vec![(id.clone(), record)])
-                            .unwrap_or_default()
+                        db.get_at_keep_unbudgeted(
+                            &snapshot,
+                            &tables[1].schema.name,
+                            id,
+                            right_keep.as_deref(),
+                        )?
+                        .map(|record| ScanBatch {
+                            rows: vec![record],
+                            ids: Vec::new(),
+                            next: Some(id.clone()),
+                        })
+                        .unwrap_or_else(empty_batch)
                     } else {
-                        Vec::new()
+                        empty_batch()
                     }
                 } else {
                     let ty = tables[1]
@@ -1990,21 +2513,23 @@ fn exec_single_indexed_join_select(
                         .expect("resolved column")
                         .ty;
                     match coerce_for_lookup(&key, ty) {
-                        Some(value) => db.find_eq_batch_unbudgeted(
+                        Some(value) => db.find_eq_batch_keep_unbudgeted(
                             &tables[1].schema.name,
                             &fresh.1,
                             &value,
                             right_cursor.as_deref(),
-                            batch_rows,
+                            if probe_single_row { 1 } else { batch_rows },
+                            right_keep.as_deref(),
+                            false,
                         )?,
-                        None => Vec::new(),
+                        None => empty_batch(),
                     }
                 };
-                let Some(last_right_id) = matches.last().map(|(id, _)| id.clone()) else {
+                let Some(next_right) = matches.next else {
                     break;
                 };
-                right_cursor = Some(last_right_id);
-                for (_, right_record) in matches {
+                right_cursor = Some(next_right);
+                for right_record in matches.rows {
                     let mut row = vec![None, Some(right_record)];
                     if !eval_all(&row, &pushdown[1])? {
                         continue;
@@ -2042,7 +2567,7 @@ fn exec_single_indexed_join_select(
                         break;
                     }
                 }
-                if complete || (fresh.1 == ID_COLUMN && tables[1].schema.has_implicit_id()) {
+                if complete || probe_single_row {
                     break;
                 }
             }
@@ -2074,6 +2599,11 @@ fn exec_single_indexed_join_select(
                     }
                 }
             }
+        }
+        // `complete` also means "stop emitting rows" inside the join above, so
+        // exhausting a unique-key left side is a separate condition.
+        if left_single_row {
+            break;
         }
     }
 
@@ -2150,12 +2680,21 @@ fn resolve_query(db: &Db, stmt: &SelectStmt) -> Result<ResolvedQuery> {
 }
 
 fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
+    let resolved = resolve_query(db, stmt)?;
+    exec_select_resolved(db, stmt, resolved)
+}
+
+fn exec_select_resolved(
+    db: &Db,
+    stmt: &SelectStmt,
+    resolved: ResolvedQuery,
+) -> Result<QueryOutput> {
     let ResolvedQuery {
         tables,
         pushdown,
         residual,
         is_aggregate,
-    } = resolve_query(db, stmt)?;
+    } = resolved;
 
     if tables.len() == 1 {
         if is_aggregate {
@@ -2748,6 +3287,7 @@ fn hash_aggregate_single_table(
     group_cols: &[(usize, String)],
     specs: &[AggSpec],
     budget: usize,
+    keep: Option<&[&str]>,
 ) -> Result<Option<Vec<HashedGroup>>> {
     let mut slots: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut groups: Vec<HashedGroup> = Vec::new();
@@ -2755,7 +3295,7 @@ fn hash_aggregate_single_table(
     let mut bytes = 0usize;
     let mut sequence = 0u64;
     let mut within_budget = true;
-    visit_single_table_rows_at(db, snapshot, table, pushed, residual, |row| {
+    visit_single_table_rows_at(db, snapshot, table, pushed, residual, keep, |row| {
         key.clear();
         for (ti, column) in group_cols {
             encode_value(&mut key, col_value_ref(row, *ti, column));
@@ -2824,6 +3364,7 @@ fn exec_single_table_aggregate(
         having,
     } = aggregate_plan(tables, stmt)?;
     let order_positions = aggregate_order_positions(stmt, &headers)?;
+    let agg_keep = needed_columns(tables, 0, stmt, &[pushed, residual], &[]);
     let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
     let limit = limit_to_usize(stmt.limit.as_ref());
     let output_specs = if order_positions.is_empty() {
@@ -2845,29 +3386,36 @@ fn exec_single_table_aggregate(
             // bounded by the query spill budget instead of a RAM hash set.
             let mut distinct_sorter = SpillSorter::new(db, vec![SortSpec::ascending()], None)?;
             let mut sequence = 0u64;
-            visit_single_table_rows(db, &tables[0], pushed, residual, |row| {
-                for (index, spec) in specs.iter().enumerate() {
-                    if spec.distinct {
-                        let (table_index, column) =
-                            spec.arg.as_ref().expect("DISTINCT has an argument");
-                        let value = col_value(row, *table_index, column);
-                        if value.is_null() {
-                            continue;
+            visit_single_table_rows(
+                db,
+                &tables[0],
+                pushed,
+                residual,
+                agg_keep.as_deref(),
+                |row| {
+                    for (index, spec) in specs.iter().enumerate() {
+                        if spec.distinct {
+                            let (table_index, column) =
+                                spec.arg.as_ref().expect("DISTINCT has an argument");
+                            let value = col_value(row, *table_index, column);
+                            if value.is_null() {
+                                continue;
+                            }
+                            let mut key = (index as u64).to_be_bytes().to_vec();
+                            encode_value(&mut key, &value);
+                            distinct_sorter.push(SortedOutputRow {
+                                keys: vec![Value::Blob(key.clone())],
+                                values: vec![Value::Int64(index as i64)],
+                                sequence,
+                            })?;
+                            sequence = sequence.saturating_add(1);
+                        } else {
+                            states[index].update(spec, row)?;
                         }
-                        let mut key = (index as u64).to_be_bytes().to_vec();
-                        encode_value(&mut key, &value);
-                        distinct_sorter.push(SortedOutputRow {
-                            keys: vec![Value::Blob(key.clone())],
-                            values: vec![Value::Int64(index as i64)],
-                            sequence,
-                        })?;
-                        sequence = sequence.saturating_add(1);
-                    } else {
-                        states[index].update(spec, row)?;
                     }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             let mut previous: Option<Vec<u8>> = None;
             let mut counts = vec![0u64; specs.len()];
             distinct_sorter.for_each_sorted(0, None, |row| {
@@ -2889,12 +3437,19 @@ fn exec_single_table_aggregate(
                 }
             }
         } else {
-            visit_single_table_rows(db, &tables[0], pushed, residual, |row| {
-                for (index, spec) in specs.iter().enumerate() {
-                    states[index].update(spec, row)?;
-                }
-                Ok(())
-            })?;
+            visit_single_table_rows(
+                db,
+                &tables[0],
+                pushed,
+                residual,
+                agg_keep.as_deref(),
+                |row| {
+                    for (index, spec) in specs.iter().enumerate() {
+                        states[index].update(spec, row)?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
         queue_aggregate_group(
             &mut output_sorter,
@@ -2918,6 +3473,7 @@ fn exec_single_table_aggregate(
             &group_cols,
             &specs,
             budget,
+            agg_keep.as_deref(),
         )? {
             for group in groups {
                 queue_aggregate_group(
@@ -2939,32 +3495,40 @@ fn exec_single_table_aggregate(
 
         let mut input_sorter = SpillSorter::new(db, vec![SortSpec::ascending()], None)?;
         let mut sequence = 0u64;
-        visit_single_table_rows_at(db, &snapshot, &tables[0], pushed, residual, |row| {
-            let group_values: Vec<Value> = group_cols
-                .iter()
-                .map(|(ti, column)| col_value(row, *ti, column))
-                .collect();
-            let mut encoded_key = Vec::new();
-            for value in &group_values {
-                encode_value(&mut encoded_key, value);
-            }
-            let mut values = Vec::with_capacity(1 + group_values.len() + specs.len());
-            values.push(Value::Blob(encoded_key.clone()));
-            values.extend(group_values);
-            values.extend(specs.iter().map(|spec| {
-                spec.arg
-                    .as_ref()
+        visit_single_table_rows_at(
+            db,
+            &snapshot,
+            &tables[0],
+            pushed,
+            residual,
+            agg_keep.as_deref(),
+            |row| {
+                let group_values: Vec<Value> = group_cols
+                    .iter()
                     .map(|(ti, column)| col_value(row, *ti, column))
-                    .unwrap_or(Value::Null)
-            }));
-            input_sorter.push(SortedOutputRow {
-                keys: vec![Value::Blob(encoded_key)],
-                values,
-                sequence,
-            })?;
-            sequence = sequence.saturating_add(1);
-            Ok(true)
-        })?;
+                    .collect();
+                let mut encoded_key = Vec::new();
+                for value in &group_values {
+                    encode_value(&mut encoded_key, value);
+                }
+                let mut values = Vec::with_capacity(1 + group_values.len() + specs.len());
+                values.push(Value::Blob(encoded_key.clone()));
+                values.extend(group_values);
+                values.extend(specs.iter().map(|spec| {
+                    spec.arg
+                        .as_ref()
+                        .map(|(ti, column)| col_value(row, *ti, column))
+                        .unwrap_or(Value::Null)
+                }));
+                input_sorter.push(SortedOutputRow {
+                    keys: vec![Value::Blob(encoded_key)],
+                    values,
+                    sequence,
+                })?;
+                sequence = sequence.saturating_add(1);
+                Ok(true)
+            },
+        )?;
 
         let mut current_key: Option<Vec<u8>> = None;
         let mut current_groups = Vec::new();
@@ -3209,7 +3773,7 @@ impl<'a> GraceHashJoin<'a> {
                 write_spill_exec_row(&mut partitions.left_files[partition], &row)?;
         }
         let mut right_bytes = vec![0u64; GRACE_JOIN_PARTITIONS];
-        visit_table_records(self.db, new_table, self.new_ti, pushdown, |record| {
+        visit_table_records(self.db, new_table, self.new_ti, pushdown, None, |record| {
             self.db.record_query_buffer(record_heap_bytes(&record));
             let key = record.get(self.new_col).and_then(join_key);
             let partition = grace_partition(key.as_deref(), 0);
@@ -3964,6 +4528,38 @@ fn validate_txn_sets(schema: &TableSchema, table: &str, sets: &[(String, SetValu
     Ok(())
 }
 
+/// Rows of one table as the transaction sees them, narrowed by the same
+/// access path the autocommit executor would choose (physical id, indexed
+/// equality, or scan); every conjunct is re-checked afterwards.
+fn fetch_table_txn(
+    txn: &Txn,
+    ctx: &TableCtx,
+    conjuncts: &[RExpr],
+) -> Result<Vec<(String, Record)>> {
+    let table = ctx.schema.name.as_str();
+    let rows: Vec<(String, Record)> = match table_driver(ctx, 0, conjuncts) {
+        TableDriver::Empty => Vec::new(),
+        TableDriver::Id(id) => txn
+            .get(table, &id)?
+            .into_iter()
+            .map(|record| (id.clone(), record))
+            .collect(),
+        TableDriver::Equality(column, key) => match txn.find_eq(table, &column, &key)? {
+            Some(rows) => rows,
+            None => txn.scan(table)?,
+        },
+        TableDriver::Scan => txn.scan(table)?,
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, record) in rows {
+        let row: ExecRow = vec![Some(record)];
+        if eval_all(&row, conjuncts)? {
+            out.push((id, take_single(row, 0)));
+        }
+    }
+    Ok(out)
+}
+
 fn exec_update_txn(
     txn: &mut Txn,
     table: &str,
@@ -3980,18 +4576,7 @@ fn exec_update_txn(
     // The physical row key travels with the tuple: with a declared `id`
     // column (`id int AUTO_INCREMENT PRIMARY KEY`) `record["id"]` is the SQL
     // value, not the ULID.
-    let matching: Vec<(String, Record)> = txn
-        .scan(table)?
-        .into_iter()
-        .filter_map(|(id, record)| {
-            let row = vec![Some(record.clone())];
-            match eval_all(&row, &predicates) {
-                Ok(true) => Some(Ok((id, record))),
-                Ok(false) => None,
-                Err(error) => Some(Err(error)),
-            }
-        })
-        .collect::<Result<_>>()?;
+    let matching = fetch_table_txn(txn, &tables[0], &predicates)?;
     let mut affected = 0u64;
     for (id, record) in matching {
         let id = &id;
@@ -4024,18 +4609,10 @@ fn exec_delete_txn(txn: &mut Txn, table: &str, where_clause: Option<&Expr>) -> R
         label: table.to_owned(),
     }];
     let predicates = resolve_where(&tables, where_clause)?;
-    let ids: Vec<String> = txn
-        .scan(table)?
+    let ids: Vec<String> = fetch_table_txn(txn, &tables[0], &predicates)?
         .into_iter()
-        .filter_map(|(id, record)| {
-            let row = vec![Some(record)];
-            match eval_all(&row, &predicates) {
-                Ok(true) => Some(Ok(id)),
-                Ok(false) => None,
-                Err(error) => Some(Err(error)),
-            }
-        })
-        .collect::<Result<_>>()?;
+        .map(|(id, _)| id)
+        .collect();
     let mut affected = 0u64;
     for id in ids {
         if txn.delete(table, &id)? {
@@ -4068,19 +4645,10 @@ fn exec_select_txn(txn: &mut Txn, statement: &SelectStmt) -> Result<QueryOutput>
             .unwrap_or_else(|| statement.from.name.clone()),
     }];
     let predicates = resolve_where(&tables, statement.where_clause.as_ref())?;
-    let mut records: Vec<Record> = txn
-        .scan(&statement.from.name)?
+    let mut records: Vec<Record> = fetch_table_txn(txn, &tables[0], &predicates)?
         .into_iter()
         .map(|(_, record)| record)
-        .filter_map(|record| {
-            let row = vec![Some(record.clone())];
-            match eval_all(&row, &predicates) {
-                Ok(true) => Some(Ok(record)),
-                Ok(false) => None,
-                Err(error) => Some(Err(error)),
-            }
-        })
-        .collect::<Result<_>>()?;
+        .collect();
     let order: Vec<_> = statement
         .order_by
         .iter()

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+<rect width="1080" height="480" fill="#ffffff"/>
+<text x="84" y="26" font-size="17" font-weight="600" fill="#1f2328">Throughput vs concurrent users</text>
+<text x="84" y="44" fill="#57606a">concurrent virtual users, closed loop</text>
+<line x1="84" y1="416.0" x2="830" y2="416.0" stroke="#eaeef2"/>
+<text x="76" y="420.0" text-anchor="end" fill="#57606a">0</text>
+<line x1="84" y1="297.3" x2="830" y2="297.3" stroke="#eaeef2"/>
+<text x="76" y="301.3" text-anchor="end" fill="#57606a">2k</text>
+<line x1="84" y1="178.7" x2="830" y2="178.7" stroke="#eaeef2"/>
+<text x="76" y="182.7" text-anchor="end" fill="#57606a">4k</text>
+<line x1="84" y1="60.0" x2="830" y2="60.0" stroke="#eaeef2"/>
+<text x="76" y="64.0" text-anchor="end" fill="#57606a">6k</text>
+<line x1="84.0" y1="60" x2="84.0" y2="416" stroke="#f0f2f4"/>
+<text x="84.0" y="434" text-anchor="middle" fill="#57606a">10</text>
+<line x1="360.4" y1="60" x2="360.4" y2="416" stroke="#f0f2f4"/>
+<text x="360.4" y="434" text-anchor="middle" fill="#57606a">100</text>
+<line x1="443.6" y1="60" x2="443.6" y2="416" stroke="#f0f2f4"/>
+<text x="443.6" y="434" text-anchor="middle" fill="#57606a">200</text>
+<line x1="553.6" y1="60" x2="553.6" y2="416" stroke="#f0f2f4"/>
+<text x="553.6" y="434" text-anchor="middle" fill="#57606a">500</text>
+<line x1="636.8" y1="60" x2="636.8" y2="416" stroke="#f0f2f4"/>
+<text x="636.8" y="434" text-anchor="middle" fill="#57606a">1k</text>
+<line x1="720.0" y1="60" x2="720.0" y2="416" stroke="#f0f2f4"/>
+<text x="720.0" y="434" text-anchor="middle" fill="#57606a">2k</text>
+<line x1="768.7" y1="60" x2="768.7" y2="416" stroke="#f0f2f4"/>
+<text x="768.7" y="434" text-anchor="middle" fill="#57606a">3k</text>
+<line x1="803.2" y1="60" x2="803.2" y2="416" stroke="#f0f2f4"/>
+<text x="803.2" y="434" text-anchor="middle" fill="#57606a">4k</text>
+<line x1="830.0" y1="60" x2="830.0" y2="416" stroke="#f0f2f4"/>
+<text x="830.0" y="434" text-anchor="middle" fill="#57606a">5k</text>
+<rect x="84" y="60" width="746" height="356" fill="none" stroke="#d0d7de"/>
+<text x="457.0" y="466" text-anchor="middle" fill="#57606a">concurrent users (log)</text>
+<text x="18" y="238.0" text-anchor="middle" fill="#57606a" transform="rotate(-90 18 238.0)">operations / s</text>
+<path d="M84.0,3.3 L360.4,128.0 L443.6,153.5 L553.6,197.9 L636.8,312.6 L720.0,334.7 L768.7,317.3 L803.2,301.2 L830.0,321.9" fill="none" stroke="#c99700" stroke-width="2"/>
+<circle cx="84.0" cy="3.3" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 10 → 6955.4</title></circle>
+<circle cx="360.4" cy="128.0" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 100 → 4854.2</title></circle>
+<circle cx="443.6" cy="153.5" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 200 → 4423.4</title></circle>
+<circle cx="553.6" cy="197.9" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 500 → 3675.3</title></circle>
+<circle cx="636.8" cy="312.6" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 1k → 1742.1</title></circle>
+<circle cx="720.0" cy="334.7" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 2k → 1370.5</title></circle>
+<circle cx="768.7" cy="317.3" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 3k → 1664.1</title></circle>
+<circle cx="803.2" cy="301.2" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 4k → 1934.4</title></circle>
+<circle cx="830.0" cy="321.9" r="3" fill="#c99700"><title>elitesql-sidecar-think0-optimized: 5k → 1585.2</title></circle>
+<line x1="848" y1="68" x2="870" y2="68" stroke="#c99700" stroke-width="2"/>
+<text x="876" y="72" fill="#1f2328">elitesql-sidecar-think0-optimized</text>
+</svg>

@@ -17,6 +17,7 @@ use crate::db::{
 use crate::ddl::DDL_FILE;
 use crate::error::{Error, Result};
 use crate::manifest::fsync_dir;
+use crate::schema::TableSchema;
 use crate::wal::{Durability, WAL_DIR};
 
 #[derive(Debug, Default)]
@@ -78,7 +79,7 @@ impl Db {
                 .filter_map(|table| self.table_schema(table))
                 .collect();
             for schema in &schemas {
-                let mut loading_schema = schema.clone();
+                let mut loading_schema = TableSchema::clone(schema);
                 loading_schema.foreign_keys.clear();
                 out.create_table(loading_schema)?;
             }
@@ -105,6 +106,10 @@ impl Db {
                     cursor = rows.last().map(|(id, _)| id.clone());
                 }
             }
+            let schemas: Vec<TableSchema> = schemas
+                .iter()
+                .map(|schema| TableSchema::clone(schema))
+                .collect();
             out.restore_foreign_keys(&schemas)?;
             out.wait_vector_indexing()?;
             out.checkpoint()?;

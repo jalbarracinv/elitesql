@@ -35,16 +35,16 @@ fn build_template(path: &Path) {
     .unwrap();
     for i in 0..40 {
         let mut r = Record::new();
-        r.insert("title".into(), Value::Text(format!("doc {i}")));
-        r.insert("score".into(), Value::Int64(i));
+        r.insert("title", Value::Text(format!("doc {i}")));
+        r.insert("score", Value::Int64(i));
         db.insert("docs", r).unwrap();
     }
     db.checkpoint().unwrap();
     // Leave a WAL tail too, so both paths get fuzzed.
     for i in 40..60 {
         let mut r = Record::new();
-        r.insert("title".into(), Value::Text(format!("doc {i}")));
-        r.insert("score".into(), Value::Int64(i));
+        r.insert("title", Value::Text(format!("doc {i}")));
+        r.insert("score", Value::Int64(i));
         db.insert("docs", r).unwrap();
     }
 }

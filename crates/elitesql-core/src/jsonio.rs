@@ -252,7 +252,7 @@ pub fn json_to_value_for_type(j: &J, ty: ColumnType) -> Result<Value> {
 pub fn record_to_json(record: &Record) -> J {
     let mut map = Map::new();
     for (k, v) in record {
-        map.insert(k.clone(), value_to_json(v));
+        map.insert(k.to_owned(), value_to_json(v));
     }
     J::Object(map)
 }
@@ -477,6 +477,28 @@ fn filter_from_json(params: &J) -> Result<Option<Record>> {
 
 /// BM25 full-text search: {"table","column","query","top_k"?,
 /// "filter"?: {col: value}} -> {"hits":[{"id","score","record"}]}.
+/// Optional `"columns"` of a search request: which columns each hit carries.
+/// Absent means every column, as before.
+fn columns_from_json(params: &J) -> Result<Option<Vec<String>>> {
+    let Some(value) = params.get("columns") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let list = value
+        .as_array()
+        .ok_or_else(|| Error::InvalidArgument("'columns' must be an array of names".into()))?;
+    list.iter()
+        .map(|name| {
+            name.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Error::InvalidArgument("'columns' must hold strings".into()))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
 pub fn search_text_json(db: &crate::Db, params: &J) -> Result<J> {
     let table = params
         .get("table")
@@ -492,7 +514,17 @@ pub fn search_text_json(db: &crate::Db, params: &J) -> Result<J> {
         .ok_or_else(|| Error::InvalidArgument("missing 'query'".into()))?;
     let top_k = params.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let filter = filter_from_json(params)?;
-    let hits = db.search_text(table, column, query, top_k, filter.as_ref())?;
+    // `"columns"` narrows what each hit carries; an empty list asks for ids
+    // and scores alone, which is what a caller that only ranks needs.
+    let columns = columns_from_json(params)?;
+    let hits = db.search_text_columns(
+        table,
+        column,
+        query,
+        top_k,
+        filter.as_ref(),
+        columns.as_deref(),
+    )?;
     let hits_json: Vec<J> = hits
         .iter()
         .map(|h| json!({"id": h.id, "score": h.score, "record": record_to_json(&h.record)}))

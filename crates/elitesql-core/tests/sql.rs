@@ -608,8 +608,8 @@ fn sql_and_api_interoperate() {
     let (_d, db) = seeded();
     // SQL sees API writes and vice versa.
     let mut rec = elitesql_core::Record::new();
-    rec.insert("name".into(), Value::Text("api-user".into()));
-    rec.insert("age".into(), Value::Int64(50));
+    rec.insert("name", Value::Text("api-user".into()));
+    rec.insert("age", Value::Int64(50));
     let id = db.insert("users", rec).unwrap();
 
     let (_, r) = rows(db.query("SELECT name FROM users WHERE age = 50").unwrap());
@@ -634,4 +634,122 @@ fn sql_survives_reopen() {
     let db = Db::open(&path).unwrap();
     let (_, r) = rows(db.query("SELECT v FROM kv WHERE id = 'k1'").unwrap());
     assert_eq!(r[0][0], Value::Text("hello".into()));
+}
+
+/// A projection that emits the same column twice must emit it twice.
+///
+/// The executor moves a value out of the row it is about to drop rather than
+/// copying it, which is only sound while no column is projected more than
+/// once; a row read back as `(x, NULL)` is what getting that wrong looks
+/// like. Ordering and sorting take the same path, so both are checked.
+#[test]
+fn a_column_projected_twice_is_returned_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("twice.esql")).unwrap();
+    db.query("CREATE TABLE t (name text NOT NULL, n int NOT NULL)")
+        .unwrap();
+    for (name, n) in [("alpha", 2), ("beta", 1)] {
+        db.query_params(
+            "INSERT INTO t (name, n) VALUES (?, ?)",
+            &[Value::Text(name.into()), Value::Int64(n)],
+        )
+        .unwrap();
+    }
+
+    let (columns, r) = rows(
+        db.query("SELECT name, name, n, n FROM t ORDER BY n")
+            .unwrap(),
+    );
+    assert_eq!(columns.len(), 4);
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0][0], Value::Text("beta".into()));
+    assert_eq!(r[0][1], Value::Text("beta".into()));
+    assert_eq!(r[0][2], Value::Int64(1));
+    assert_eq!(r[0][3], Value::Int64(1));
+    assert_eq!(r[1][0], Value::Text("alpha".into()));
+    assert_eq!(r[1][1], Value::Text("alpha".into()));
+
+    let (_, r) = rows(
+        db.query("SELECT name, name FROM t WHERE name = 'alpha'")
+            .unwrap(),
+    );
+    assert_eq!(r[0][0], Value::Text("alpha".into()));
+    assert_eq!(r[0][1], Value::Text("alpha".into()));
+}
+
+/// A bounded sort skips materialising rows it would discard, and the check
+/// that decides has to agree with the sort exactly.
+///
+/// Ties are the sharp edge: rows arrive in order and the sort breaks equal
+/// keys by arrival, so a later row that merely ties the worst kept one must
+/// lose. If the skip were conservative the query would still be correct; if
+/// it were eager it would drop a row that belongs in the answer.
+#[test]
+fn order_by_with_a_limit_keeps_the_right_rows_when_keys_tie() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("ties.esql")).unwrap();
+    db.query(
+        "CREATE TABLE t (id int AUTO_INCREMENT PRIMARY KEY, grp int NOT NULL, \
+              price int NOT NULL, label text NOT NULL)",
+    )
+    .unwrap();
+    db.query("CREATE INDEX ON t (grp)").unwrap();
+    // Twelve rows in one group: prices 5,5,5,5,1,1,2,2,3,3,4,4.
+    let prices = [5, 5, 5, 5, 1, 1, 2, 2, 3, 3, 4, 4];
+    for (n, price) in prices.iter().enumerate() {
+        db.query_params(
+            "INSERT INTO t (grp, price, label) VALUES (?, ?, ?)",
+            &[
+                Value::Int64(1),
+                Value::Int64(*price),
+                Value::Text(format!("row {n}")),
+            ],
+        )
+        .unwrap();
+    }
+
+    // The three cheapest, ties broken by insertion order: prices 1,1,2 which
+    // are rows 4, 5 and 6, so declared ids 5, 6 and 7.
+    let (_, rows) = super_rows(
+        &db,
+        "SELECT id, price FROM t WHERE grp = 1 ORDER BY price ASC LIMIT 3",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec![Value::Int64(5), Value::Int64(1)]);
+    assert_eq!(rows[1], vec![Value::Int64(6), Value::Int64(1)]);
+    assert_eq!(rows[2], vec![Value::Int64(7), Value::Int64(2)]);
+
+    // With an OFFSET the window moves but the order does not.
+    let (_, rows) = super_rows(
+        &db,
+        "SELECT id, price FROM t WHERE grp = 1 ORDER BY price ASC LIMIT 2 OFFSET 2",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec![Value::Int64(7), Value::Int64(2)]);
+    assert_eq!(rows[1], vec![Value::Int64(8), Value::Int64(2)]);
+
+    // Descending takes the four at price 5, in insertion order.
+    let (_, rows) = super_rows(
+        &db,
+        "SELECT id FROM t WHERE grp = 1 ORDER BY price DESC LIMIT 4",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)],
+        ]
+    );
+
+    // And the whole ordering, unbounded, is what the bounded ones are cut from.
+    let (_, all) = super_rows(&db, "SELECT id FROM t WHERE grp = 1 ORDER BY price ASC");
+    assert_eq!(all.len(), 12);
+    assert_eq!(all[0], vec![Value::Int64(5)]);
+    assert_eq!(all[11], vec![Value::Int64(4)]);
+}
+
+fn super_rows(db: &Db, sql: &str) -> (Vec<String>, Vec<Vec<Value>>) {
+    rows(db.query(sql).unwrap())
 }

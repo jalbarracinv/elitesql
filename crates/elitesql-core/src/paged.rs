@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use memmap2::{Advice, Mmap, MmapOptions};
 use ulid::Ulid;
@@ -21,12 +22,27 @@ const FORMAT_V1: u32 = 1;
 const FORMAT_V2: u32 = 2;
 const FORMAT: u32 = 3;
 const HEADER_LEN: usize = 48;
-const DEFAULT_PAGE_SIZE: usize = 4096;
+/// Bytes of entries per data page.
+///
+/// A key inside a page is found by parsing the entries in front of it, so a
+/// lookup parses on average half a page: at 4 KiB that was about thirty
+/// entries of a primary run, and it dominated an indexed read. A quarter of
+/// that page size cuts the parse fourfold and costs a deeper directory, which
+/// is a handful of sixteen-byte comparisons, plus one page header per page on
+/// disk. Measured over 256, 512, 1024, 2048 and 4096 on a 20 000-row table,
+/// 1 KiB is the floor: below it the per-page header overtakes the saving.
+/// The page size lives in the file header, so runs written at any of them
+/// stay readable.
+const DEFAULT_PAGE_SIZE: usize = 1024;
 const WRITER_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_MERGE_FAN_IN: usize = 32;
 
 #[derive(Clone, Copy)]
 struct PageView<'a> {
+    /// Offset of this page's directory record.
+    directory_entry: usize,
+    /// Index of that record in `pages`, when the caller already knew it.
+    position: Option<usize>,
     offset: usize,
     payload_offset: usize,
     payload_len: usize,
@@ -42,9 +58,31 @@ pub(crate) struct PagedIndex {
     /// and fixed-width in V2). Keys remain file-backed instead of being copied
     /// into two heap allocations per page.
     pages: Vec<usize>,
+    /// Where each page's last key lives inside `mmap`, as (offset, length).
+    ///
+    /// Locating a key is a binary search over these, and reading one out of
+    /// the page directory means rebuilding a whole `PageView` per probe: a
+    /// profile of an indexed lookup put a fifth of the statement in exactly
+    /// that. Sixteen bytes a page buys the comparison directly. The keys stay
+    /// file-backed, as they were.
+    ///
+    /// Holding the opening twenty bytes of each key inline beside the span,
+    /// so that a probe need not follow it into the mapping, measured neutral
+    /// (hypothesis 53): the directory of a 20 000-row run is small enough to
+    /// stay in cache either way.
+    last_key_spans: Vec<(u64, u32)>,
+    /// First key of the first page, as a span into `mmap`. With the last key
+    /// of the last page it is the run's whole key range, which is how a
+    /// lookup skips a run it cannot be in. Reading either out of the page
+    /// directory means rebuilding a page header, twice, per run and per row.
+    first_key_span: Option<(u64, u32)>,
     format: u32,
     dump_version: u64,
     entry_count: u64,
+    /// One bit per page, set once its payload checksum has been verified by
+    /// this mapping. The file is immutable after publication, so re-hashing
+    /// the same page on every lookup only cost CPU under the state lock.
+    verified: Vec<AtomicU64>,
 }
 
 pub(crate) struct PagedPrefixCursor<'a> {
@@ -176,8 +214,16 @@ impl PagedIndex {
         // detect a damaged lower/upper bound that bypasses the payload.
         let mut metadata_crc = crc32fast::Hasher::new();
         let mut expected_offset = HEADER_LEN;
+        let mut last_key_spans = Vec::with_capacity(pages.len());
+        let mut first_key_span = None;
         for &directory_entry in &pages {
             let page = page_view(&mmap, format, directory_entry);
+            let last_start = page.last_key.as_ptr() as usize - mmap.as_ptr() as usize;
+            last_key_spans.push((last_start as u64, page.last_key.len() as u32));
+            if first_key_span.is_none() {
+                let first_start = page.first_key.as_ptr() as usize - mmap.as_ptr() as usize;
+                first_key_span = Some((first_start as u64, page.first_key.len() as u32));
+            }
             if page.offset != expected_offset {
                 return Err(Error::Corrupt("paged index: noncontiguous pages".into()));
             }
@@ -207,12 +253,18 @@ impl PagedIndex {
             }
         }
         let _ = mmap.advise(Advice::Random);
+        let verified = (0..pages.len().div_ceil(64))
+            .map(|_| AtomicU64::new(0))
+            .collect();
         let index = Self {
             mmap,
             pages,
+            last_key_spans,
+            first_key_span,
             format,
             dump_version,
             entry_count,
+            verified,
         };
         if format != FORMAT {
             index.validate_legacy_navigation()?;
@@ -271,37 +323,83 @@ impl PagedIndex {
         self.dump_version
     }
 
+    /// First key of the whole run, or `None` when it has no pages.
+    #[inline]
     fn first_key(&self) -> Option<&[u8]> {
-        self.pages.first().map(|page| self.page(*page).first_key)
+        let (offset, len) = self.first_key_span?;
+        let start = offset as usize;
+        Some(&self.mmap[start..start + len as usize])
     }
 
+    /// Last key of the whole run.
+    #[inline]
     fn last_key(&self) -> Option<&[u8]> {
-        self.pages.last().map(|page| self.page(*page).last_key)
+        self.last_key_spans
+            .len()
+            .checked_sub(1)
+            .map(|last| self.last_key_at(last))
     }
 
+    #[inline]
     pub(crate) fn may_contain_key(&self, key: &[u8]) -> bool {
-        self.pages.first().is_some_and(|first| {
-            self.page(*first).first_key <= key
-                && self
-                    .pages
-                    .last()
-                    .is_some_and(|last| key <= self.page(*last).last_key)
-        })
+        self.first_key()
+            .is_some_and(|first| first <= key && self.last_key().is_some_and(|last| key <= last))
     }
 
     pub(crate) fn may_contain_prefix(&self, prefix: &[u8]) -> bool {
-        self.pages.first().is_some_and(|first| {
-            (self.page(*first).first_key <= prefix
-                || self.page(*first).first_key.starts_with(prefix))
-                && self
-                    .pages
-                    .last()
-                    .is_some_and(|last| self.page(*last).last_key >= prefix)
+        self.first_key().is_some_and(|first| {
+            (first <= prefix || first.starts_with(prefix))
+                && self.last_key().is_some_and(|last| last >= prefix)
         })
     }
 
     fn page(&self, directory_entry: usize) -> PageView<'_> {
         page_view(&self.mmap, self.format, directory_entry)
+    }
+
+    /// The page at `position` in the directory, remembering the position.
+    ///
+    /// Checking a page's checksum only once per mapping needs the position,
+    /// which is the bit to test; recovering it from the page's directory
+    /// offset meant a binary search over the whole directory on every lookup,
+    /// and a sampled profile of a point read put it among the named costs.
+    /// Every caller already iterates positions.
+    fn page_at(&self, position: usize) -> PageView<'_> {
+        let mut page = page_view(&self.mmap, self.format, self.pages[position]);
+        page.position = Some(position);
+        page
+    }
+
+    /// Last key of the page at `position`, read straight from the mmap.
+    #[inline]
+    fn last_key_at(&self, position: usize) -> &[u8] {
+        let (offset, len) = self.last_key_spans[position];
+        let start = offset as usize;
+        &self.mmap[start..start + len as usize]
+    }
+
+    /// First page that can still hold a key at or after `key`: every earlier
+    /// page ends below it. With `strictly_after`, a page whose last key *is*
+    /// `key` is skipped too, which is what a cursor positioned after a
+    /// complete key needs.
+    fn first_page_for(&self, key: &[u8], strictly_after: bool) -> usize {
+        let mut low = 0usize;
+        let mut high = self.last_key_spans.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let last = self.last_key_at(mid);
+            let before = if strictly_after {
+                last <= key
+            } else {
+                last < key
+            };
+            if before {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
     }
 
     /// Visit values for one key in sorted order. Returning `false` stops at
@@ -311,11 +409,9 @@ impl PagedIndex {
         key: &[u8],
         mut visit: impl FnMut(&[u8]) -> Result<bool>,
     ) -> Result<()> {
-        let first = self
-            .pages
-            .partition_point(|page| self.page(*page).last_key < key);
-        for directory_entry in &self.pages[first..] {
-            let page = self.page(*directory_entry);
+        let first = self.first_page_for(key, false);
+        for position in first..self.pages.len() {
+            let page = self.page_at(position);
             if page.first_key > key {
                 break;
             }
@@ -351,12 +447,8 @@ impl PagedIndex {
         after: Option<&[u8]>,
     ) -> PagedPrefixCursor<'_> {
         let page_index = match after {
-            Some(after) => self
-                .pages
-                .partition_point(|page| self.page(*page).last_key <= after),
-            None => self
-                .pages
-                .partition_point(|page| self.page(*page).last_key < prefix),
+            Some(after) => self.first_page_for(after, true),
+            None => self.first_page_for(prefix, false),
         };
         PagedPrefixCursor {
             index: self,
@@ -392,6 +484,27 @@ impl PagedIndex {
         Ok(())
     }
 
+    /// Check a page payload against its stored checksum, once per page for the
+    /// lifetime of this mapping.
+    fn verify_page(&self, page: &PageView<'_>, payload: &[u8], stored_crc: u32) -> Result<()> {
+        let position = page
+            .position
+            .or_else(|| self.pages.binary_search(&page.directory_entry).ok());
+        let slot = position.map(|position| (position / 64, 1u64 << (position % 64)));
+        if let Some((word, bit)) = slot {
+            if self.verified[word].load(AtomicOrdering::Relaxed) & bit != 0 {
+                return Ok(());
+            }
+        }
+        if crc32fast::hash(payload) != stored_crc {
+            return Err(Error::Corrupt("paged index: page crc mismatch".into()));
+        }
+        if let Some((word, bit)) = slot {
+            self.verified[word].fetch_or(bit, AtomicOrdering::Relaxed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn scan(&self, mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()> {
         for directory_entry in &self.pages {
             let page = self.page(*directory_entry);
@@ -414,9 +527,7 @@ impl PagedIndex {
             .mmap
             .get(page.payload_offset..page.payload_offset + page.payload_len)
             .ok_or_else(|| Error::Corrupt("paged index: truncated page".into()))?;
-        if crc32fast::hash(payload) != stored_crc {
-            return Err(Error::Corrupt("paged index: page crc mismatch".into()));
-        }
+        self.verify_page(&page, payload, stored_crc)?;
         let mut pos = 0usize;
         while pos < payload.len() {
             let key_len = read_u32_at(payload, &mut pos)? as usize;
@@ -442,9 +553,7 @@ impl PagedIndex {
             .mmap
             .get(page.payload_offset..page.payload_offset + page.payload_len)
             .ok_or_else(|| Error::Corrupt("paged index: truncated page".into()))?;
-        if crc32fast::hash(payload) != stored_crc {
-            return Err(Error::Corrupt("paged index: page crc mismatch".into()));
-        }
+        self.verify_page(&page, payload, stored_crc)?;
         let mut pos = 0usize;
         while pos < payload.len() {
             let key_len = read_u32_at(payload, &mut pos)? as usize;
@@ -463,7 +572,7 @@ impl<'a> PagedPrefixCursor<'a> {
     pub(crate) fn next(&mut self) -> Result<Option<(&'a [u8], &'a [u8])>> {
         while !self.done && (self.pos < self.end || self.page_index < self.index.pages.len()) {
             if self.pos == self.end {
-                let page = self.index.page(self.index.pages[self.page_index]);
+                let page = self.index.page_at(self.page_index);
                 if page.first_key > self.prefix.as_slice()
                     && !page.first_key.starts_with(&self.prefix)
                 {
@@ -482,9 +591,7 @@ impl<'a> PagedPrefixCursor<'a> {
                     .mmap
                     .get(start..end)
                     .ok_or_else(|| Error::Corrupt("paged index: truncated page".into()))?;
-                if crc32fast::hash(payload) != stored_crc {
-                    return Err(Error::Corrupt("paged index: page crc mismatch".into()));
-                }
+                self.index.verify_page(&page, payload, stored_crc)?;
                 self.pos = start;
                 self.end = end;
                 self.page_index += 1;
@@ -547,6 +654,8 @@ fn page_view(mmap: &[u8], format: u32, directory_entry: usize) -> PageView<'_> {
         last_end
     };
     PageView {
+        directory_entry,
+        position: None,
         offset,
         payload_offset,
         payload_len,
