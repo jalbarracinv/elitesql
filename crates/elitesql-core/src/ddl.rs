@@ -168,8 +168,13 @@ impl Rewrite<'_> {
                 if let Some(c) = t.columns.iter_mut().find(|c| c.name == from) {
                     c.name = to.to_owned();
                 }
-                for d in t.indexes.iter_mut().filter(|d| d.column == from) {
-                    d.column = to.to_owned();
+                for d in &mut t.indexes {
+                    for column in &mut d.columns {
+                        if column == from {
+                            *column = to.to_owned();
+                        }
+                    }
+                    d.column = d.columns[0].clone();
                 }
                 for d in t.vector_indexes.iter_mut().filter(|d| d.column == from) {
                     d.column = to.to_owned();
@@ -183,7 +188,8 @@ impl Rewrite<'_> {
                     return;
                 };
                 t.columns.retain(|c| c.name != column);
-                t.indexes.retain(|d| d.column != column);
+                t.indexes
+                    .retain(|d| !d.columns.iter().any(|indexed| indexed == column));
                 t.vector_indexes.retain(|d| d.column != column);
                 t.text_indexes.retain(|d| d.column != column);
             }

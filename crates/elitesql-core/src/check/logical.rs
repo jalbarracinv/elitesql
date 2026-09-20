@@ -11,7 +11,8 @@ use ulid::Ulid;
 
 use super::CheckReport;
 use crate::db::{
-    decode_record_for, encode_record_ordered, normalize_record, BLOBS_DIR, SEGMENTS_DIR,
+    decode_record_for, encode_record_ordered, normalize_record, secondary_tuple_key, BLOBS_DIR,
+    SEGMENTS_DIR,
 };
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
@@ -287,11 +288,12 @@ pub(super) fn check_logical(
             decode_record_for(schema, &payload[8..], Some(&blobs))?,
         )?;
         for index in &schema.indexes {
-            let value = expected.get(&index.column).unwrap_or(&Value::Null);
-            if !value.is_null() && !db.secondary_contains(&table, &index.column, value, &id)? {
+            let key = secondary_tuple_key(&expected, index.columns());
+            if !db.secondary_contains_key(&table, index, &key, &id)? {
                 report.warnings.push(format!(
                     "secondary index {}.{} omits canonical row {id}; rebuild derived indexes",
-                    table, index.column
+                    table,
+                    index.columns().join(", ")
                 ));
             }
         }
@@ -311,18 +313,16 @@ pub(super) fn check_logical(
         }
         Ok(())
     })?;
-    db.visit_secondary_entries(|table, column, encoded, id| {
+    db.visit_secondary_entries(|table, def, encoded, id| {
         let mut agrees = false;
         live.visit_key(&row_key(table, id), |payload| {
             let schema = catalog.table(table).expect("validated catalog");
             let record = normalize_record(schema, decode_record_for(schema, &payload[8..], Some(&blobs))?)?;
-            let value = record.get(column).unwrap_or(&Value::Null);
-            let mut actual = Vec::new();
-            encode_value(&mut actual, value);
-            agrees = !value.is_null() && actual == encoded;
+            let actual = secondary_tuple_key(&record, def.columns());
+            agrees = actual == encoded;
             Ok(false)
         })?;
-        if !agrees { report.warnings.push(format!("secondary index {table}.{column} contains a noncanonical pair for {id}; rebuild derived indexes")); }
+        if !agrees { report.warnings.push(format!("secondary index {}.{} contains a noncanonical pair for {id}; rebuild derived indexes", table, def.columns().join(", "))); }
         Ok(())
     })?;
     for table in &catalog.tables {

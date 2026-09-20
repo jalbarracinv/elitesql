@@ -124,7 +124,8 @@ fn create_index_variants() {
     db.query("CREATE TABLE t (a text, b int64)").unwrap();
     db.query("CREATE INDEX ON t (a)").unwrap();
     db.query("CREATE UNIQUE INDEX idx_b ON t (b)").unwrap();
-    assert_sql_err(&db, "CREATE INDEX ON t (a, b)", "multi-column");
+    db.query("CREATE INDEX ON t (a, b)").unwrap();
+    assert_eq!(db.table_schema("t").unwrap().indexes.len(), 3);
     assert!(matches!(
         db.query("CREATE INDEX ON t (nope)"),
         Err(Error::SchemaViolation(_))

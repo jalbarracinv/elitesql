@@ -26,6 +26,44 @@ WORDS = ("quality durable design comfortable battery fast lightweight quiet "
          "bright warranty steel bamboo cotton waterproof rechargeable family "
          "travel kitchen office garden studio outdoor compact silent").split()
 
+# One source of truth for the request mix. The concurrency generator and the
+# single-operation benchmark intentionally consume the same weights; callers
+# may normalize a selected subset, but must print which subset they used.
+OPERATION_WEIGHTS = {
+    "browse": 20.0,
+    "product_detail": 17.0,
+    "session_check": 12.0,
+    "add_to_cart": 10.0,
+    "search_text": 8.0,
+    "view_cart": 8.0,
+    "recommend": 7.0,
+    "checkout": 4.0,
+    "update_cart_item": 3.0,
+    "order_history": 3.0,
+    "write_review": 2.0,
+    "relogin": 1.5,
+    "update_profile": 1.0,
+    "admin_dashboard": 1.0,
+    "signup": 0.5,
+    "restock": 0.3,
+}
+
+# Kept solely to reproduce reports made before metric v2. It is not a full
+# workload: its weights add to 89 and the old script divided by 100.
+HISTORICAL_OPS_COST_WEIGHTS = {
+    "browse": 20.0,
+    "product_detail": 17.0,
+    "session_check": 12.0,
+    "add_to_cart": 10.0,
+    "search_text": 8.0,
+    "view_cart": 8.0,
+    "recommend": 7.0,
+    "order_history": 3.0,
+    "write_review": 2.0,
+    "update_profile": 1.0,
+    "admin_dashboard": 1.0,
+}
+
 # Portable DDL: `?` placeholders everywhere, `AUTO_INCREMENT` integer ids,
 # `text` for strings. The SQLite driver rewrites the few type names it does
 # not know (see drivers.py) and drops the vector column.

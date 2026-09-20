@@ -551,7 +551,8 @@ def run_stage(cfg: StageConfig, stage_dir: Path, server_pid: Optional[int] = Non
 
 
 def prepare_database(transport: str, db_path: str, durability: str, products: int,
-                     accounts: int, elitesql_bin: Optional[str] = None) -> dict:
+                     accounts: int, elitesql_bin: Optional[str] = None,
+                     scenario: str = "baseline") -> dict:
     """Create and seed a fresh database; returns seed info + initial stock."""
     path = Path(db_path)
     if path.exists():
@@ -567,6 +568,9 @@ def prepare_database(transport: str, db_path: str, durability: str, products: in
         sqlite = False
     service.create_schema(conn, sqlite=sqlite)
     info = service.seed(conn, users=accounts, products=products, sqlite=sqlite)
+    if scenario == "compound-index":
+        ddl = "CREATE INDEX ON products (category, price_cents)"
+        conn.execute(drivers.sqlite_ddl(ddl) if sqlite else ddl)
     initial = {pid: stock for pid, stock in conn.execute("SELECT id, stock FROM products LIMIT 10000").rows}
     conn.checkpoint()
     conn.close()

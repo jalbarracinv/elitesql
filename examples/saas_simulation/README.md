@@ -24,12 +24,26 @@ python3 examples/saas_simulation/plot.py results/sidecar-… results/sqlite-… 
 
 # 5. what one operation costs on each engine, nothing else running
 python3 examples/saas_simulation/ops_cost.py
+# The same mix with products(category, price_cents) added to both engines.
+python3 examples/saas_simulation/ops_cost.py --scenario compound-index
 ```
 
 `ops_cost.py` is the counterpart of the sweep: it seeds both engines in the
-same process, checkpoints, and times one operation at a time. The sweep says
-how the engine behaves under concurrency; this says what the work itself
-costs, which is where per-row and per-statement overhead shows up undiluted.
+same process, checkpoints, and times one operation at a time. By default its
+`full-v2` metric uses the same sixteen weighted operations as the virtual-user
+generator and normalizes their 98.3 total weight. Its `historical-v1` option
+reproduces the older eleven-operation, weights-over-100 calculation solely for
+comparison with earlier reports; it is a partial mix, not an average request.
+Each timed mutation receives an independently prepared account and cart, so a
+sample does not change the state measured by the next one. The sweep says how
+the engine behaves under concurrency; this says what the work itself costs,
+which is where per-row and per-statement overhead shows up undiluted.
+
+`--scenario baseline` is the original schema. `--scenario compound-index`
+keeps every baseline index and adds `products(category, price_cents)` to both
+engines before the checkpoint; it isolates the browse access path and records
+the scenario in the JSON output. Compare matching scenarios from the same run,
+not a compound result against an older baseline.
 
 A 9-level sweep with the default 60 s per level takes about 15 minutes. Each
 run writes `stages.csv` (one row per level), `report.md`, SVG charts and a
@@ -156,9 +170,26 @@ Universal Scalability Law (σ = contention, κ = coherency, predicted peak).
 | `--processes` | CPUs | load-generator processes |
 | `--durability` | `balanced` | `safe`, `balanced`, `fast` (server and seed) |
 | `--products`, `--accounts` | 5000, 20000 | seed size |
+| `--scenario` | `baseline` | `compound-index` adds `(category, price_cents)` to both engines |
 | `--fresh-per-stage` | off | reseed before every level |
 | `--compare-with DIR` | – | overlay another run's curve in the charts |
 | env `SAAS_SIM_DROP_OPS=op,op` | – | remove operations from the mix (e.g. `search_text,recommend`) to attribute a bottleneck |
 | `--rebuild-report DIR [--reverify-db PATH]` | – | rewrite `stages.csv`, `report.md` and charts of a finished run, optionally re-running the invariants on its database |
 
 Results of the reference runs live in `benchmark-results/saas-simulation-<date>/`.
+
+For an isolated paired pagination measurement, use `browse_cost.py`. It checks
+price sequences against SQLite, records both query plans, alternates engine
+order, and saves warmed block timings for offsets 0–1000. Block timings are
+average query costs, not request percentiles. Run before/after libraries in
+separate processes, without simultaneous builds or other benchmarks:
+
+```bash
+ELITESQL_LIB="$PWD/target/release/libelitesql.dylib" \
+  python3 examples/saas_simulation/browse_cost.py \
+  --products 5000 --iterations 500 --repetitions 5 --out /tmp/browse.json
+```
+
+Choose the platform's library filename (`.so` on Linux). The report records
+its SHA-256 and the exact SQL; both engines retain their baseline indexes and
+add the same compound index. The seed is checkpointed before timing.

@@ -1,0 +1,3 @@
+# Preserved local A/B builds; identities are recorded in build-identities.json.
+*.dylib
+before-elitesql

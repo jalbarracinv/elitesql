@@ -1,0 +1,22 @@
+metric: full-v2 (normalized full virtual-user mix)
+weights: 98.3; divisor: 98.3; operations: 16
+scenario: compound-index; scale: 20000 accounts, 5000 products; samples: 60 (20 heavy); repetitions: 3
+operation           weight                elite               sqlite
+browse               20.0%     37.2 us [35.4,40.5]     20.4 us [20.0,21.3]
+product_detail       17.0%     15.6 us [15.2,16.4]      6.4 us [6.3,7.0]
+session_check        12.0%     30.3 us [30.1,79.6]      9.8 us [9.7,10.0]
+add_to_cart          10.0%     53.0 us [50.4,53.0]     22.1 us [21.6,22.4]
+search_text           8.0%    166.1 us [166.0,173.6]    108.5 us [107.9,111.4]
+view_cart             8.0%     29.3 us [28.9,40.0]      8.2 us [8.1,8.3]
+recommend             7.0%    163.9 us [163.4,167.1]     70.1 us [67.6,70.3]
+checkout              4.0%    206.0 us [204.9,215.1]     80.6 us [75.6,84.9]
+update_cart_item      3.0%     35.3 us [35.2,36.3]     14.1 us [13.6,19.3]
+order_history         3.0%     29.7 us [28.1,30.9]     10.3 us [10.0,10.8]
+write_review          2.0%     39.5 us [39.0,39.8]     18.0 us [17.6,20.1]
+relogin               1.5%     73.2 us [70.5,80.7]     66.2 us [62.1,163.9]
+update_profile        1.0%     18.7 us [18.5,77.8]      6.9 us [6.7,6.9]
+admin_dashboard       1.0%   1473.9 us [1455.5,1529.2]    852.0 us [846.6,855.9]
+signup                0.5%     40.4 us [40.3,47.2]     29.6 us [29.1,30.2]
+restock               0.3%     39.4 us [38.1,39.5]     18.1 us [17.6,18.4]
+weighted operation (median per operation): elite=74.7 us, sqlite=37.5 us
+ratio elite/sqlite: 1.99x

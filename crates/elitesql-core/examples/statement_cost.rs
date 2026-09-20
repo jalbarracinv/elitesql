@@ -597,6 +597,20 @@ fn main() {
             "  the JSON boundary adds",
             json - engine
         );
+        // The compound scenario preserves all baseline indexes and adds only
+        // the ordered browse path. It is intentionally measured after the
+        // baseline so both labels remain visible in this engine-only harness.
+        shop.query("CREATE INDEX ON products (category, price_cents)")
+            .expect("compound browse index");
+        shop.checkpoint().expect("checkpoint compound browse index");
+        let compound = bench("compound index: the engine alone", 2_000, || {
+            shop.query_params(browse, &params).expect("compound browse");
+        });
+        println!(
+            "{:<52} {:8.1} us",
+            "  compound index change from baseline",
+            compound - engine
+        );
     }
 
     println!("\n--- other statements (SQL executor, no JSON) ---");

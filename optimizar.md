@@ -1,5 +1,13 @@
 # Optimizar EliteSQL
 
+Actualización 2026-09-19: la continuación vigente está en
+[las tareas TERRA](optimizar-tareas-terra.md) y los resultados más recientes en
+[la iteración 02](benchmark-results/optimization-2026-09-19/iteration-02/README.md).
+El índice compuesto y su recorrido ordenado están implementados; OFFSET evita
+decodificar filas descartadas cuando el prefijo satisface todos los filtros.
+La aceptación global T14/T15 continúa abierta. Los estados y cifras del
+traspaso que sigue son históricos, no la certificación de estos cambios.
+
 Nota de traspaso, 2026-09-14. Escrita para alguien que no ha visto este
 repositorio antes. Si solo lees una cosa más, que sea
 [el informe de la simulación](benchmark-results/saas-simulation-2026-09-12/README.md):

@@ -1,6 +1,41 @@
 //! Phase 4: salvage (repair) and the JSON marshaling used by bindings.
 
-use elitesql_core::{jsonio, salvage, Db, Record, Value};
+use elitesql_core::{jsonio, salvage, Db, QueryOutput, Record, Value};
+
+#[test]
+fn query_output_preserves_tagged_cells_empty_rows_and_column_order() {
+    let cells = vec![
+        Value::Null,
+        Value::Bool(false),
+        Value::Int64(i64::MAX),
+        Value::Float64(f64::INFINITY),
+        Value::Text("quotes\"\n\0á".into()),
+        Value::Blob(vec![0, 255]),
+        Value::Date(0),
+        Value::Time(12),
+        Value::Timestamp(0),
+        Value::Json(serde_json::json!({"n": 9_007_199_254_740_993_i64})),
+        Value::Vector(vec![0.5, -2.0]),
+    ];
+    let columns: Vec<String> = (0..cells.len()).rev().map(|n| format!("col{n}")).collect();
+    for rows in [vec![], vec![cells.clone(), cells]] {
+        let output = QueryOutput::Rows {
+            columns: columns.clone(),
+            rows: rows.clone(),
+        };
+        let encoded = jsonio::output_to_json(&output);
+        let decoded: serde_json::Value = serde_json::from_str(&encoded.to_string()).unwrap();
+        assert_eq!(decoded["columns"], serde_json::json!(columns));
+        assert_eq!(decoded["rows"].as_array().unwrap().len(), rows.len());
+        for (encoded_row, expected) in decoded["rows"].as_array().unwrap().iter().zip(&rows) {
+            for (encoded_cell, expected_cell) in
+                encoded_row.as_array().unwrap().iter().zip(expected)
+            {
+                assert_eq!(jsonio::json_to_value(encoded_cell).unwrap(), *expected_cell);
+            }
+        }
+    }
+}
 
 #[test]
 fn jsonio_value_roundtrip() {

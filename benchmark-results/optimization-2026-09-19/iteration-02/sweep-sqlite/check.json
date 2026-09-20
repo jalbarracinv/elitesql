@@ -1,0 +1,6 @@
+{
+ "tool": "PRAGMA integrity_check",
+ "ok": true,
+ "output": "[('ok',)]",
+ "seconds": 0.11
+}

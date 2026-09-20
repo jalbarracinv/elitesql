@@ -15,24 +15,7 @@ from typing import Optional
 from . import schema, service
 from .drivers import Conflict, NotSupported
 
-WEIGHTS = {
-    "browse": 20.0,
-    "product_detail": 17.0,
-    "session_check": 12.0,
-    "add_to_cart": 10.0,
-    "search_text": 8.0,
-    "view_cart": 8.0,
-    "recommend": 7.0,
-    "checkout": 4.0,
-    "update_cart_item": 3.0,
-    "order_history": 3.0,
-    "write_review": 2.0,
-    "relogin": 1.5,
-    "update_profile": 1.0,
-    "admin_dashboard": 1.0,
-    "signup": 0.5,
-    "restock": 0.3,
-}
+WEIGHTS = dict(schema.OPERATION_WEIGHTS)
 # Experiments: SAAS_SIM_DROP_OPS="search_text,recommend" removes operations from the mix.
 for _dropped in filter(None, __import__("os").environ.get("SAAS_SIM_DROP_OPS", "").split(",")):
     WEIGHTS.pop(_dropped.strip(), None)

@@ -1,86 +1,232 @@
-"""Cost of one operation of the shop mix, engine against engine.
+"""Cost of one mini-SaaS operation, engine against engine.
 
-The sweep measures throughput and latency under concurrency; this measures
-what a single operation costs with nothing else running, which is where the
-per-row and per-statement work shows up undiluted. Both engines are seeded
-from scratch in the same run, so the ratio does not depend on the machine.
+The sweep measures concurrency; this benchmark measures an operation without
+other requests. It seeds each selected engine from scratch, checkpoints before
+timing and records the exact request mix it used.
 
-The database is checkpointed before measuring: rows live in a published run,
-not in the resident overlay. Reaching a published row costs about twice what
-reaching a resident one costs, and a long-lived database is always in the
-first state.
-
-    python3 examples/saas_simulation/ops_cost.py
+``full-v2`` (the default) measures the sixteen operations used by
+``saas.vuser`` and normalizes their weights. ``historical-v1`` keeps the
+old eleven-operation weights-over-100 formula only for comparison with old
+reports; it is a partial mix and is labelled as such.
 """
 
-import sys, time, random, os, subprocess
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(HERE, "..", "..", "bindings", "python"))
-TMP = os.environ.get("TMPDIR", "/tmp").rstrip("/")
-# The mix is measured at whatever scale the caller asks for: the cost of a
-# keyed row grows with the table on one engine and with the B-tree depth on
-# the other, so the ratio between them is not a constant.
-PRODUCTS = int(os.environ.get("OPS_COST_PRODUCTS", "5000"))
-USERS = int(os.environ.get("OPS_COST_USERS", "20000"))
-from saas import service, schema, drivers
-for f in (f"{TMP}/ops_cost.esql", f"{TMP}/ops_cost.sqlite", f"{TMP}/ops_cost.sqlite-wal", f"{TMP}/ops_cost.sqlite-shm"):
-    subprocess.run(["rm", "-rf", f])
-def build(kind):
-    c = drivers.open_embedded(f"{TMP}/ops_cost.esql", "balanced") if kind == "elite" else drivers.SqliteConnection(f"{TMP}/ops_cost.sqlite")
-    service.create_schema(c, sqlite=(kind != "elite"))
-    service.seed(c, users=USERS, products=PRODUCTS, sqlite=(kind != "elite"))
-    # The canonical figures are measured against a published database: rows in
-    # a run, not in the resident overlay. Reaching a published row costs about
-    # twice what reaching a resident one costs, so a benchmark that skips this
-    # measures a state no long-lived database is ever in.
-    c.checkpoint()
-    o = service.login(c, schema.user_email(3), schema.user_password(3))
-    return c, o.data["user_id"], o.data["token"]
-conns = {k: build(k) for k in ("elite", "sqlite")}
-for c, uid, _ in conns.values():
-    for pid in (11, 22, 33): service.add_to_cart(c, uid, pid, 1)
-    service.checkout(c, uid)
-    for pid in (44, 55, 66, 77, 88): service.add_to_cart(c, uid, pid, 1)
-ops = {
-    "browse":          lambda c,u,t,r: service.browse(c, r.choice(schema.CATEGORIES), r.randrange(3)),
-    "product_detail":  lambda c,u,t,r: service.product_detail(c, r.randint(1,5000)),
-    "session_check":   lambda c,u,t,r: service.session_check(c, t),
-    # Keep the cart at a realistic size: the benchmark's own repetition would
-    # otherwise grow it to hundreds of lines and make `view_cart` measure a
-    # cart no simulated user ever has.
-    "add_to_cart":     lambda c,u,t,r: (service.add_to_cart(c, u, r.randint(1,5000), 1),
-                                        service.update_cart_item(c, u, r.randint(1,5000), 0)),
-    "search_text":     lambda c,u,t,r: service.search_text(c, "bamboo kettle"),
-    "view_cart":       lambda c,u,t,r: service.view_cart(c, u),
-    "recommend":       lambda c,u,t,r: service.recommend(c, r.randint(1,5000)),
-    "order_history":   lambda c,u,t,r: service.order_history(c, u),
-    "write_review":    lambda c,u,t,r: service.write_review(c, u, r.randint(1,5000), 4, "ok"),
-    "update_profile":  lambda c,u,t,r: service.update_profile(c, u, "n"),
-    "admin_dashboard": lambda c,u,t,r: service.admin_dashboard(c, 0),
-}
-weights = {"browse":20,"product_detail":17,"session_check":12,"add_to_cart":10,"search_text":8,
-           "view_cart":8,"recommend":7,"order_history":3,"write_review":2,"update_profile":1,"admin_dashboard":1}
-print(f"escala: {USERS} cuentas, {PRODUCTS} productos")
-print(f"{'operation':18s} {'weight':>6s} {'EliteSQL':>10s} {'SQLite':>10s} {'ratio':>7s} {'elite share':>12s}")
-totals = {"elite":0.0, "sqlite":0.0}
-for name, fn in ops.items():
-    t = {}
-    for kind, (c, uid, tok) in conns.items():
-        # A realistic cart for the operations that read it: the benchmark's own
-        # repetition of add_to_cart would otherwise leave hundreds of lines.
-        cart = c.execute("SELECT id FROM carts WHERE user_id = ? AND status = 'open' LIMIT 1", [uid]).one
-        if cart:
-            c.execute("DELETE FROM cart_items WHERE cart_id = ?", [cart[0]])
-        for pid in (44, 55, 66, 77, 88):
-            service.add_to_cart(c, uid, pid, 1)
-        r = random.Random(7); n = 60 if name == "admin_dashboard" else 400
-        fn(c, uid, tok, random.Random(7))
-        t0 = time.perf_counter()
-        for _ in range(n): fn(c, uid, tok, r)
-        t[kind] = (time.perf_counter()-t0)/n*1e6
-    w = weights[name]/100
-    totals["elite"] += t["elite"]*w; totals["sqlite"] += t["sqlite"]*w
-    print(f"{name:18s} {weights[name]:5d}% {t['elite']:9.1f}us {t['sqlite']:9.1f}us {t['elite']/t['sqlite']:6.1f}x {t['elite']*w:10.1f}us")
-print(f"\n{'weighted operation':18s} {'':6s} {totals['elite']:9.1f}us {totals['sqlite']:9.1f}us {totals['elite']/totals['sqlite']:6.1f}x")
-for c,_,_ in conns.values(): c.close()
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import statistics
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE / ".." / ".." / "bindings" / "python"))
+
+from saas import drivers, schema, service
+
+FULL_METRIC = "full-v2"
+HISTORICAL_METRIC = "historical-v1"
+
+
+@dataclass
+class Sample:
+    user_id: int
+    email: str
+    token: str
+    product_id: int
+
+
+@dataclass
+class Operation:
+    call: Callable[[Any, Sample, int], service.Outcome]
+    prepare: Callable[[Any, list[Sample], int], None]
+    heavy: bool = False
+
+
+def no_prepare(_conn: Any, _samples: list[Sample], _products: int) -> None:
+    pass
+
+
+def product_ids(products: int, count: int, seed: int) -> list[int]:
+    rng = random.Random(seed)
+    return [rng.randint(1, products) for _ in range(count)]
+
+
+def make_samples(conn: Any, count: int, products: int, tag: str) -> list[Sample]:
+    """Prepare independent identities outside the timed interval."""
+    samples = []
+    for position, product_id in enumerate(product_ids(products, count, 10_000 + len(tag))):
+        email = f"ops-cost-{tag}-{position}@example.com"
+        password = "ops-cost-password"
+        signup = service.signup(conn, email, password, f"Ops cost {tag} {position}")
+        if signup.business != "ok":
+            raise RuntimeError(f"could not prepare {tag} sample {position}: {signup.business}")
+        login = service.login(conn, email, password)
+        if login.business != "ok":
+            raise RuntimeError(f"could not log in {tag} sample {position}: {login.business}")
+        samples.append(Sample(login.data["user_id"], email, login.data["token"], product_id))
+    return samples
+
+
+def fill_cart(conn: Any, sample: Sample, products: int) -> None:
+    for product_id in product_ids(products, 5, sample.user_id):
+        outcome = service.add_to_cart(conn, sample.user_id, product_id, 1)
+        if outcome.business != "ok":
+            raise RuntimeError(f"could not prepare cart: {outcome.business}")
+
+
+def prepare_carts(conn: Any, samples: list[Sample], products: int) -> None:
+    for sample in samples:
+        fill_cart(conn, sample, products)
+
+
+def prepare_cart_items(conn: Any, samples: list[Sample], _products: int) -> None:
+    for sample in samples:
+        outcome = service.add_to_cart(conn, sample.user_id, sample.product_id, 2)
+        if outcome.business != "ok":
+            raise RuntimeError(f"could not prepare cart item: {outcome.business}")
+
+
+def prepare_orders(conn: Any, samples: list[Sample], products: int) -> None:
+    for sample in samples:
+        fill_cart(conn, sample, products)
+        outcome = service.checkout(conn, sample.user_id)
+        if outcome.business != "ok":
+            raise RuntimeError(f"could not prepare order history: {outcome.business}")
+
+
+def relogin(conn: Any, sample: Sample, _position: int) -> service.Outcome:
+    service.logout(conn, sample.token)
+    outcome = service.login(conn, sample.email, "ops-cost-password")
+    if outcome.business == "ok":
+        sample.token = outcome.data["token"]
+    return outcome
+
+
+def operation_definitions() -> dict[str, Operation]:
+    return {
+        "browse": Operation(lambda conn, _sample, n: service.browse(conn, schema.CATEGORIES[n % len(schema.CATEGORIES)], n % 5), no_prepare),
+        "product_detail": Operation(lambda conn, sample, _n: service.product_detail(conn, sample.product_id), no_prepare),
+        "session_check": Operation(lambda conn, sample, _n: service.session_check(conn, sample.token), no_prepare),
+        "add_to_cart": Operation(lambda conn, sample, _n: service.add_to_cart(conn, sample.user_id, sample.product_id, 1), no_prepare),
+        "search_text": Operation(lambda conn, _sample, _n: service.search_text(conn, "bamboo kettle"), no_prepare),
+        "view_cart": Operation(lambda conn, sample, _n: service.view_cart(conn, sample.user_id), prepare_carts),
+        "recommend": Operation(lambda conn, sample, _n: service.recommend(conn, sample.product_id), no_prepare),
+        "checkout": Operation(lambda conn, sample, _n: service.checkout(conn, sample.user_id), prepare_carts, heavy=True),
+        "update_cart_item": Operation(lambda conn, sample, _n: service.update_cart_item(conn, sample.user_id, sample.product_id, 1), prepare_cart_items),
+        "order_history": Operation(lambda conn, sample, _n: service.order_history(conn, sample.user_id), prepare_orders),
+        "write_review": Operation(lambda conn, sample, _n: service.write_review(conn, sample.user_id, sample.product_id, 4, "ops cost review"), no_prepare),
+        "relogin": Operation(relogin, no_prepare),
+        "update_profile": Operation(lambda conn, sample, n: service.update_profile(conn, sample.user_id, f"Ops cost {n}"), no_prepare),
+        "admin_dashboard": Operation(lambda conn, _sample, _n: service.admin_dashboard(conn, 0), no_prepare, heavy=True),
+        "signup": Operation(lambda conn, sample, n: service.signup(conn, f"ops-cost-new-{sample.user_id}-{n}@example.com", "pw", "New"), no_prepare),
+        "restock": Operation(lambda conn, sample, _n: service.restock(conn, [sample.product_id], 1), no_prepare),
+    }
+
+
+def build(kind: str, root: Path, users: int, products: int, scenario: str):
+    path = root / ("elite.esql" if kind == "elite" else "sqlite.db")
+    conn = drivers.open_embedded(str(path), "balanced") if kind == "elite" else drivers.SqliteConnection(str(path))
+    service.create_schema(conn, sqlite=(kind == "sqlite"))
+    service.seed(conn, users=users, products=products, sqlite=(kind == "sqlite"))
+    if scenario == "compound-index":
+        # Keep every baseline index and add only the browse access path. The
+        # same portable DDL reaches SQLite so the scenario remains comparable.
+        ddl = "CREATE INDEX ON products (category, price_cents)"
+        conn.execute(drivers.sqlite_ddl(ddl) if kind == "sqlite" else ddl)
+    conn.checkpoint()
+    return conn
+
+
+def benchmark_operation(conn: Any, name: str, operation: Operation, products: int, iterations: int) -> float:
+    samples = make_samples(conn, iterations, products, name)
+    operation.prepare(conn, samples, products)
+    # Every timed write targets a distinct prepared account. This avoids the
+    # old benchmark's cart growth and makes all configured product scales real.
+    started = time.perf_counter()
+    for position, sample in enumerate(samples):
+        outcome = operation.call(conn, sample, position)
+        if outcome.business != "ok":
+            raise RuntimeError(f"{name} sample {position} returned {outcome.business}")
+    return (time.perf_counter() - started) * 1e6 / iterations
+
+
+def metric_definition(metric: str) -> tuple[dict[str, float], float, str]:
+    if metric == FULL_METRIC:
+        weights = dict(schema.OPERATION_WEIGHTS)
+        return weights, sum(weights.values()), "normalized full virtual-user mix"
+    weights = dict(schema.HISTORICAL_OPS_COST_WEIGHTS)
+    return weights, 100.0, "historical partial mix; weights intentionally divide by 100"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--metric", choices=(FULL_METRIC, HISTORICAL_METRIC), default=FULL_METRIC)
+    parser.add_argument("--products", type=int, default=int(os.environ.get("OPS_COST_PRODUCTS", "5000")))
+    parser.add_argument("--users", type=int, default=int(os.environ.get("OPS_COST_USERS", "20000")))
+    parser.add_argument("--iterations", type=int, default=400)
+    parser.add_argument("--heavy-iterations", type=int, default=60)
+    parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--engines", default="elite,sqlite", help="comma-separated subset of elite,sqlite")
+    parser.add_argument("--scenario", choices=("baseline", "compound-index"), default="baseline")
+    parser.add_argument("--out", type=Path, help="write raw timings and configuration as JSON")
+    args = parser.parse_args()
+    if min(args.products, args.users, args.iterations, args.heavy_iterations, args.repetitions) < 1:
+        parser.error("products, users, iterations, heavy-iterations and repetitions must be positive")
+    engines = [engine.strip() for engine in args.engines.split(",") if engine.strip()]
+    if not engines or any(engine not in {"elite", "sqlite"} for engine in engines):
+        parser.error("--engines must be a non-empty subset of elite,sqlite")
+
+    weights, divisor, description = metric_definition(args.metric)
+    definitions = operation_definitions()
+    missing = set(weights).difference(definitions)
+    if missing:
+        raise RuntimeError(f"metric refers to missing operations: {sorted(missing)}")
+    print(f"metric: {args.metric} ({description})")
+    print(f"weights: {sum(weights.values()):.1f}; divisor: {divisor:.1f}; operations: {len(weights)}")
+    print(f"scenario: {args.scenario}; scale: {args.users} accounts, {args.products} products; samples: {args.iterations} ({args.heavy_iterations} heavy); repetitions: {args.repetitions}")
+
+    raw: dict[str, dict[str, list[float]]] = {name: {engine: [] for engine in engines} for name in weights}
+    for repetition in range(args.repetitions):
+        # Alternating engine order limits systematic thermal/cache bias.
+        shift = repetition % len(engines)
+        order = engines[shift:] + engines[:shift]
+        with tempfile.TemporaryDirectory(prefix=f"elitesql-ops-cost-r{repetition}-") as temp:
+            root = Path(temp)
+            conns = {}
+            try:
+                for engine in order:
+                    conns[engine] = build(engine, root, args.users, args.products, args.scenario)
+                    for name in weights:
+                        definition = definitions[name]
+                        count = args.heavy_iterations if definition.heavy else args.iterations
+                        raw[name][engine].append(benchmark_operation(conns[engine], name, definition, args.products, count))
+            finally:
+                for conn in conns.values():
+                    conn.close()
+
+    medians = {name: {engine: statistics.median(samples) for engine, samples in values.items()} for name, values in raw.items()}
+    totals = {engine: sum(medians[name][engine] * weight / divisor for name, weight in weights.items()) for engine in engines}
+    print(f"{'operation':18s} {'weight':>7s}" + "".join(f" {engine:>20s}" for engine in engines))
+    for name, weight in weights.items():
+        columns = []
+        for engine in engines:
+            samples = raw[name][engine]
+            columns.append(f"{medians[name][engine]:8.1f} us [{min(samples):.1f},{max(samples):.1f}]")
+        print(f"{name:18s} {weight:6.1f}%" + "".join(f" {column:>20s}" for column in columns))
+    print("weighted operation (median per operation): " + ", ".join(f"{engine}={total:.1f} us" for engine, total in totals.items()))
+    if len(engines) == 2:
+        print(f"ratio elite/sqlite: {totals['elite'] / totals['sqlite']:.2f}x")
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps({"metric": args.metric, "description": description, "scenario": args.scenario, "weights": weights, "divisor": divisor, "products": args.products, "users": args.users, "iterations": args.iterations, "heavy_iterations": args.heavy_iterations, "repetitions": args.repetitions, "raw_us": raw, "median_us": medians, "weighted_us": totals}, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

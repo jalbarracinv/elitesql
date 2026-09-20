@@ -241,7 +241,7 @@ def write_report(out: Path, config: dict, env: dict, rows: list[dict], summaries
     lines.append("## Configuration")
     lines.append("")
     for key in ("transport", "levels", "duration", "warmup", "ramp", "think", "processes",
-                "connections", "durability", "products", "accounts", "seed", "fresh_per_stage"):
+                "connections", "durability", "products", "accounts", "scenario", "seed", "fresh_per_stage"):
         lines.append(f"- **{key}**: {config.get(key)}")
     lines.append(f"- **seed time**: {seed_info.get('seed_seconds')} s, "
                  f"{seed_info.get('db_bytes', 0) / 2**20:.1f} MiB after seeding")
@@ -413,6 +413,7 @@ def main() -> None:
                     help="engine memory envelope for the sidecar (0 = the engine default, 384)")
     ap.add_argument("--products", type=int, default=5000)
     ap.add_argument("--accounts", type=int, default=20000)
+    ap.add_argument("--scenario", choices=("baseline", "compound-index"), default="baseline")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--fresh-per-stage", action="store_true", help="reseed the database before every level")
     ap.add_argument("--keep-samples", action="store_true", help="keep the raw per-request samples (large)")
@@ -446,7 +447,7 @@ def main() -> None:
 
     def prepare() -> dict:
         info = runner.prepare_database(args.transport, db_path, args.durability, args.products,
-                                       args.accounts)
+                                       args.accounts, scenario=args.scenario)
         print(f"seeded {info['users']} accounts, {info['products']} products in {info['seed_seconds']} s "
               f"({info['db_bytes'] / 2**20:.1f} MiB)", flush=True)
         return info

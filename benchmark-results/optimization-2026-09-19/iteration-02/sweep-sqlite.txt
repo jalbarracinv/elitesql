@@ -1,0 +1,9 @@
+results → /Users/jalbarracin/elitesql/benchmark-results/optimization-2026-09-19/iteration-02/sweep-sqlite
+database → /private/var/folders/z_/dcnr0h75667d0d42ldb92hb00000gn/T/saas-sim-_pz4yg24/saas.sqlite
+seeded 20000 accounts, 5000 products in 0.14 s (4.6 MiB)
+ users     ops/s    p50ms     p99ms   usr p99   succ%  retry% srvCPU genCPU  inv   wall
+    10   27922.3    0.036     3.836     3.836   100.0     0.0   None   2.49   ok  26.32
+   100   25362.8     0.07    64.349     64.35   100.0     0.0   None   3.83   ok  26.56
+   500   23676.8    0.115   667.085   667.086   100.0     0.0   None   5.14   ok  27.12
+offline check: ok (0.11 s)
+report → /Users/jalbarracin/elitesql/benchmark-results/optimization-2026-09-19/iteration-02/sweep-sqlite/report.md

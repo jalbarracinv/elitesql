@@ -1779,13 +1779,19 @@ pub(super) fn rebuild_derived_indexes_after_rewrite(
                 table
                     .indexes
                     .iter()
-                    .map(|def| (table.name.clone(), def.column.clone()))
+                    .map(|def| {
+                        (
+                            table.name.clone(),
+                            def.clone(),
+                            secondary_index_id(def.columns()),
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .collect();
         let mut rebuilt = HashMap::new();
-        for (table, column) in definitions {
-            let path = sidx_path(&shared.dir, &table, &column);
+        for (table, def, index_id) in definitions {
+            let path = sidx_path(&shared.dir, &table, &index_id);
             let tmp = path.with_extension("sidx.tmp");
             write_secondary_from_canonical(
                 &tmp,
@@ -1796,7 +1802,7 @@ pub(super) fn rebuild_derived_indexes_after_rewrite(
                 st.catalog
                     .table(&table)
                     .ok_or_else(|| Error::TableNotFound(table.clone()))?,
-                &column,
+                &def,
                 &st.index,
                 &st.readers,
             )?;
@@ -1818,8 +1824,8 @@ pub(super) fn rebuild_derived_indexes_after_rewrite(
                     index: Arc::new(PagedIndex::open(&path)?),
                 }],
             )?;
-            publish_secondary_manifest(&shared.dir, &table, &column, version, &index)?;
-            rebuilt.insert((table, column), index);
+            publish_secondary_manifest(&shared.dir, &table, &index_id, version, &index)?;
+            rebuilt.insert((table, index_id), index);
         }
         st.secondary = rebuilt;
     }

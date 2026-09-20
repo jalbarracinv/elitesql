@@ -1,0 +1,4 @@
+   Compiling elitesql-cli v0.0.1 (/Users/jalbarracin/elitesql/crates/elitesql-cli)
+   Compiling elitesql-core v0.0.1 (/Users/jalbarracin/elitesql/crates/elitesql-core)
+   Compiling elitesql-ffi v0.0.1 (/Users/jalbarracin/elitesql/crates/elitesql-ffi)
+    Finished `release` profile [optimized] target(s) in 48.07s

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -299,12 +299,72 @@ impl Column {
     }
 }
 
-/// A secondary index over one column. Secondary indexes reflect the latest
-/// committed state (not historical snapshot versions) in Phase 1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A secondary index over an ordered, nonempty list of columns. Secondary
+/// indexes reflect the latest committed state (not historical snapshots).
+///
+/// `column` is retained in the on-disk catalog for readers that only know
+/// single-column indexes. It always mirrors the first item in `columns`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexDef {
     pub column: String,
+    #[serde(default)]
+    pub columns: Vec<String>,
     pub unique: bool,
+}
+
+impl IndexDef {
+    pub fn new(columns: Vec<String>, unique: bool) -> Self {
+        assert!(!columns.is_empty(), "secondary index needs a column");
+        Self {
+            column: columns[0].clone(),
+            columns,
+            unique,
+        }
+    }
+
+    pub fn single(column: impl Into<String>, unique: bool) -> Self {
+        Self::new(vec![column.into()], unique)
+    }
+
+    /// Old catalogs had only `column`; custom deserialization below expands
+    /// those definitions, so callers can always consume this ordered slice.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
+impl<'de> Deserialize<'de> for IndexDef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireIndexDef {
+            column: String,
+            #[serde(default)]
+            columns: Vec<String>,
+            unique: bool,
+        }
+
+        let WireIndexDef {
+            column,
+            mut columns,
+            unique,
+        } = WireIndexDef::deserialize(deserializer)?;
+        if columns.is_empty() {
+            columns.push(column.clone());
+        }
+        if columns[0] != column {
+            return Err(serde::de::Error::custom(
+                "secondary index column must equal the first columns entry",
+            ));
+        }
+        Ok(Self {
+            column,
+            columns,
+            unique,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,6 +501,26 @@ impl TableSchema {
                 "table '{}' can have at most one identity column",
                 self.name
             )));
+        }
+        for index in &self.indexes {
+            if index.columns.is_empty() || index.column != index.columns[0] {
+                return Err(Error::SchemaViolation(format!(
+                    "secondary index on '{}' has an invalid column list",
+                    self.name
+                )));
+            }
+            for (position, column) in index.columns.iter().enumerate() {
+                if self.column(column).is_none()
+                    || index.columns[..position]
+                        .iter()
+                        .any(|previous| previous == column)
+                {
+                    return Err(Error::SchemaViolation(format!(
+                        "secondary index on '{}' has an invalid column '{}'",
+                        self.name, column
+                    )));
+                }
+            }
         }
         for (index, foreign_key) in self.foreign_keys.iter().enumerate() {
             if self.column(&foreign_key.column).is_none() {
@@ -581,5 +661,28 @@ impl Catalog {
             crate::manifest::fsync_dir(dir)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_single_column_index_deserializes_as_an_ordered_list() {
+        let index: IndexDef =
+            serde_json::from_str(r#"{"column":"category","unique":false}"#).unwrap();
+        assert_eq!(index.columns(), ["category"]);
+        let encoded = serde_json::to_value(index).unwrap();
+        assert_eq!(encoded["column"], "category");
+        assert_eq!(encoded["columns"], serde_json::json!(["category"]));
+    }
+
+    #[test]
+    fn index_rejects_a_legacy_alias_that_disagrees_with_the_list() {
+        let result = serde_json::from_str::<IndexDef>(
+            r#"{"column":"category","columns":["price"],"unique":false}"#,
+        );
+        assert!(result.is_err());
     }
 }

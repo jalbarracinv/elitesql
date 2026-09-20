@@ -273,13 +273,21 @@ pub fn json_to_record(value: &J) -> Result<Record> {
 /// sidecar protocol.
 pub fn output_to_json(out: &QueryOutput) -> J {
     match out {
-        QueryOutput::Rows { columns, rows } => json!({
-            "columns": columns,
-            "rows": rows
-                .iter()
-                .map(|r| r.iter().map(value_to_json).collect::<Vec<_>>())
-                .collect::<Vec<_>>(),
-        }),
+        QueryOutput::Rows { columns, rows } => {
+            // These cells are already JSON values. Feeding a Vec<Vec<J>> to
+            // json! serializes the entire tree into a second tree, allocating
+            // every row and copying every string a second time.
+            let columns = J::Array(columns.iter().cloned().map(J::String).collect());
+            let rows = J::Array(
+                rows.iter()
+                    .map(|row| J::Array(row.iter().map(value_to_json).collect()))
+                    .collect(),
+            );
+            J::Object(Map::from_iter([
+                ("columns".into(), columns),
+                ("rows".into(), rows),
+            ]))
+        }
         QueryOutput::Inserted { ids } => json!({"inserted": ids}),
         QueryOutput::InsertedIdentity {
             ids,

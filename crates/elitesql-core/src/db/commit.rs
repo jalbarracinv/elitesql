@@ -1494,15 +1494,16 @@ pub(super) fn validate_unique(st: &State, staged: &[&PreparedTable]) -> Result<(
                 if !def.unique {
                     continue;
                 }
-                let Some(value) = record.get(&def.column) else {
-                    continue;
-                };
-                if value.is_null() {
+                if secondary_key_has_null(record, def.columns()) {
                     continue;
                 }
-                let key = index_key(value);
+                let key = secondary_tuple_key(record, def.columns());
                 if let Some(previous) = staged_new.insert(
-                    (table.name.clone(), def.column.clone(), key.clone()),
+                    (
+                        table.name.clone(),
+                        secondary_index_id(def.columns()),
+                        key.clone(),
+                    ),
                     change.id.clone(),
                 ) {
                     if previous != change.id {
@@ -1517,7 +1518,7 @@ pub(super) fn validate_unique(st: &State, staged: &[&PreparedTable]) -> Result<(
                 // holders".
                 let index = st
                     .secondary
-                    .get(&(table.name.clone(), def.column.clone()))
+                    .get(&secondary_index_key(&table.name, def))
                     .ok_or_else(|| missing_unique_index(&table.name, &def.column))?;
                 for holder in index.ids(&key)? {
                     // A holder also written by this transaction is judged
@@ -1606,7 +1607,7 @@ pub(super) fn final_ids_matching(
         if let Value::Text(id) = value {
             candidates.insert(id.clone());
         }
-    } else if let Some(index) = st.secondary.get(&(table.to_owned(), column.to_owned())) {
+    } else if let Some(index) = st.secondary.get(&single_secondary_index_key(table, column)) {
         candidates.extend(index.ids(&index_key(value))?);
     } else {
         // Catalog validation normally guarantees an index for every FK side.

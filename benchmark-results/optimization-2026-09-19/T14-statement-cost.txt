@@ -1,0 +1,110 @@
+   Compiling elitesql-core v0.0.1 (/Users/jalbarracin/elitesql/crates/elitesql-core)
+    Finished `release` profile [optimized] target(s) in 41.93s
+     Running `target/release/examples/statement_cost`
+published runs: 1 primary, 5 secondary
+
+--- point read, one row of three columns ---
+Db::get (storage primitive, no SQL)                      0.22 us
+Db::query_params -> QueryOutput (SQL executor)           1.28 us
+jsonio JSON path (what the C ABI returns)                1.97 us
+  SQL layer above the storage primitive                  1.06 us
+  JSON boundary above the SQL layer                      0.69 us
+
+--- full scan of 20 000 rows, by projection width ---
+COUNT(*): no column decoded                           1594.51 us
+SELECT 1 of 8 columns                                 2424.20 us
+SELECT 2 of 8 columns                                 2589.53 us
+SELECT 4 of 8 columns                                 3349.66 us
+SELECT 8 of 8 columns                                 5528.73 us
+  per row, reaching the visible version                  79.7 ns
+  per row, before any column                             88.0 ns
+  per column                                             22.8 ns
+
+--- indexed read of 40 rows, stage by stage ---
+COUNT(*): reached and handed over, not decoded          14.61 us
+COUNT(*) of one row, by identity                         1.39 us
++ one column decoded and returned                       15.76 us
++ a second column                                       19.01 us
++ ORDER BY price, LIMIT 20                              17.89 us
+  fixed cost of the statement                            1386 ns
+  reaching a row and handing it over, per row             339 ns
+  first column, per row                                    29 ns
+  second column, per row                                   81 ns
+  sort and limit, per row                                 -28 ns
+
+--- the same 40 rows from the resident delta ---
+COUNT(*) of one row, by identity                         1.43 us
+COUNT(*): reached and handed over, not decoded           8.23 us
+  reaching a row and handing it over, per row             174 ns
+COUNT(*) of one row, 200-row table                       1.27 us
+COUNT(*) of 40 rows, 200-row table                      11.89 us
+  reaching a row and handing it over, per row             272 ns
+  in 1 published run(s)
+
+--- allocations a matched row costs, counted ---
+COUNT(*), one row                                        72.0 allocs      4794 B
+COUNT(*), forty rows                                    136.0 allocs     13895 B
+  per matched row                                        1.64 allocs
+one int column, one row                                  65.0 allocs      4058 B
+one int column, forty rows                              172.0 allocs     18537 B
+  per matched row                                        2.74 allocs
+two int columns, one row                                 67.0 allocs      4206 B
+two int columns, forty rows                             174.0 allocs     21181 B
+  per matched row                                        2.74 allocs
+every column, including the text one, one row            70.0 allocs      4634 B
+every column, including the text one, forty rows        216.0 allocs     27967 B
+  per matched row                                        3.74 allocs
+SUM of an int column, one row                            75.0 allocs      4852 B
+SUM of an int column, forty rows                        139.0 allocs     15201 B
+  per matched row                                        1.64 allocs
+the identity column alone, one row                       65.0 allocs      4052 B
+the identity column alone, forty rows                   172.0 allocs     18531 B
+  per matched row                                        2.74 allocs
+the driver column alone, one row                         65.0 allocs      4060 B
+the driver column alone, forty rows                     172.0 allocs     17259 B
+  per matched row                                        2.74 allocs
+two ints, neither the identity, one row                  67.0 allocs      4214 B
+two ints, neither the identity, forty rows              174.0 allocs     19909 B
+  per matched row                                        2.74 allocs
+the text column alone, one row                           66.0 allocs      4058 B
+the text column alone, forty rows                       212.0 allocs     18655 B
+  per matched row                                        3.74 allocs
+
+--- allocations a statement pays whatever it reads ---
+Db::get: the storage primitive                            3.0 allocs       169 B
+SELECT one row by identity                               28.0 allocs      2013 B
+the same SELECT with no parameters                       28.0 allocs      2013 B
+  no WHERE, LIMIT 1                                      34.0 allocs     10381 B
+  WHERE on the identity                                  28.0 allocs      2013 B
+  two columns                                            30.0 allocs      2129 B
+  four columns                                           35.0 allocs      2439 B
+  WHERE plus ORDER BY                                    40.0 allocs      2858 B
+  two conjuncts                                          35.0 allocs      2471 B
+INSERT one row                                          159.5 allocs     10769 B
+INSERT staged in a transaction of 100                    58.8 allocs
+
+--- what a statement pays before it reads anything ---
+Db::table_schema: one clone of the catalog entry         0.01 us
+
+--- the shop's browse page, 339 rows read, 20 returned ---
+before a checkpoint, rows in the overlay                80.56 us
+the engine alone                                       133.67 us
+across the JSON the C ABI returns                      139.19 us
+  the JSON boundary adds                                  5.5 us
+compound index: the engine alone                        30.86 us
+  compound index change from baseline                  -102.8 us
+
+--- other statements (SQL executor, no JSON) ---
+SELECT by indexed column, ORDER BY, LIMIT 20            19.45 us
+UPDATE by id                                             9.17 us
+
+--- where one autocommit commit's time goes ---
+whole commit                                             6.18 us
+  waiting for the serialization lock                     0.04 us
+  holding it                                             5.09 us
+  preparing                                              0.52 us
+  encoding the record                                    0.12 us
+  encoding the WAL frame                                 0.14 us
+  validating                                             1.33 us
+  WAL append and sync                                    3.70 us
+INSERT one row                                           8.70 us

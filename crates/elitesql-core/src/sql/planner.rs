@@ -12,6 +12,136 @@ pub(super) enum TableDriver {
     Scan,
 }
 
+/// A single-table access path whose physical secondary-index order satisfies
+/// the SQL `ORDER BY`. Materialized rows still pass every predicate; only an
+/// exact prefix with no residual filter can skip OFFSET records by membership.
+pub(super) struct OrderedSecondaryPlan {
+    pub(super) columns: Vec<String>,
+    pub(super) tuple_prefix: Vec<u8>,
+    /// Every pushed predicate is a distinct equality in the tuple prefix.
+    /// Only this case can count OFFSET directly from live index entries.
+    pub(super) exact_prefix: bool,
+}
+
+/// Return an ordered secondary-index plan only when its byte order is the SQL
+/// order requested by the statement. This deliberately starts with the small
+/// proven subset: ascending values after an equality prefix, and an optional
+/// binary physical-id tie breaker. Other types and collations retain the
+/// spill-sort path until their ordering equivalence is demonstrated.
+pub(super) fn ordered_secondary_plan(
+    table: &TableCtx,
+    ti: usize,
+    predicates: &[RExpr],
+    order_keys: &[((usize, String), SortSpec)],
+    has_limit: bool,
+) -> Option<OrderedSecondaryPlan> {
+    if !has_limit || order_keys.is_empty() || order_keys.iter().any(|(_, spec)| spec.desc) {
+        return None;
+    }
+
+    let mut equalities = std::collections::BTreeMap::<String, Value>::new();
+    for predicate in predicates {
+        let RExpr::Cmp {
+            left,
+            op: CmpOp::Eq,
+            right,
+        } = predicate
+        else {
+            continue;
+        };
+        let (column, value) = match (left, right) {
+            (RVal::Col(index, column), RVal::Val(value)) if *index == ti => (column, value),
+            (RVal::Val(value), RVal::Col(index, column)) if *index == ti => (column, value),
+            _ => continue,
+        };
+        if value.is_null() {
+            return None;
+        }
+        let value = coerce_for_lookup(value, table.schema.column(column)?.ty)?;
+        match equalities.get(column) {
+            Some(existing) if existing != &value => return None,
+            Some(_) => {}
+            None => {
+                equalities.insert(column.clone(), value);
+            }
+        }
+    }
+
+    for def in &table.schema.indexes {
+        let columns = def.columns();
+        let prefix_len = columns
+            .iter()
+            .take_while(|column| equalities.contains_key(*column))
+            .count();
+        // An ordered walk is useful only after an actual equality prefix and
+        // at least one indexed ordering component remains.
+        if prefix_len == 0 || prefix_len == columns.len() {
+            continue;
+        }
+
+        let expected_count = columns.len() - prefix_len;
+        if !(order_keys.len() == expected_count || order_keys.len() == expected_count + 1) {
+            continue;
+        }
+        let mut compatible = true;
+        for (position, ((key_ti, key_column), spec)) in order_keys.iter().enumerate() {
+            if *key_ti != ti {
+                compatible = false;
+                break;
+            }
+            if position < expected_count {
+                let column = &columns[prefix_len + position];
+                if key_column != column
+                    || !secondary_order_matches_sql(&table.schema, column, *spec)
+                {
+                    compatible = false;
+                    break;
+                }
+                continue;
+            }
+            // Every secondary pair ends in its physical identity. Exposing
+            // that as the final binary id key makes ties fully deterministic.
+            if key_column != ID_COLUMN
+                || !table.schema.has_implicit_id()
+                || spec.collation != Collation::Binary
+            {
+                compatible = false;
+            }
+        }
+        if !compatible {
+            continue;
+        }
+
+        let mut tuple_prefix = Vec::new();
+        for column in &columns[..prefix_len] {
+            crate::value::encode_index_value(
+                &mut tuple_prefix,
+                equalities.get(column).expect("equality prefix was counted"),
+            );
+        }
+        return Some(OrderedSecondaryPlan {
+            columns: columns.to_vec(),
+            tuple_prefix,
+            exact_prefix: predicates.len() == prefix_len && equalities.len() == prefix_len,
+        });
+    }
+    None
+}
+
+fn secondary_order_matches_sql(schema: &TableSchema, column: &str, spec: SortSpec) -> bool {
+    match schema.column(column).map(|column| column.ty) {
+        Some(
+            ColumnType::Bool
+            | ColumnType::Int64
+            | ColumnType::Timestamp
+            | ColumnType::Date
+            | ColumnType::Time,
+        ) => true,
+        Some(ColumnType::Text) => spec.collation == Collation::Binary,
+        _ => false,
+    }
+}
+
 pub(super) fn table_driver(table: &TableCtx, ti: usize, predicates: &[RExpr]) -> TableDriver {
     table_driver_at(table, ti, predicates).0
 }
@@ -80,7 +210,7 @@ pub(super) fn table_driver_at(
                 .schema
                 .indexes
                 .iter()
-                .find(|index| index.column == *column)
+                .find(|index| index.columns().len() == 1 && index.column == *column)
                 .map_or(3, |index| if index.unique { 1 } else { 2 });
             if best
                 .as_ref()
@@ -109,13 +239,17 @@ pub(super) fn driver_yields_at_most_one_row(table: &TableCtx, driver: &TableDriv
             .schema
             .indexes
             .iter()
-            .any(|index| index.unique && index.column == *column),
+            .any(|index| index.unique && index.columns().len() == 1 && index.column == *column),
         TableDriver::Scan => false,
     }
 }
 
 pub(super) fn has_secondary_index(table: &TableCtx, column: &str) -> bool {
-    table.schema.indexes.iter().any(|d| d.column == column)
+    table
+        .schema
+        .indexes
+        .iter()
+        .any(|index| index.columns().len() == 1 && index.column == column)
 }
 
 /// True when `column` on `table` can be probed directly instead of scanned.
@@ -397,6 +531,30 @@ pub(super) fn explain_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> 
         }
         None
     };
+    let ordered = if !is_aggregate && tables.len() == 1 {
+        let order_keys = stmt
+            .order_by
+            .iter()
+            .map(|key| {
+                Ok((
+                    resolve_col(&tables, &key.column)?,
+                    SortSpec {
+                        desc: key.desc,
+                        collation: key.collation,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ordered_secondary_plan(
+            &tables[0],
+            0,
+            &pushdown[0],
+            &order_keys,
+            stmt.limit.is_some(),
+        )
+    } else {
+        None
+    };
     let agg_names: Vec<String> = match &aggregate {
         Some(plan) => plan
             .specs
@@ -425,7 +583,7 @@ pub(super) fn explain_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> 
         plan.line(depth, line);
         depth += 1;
     }
-    if !stmt.order_by.is_empty() {
+    if !stmt.order_by.is_empty() && ordered.is_none() {
         let keys: Vec<String> = stmt
             .order_by
             .iter()
@@ -491,14 +649,25 @@ pub(super) fn explain_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> 
     // The bounded streaming join path only handles a two-table, non-aggregate
     // SELECT; see exec_select's dispatch.
     let streamed = tables.len() == 2 && !is_aggregate;
-    explain_join_tree(
-        &mut plan,
-        depth,
-        stmt,
-        &tables,
-        &pushdown,
-        stmt.joins.len(),
-        streamed,
-    )?;
+    if let Some(ordered) = ordered {
+        plan.line(
+            depth,
+            format!(
+                "INDEX ORDERED {} ({})",
+                tables[0].label,
+                ordered.columns.join(", ")
+            ),
+        );
+    } else {
+        explain_join_tree(
+            &mut plan,
+            depth,
+            stmt,
+            &tables,
+            &pushdown,
+            stmt.joins.len(),
+            streamed,
+        )?;
+    }
     Ok(plan.finish())
 }

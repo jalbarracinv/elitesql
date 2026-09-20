@@ -1,0 +1,13 @@
+{
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.11.13",
+  "git_head": "b4dda861765a4cf3a983577d23753d3a6d1d94f1",
+  "note": "Dirty worktree; before.diff and before-secondary.rs preserve start of this iteration. Final source is the working tree.",
+  "sha256": {
+    "benchmark-results/optimization-2026-09-19/iteration-02/before-libelitesql.dylib": "34377bcc9a651ac4235675f43f553536689a1f24dcaa4de6e1d2d1c9b7608cc4",
+    "benchmark-results/optimization-2026-09-19/iteration-02/offset-only-libelitesql.dylib": "f427cbc3afbf71235c350ddafee7fb772457eaf31037acd1a3d0c261b0b8e703",
+    "target/release/libelitesql.dylib": "1cf4e192cdb8e3736be9850f1f535df106b56ef5fc314ab9ce553b49cbd183ba",
+    "benchmark-results/optimization-2026-09-19/iteration-02/before-elitesql": "49b9f64ab8be8382d4486efc2334fe1c021e9c0d86c6929f2b837a98a49ca01d",
+    "target/release/elitesql": "47a463cff77b6188abd93fe237727ae7011cdde9c4b9516f821918637e782b68"
+  }
+}

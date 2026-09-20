@@ -22,6 +22,24 @@ tree by a few percent.
 | SQLite, same workload and generator | [`sqlite-think0/`](sqlite-think0/report.md) |
 | overlays: after / before / SQLite | [`compare/`](compare/), [`compare-think/`](compare-think/) |
 
+## Follow-up experiments (2026-09-19)
+
+These measurements start from the compound-index implementation, not the
+historical baselines below. Raw data, methods and acceptance limits are in the
+[iteration 02 report](../optimization-2026-09-19/iteration-02/README.md).
+
+| # | Hypothesis | Change | Evidence |
+|---|---|---|---|
+| 72 | Ordered pagination still decodes the records discarded by OFFSET, and resident continuation revisits earlier pairs | Count live index entries when the equality prefix proves every filter; seek the resident tuple/id cursor directly and avoid duplicate pair/version allocations | At 5,000 products, OFFSET 80: 72.01 → 34.02 µs before the JSON change; SQLite 16.78 → 16.70 µs. Five warmed blocks per page. Additional predicates keep row evaluation; a concurrent commit falls back to the original snapshot. |
+| 73 | Wrapping converted JSON cells in `json!` serializes and copies the result tree again | Build JSON arrays/objects directly, keeping the wire format and tagged values | Incremental page-0 cost 28.46 → 27.14 µs, OFFSET 80: 34.02 → 32.64 µs in sequential measurements. Small gain; most of #72's improvement was already present. The first full-v2 comparison for both changes is 78.57 → 74.73 µs, still 1.99× its paired SQLite reference. |
+
+The expanded full-v2 comparison (six 200-sample blocks per operation/version,
+60 for heavy operations) gives 77.13 → 72.84 µs, 2.03× → 1.93× the paired
+SQLite latency. One invocation was neutral, so the aggregate is not a stable
+gain guarantee. The final exploratory compound-index sweep reaches only
+0.483× / 0.584× / 0.608× SQLite throughput at 10 / 100 / 500 users. The ≥0.90×
+acceptance goal remains unmet for this configuration; see the report above.
+
 ## Handover after the third pass (2026-09-14)
 
 **The goal.** Parity with SQLite on operational reads without losing the

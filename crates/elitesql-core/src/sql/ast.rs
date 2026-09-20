@@ -8,7 +8,7 @@ pub(crate) enum Statement {
     },
     CreateIndex {
         table: String,
-        column: String,
+        columns: Vec<String>,
         unique: bool,
     },
     Insert {
@@ -36,7 +36,7 @@ pub(crate) enum Statement {
     },
     DropIndex {
         table: String,
-        column: String,
+        columns: Vec<String>,
         if_exists: bool,
     },
     AddColumn {

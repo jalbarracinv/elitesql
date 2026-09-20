@@ -123,6 +123,13 @@ A bad primary run is rebuilt from canonical segments before serving writes.
 V3 disjoint-range merges can copy whole pages while updating the navigation
 checksum; the canonical segment and WAL layouts are unchanged by this upgrade.
 
+Secondary runs contain a format marker under key `00`. `ESQLSID4` entries use
+`01 || encoded_value || FF || physical_id_utf8`; the last `FF` delimits the
+identity because valid UTF-8 cannot contain that byte. The encoded value is
+therefore directly after the tag, preserving its byte order in the run. A run
+with an older secondary marker is disposable and is rebuilt from canonical
+records during a writable open.
+
 ## ANN graphs (`vectors/`)
 
 `ESQLVIDX` + crc + length + body: the index identity (table, column, metric,

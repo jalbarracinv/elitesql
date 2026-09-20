@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::collate::Collation;
-use crate::db::{Db, Record, ScanBatch, ScanCmp, ScanFilter, Snapshot, Txn};
+use crate::db::{Db, OrderedSecondaryRead, Record, ScanBatch, ScanCmp, ScanFilter, Snapshot, Txn};
 use crate::error::{Error, Result};
 use crate::memory::MemoryPermit;
 use crate::schema::{TableSchema, ID_COLUMN};
@@ -423,7 +423,32 @@ fn resolved_select_tier(stmt: &SelectStmt, resolved: &ResolvedQuery) -> Admissio
         return AdmissionTier::Full;
     }
     match tables.len() {
-        1 => single_table_driver_tier(&tables[0], &pushdown[0]),
+        1 => {
+            let order_keys = stmt
+                .order_by
+                .iter()
+                .map(|key| {
+                    Ok((
+                        resolve_col(tables, &key.column)?,
+                        SortSpec {
+                            desc: key.desc,
+                            collation: key.collation,
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>>>();
+            if order_keys
+                .ok()
+                .and_then(|keys| {
+                    ordered_secondary_plan(&tables[0], 0, &pushdown[0], &keys, stmt.limit.is_some())
+                })
+                .is_some()
+            {
+                AdmissionTier::Medium
+            } else {
+                single_table_driver_tier(&tables[0], &pushdown[0])
+            }
+        }
         2 => {
             let join = &stmt.joins[0];
             let (Ok(left), Ok(right)) = (
@@ -457,7 +482,7 @@ fn single_table_driver_tier(table: &TableCtx, pushdown: &[RExpr]) -> AdmissionTi
                 .schema
                 .indexes
                 .iter()
-                .any(|index| index.unique && index.column == column)
+                .any(|index| index.unique && index.columns().len() == 1 && index.column == column)
             {
                 AdmissionTier::Small
             } else {
@@ -629,10 +654,10 @@ fn execute_statement(
         }
         Statement::CreateIndex {
             table,
-            column,
+            columns,
             unique,
         } => {
-            db.create_index(&table, &column, unique)?;
+            db.create_index_columns(&table, &columns, unique)?;
             Ok(QueryOutput::None)
         }
         Statement::DropTable { name, if_exists } => {
@@ -644,10 +669,10 @@ fn execute_statement(
         }
         Statement::DropIndex {
             table,
-            column,
+            columns,
             if_exists,
         } => {
-            match db.drop_index(&table, &column) {
+            match db.drop_index_columns(&table, &columns) {
                 Err(Error::IndexNotFound { .. }) if if_exists => {}
                 other => other?,
             }
@@ -2134,6 +2159,17 @@ fn exec_single_table_select(
     pushed: &[RExpr],
     residual: &[RExpr],
 ) -> Result<QueryOutput> {
+    exec_single_table_select_at(db, &db.snapshot(), tables, stmt, pushed, residual)
+}
+
+fn exec_single_table_select_at(
+    db: &Db,
+    snapshot: &Snapshot,
+    tables: &[TableCtx],
+    stmt: &SelectStmt,
+    pushed: &[RExpr],
+    residual: &[RExpr],
+) -> Result<QueryOutput> {
     let (columns, extract) = projection_plan(tables, &stmt.projection)?;
     let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
     let limit = limit_to_usize(stmt.limit.as_ref());
@@ -2157,6 +2193,27 @@ fn exec_single_table_select(
             ))
         })
         .collect::<Result<_>>()?;
+    let keep = needed_columns(tables, 0, stmt, &[pushed, residual], &[]);
+    let mut ordered_fallback = false;
+    if let Some(plan) = ordered_secondary_plan(&tables[0], 0, pushed, &order_keys, limit.is_some())
+    {
+        if let Some(output) = exec_ordered_secondary_select(
+            db,
+            snapshot,
+            tables,
+            &columns,
+            &extract,
+            pushed,
+            residual,
+            &plan,
+            offset,
+            limit,
+            keep.as_deref(),
+        )? {
+            return Ok(output);
+        }
+        ordered_fallback = true;
+    }
     let mut sorter = if order_keys.is_empty() {
         None
     } else {
@@ -2172,8 +2229,14 @@ fn exec_single_table_select(
     let batch_rows = memory
         .scan_batch_rows
         .min((memory.query_working_bytes / 1024).max(1));
-    let snapshot = db.snapshot();
-    let driver = table_driver(&tables[0], 0, pushed);
+    // An intervening commit invalidated the current secondary membership.
+    // Restart entirely on the captured snapshot, including equality filters;
+    // the ordinary read-committed equality driver would see newer rows.
+    let driver = if ordered_fallback {
+        TableDriver::Scan
+    } else {
+        table_driver(&tables[0], 0, pushed)
+    };
     let mut cursor: Option<String> = None;
     let mut sequence = 0u64;
     let mut skipped = 0usize;
@@ -2183,7 +2246,6 @@ fn exec_single_table_select(
     // The last batch is trimmed to that remainder instead of decoding a full
     // batch and discarding most of it; the predicates are still re-checked.
     let scan_filter = scan_filter_from(&tables[0], 0, pushed);
-    let keep = needed_columns(tables, 0, stmt, &[pushed, residual], &[]);
     let driver_is_exact = residual.is_empty()
         && (pushed.is_empty()
             || (pushed.len() == 1 && matches!(driver, TableDriver::Equality(..))));
@@ -2204,7 +2266,7 @@ fn exec_single_table_select(
         };
         let batch = driven_batch(
             db,
-            &snapshot,
+            snapshot,
             &tables[0],
             &driver,
             cursor.as_deref(),
@@ -2271,6 +2333,194 @@ fn exec_single_table_select(
         None => out,
     };
     Ok(QueryOutput::Rows { columns, rows })
+}
+
+/// Execute the proven ordered-secondary subset without materializing a sort.
+/// If a commit makes the captured snapshot historical before any index
+/// batch is acquired, return `None` so the caller restarts on its existing
+/// snapshot through the normal scan-and-sort path.
+#[allow(clippy::too_many_arguments)]
+fn exec_ordered_secondary_select(
+    db: &Db,
+    snapshot: &Snapshot,
+    tables: &[TableCtx],
+    columns: &[String],
+    extract: &[(usize, &str)],
+    pushed: &[RExpr],
+    residual: &[RExpr],
+    plan: &OrderedSecondaryPlan,
+    offset: usize,
+    limit: Option<usize>,
+    keep: Option<&[&str]>,
+) -> Result<Option<QueryOutput>> {
+    let memory = db.memory_options();
+    let batch_rows = memory
+        .scan_batch_rows
+        .min((memory.query_working_bytes / 1024).max(1));
+    let consume = extract_projects_each_column_once(extract);
+    let mut after: Option<Vec<u8>> = None;
+    let mut skipped = 0usize;
+    let mut out = Vec::new();
+    let mut row: ExecRow = vec![None];
+    let control = crate::QueryControl::current();
+    let mut visited = 0usize;
+
+    loop {
+        let fetch = match limit {
+            Some(limit) => batch_rows
+                .min(
+                    offset
+                        .saturating_add(limit)
+                        .saturating_sub(skipped + out.len()),
+                )
+                .max(1),
+            None => batch_rows,
+        };
+        let Some(batch) = db.ordered_secondary_batch_current(
+            snapshot,
+            OrderedSecondaryRead {
+                table: &tables[0].schema.name,
+                columns: &plan.columns,
+                tuple_prefix: &plan.tuple_prefix,
+                after: after.as_deref(),
+                limit: fetch,
+                skip: if plan.exact_prefix && residual.is_empty() {
+                    offset.saturating_sub(skipped)
+                } else {
+                    0
+                },
+                max_bytes: (memory.query_working_bytes / 2).max(1),
+                keep,
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(next) = batch.next else {
+            break;
+        };
+        after = Some(next);
+        skipped += batch.skipped;
+        for record in batch.rows {
+            if visited.is_multiple_of(256) {
+                if let Some(control) = &control {
+                    control.check()?;
+                }
+            }
+            visited = visited.wrapping_add(1);
+            row[0] = Some(record);
+            if !eval_all(&row, pushed)? || !eval_all(&row, residual)? {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            out.push(if consume {
+                project_row_owned(&mut row, extract)
+            } else {
+                project_row(&row, extract)
+            });
+            if limit.is_some_and(|limit| out.len() == limit) {
+                return Ok(Some(QueryOutput::Rows {
+                    columns: columns.to_vec(),
+                    rows: out,
+                }));
+            }
+        }
+    }
+    Ok(Some(QueryOutput::Rows {
+        columns: columns.to_vec(),
+        rows: out,
+    }))
+}
+
+#[cfg(test)]
+mod ordered_select_tests {
+    use super::*;
+
+    #[test]
+    fn ordered_fallback_uses_snapshot_even_with_a_current_equality_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("fallback.esql")).unwrap();
+        db.query("CREATE TABLE items(category text, price int)")
+            .unwrap();
+        db.query("CREATE INDEX ON items(category)").unwrap();
+        db.query("CREATE INDEX ON items(category,price)").unwrap();
+        db.query("INSERT INTO items(id,category,price) VALUES ('a','books',1),('b','books',2)")
+            .unwrap();
+        db.checkpoint().unwrap();
+        let Statement::Select(stmt) = parser::parse_cached(
+            "SELECT id,price FROM items WHERE category='books' ORDER BY price LIMIT 2",
+        )
+        .unwrap() else {
+            panic!("select");
+        };
+        let resolved = resolve_query(&db, &stmt).unwrap();
+        let snapshot = db.snapshot();
+        let columns = vec!["category".to_owned(), "price".to_owned()];
+        let mut prefix = Vec::new();
+        crate::value::encode_index_value(&mut prefix, &Value::Text("books".into()));
+        let request = OrderedSecondaryRead {
+            table: "items",
+            columns: &columns,
+            tuple_prefix: &prefix,
+            after: None,
+            limit: 1,
+            skip: 0,
+            max_bytes: 4096,
+            keep: None,
+        };
+        let first = db
+            .ordered_secondary_batch_current(&snapshot, request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.rows.len(), 1);
+        let mut txn = db.begin();
+        txn.query("DELETE FROM items WHERE id='a'").unwrap();
+        txn.query("UPDATE items SET price=99 WHERE id='b'").unwrap();
+        txn.query("INSERT INTO items(id,category,price) VALUES ('c','books',-1)")
+            .unwrap();
+        txn.commit().unwrap();
+        // Continuing the previous batch must refuse the new membership.
+        let next = db
+            .ordered_secondary_batch_current(
+                &snapshot,
+                OrderedSecondaryRead {
+                    table: "items",
+                    columns: &columns,
+                    tuple_prefix: &prefix,
+                    after: first.next.as_deref(),
+                    limit: 1,
+                    skip: 0,
+                    max_bytes: 4096,
+                    keep: None,
+                },
+            )
+            .unwrap();
+        assert!(next.is_none());
+        // Retrying through the generic executor must also use the OLD rows;
+        // the scalar category index contains c/b now and cannot drive it.
+        let result = exec_single_table_select_at(
+            &db,
+            &snapshot,
+            &resolved.tables,
+            &stmt,
+            &resolved.pushdown[0],
+            &resolved.residual,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            QueryOutput::Rows {
+                columns: vec!["id".into(), "price".into()],
+                rows: vec![
+                    vec![Value::Text("a".into()), Value::Int64(1)],
+                    vec![Value::Text("b".into()), Value::Int64(2)]
+                ],
+            }
+        );
+    }
 }
 
 fn visit_single_table_rows(

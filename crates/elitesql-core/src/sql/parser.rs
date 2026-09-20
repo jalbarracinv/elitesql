@@ -341,14 +341,14 @@ impl Parser {
             }
             let table = self.ident("table name")?;
             self.expect(&Tok::LParen, "'(' — DROP INDEX ON table (column)")?;
-            let column = self.ident("column name")?;
-            if self.eat(&Tok::Comma) {
-                return Err(self.err_at("multi-column indexes are not supported in V1"));
+            let mut columns = vec![self.ident("column name")?];
+            while self.eat(&Tok::Comma) {
+                columns.push(self.ident("column name")?);
             }
             self.expect(&Tok::RParen, "')'")?;
             return Ok(Statement::DropIndex {
                 table,
-                column,
+                columns,
                 if_exists,
             });
         }
@@ -666,14 +666,14 @@ impl Parser {
 
     fn finish_create_index(&mut self, table: String, unique: bool) -> Result<Statement> {
         self.expect(&Tok::LParen, "'('")?;
-        let column = self.ident("column name")?;
-        if self.eat(&Tok::Comma) {
-            return Err(self.err_at("multi-column indexes are not supported in V1"));
+        let mut columns = vec![self.ident("column name")?];
+        while self.eat(&Tok::Comma) {
+            columns.push(self.ident("column name")?);
         }
         self.expect(&Tok::RParen, "')'")?;
         Ok(Statement::CreateIndex {
             table,
-            column,
+            columns,
             unique,
         })
     }

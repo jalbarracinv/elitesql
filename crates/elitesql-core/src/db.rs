@@ -1,12 +1,14 @@
 mod commit;
 mod maintenance;
 mod reads;
+mod secondary;
 use commit::*;
 use maintenance::*;
 pub(crate) use reads::json_heap_bytes;
 pub(crate) use reads::ScanBatch;
 use reads::*;
 pub(crate) use reads::{push_id, IdSpan};
+use secondary::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -2044,485 +2046,6 @@ fn primary_generation(committed_version: u64, segments: &[SegmentMeta], catalog:
     hash
 }
 
-const SECONDARY_FORMAT_KEY: &[u8] = &[0];
-// Bumped when the key encoding changes: a run written under an older marker
-// fails to load and the loader rebuilds it from canonical data.
-const SECONDARY_FORMAT_VALUE: &[u8] = b"ESQLSID3";
-const SECONDARY_ENTRY_TAG: u8 = 1;
-const SECONDARY_DELETE: u8 = 0;
-const SECONDARY_ADD: u8 = 1;
-
-struct SecRun {
-    meta: DerivedRunMeta,
-    index: Arc<PagedIndex>,
-}
-
-struct SecIdx {
-    generation: u64,
-    runs: Vec<SecRun>,
-    /// Final additions since the last immutable run was published.
-    delta: HashMap<Vec<u8>, BTreeSet<String>>,
-    /// Final removals since publication. Tombstones are required even when
-    /// the matching add lives in a non-base level.
-    removed: HashMap<Vec<u8>, BTreeSet<String>>,
-    /// Immutable in-memory overlay being written by background maintenance.
-    /// New commits land in `delta`/`removed` and therefore never mutate the
-    /// generation owned by the worker.
-    frozen: Option<Arc<FrozenSecDelta>>,
-}
-
-struct FrozenSecDelta {
-    generation: u64,
-    delta: HashMap<Vec<u8>, BTreeSet<String>>,
-    removed: HashMap<Vec<u8>, BTreeSet<String>>,
-}
-
-/// Ids of one equality batch, packed end to end.
-///
-/// A category page matches hundreds of rows and every one of them used to
-/// arrive as its own `String`. Here the batch owns one growing arena and one
-/// span per id, so a wide equality allocates per batch instead of per row.
-#[derive(Default)]
-pub(crate) struct IdBatch {
-    arena: String,
-    spans: Vec<IdSpan>,
-    /// Buffer for the id currently being merged, reused on every pass.
-    scratch: String,
-}
-
-impl IdBatch {
-    fn clear(&mut self) {
-        self.arena.clear();
-        self.spans.clear();
-    }
-
-    fn push(&mut self, id: &str) {
-        let span = push_id(&mut self.arena, id);
-        self.spans.push(span);
-    }
-
-    fn len(&self) -> usize {
-        self.spans.len()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &str> {
-        self.spans.iter().map(|span| span.of(&self.arena))
-    }
-
-    fn last(&self) -> Option<&str> {
-        self.spans.last().map(|span| span.of(&self.arena))
-    }
-}
-
-struct SecPairCursor<'a> {
-    cursor: PagedPrefixCursor<'a>,
-    prefix: Vec<u8>,
-    /// Id of the head entry. It lives in a buffer the cursor refills instead
-    /// of a fresh `String` per entry: an equality on a wide key advances the
-    /// cursor once per member, and every one of those ids was allocated only
-    /// to be compared against the merge head and dropped.
-    id: String,
-    head: Option<(u64, u8)>,
-}
-
-impl<'a> SecPairCursor<'a> {
-    fn new(index: &'a PagedIndex, key: &[u8], after: Option<&str>) -> Result<Self> {
-        let prefix = secondary_pair_prefix(key);
-        let after_key = after.map(|after| secondary_pair_key(key, after));
-        let mut cursor = Self {
-            cursor: index.prefix_cursor_after(&prefix, after_key.as_deref()),
-            prefix,
-            id: String::new(),
-            head: None,
-        };
-        cursor.advance()?;
-        Ok(cursor)
-    }
-
-    /// The id the cursor sits on, or `None` once the run is exhausted.
-    fn head_id(&self) -> Option<&str> {
-        self.head.map(|_| self.id.as_str())
-    }
-
-    fn advance(&mut self) -> Result<()> {
-        self.head = None;
-        self.id.clear();
-        let Some((key, value)) = self.cursor.next()? else {
-            return Ok(());
-        };
-        let id = key
-            .strip_prefix(self.prefix.as_slice())
-            .ok_or_else(|| Error::Corrupt("secondary index: invalid pair prefix".into()))?;
-        let id = std::str::from_utf8(id)
-            .map_err(|_| Error::Corrupt("secondary index: invalid id utf8".into()))?;
-        let (version, operation) = decode_secondary_operation(value)?;
-        self.id.push_str(id);
-        self.head = Some((version, operation));
-        Ok(())
-    }
-}
-
-impl SecIdx {
-    fn resident(map: HashMap<Vec<u8>, BTreeSet<String>>) -> Self {
-        Self {
-            generation: 0,
-            runs: Vec::new(),
-            delta: map,
-            removed: HashMap::new(),
-            frozen: None,
-        }
-    }
-
-    fn paged_runs(generation: u64, runs: Vec<SecRun>) -> Result<Self> {
-        for run in &runs {
-            validate_secondary_run(&run.index)?;
-        }
-        Ok(Self {
-            generation,
-            runs,
-            delta: HashMap::new(),
-            removed: HashMap::new(),
-            frozen: None,
-        })
-    }
-
-    fn run_metas(&self) -> Vec<DerivedRunMeta> {
-        self.runs.iter().map(|run| run.meta.clone()).collect()
-    }
-
-    fn ids(&self, key: &[u8]) -> Result<BTreeSet<String>> {
-        let mut batch = IdBatch::default();
-        self.ids_batch_into(key, None, usize::MAX, &mut batch)?;
-        Ok(batch.iter().map(str::to_owned).collect())
-    }
-
-    fn contains_pair(&self, key: &[u8], id: &str) -> Result<bool> {
-        if self.removed.get(key).is_some_and(|ids| ids.contains(id)) {
-            return Ok(false);
-        }
-        if self.delta.get(key).is_some_and(|ids| ids.contains(id)) {
-            return Ok(true);
-        }
-        self.persisted_pair(key, id)
-    }
-
-    /// Whether a published generation still offers this pair, ignoring the
-    /// mutable overlay. A pair that no generation carries needs no tombstone
-    /// when it is removed: there is nothing for one to hide.
-    fn persisted_pair(&self, key: &[u8], id: &str) -> Result<bool> {
-        let mut newest = None;
-        let pair = secondary_pair_key(key, id);
-        for run in &self.runs {
-            run.index.visit_key(&pair, |encoded| {
-                let operation = decode_secondary_operation(encoded)?;
-                if newest.is_none_or(|current| operation > current) {
-                    newest = Some(operation);
-                }
-                Ok(true)
-            })?;
-        }
-        if let Some(frozen) = &self.frozen {
-            for (map, op) in [
-                (&frozen.delta, SECONDARY_ADD),
-                (&frozen.removed, SECONDARY_DELETE),
-            ] {
-                if map.get(key).is_some_and(|ids| ids.contains(id)) {
-                    let operation = (frozen.generation, op);
-                    if newest.is_none_or(|current| {
-                        operation.0 > current.0
-                            || (op == SECONDARY_DELETE && operation.0 == current.0)
-                    }) {
-                        newest = Some(operation);
-                    }
-                }
-            }
-        }
-        Ok(newest.is_some_and(|(_, op)| op == SECONDARY_ADD))
-    }
-
-    /// Merge one cursor per immutable run plus the bounded mutable overlay.
-    /// Versioned tombstones make the result independent of level order.
-    /// Ids of one equality batch, packed into `out`.
-    ///
-    /// The merge compares one id at a time against the head of every run and
-    /// overlay. Handing that id out as a `String` cost an allocation for each
-    /// entry the merge looked at, including the ones a delete tombstone then
-    /// removed; `out` reuses one buffer for the comparison and one arena for
-    /// the ids that survive.
-    fn ids_batch_into(
-        &self,
-        key: &[u8],
-        after: Option<&str>,
-        limit: usize,
-        out: &mut IdBatch,
-    ) -> Result<()> {
-        use std::ops::Bound::{Excluded, Unbounded};
-
-        out.clear();
-        if limit == 0 {
-            return Ok(());
-        }
-        let prefix = secondary_pair_prefix(key);
-        let mut cursors = self
-            .runs
-            .iter()
-            .filter(|run| run.index.may_contain_prefix(&prefix))
-            .map(|run| SecPairCursor::new(&run.index, key, after))
-            .collect::<Result<Vec<_>>>()?;
-        let mut added = self.delta.get(key).map(|ids| match after {
-            Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
-            None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
-        });
-        let mut removed = self.removed.get(key).map(|ids| match after {
-            Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
-            None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
-        });
-        let mut frozen_added = self.frozen.as_ref().and_then(|frozen| {
-            frozen.delta.get(key).map(|ids| match after {
-                Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
-                None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
-            })
-        });
-        let mut frozen_removed = self.frozen.as_ref().and_then(|frozen| {
-            frozen.removed.get(key).map(|ids| match after {
-                Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
-                None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
-            })
-        });
-        loop {
-            let next_persisted = cursors.iter().filter_map(SecPairCursor::head_id).min();
-            let next_added = added
-                .as_mut()
-                .and_then(|iter| iter.peek().map(|id| id.as_str()));
-            let next_removed = removed
-                .as_mut()
-                .and_then(|iter| iter.peek().map(|id| id.as_str()));
-            let next_frozen_added = frozen_added
-                .as_mut()
-                .and_then(|iter| iter.peek().map(|id| id.as_str()));
-            let next_frozen_removed = frozen_removed
-                .as_mut()
-                .and_then(|iter| iter.peek().map(|id| id.as_str()));
-            let Some(next) = next_persisted
-                .into_iter()
-                .chain(next_frozen_added)
-                .chain(next_frozen_removed)
-                .chain(next_added)
-                .chain(next_removed)
-                .min()
-            else {
-                break;
-            };
-            // Copied out of the heads so they can be advanced below; the
-            // buffer is the same one on every pass.
-            out.scratch.clear();
-            out.scratch.push_str(next);
-            let id = std::mem::take(&mut out.scratch);
-            let mut newest: Option<(u64, u8)> = None;
-            for cursor in &mut cursors {
-                while cursor.head_id() == Some(id.as_str()) {
-                    let (version, operation) = cursor.head.take().expect("matching secondary head");
-                    if newest.is_none_or(|current| (version, operation) > current) {
-                        newest = Some((version, operation));
-                    }
-                    cursor.advance()?;
-                }
-            }
-            let frozen_generation = self.frozen.as_ref().map(|frozen| frozen.generation);
-            if frozen_added.as_mut().is_some_and(|iter| {
-                iter.peek()
-                    .is_some_and(|candidate| candidate.as_str() == id)
-            }) {
-                frozen_added.as_mut().expect("checked above").next();
-                let operation = (
-                    frozen_generation.expect("frozen iterator has generation"),
-                    SECONDARY_ADD,
-                );
-                if newest.is_none_or(|current| operation.0 > current.0) {
-                    newest = Some(operation);
-                }
-            }
-            if frozen_removed.as_mut().is_some_and(|iter| {
-                iter.peek()
-                    .is_some_and(|candidate| candidate.as_str() == id)
-            }) {
-                frozen_removed.as_mut().expect("checked above").next();
-                let generation = frozen_generation.expect("frozen iterator has generation");
-                if newest.is_none_or(|current| generation >= current.0) {
-                    newest = Some((generation, SECONDARY_DELETE));
-                }
-            }
-            if added.as_mut().is_some_and(|iter| {
-                iter.peek()
-                    .is_some_and(|candidate| candidate.as_str() == id)
-            }) {
-                added.as_mut().expect("checked above").next();
-                newest = Some((u64::MAX, SECONDARY_ADD));
-            }
-            if removed.as_mut().is_some_and(|iter| {
-                iter.peek()
-                    .is_some_and(|candidate| candidate.as_str() == id)
-            }) {
-                removed.as_mut().expect("checked above").next();
-                newest = Some((u64::MAX, SECONDARY_DELETE));
-            }
-            let keep = newest.is_some_and(|(_, operation)| operation == SECONDARY_ADD);
-            if keep {
-                out.push(&id);
-            }
-            // Give the buffer back whether the id was kept or not, so the
-            // next pass writes into the same allocation.
-            out.scratch = id;
-            if keep && out.len() == limit {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn add(&mut self, key: Vec<u8>, id: &str) {
-        if let Some(removed) = self.removed.get_mut(&key) {
-            removed.remove(id);
-            if removed.is_empty() {
-                self.removed.remove(&key);
-            }
-        }
-        self.delta.entry(key).or_default().insert(id.to_owned());
-    }
-
-    fn remove(&mut self, key: &[u8], id: &str) {
-        if let Some(delta) = self.delta.get_mut(key) {
-            delta.remove(id);
-            if delta.is_empty() {
-                self.delta.remove(key);
-            }
-        }
-        // A row written and deleted between two publications never reached a
-        // generation, so nothing has to be hidden from a later reader.
-        // Recording its removal anyway left an entry that every subsequent
-        // lookup of that key walked past: a cart emptied a few thousand times
-        // made reading it seventeen times slower with one row left in it.
-        // A read failure here keeps the old, conservative tombstone.
-        if (!self.runs.is_empty() || self.frozen.is_some())
-            && self.persisted_pair(key, id).unwrap_or(true)
-        {
-            self.removed
-                .entry(key.to_vec())
-                .or_default()
-                .insert(id.to_owned());
-        }
-    }
-
-    fn delta_memory_bytes(&self) -> usize {
-        fn map_bytes(map: &HashMap<Vec<u8>, BTreeSet<String>>) -> usize {
-            map.iter()
-                .map(|(key, ids)| {
-                    key.len() + 96 + ids.iter().map(|id| id.len() + 48).sum::<usize>()
-                })
-                .sum()
-        }
-        map_bytes(&self.delta) + map_bytes(&self.removed)
-    }
-
-    fn frozen_delta_memory_bytes(&self) -> usize {
-        fn map_bytes(map: &HashMap<Vec<u8>, BTreeSet<String>>) -> usize {
-            map.iter()
-                .map(|(key, ids)| {
-                    key.len() + 96 + ids.iter().map(|id| id.len() + 48).sum::<usize>()
-                })
-                .sum()
-        }
-        self.frozen.as_ref().map_or(0, |frozen| {
-            map_bytes(&frozen.delta).saturating_add(map_bytes(&frozen.removed))
-        })
-    }
-
-    fn freeze_delta(&mut self, generation: u64) -> Option<Arc<FrozenSecDelta>> {
-        if self.frozen.is_some() || (self.delta.is_empty() && self.removed.is_empty()) {
-            return None;
-        }
-        let frozen = Arc::new(FrozenSecDelta {
-            generation,
-            delta: std::mem::take(&mut self.delta),
-            removed: std::mem::take(&mut self.removed),
-        });
-        self.frozen = Some(frozen.clone());
-        Some(frozen)
-    }
-
-    fn frozen_matches(&self, frozen: &Arc<FrozenSecDelta>) -> bool {
-        self.frozen
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, frozen))
-    }
-
-    fn clear_frozen(&mut self, frozen: &Arc<FrozenSecDelta>) {
-        if self.frozen_matches(frozen) {
-            self.frozen = None;
-        }
-    }
-}
-
-fn secondary_pair_prefix(key: &[u8]) -> Vec<u8> {
-    let mut pair = Vec::with_capacity(5 + key.len());
-    pair.push(SECONDARY_ENTRY_TAG);
-    pair.extend_from_slice(&(key.len() as u32).to_be_bytes());
-    pair.extend_from_slice(key);
-    pair
-}
-
-fn secondary_pair_key(key: &[u8], id: &str) -> Vec<u8> {
-    let mut pair = secondary_pair_prefix(key);
-    pair.extend_from_slice(id.as_bytes());
-    pair
-}
-
-fn secondary_pair_parts(pair: &[u8]) -> Result<(&[u8], &str)> {
-    if pair.first() != Some(&SECONDARY_ENTRY_TAG) || pair.len() < 5 {
-        return Err(Error::Corrupt("secondary index: invalid pair key".into()));
-    }
-    let key_len = u32::from_be_bytes(pair[1..5].try_into().expect("four bytes")) as usize;
-    let key_end = 5usize
-        .checked_add(key_len)
-        .filter(|end| *end <= pair.len())
-        .ok_or_else(|| Error::Corrupt("secondary index: truncated pair key".into()))?;
-    let id = std::str::from_utf8(&pair[key_end..])
-        .map_err(|_| Error::Corrupt("secondary index: invalid id utf8".into()))?;
-    Ok((&pair[5..key_end], id))
-}
-
-fn secondary_operation(version: u64, operation: u8) -> [u8; 9] {
-    let mut value = [0; 9];
-    value[..8].copy_from_slice(&version.to_be_bytes());
-    value[8] = operation;
-    value
-}
-
-fn decode_secondary_operation(value: &[u8]) -> Result<(u64, u8)> {
-    if value.len() != 9 || !matches!(value[8], SECONDARY_DELETE | SECONDARY_ADD) {
-        return Err(Error::Corrupt("secondary index: invalid operation".into()));
-    }
-    Ok((
-        u64::from_be_bytes(value[..8].try_into().expect("eight bytes")),
-        value[8],
-    ))
-}
-
-fn validate_secondary_run(index: &PagedIndex) -> Result<()> {
-    let mut valid = false;
-    index.visit_key(SECONDARY_FORMAT_KEY, |value| {
-        valid = value == SECONDARY_FORMAT_VALUE;
-        Ok(false)
-    })?;
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::Corrupt(
-            "secondary index: unsupported run format".into(),
-        ))
-    }
-}
-
 struct State {
     catalog: Catalog,
     /// The catalog's table entries, shared. Resolving a statement used to
@@ -2766,7 +2289,7 @@ impl State {
         self.catalog.tables.iter().all(|table| {
             table.indexes.iter().all(|def| {
                 self.secondary
-                    .contains_key(&(table.name.clone(), def.column.clone()))
+                    .contains_key(&secondary_index_key(&table.name, def))
             }) && table.text_indexes.iter().all(|def| {
                 self.text
                     .contains_key(&(table.name.clone(), def.column.clone()))
@@ -3584,6 +3107,28 @@ pub struct Snapshot {
     shared: Arc<Shared>,
 }
 
+/// One bounded page requested from a current secondary-index ordered walk.
+/// The request keeps the continuation as a complete physical pair, never an
+/// id alone, so equal tuple values paginate without gaps or duplicates.
+pub(crate) struct OrderedSecondaryRead<'a> {
+    pub(crate) table: &'a str,
+    pub(crate) columns: &'a [String],
+    pub(crate) tuple_prefix: &'a [u8],
+    pub(crate) after: Option<&'a [u8]>,
+    pub(crate) limit: usize,
+    /// Live index members to count without retrieving their canonical rows.
+    /// The caller must prove the tuple prefix enforces every SQL predicate.
+    pub(crate) skip: usize,
+    pub(crate) max_bytes: usize,
+    pub(crate) keep: Option<&'a [&'a str]>,
+}
+
+pub(crate) struct OrderedSecondaryBatch {
+    pub(crate) rows: Vec<Record>,
+    pub(crate) next: Option<Vec<u8>>,
+    pub(crate) skipped: usize,
+}
+
 impl Snapshot {
     pub fn version(&self) -> u64 {
         self.version
@@ -3902,7 +3447,11 @@ impl DerivedIndexKeys {
     fn new(table: &str, schema: &TableSchema) -> Self {
         let key = |column: &str| (table.to_owned(), column.to_owned());
         Self {
-            secondary: schema.indexes.iter().map(|def| key(&def.column)).collect(),
+            secondary: schema
+                .indexes
+                .iter()
+                .map(|def| secondary_index_key(table, def))
+                .collect(),
             text: schema
                 .text_indexes
                 .iter()
@@ -4688,6 +4237,8 @@ impl Db {
             Some(catalog) => catalog,
             None => Catalog::load(&dir.join(CATALOG_FILE))?,
         };
+        let catalog_has_legacy_secondary_indexes =
+            catalog_mirror_has_legacy_secondary_indexes(&dir);
         if used_prev && !ro {
             // The primary manifest was unreadable; re-establish it from the
             // fallback without ever rotating the corrupt file over the good one.
@@ -4697,14 +4248,15 @@ impl Db {
                 )));
             }
         }
-        if manifest.catalog.is_none() && !ro {
-            // Upgrade legacy manifests before serving writes. From this point
-            // onward both primary and fallback generations carry the schema
-            // that describes their segment set.
+        if !ro && (manifest.catalog.is_none() || catalog_has_legacy_secondary_indexes) {
+            // Upgrade legacy manifests and index definitions before serving
+            // writes. From this point both primary and fallback generations
+            // carry the ordered column list that describes every index.
+            catalog.save(&dir.join(CATALOG_FILE))?;
             manifest.catalog = Some(catalog.clone());
             if let PublishOutcome::SyncFailed(error) = manifest.publish(&dir)? {
                 return Err(Error::CommitUnknown(format!(
-                    "legacy manifest was upgraded, but syncing its directory failed: {error}"
+                    "catalog migration was published, but syncing its directory failed: {error}"
                 )));
             }
         }
@@ -5393,10 +4945,7 @@ impl Db {
                 .find(|index| index.column == identity_name)
             {
                 Some(index) => index.unique = true,
-                None => schema.indexes.push(IndexDef {
-                    column: identity_name,
-                    unique: true,
-                }),
+                None => schema.indexes.push(IndexDef::single(identity_name, true)),
             }
         }
         // A local equality index is part of the FK contract. It bounds parent
@@ -5408,10 +4957,9 @@ impl Db {
                 .iter()
                 .any(|index| index.column == foreign_key.column)
             {
-                schema.indexes.push(IndexDef {
-                    column: foreign_key.column.clone(),
-                    unique: false,
-                });
+                schema
+                    .indexes
+                    .push(IndexDef::single(foreign_key.column.clone(), false));
             }
         }
         let mut cs = lock_commit_for_maintenance(&self.shared)?;
@@ -5515,8 +5063,8 @@ impl Db {
             publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next_catalog)?;
         for def in &schema.indexes {
             st.secondary.insert(
-                (schema.name.clone(), def.column.clone()),
-                SecIdx::resident(HashMap::new()),
+                secondary_index_key(&schema.name, def),
+                SecIdx::resident(BTreeMap::new()),
             );
         }
         for def in &schema.vector_indexes {
@@ -5532,9 +5080,25 @@ impl Db {
         publication_error.map_or(Ok(()), Err)
     }
 
-    /// Create a secondary (optionally unique) equality index over a column,
-    /// built from the current committed state.
+    /// Backward-compatible single-column adapter.
     pub fn create_index(&self, table: &str, column: &str, unique: bool) -> Result<()> {
+        self.create_index_columns(table, &[column.to_owned()], unique)
+    }
+
+    /// Create a secondary (optionally unique) index over an ordered column
+    /// list, built from the current committed state.
+    pub fn create_index_columns(
+        &self,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<()> {
+        if columns.is_empty() {
+            return Err(Error::InvalidArgument(
+                "secondary index needs a column".into(),
+            ));
+        }
+        let label = columns.join(", ");
         if self.shared.opts.read_only {
             return Err(Error::ReadOnly);
         }
@@ -5547,21 +5111,33 @@ impl Db {
                 .catalog
                 .table(table)
                 .ok_or_else(|| Error::TableNotFound(table.into()))?;
-            let Some(col) = schema.column(column) else {
-                return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
-            };
-            if col.ty == ColumnType::Vector {
-                return Err(Error::SchemaViolation(format!(
-                    "{table}.{column} is a vector column; use create_vector_index"
-                )));
+            for (position, column) in columns.iter().enumerate() {
+                let Some(col) = schema.column(column) else {
+                    return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
+                };
+                if col.ty == ColumnType::Vector {
+                    return Err(Error::SchemaViolation(format!(
+                        "{table}.{column} is a vector column; use create_vector_index"
+                    )));
+                }
+                if columns[..position]
+                    .iter()
+                    .any(|previous| previous == column)
+                {
+                    return Err(Error::InvalidArgument(format!(
+                        "index on {table} repeats column '{column}'"
+                    )));
+                }
             }
-            if schema.indexes.iter().any(|d| d.column == column) {
+            if schema.indexes.iter().any(|d| d.columns() == columns) {
                 return Err(Error::InvalidArgument(format!(
-                    "index on {table}.{column} already exists"
+                    "index on {table} ({label}) already exists"
                 )));
             }
         }
-        let path = sidx_path(&self.shared.dir, table, column);
+        let new_def = IndexDef::new(columns.to_vec(), unique);
+        let secondary_key = secondary_index_key(table, &new_def);
+        let path = sidx_path(&self.shared.dir, table, &secondary_key.1);
         let tmp = path.with_extension("sidx.tmp");
         let temp_dir = self
             .shared
@@ -5579,7 +5155,7 @@ impl Db {
             st.catalog
                 .table(table)
                 .ok_or_else(|| Error::TableNotFound(table.into()))?,
-            column,
+            &new_def,
             &st.index,
             &st.readers,
         ) {
@@ -5587,24 +5163,15 @@ impl Db {
             return Err(error);
         }
         if unique {
-            let built = PagedIndex::open(&tmp)?;
-            let mut previous_key: Option<Vec<u8>> = None;
-            let unique_result = built.scan(|pair, _operation| {
-                if pair == SECONDARY_FORMAT_KEY {
-                    return Ok(());
-                }
-                let (key, _id) = secondary_pair_parts(pair)?;
-                if previous_key.as_deref() == Some(key) {
-                    return Err(Error::UniqueViolation {
-                        table: table.into(),
-                        column: column.into(),
-                    });
-                }
-                previous_key = Some(key.to_vec());
-                Ok(())
-            });
-            drop(built);
-            if let Err(error) = unique_result {
+            if let Err(error) = validate_unique_secondary_from_canonical(
+                &st.blobs,
+                st.catalog.table(table).expect("table checked above"),
+                &new_def,
+                &st.index,
+                &st.readers,
+                table,
+                &label,
+            ) {
                 let _ = fs::remove_file(&tmp);
                 return Err(error);
             }
@@ -5614,10 +5181,7 @@ impl Db {
             .table_mut(table)
             .expect("checked above")
             .indexes
-            .push(IndexDef {
-                column: column.into(),
-                unique,
-            });
+            .push(new_def);
         let publication_error =
             match publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next_catalog) {
                 Ok(error) => error,
@@ -5642,15 +5206,19 @@ impl Db {
             DerivedRunManifest::new(
                 DerivedRunKind::Secondary,
                 table,
-                column,
+                &secondary_key.1,
                 st.committed_version,
                 vec![meta.clone()],
                 [0, 0],
             )
-            .publish(&sidx_manifest_path(&self.shared.dir, table, column))?;
+            .publish(&sidx_manifest_path(
+                &self.shared.dir,
+                table,
+                &secondary_key.1,
+            ))?;
             let version = st.committed_version;
             st.secondary.insert(
-                (table.into(), column.into()),
+                secondary_key,
                 SecIdx::paged_runs(
                     version,
                     vec![SecRun {
@@ -5664,7 +5232,7 @@ impl Db {
         if let Err(error) = post_publish {
             fence_writes(
                 &self.shared,
-                format!("catalog published for {table}.{column}, but secondary index setup failed: {error}"),
+                format!("catalog published for {table} ({label}), but secondary index setup failed: {error}"),
             );
             return Err(error);
         }
@@ -6003,7 +5571,70 @@ impl Db {
     /// Drop the secondary (equality) index on a column. The column and its
     /// data are untouched; queries fall back to a scan.
     pub fn drop_index(&self, table: &str, column: &str) -> Result<()> {
-        self.drop_index_of_kind(table, column, IndexKind::Secondary)
+        self.drop_index_columns(table, &[column.to_owned()])
+    }
+
+    /// Drop a secondary index identified by its full ordered column list.
+    pub fn drop_index_columns(&self, table: &str, columns: &[String]) -> Result<()> {
+        if self.shared.opts.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let _ddl = self.shared.ddl.lock().unwrap();
+        let mut cs = lock_commit_for_maintenance(&self.shared)?;
+        let mut st = self.shared.state.write().unwrap();
+        let schema = st
+            .catalog
+            .table(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        let def = schema
+            .indexes
+            .iter()
+            .find(|def| def.columns() == columns)
+            .cloned()
+            .ok_or_else(|| Error::IndexNotFound {
+                table: table.into(),
+                column: columns.join(", "),
+            })?;
+        if def.columns().len() == 1 {
+            let column = &def.column;
+            if schema.column(column).is_some_and(|column| column.identity) {
+                return Err(Error::SchemaViolation(format!(
+                    "cannot drop unique index on {table}.{column}: required by an identity/primary key"
+                )));
+            }
+            if schema
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.column == *column)
+                || st.catalog.tables.iter().any(|child| {
+                    child.foreign_keys.iter().any(|foreign_key| {
+                        foreign_key.referenced_table == table
+                            && foreign_key.referenced_column == *column
+                    })
+                })
+            {
+                return Err(Error::SchemaViolation(format!(
+                    "cannot drop index on {table}.{column}: required by a foreign key"
+                )));
+            }
+        }
+        let key = secondary_index_key(table, &def);
+        let mut next = st.catalog.clone();
+        next.table_mut(table)
+            .expect("table exists")
+            .indexes
+            .retain(|candidate| candidate.columns() != columns);
+        let publication_error =
+            publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next)?;
+        st.secondary.remove(&key);
+        let retained_delta_bytes = st.index_delta_memory_bytes();
+        let cleanup_catalog = st.catalog.clone();
+        drop(st);
+        self.shared
+            .memory_governor
+            .set_index_delta_bytes(retained_delta_bytes);
+        cleanup_orphan_sidx(&self.shared.dir, &cleanup_catalog);
+        publication_error.map_or(Ok(()), Err)
     }
 
     /// Drop the ANN (HNSW) index on a vector column, including its persisted
@@ -6039,6 +5670,15 @@ impl Db {
                 column: column.into(),
             });
         }
+        let secondary_key = (kind == IndexKind::Secondary)
+            .then(|| {
+                schema
+                    .indexes
+                    .iter()
+                    .find(|def| def.columns().len() == 1 && def.column == column)
+                    .map(|def| secondary_index_key(table, def))
+            })
+            .flatten();
         if kind == IndexKind::Secondary {
             if schema.column(column).is_some_and(|column| column.identity) {
                 return Err(Error::SchemaViolation(format!(
@@ -6076,7 +5716,9 @@ impl Db {
         let key = (table.to_owned(), column.to_owned());
         match kind {
             IndexKind::Secondary => {
-                st.secondary.remove(&key);
+                st.secondary.remove(
+                    &secondary_key.expect("single-column index was present before publication"),
+                );
             }
             IndexKind::Vector => {
                 st.vector.remove(&key);
@@ -6163,18 +5805,17 @@ impl Db {
             }
             let identity_key = column
                 .identity
-                .then(|| (table.to_owned(), column.name.clone()));
+                .then(|| single_secondary_index_key(table, &column.name));
             if column.identity {
-                schema.indexes.push(IndexDef {
-                    column: column.name.clone(),
-                    unique: true,
-                });
+                schema
+                    .indexes
+                    .push(IndexDef::single(column.name.clone(), true));
             }
             schema.columns.push(column);
             let publication_error =
                 publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next)?;
             if let Some(key) = identity_key {
-                st.secondary.insert(key, SecIdx::resident(HashMap::new()));
+                st.secondary.insert(key, SecIdx::resident(BTreeMap::new()));
             }
             return publication_error.map_or(Ok(()), Err);
         }
@@ -7160,16 +6801,16 @@ impl Db {
         )
     }
 
-    pub(crate) fn secondary_contains(
+    pub(crate) fn secondary_contains_key(
         &self,
         table: &str,
-        column: &str,
-        value: &Value,
+        def: &IndexDef,
+        key: &[u8],
         id: &str,
     ) -> Result<bool> {
         let state = self.shared.state.read().unwrap();
-        match state.secondary.get(&(table.into(), column.into())) {
-            Some(index) => index.contains_pair(&index_key(value), id),
+        match state.secondary.get(&secondary_index_key(table, def)) {
+            Some(index) => index.contains_pair(key, id),
             None => Ok(false),
         }
     }
@@ -7187,10 +6828,22 @@ impl Db {
 
     pub(crate) fn visit_secondary_entries(
         &self,
-        mut visit: impl FnMut(&str, &str, &[u8], &str) -> Result<()>,
+        mut visit: impl FnMut(&str, &IndexDef, &[u8], &str) -> Result<()>,
     ) -> Result<()> {
         let state = self.shared.state.read().unwrap();
-        for ((table, column), index) in &state.secondary {
+        for ((table, index_id), index) in &state.secondary {
+            let schema = state.catalog.table(table).ok_or_else(|| {
+                Error::Corrupt(format!("secondary index has unknown table {table}"))
+            })?;
+            let def = schema
+                .indexes
+                .iter()
+                .find(|def| secondary_index_id(def.columns()) == *index_id)
+                .ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "secondary index {table}.{index_id} is absent from catalog"
+                    ))
+                })?;
             for run in &index.runs {
                 run.index.scan(|pair, _| {
                     if pair == SECONDARY_FORMAT_KEY {
@@ -7198,7 +6851,7 @@ impl Db {
                     }
                     let (key, id) = secondary_pair_parts(pair)?;
                     if index.contains_pair(key, id)? {
-                        visit(table, column, key, id)?;
+                        visit(table, def, key, id)?;
                     }
                     Ok(())
                 })?;
@@ -7209,7 +6862,7 @@ impl Db {
                 for (key, ids) in map {
                     for id in ids {
                         if index.contains_pair(key, id)? {
-                            visit(table, column, key, id)?;
+                            visit(table, def, key, id)?;
                         }
                     }
                 }
@@ -7940,7 +7593,7 @@ impl Db {
         if value.is_null() {
             return Ok(Vec::new());
         }
-        if let Some(idx) = st.secondary.get(&(table.to_owned(), column.to_owned())) {
+        if let Some(idx) = st.secondary.get(&single_secondary_index_key(table, column)) {
             let ids = idx.ids(&index_key(value))?;
             let blobs = st.blobs.clone();
             let implicit_id = schema.has_implicit_id();
@@ -8124,7 +7777,7 @@ impl Db {
         // snapshot-bound caller then finishes through the directory walk.
         let byte_budget = version.map(|_| (self.shared.opts.memory.query_working_bytes / 2).max(1));
         let epoch = schema.epoch;
-        let indexed_key = (table.to_owned(), column.to_owned());
+        let indexed_key = single_secondary_index_key(table, column);
         let index_usable = |st: &State| {
             st.secondary.contains_key(&indexed_key)
                 && version.is_none_or(|version| version == st.committed_version)
@@ -8244,6 +7897,110 @@ impl Db {
             .get(rows.len().wrapping_sub(1))
             .map(|(span, _)| span.of(&prepared_ids).to_owned());
         Ok(ScanBatch { rows, ids, next })
+    }
+
+    /// Current-state ordered walk of a secondary index. Historical snapshots
+    /// deliberately use the established scan/sort path because secondary runs
+    /// only model the latest committed membership.
+    pub(crate) fn ordered_secondary_batch_current(
+        &self,
+        snapshot: &Snapshot,
+        request: OrderedSecondaryRead<'_>,
+    ) -> Result<Option<OrderedSecondaryBatch>> {
+        if request.limit == 0 {
+            return Ok(Some(OrderedSecondaryBatch {
+                rows: Vec::new(),
+                next: None,
+                skipped: 0,
+            }));
+        }
+        let st = self.shared.state.read().unwrap();
+        // Secondary runs describe only the latest membership. A caller that
+        // has become historical while waiting for this lock must fall back to
+        // the snapshot-aware primary scan and sort, before yielding any rows.
+        if st.committed_version != snapshot.version() {
+            return Ok(None);
+        }
+        let schema = st
+            .catalog
+            .table(request.table)
+            .ok_or_else(|| Error::TableNotFound(request.table.into()))?;
+        let def = schema
+            .indexes
+            .iter()
+            .find(|def| def.columns() == request.columns)
+            .ok_or_else(|| Error::IndexNotFound {
+                table: request.table.into(),
+                column: request.columns.join(", "),
+            })?;
+        let index = st
+            .secondary
+            .get(&secondary_index_key(request.table, def))
+            .ok_or_else(|| Error::Corrupt("ordered secondary index is not loaded".into()))?;
+        let mut entries = Vec::new();
+        index.ordered_entries_into(
+            request.tuple_prefix,
+            request.after,
+            request.limit,
+            &mut entries,
+        )?;
+        let skipped = request.skip.min(entries.len());
+        let mut key_buffer = Vec::new();
+        let mut prepared_ids = String::new();
+        let mut prepared = Vec::new();
+        let mut positions = Vec::new();
+        let mut readers = SegmentReaders::default();
+        if let Some((mut view, epoch)) = st.table_view(request.table, &mut key_buffer) {
+            for (position, entry) in entries.iter().enumerate().skip(skipped) {
+                let Some(version) = view
+                    .newest(entry.id(), snapshot.version())?
+                    .filter(|version| version.version > epoch)
+                else {
+                    continue;
+                };
+                if version.is_tombstone() {
+                    continue;
+                }
+                let span = push_id(&mut prepared_ids, entry.id());
+                prepared.push((span, version.kind));
+                positions.push(position);
+            }
+        }
+        retain_segment_readers(&st, &prepared, &mut readers)?;
+        let blobs = st.blobs.clone();
+        let implicit_id = schema.has_implicit_id();
+        let projection = RowProjection::new(Some(schema), request.keep);
+        drop(st);
+        let mut rows = Vec::with_capacity(prepared.len());
+        let mut retained_bytes = 0usize;
+        let mut last_returned = None;
+        let mut truncated = false;
+        for ((span, kind), position) in prepared.into_iter().zip(positions) {
+            let id = span.of(&prepared_ids);
+            let mut record = read_record_kind_keep(&blobs, &readers, &kind, &projection)?;
+            if implicit_id {
+                record.insert(ID_COLUMN, Value::Text(id.to_owned()));
+            }
+            if !record_fits_batch(&record, id, Some(request.max_bytes), &mut retained_bytes)? {
+                truncated = true;
+                break;
+            }
+            last_returned = Some(position);
+            rows.push(record);
+        }
+        let next_position = if truncated {
+            last_returned
+        } else {
+            entries.len().checked_sub(1)
+        };
+        let next = next_position.map(|position| std::mem::take(&mut entries[position].pair));
+        // A stale index entry can produce no visible row; advancing through
+        // it is still required to avoid repeating the empty batch forever.
+        Ok(Some(OrderedSecondaryBatch {
+            rows,
+            next,
+            skipped,
+        }))
     }
 
     // --- maintenance -----------------------------------------------------------
@@ -9508,7 +9265,7 @@ impl Txn {
             if schema.column(column).is_none() {
                 return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
             }
-            let Some(index) = st.secondary.get(&(table.to_owned(), column.to_owned())) else {
+            let Some(index) = st.secondary.get(&single_secondary_index_key(table, column)) else {
                 return Ok(None);
             };
             let mut candidates: BTreeSet<String> = index.ids(&key)?;
@@ -9824,14 +9581,16 @@ impl Txn {
                     )));
                 }
                 for def in staged.schema.indexes.iter().filter(|def| def.unique) {
-                    let Some(value) = record.get(&def.column).filter(|value| !value.is_null())
-                    else {
+                    if secondary_key_has_null(record, def.columns()) {
                         continue;
-                    };
-                    let key = (def.column.clone(), index_key(value));
+                    }
+                    let key = (
+                        secondary_index_id(def.columns()),
+                        secondary_tuple_key(record, def.columns()),
+                    );
                     let index = state
                         .secondary
-                        .get(&(table.to_owned(), def.column.clone()))
+                        .get(&secondary_index_key(table, def))
                         .ok_or_else(|| missing_unique_index(table, &def.column))?;
                     if accepted.contains(&key) || !index.ids(&key.1)?.is_empty() {
                         return Err(Error::UniqueViolation {
@@ -10644,16 +10403,11 @@ fn apply_one_owned(
     if !defs.is_empty() || !tdefs.is_empty() {
         if let Some(prior) = prior_record {
             for (def, key) in defs.iter().zip(&keys.secondary) {
-                if unchanged(&def.column) {
+                if def.columns().iter().all(|column| unchanged(column)) {
                     continue;
                 }
-                if let Some(v) = prior.get(&def.column) {
-                    if !v.is_null() {
-                        if let Some(idx) = st.secondary.get_mut(key) {
-                            let key = index_key(v);
-                            idx.remove(&key, id_ref);
-                        }
-                    }
+                if let Some(idx) = st.secondary.get_mut(key) {
+                    idx.remove(&secondary_tuple_key(prior, def.columns()), id_ref);
                 }
             }
             for (tdef, key) in tdefs.iter().zip(&keys.text) {
@@ -10674,15 +10428,11 @@ fn apply_one_owned(
     };
     if let Some((_, rec)) = put {
         for (def, key) in defs.iter().zip(&keys.secondary) {
-            if unchanged(&def.column) {
+            if def.columns().iter().all(|column| unchanged(column)) {
                 continue;
             }
-            if let Some(v) = rec.get(&def.column) {
-                if !v.is_null() {
-                    if let Some(idx) = st.secondary.get_mut(key) {
-                        idx.add(index_key(v), id_ref);
-                    }
-                }
+            if let Some(idx) = st.secondary.get_mut(key) {
+                idx.add(secondary_tuple_key(rec, def.columns()), id_ref);
             }
         }
         for (tdef, key) in tdefs.iter().zip(&keys.text) {
@@ -10734,18 +10484,63 @@ fn apply_one_owned(
     st.index.push(table, id, VersionEntry { version, kind });
 }
 
-fn sidx_path(dir: &Path, table: &str, column: &str) -> PathBuf {
-    let key = format!("{table}\u{0}{column}");
+/// A collision-free, filesystem-safe identity for the full ordered column
+/// list. It deliberately differs from a display name: `(a)`, `(a, b)` and
+/// `(a, c)` must never share a run or manifest.
+fn catalog_mirror_has_legacy_secondary_indexes(dir: &Path) -> bool {
+    let Ok(bytes) = fs::read(dir.join(CATALOG_FILE)) else {
+        return false;
+    };
+    let Ok(catalog) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    catalog
+        .get("tables")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|table| table.get("indexes").and_then(serde_json::Value::as_array))
+        .flatten()
+        .any(|index| index.get("columns").is_none())
+}
+
+pub(super) fn secondary_index_id(columns: &[String]) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(columns.len() as u32).to_be_bytes());
+    for column in columns {
+        bytes.extend_from_slice(&(column.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(column.as_bytes());
+    }
+    let mut id = String::with_capacity(4 + bytes.len() * 2);
+    id.push_str("idx-");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut id, "{byte:02x}").expect("writing into String cannot fail");
+    }
+    id
+}
+
+pub(super) fn secondary_index_key(table: &str, def: &IndexDef) -> (String, String) {
+    (table.to_owned(), secondary_index_id(def.columns()))
+}
+
+pub(super) fn single_secondary_index_key(table: &str, column: &str) -> (String, String) {
+    let columns = [column.to_owned()];
+    (table.to_owned(), secondary_index_id(&columns))
+}
+
+fn sidx_path(dir: &Path, table: &str, index_id: &str) -> PathBuf {
+    let key = format!("{table}\u{0}{index_id}");
     dir.join(INDEXES_DIR)
         .join(format!("{:08x}.sidx", crc32fast::hash(key.as_bytes())))
 }
 
-fn sidx_manifest_path(dir: &Path, table: &str, column: &str) -> PathBuf {
-    sidx_path(dir, table, column).with_extension("sidx.runs")
+fn sidx_manifest_path(dir: &Path, table: &str, index_id: &str) -> PathBuf {
+    sidx_path(dir, table, index_id).with_extension("sidx.runs")
 }
 
-fn sidx_run_filename(dir: &Path, table: &str, column: &str, level: u8) -> String {
-    let stem = sidx_path(dir, table, column)
+fn sidx_run_filename(dir: &Path, table: &str, index_id: &str, level: u8) -> String {
+    let stem = sidx_path(dir, table, index_id)
         .file_stem()
         .and_then(|stem| stem.to_str())
         .expect("secondary path has utf8 stem")
@@ -10753,12 +10548,12 @@ fn sidx_run_filename(dir: &Path, table: &str, column: &str, level: u8) -> String
     format!("{stem}-L{level}-{}.sidx.run", Ulid::new())
 }
 
-fn load_secondary_runs(dir: &Path, table: &str, column: &str, generation: u64) -> Result<SecIdx> {
+fn load_secondary_runs(dir: &Path, table: &str, index_id: &str, generation: u64) -> Result<SecIdx> {
     let manifest = DerivedRunManifest::load(
-        &sidx_manifest_path(dir, table, column),
+        &sidx_manifest_path(dir, table, index_id),
         DerivedRunKind::Secondary,
         table,
-        column,
+        index_id,
         generation,
     )?;
     let mut seen = HashSet::new();
@@ -10795,19 +10590,19 @@ fn load_secondary_runs(dir: &Path, table: &str, column: &str, generation: u64) -
 fn publish_secondary_manifest(
     dir: &Path,
     table: &str,
-    column: &str,
+    index_id: &str,
     generation: u64,
     index: &SecIdx,
 ) -> Result<()> {
     DerivedRunManifest::new(
         DerivedRunKind::Secondary,
         table,
-        column,
+        index_id,
         generation,
         index.run_metas(),
         [0, 0],
     )
-    .publish(&sidx_manifest_path(dir, table, column))
+    .publish(&sidx_manifest_path(dir, table, index_id))
 }
 
 /// Load immutable secondary runs only when they describe exactly the
@@ -10827,8 +10622,8 @@ fn load_or_build_secondary_indexes(
     let mut out = HashMap::new();
     for table in &catalog.tables {
         for def in &table.indexes {
-            let key = (table.name.clone(), def.column.clone());
-            match load_secondary_runs(dir, &table.name, &def.column, committed_version) {
+            let key = secondary_index_key(&table.name, def);
+            match load_secondary_runs(dir, &table.name, &key.1, committed_version) {
                 Ok(index) => {
                     out.insert(key, index);
                 }
@@ -10837,7 +10632,7 @@ fn load_or_build_secondary_indexes(
                     // fallback. A read-only open never repairs derived data.
                 }
                 _ => {
-                    let path = sidx_path(dir, &table.name, &def.column);
+                    let path = sidx_path(dir, &table.name, &key.1);
                     let tmp = path.with_extension("sidx.tmp");
                     let temp_dir = memory
                         .spill_directory
@@ -10850,7 +10645,7 @@ fn load_or_build_secondary_indexes(
                         memory.maintenance_pool_bytes,
                         blobs,
                         table,
-                        &def.column,
+                        def,
                         index,
                         readers,
                     )?;
@@ -10876,7 +10671,7 @@ fn load_or_build_secondary_indexes(
                     publish_secondary_manifest(
                         dir,
                         &table.name,
-                        &def.column,
+                        &key.1,
                         committed_version,
                         &index,
                     )?;
@@ -10889,6 +10684,39 @@ fn load_or_build_secondary_indexes(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn validate_unique_secondary_from_canonical(
+    blobs: &Path,
+    schema: &TableSchema,
+    def: &IndexDef,
+    index: &PrimaryIdx,
+    readers: &SegmentReaders,
+    table: &str,
+    label: &str,
+) -> Result<()> {
+    let wanted = def.columns().iter().map(String::as_str).collect::<Vec<_>>();
+    let projection = RowProjection::new(Some(schema), Some(&wanted));
+    let mut seen = HashSet::new();
+    index.visit_table(&schema.name, None, |_, versions| {
+        let Some(last) = versions.last() else {
+            return Ok(true);
+        };
+        if last.is_tombstone() {
+            return Ok(true);
+        }
+        let record = read_record_kind_keep(blobs, readers, &last.kind, &projection)?;
+        if !secondary_key_has_null(&record, def.columns())
+            && !seen.insert(secondary_tuple_key(&record, def.columns()))
+        {
+            return Err(Error::UniqueViolation {
+                table: table.into(),
+                column: label.into(),
+            });
+        }
+        Ok(true)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_secondary_from_canonical(
     target: &Path,
     temp_dir: &Path,
@@ -10896,13 +10724,13 @@ fn write_secondary_from_canonical(
     budget: usize,
     blobs: &Path,
     schema: &TableSchema,
-    column: &str,
+    def: &IndexDef,
     index: &PrimaryIdx,
     readers: &SegmentReaders,
 ) -> Result<()> {
     let mut writer = ExternalPagedWriter::new(target, temp_dir, dump_version, budget)?;
     writer.add(SECONDARY_FORMAT_KEY, SECONDARY_FORMAT_VALUE)?;
-    let wanted = [column];
+    let wanted = def.columns().iter().map(String::as_str).collect::<Vec<_>>();
     let projection = RowProjection::new(Some(schema), Some(&wanted));
     index.visit_table(&schema.name, None, |id, versions| {
         let Some(last) = versions.last() else {
@@ -10912,12 +10740,11 @@ fn write_secondary_from_canonical(
             return Ok(true);
         }
         let record = read_record_kind_keep(blobs, readers, &last.kind, &projection)?;
-        if let Some(value) = record.get(column).filter(|value| !value.is_null()) {
-            writer.add(
-                &secondary_pair_key(&index_key(value), id),
-                &secondary_operation(dump_version, SECONDARY_ADD),
-            )?;
-        }
+        let key = secondary_tuple_key(&record, def.columns());
+        writer.add(
+            &secondary_pair_key(&key, id),
+            &secondary_operation(dump_version, SECONDARY_ADD),
+        )?;
         Ok(true)
     })?;
     writer.finish()
@@ -10927,15 +10754,16 @@ fn cleanup_orphan_sidx(dir: &Path, catalog: &Catalog) {
     let mut expected = HashSet::new();
     for table in &catalog.tables {
         for def in &table.indexes {
-            let base = sidx_path(dir, &table.name, &def.column);
-            let manifest = sidx_manifest_path(dir, &table.name, &def.column);
+            let index_id = secondary_index_id(def.columns());
+            let base = sidx_path(dir, &table.name, &index_id);
+            let manifest = sidx_manifest_path(dir, &table.name, &index_id);
             expected.insert(base);
             expected.insert(manifest.clone());
             let Some(files) = DerivedRunManifest::referenced_files(
                 &manifest,
                 DerivedRunKind::Secondary,
                 &table.name,
-                &def.column,
+                &index_id,
             ) else {
                 // Unreadable (not absent) manifest: leave this sweep to a
                 // later publication instead of deleting live runs.
@@ -12453,7 +12281,7 @@ fn indexed_columns(schema: &TableSchema) -> Vec<&str> {
     let names = schema
         .indexes
         .iter()
-        .map(|def| def.column.as_str())
+        .flat_map(|def| def.columns().iter().map(String::as_str))
         .chain(schema.text_indexes.iter().map(|def| def.column.as_str()))
         .chain(schema.vector_indexes.iter().map(|def| def.column.as_str()));
     for name in names {
@@ -12505,6 +12333,22 @@ fn index_key(v: &Value) -> Vec<u8> {
     let mut buf = Vec::new();
     crate::value::encode_index_value(&mut buf, v);
     buf
+}
+
+/// Ordered tuple key shared by writes, uniqueness checks and canonical
+/// rebuilds. Missing fields are SQL NULL, as they are in record decoding.
+pub(crate) fn secondary_tuple_key(record: &Record, columns: &[String]) -> Vec<u8> {
+    let mut key = Vec::new();
+    for column in columns {
+        crate::value::encode_index_value(&mut key, record.get(column).unwrap_or(&Value::Null));
+    }
+    key
+}
+
+fn secondary_key_has_null(record: &Record, columns: &[String]) -> bool {
+    columns
+        .iter()
+        .any(|column| record.get(column).is_none_or(Value::is_null))
 }
 
 /// Storage form of a value: `-0.0` becomes `0.0` so equality, index keys and
@@ -14079,7 +13923,7 @@ mod primary_index_tests {
             let generation = state.committed_version;
             state
                 .secondary
-                .get_mut(&("docs".into(), "tag".into()))
+                .get_mut(&single_secondary_index_key("docs", "tag"))
                 .unwrap()
                 .freeze_delta(generation)
                 .unwrap();
@@ -14140,7 +13984,7 @@ mod primary_index_tests {
         assert_eq!(
             state
                 .secondary
-                .get(&("docs".into(), "tag".into()))
+                .get(&single_secondary_index_key("docs", "tag"))
                 .unwrap()
                 .runs
                 .last()
