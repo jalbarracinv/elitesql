@@ -32,6 +32,11 @@ impl<'a> SpillSorter<'a> {
         })
     }
 
+    /// Bytes of the rows buffered in memory.
+    pub(super) fn buffered_bytes(&self) -> usize {
+        self.buffer_bytes
+    }
+
     /// Whether a row with these sort keys can still reach the output.
     ///
     /// A bounded sort keeps `keep` rows and discards the rest, but the caller

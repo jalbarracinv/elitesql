@@ -138,6 +138,8 @@ trait Stream: Read + Write + Send + Sized + 'static {
     fn duplicate(&self) -> std::io::Result<Self>;
     fn peer(&self) -> String;
     fn set_timeouts(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn set_read_timeout_only(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout_only(&self, timeout: Option<Duration>) -> std::io::Result<()>;
     fn shutdown_write(&self) -> std::io::Result<()>;
 }
 
@@ -150,6 +152,12 @@ impl Stream for UnixStream {
     }
     fn set_timeouts(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.set_read_timeout(timeout)?;
+        self.set_write_timeout(timeout)
+    }
+    fn set_read_timeout_only(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+    fn set_write_timeout_only(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.set_write_timeout(timeout)
     }
     fn shutdown_write(&self) -> std::io::Result<()> {
@@ -168,6 +176,12 @@ impl Stream for TcpStream {
     }
     fn set_timeouts(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.set_read_timeout(timeout)?;
+        self.set_write_timeout(timeout)
+    }
+    fn set_read_timeout_only(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+    fn set_write_timeout_only(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.set_write_timeout(timeout)
     }
     fn shutdown_write(&self) -> std::io::Result<()> {
@@ -338,19 +352,30 @@ fn handle_connection_with_timeouts<S: Stream>(
     let auth_deadline = (!authenticated).then(|| Instant::now() + auth_timeout);
     let mut txn = None;
     let mut cursor = None;
+    // The socket timeouts in force, `None` when unknown. The read and write
+    // halves share one socket, so these are its two options; each is set only
+    // when the wanted value changes instead of twice per request (four
+    // `setsockopt` calls that were about as costly as decoding the rows).
+    let mut read_timeout: Option<Option<Duration>> = Some(None);
+    let mut write_timeout: Option<Option<Duration>> = Some(None);
     loop {
-        if reader
-            .get_ref()
-            .set_timeouts((txn.is_some() || cursor.is_some()).then_some(idle_timeout))
-            .is_err()
-        {
-            return;
+        let wanted = (txn.is_some() || cursor.is_some()).then_some(idle_timeout);
+        if read_timeout != Some(wanted) {
+            if reader.get_ref().set_read_timeout_only(wanted).is_err() {
+                return;
+            }
+            read_timeout = Some(wanted);
         }
-        let (read, line) =
-            match read_request_line(&mut reader, auth_deadline.filter(|_| !authenticated)) {
-                Ok(read) => read,
-                Err(_) => return, // timeout/disconnect rolls back `txn` by drop
-            };
+        let deadline = auth_deadline.filter(|_| !authenticated);
+        if deadline.is_some() {
+            // The deadline path sets both options as it reads.
+            read_timeout = None;
+            write_timeout = None;
+        }
+        let (read, line) = match read_request_line(&mut reader, deadline) {
+            Ok(read) => read,
+            Err(_) => return, // timeout/disconnect rolls back `txn` by drop
+        };
         if read == 0 {
             return;
         }
@@ -369,8 +394,15 @@ fn handle_connection_with_timeouts<S: Stream>(
         }
         let response =
             dispatch_with_txn(&db, &line, &auth, &mut authenticated, &mut txn, &mut cursor);
-        if authenticated && writer.get_ref().set_timeouts(Some(idle_timeout)).is_err() {
-            return;
+        if authenticated && write_timeout != Some(Some(idle_timeout)) {
+            if writer
+                .get_ref()
+                .set_write_timeout_only(Some(idle_timeout))
+                .is_err()
+            {
+                return;
+            }
+            write_timeout = Some(Some(idle_timeout));
         }
         let response = bounded_response_bytes(&response);
         if writer.write_all(&response).is_err()
@@ -870,7 +902,11 @@ fn stats_json(db: &Db) -> J {
         "wal_sync_time_us": us(m.wal_sync_time),
         "wal_appended_bytes": m.wal_appended_bytes,
         "grouped_commits": m.grouped_commits,
+        "coordinated_batches": m.coordinated_batches,
         "coordinated_commits": m.coordinated_commits,
+        "coordinator_handoffs": m.coordinator_handoffs,
+        "coordinator_handoff_us": us(m.coordinator_handoff_time),
+        "delta_rebased_rows": m.delta_rebased_rows,
         "point_read_throttles": m.point_read_throttles,
         "checkpoints": m.checkpoints,
         "query_in_use_bytes": q.query_in_use_bytes,

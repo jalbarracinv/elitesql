@@ -1,0 +1,6 @@
+users | before ops/s  after ops/s      Δ |  p50 b  p50 a |   p99 b   p99 a |  succ b  succ a |   sqlite a/sqlite b/sqlite
+   10 |        17311        18447  +6.6% |   0.29   0.28 |     5.1     4.8 | 100.000 100.000 |    27342     0.67     0.63
+  100 |        19041        21195 +11.3% |   1.60   1.06 |    32.1    28.1 |  99.997  99.979 |    27230     0.78     0.70
+  500 |        14485        14896  +2.8% |   3.88   2.12 |   200.9   192.7 |  99.784  99.916 |    24937     0.60     0.58
+invariants: {'before': ['True', 'True', 'True', 'True', 'True', 'True'], 'after': ['True', 'True', 'True', 'True', 'True', 'True'], 'sqlite': ['True', 'True', 'True', 'True', 'True', 'True']}
+consistency_violations: {'before': 0, 'after': 29, 'sqlite': 0}

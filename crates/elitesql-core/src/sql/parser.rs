@@ -3,7 +3,7 @@
 //! design principle: "hacer facil lo comun y explicito lo avanzado".
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::error::{Error, Result};
 use crate::value::ColumnType;
@@ -97,7 +97,8 @@ pub(crate) fn parse(sql: &str) -> Result<Statement> {
 }
 
 struct ParseCache {
-    statements: HashMap<String, Statement>,
+    /// Shared so a hit copies a pointer under the lock and the tree after it.
+    statements: HashMap<String, Arc<Statement>>,
     insertion_order: VecDeque<String>,
     sql_bytes: usize,
 }
@@ -128,32 +129,37 @@ impl ParseCache {
         if self.sql_bytes.saturating_add(sql.len()) <= PARSE_CACHE_BYTES {
             self.sql_bytes = self.sql_bytes.saturating_add(sql.len());
             self.insertion_order.push_back(sql.to_owned());
-            self.statements.insert(sql.to_owned(), statement);
+            self.statements.insert(sql.to_owned(), Arc::new(statement));
         }
     }
 }
 
-static PARSE_CACHE: OnceLock<Mutex<ParseCache>> = OnceLock::new();
+static PARSE_CACHE: OnceLock<RwLock<ParseCache>> = OnceLock::new();
 
 /// Parse SQL through a bounded process-wide AST cache. Binding always mutates
 /// a clone, so parameter values and statement timestamps can never leak across
 /// executions or database handles.
+///
+/// Every statement of every connection comes through here, so a hit shares
+/// the lock with other hits and copies only a pointer under it; the tree is
+/// cloned after it is released. Cloning the tree under a mutex was the
+/// largest queue in the server once the state lock stopped being one.
 pub(crate) fn parse_cached(sql: &str) -> Result<Statement> {
-    let cache = PARSE_CACHE.get_or_init(|| Mutex::new(ParseCache::new()));
-    if let Some(statement) = cache
-        .lock()
+    let cache = PARSE_CACHE.get_or_init(|| RwLock::new(ParseCache::new()));
+    let hit = cache
+        .read()
         .unwrap_or_else(|poison| poison.into_inner())
         .statements
         .get(sql)
-        .cloned()
-    {
+        .cloned();
+    if let Some(statement) = hit {
         #[cfg(test)]
         PARSE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(statement);
+        return Ok((*statement).clone());
     }
     let statement = parse(sql)?;
     cache
-        .lock()
+        .write()
         .unwrap_or_else(|poison| poison.into_inner())
         .insert(sql, statement.clone());
     Ok(statement)

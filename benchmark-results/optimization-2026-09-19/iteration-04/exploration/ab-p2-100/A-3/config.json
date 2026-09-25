@@ -1,0 +1,46 @@
+{
+ "config": {
+  "rebuild_report": null,
+  "reverify_db": null,
+  "transport": "sidecar",
+  "levels": [
+   100
+  ],
+  "duration": 15.0,
+  "warmup": 3.0,
+  "ramp": 3.0,
+  "think": [
+   0.0,
+   0.0
+  ],
+  "processes": 0,
+  "connections": 0,
+  "durability": "balanced",
+  "max_statements": 0,
+  "memory_mib": 0,
+  "products": 5000,
+  "accounts": 20000,
+  "scenario": "compound-index",
+  "seed": 1,
+  "fresh_per_stage": false,
+  "keep_samples": false,
+  "out": "/Users/jalbarracin/elitesql/benchmark-results/optimization-2026-09-19/iteration-04/ab-p2-100/A-3",
+  "db_dir": null,
+  "elitesql_bin": "/Users/jalbarracin/elitesql/benchmark-results/optimization-2026-09-19/iteration-04/before-elitesql",
+  "compare_with": [],
+  "db_path": "/private/var/folders/z_/dcnr0h75667d0d42ldb92hb00000gn/T/saas-sim-oo0ypmtl/saas.esql",
+  "socket": "/var/folders/z_/dcnr0h75667d0d42ldb92hb00000gn/T/saas-sim-21830.sock"
+ },
+ "environment": {
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "machine": "arm64",
+  "cpu_count": 10,
+  "python": "3.11.13",
+  "date": "2026-09-23T13:05:04",
+  "git_commit": "92e0290",
+  "hw.memsize": "17179869184",
+  "kern.num_taskthreads": "4096",
+  "hw.perflevel0.physicalcpu": "4",
+  "elitesql_version": "0.0.1"
+ }
+}

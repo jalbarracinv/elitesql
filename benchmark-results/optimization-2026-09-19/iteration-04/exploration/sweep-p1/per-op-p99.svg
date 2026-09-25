@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+<rect width="1080" height="480" fill="#ffffff"/>
+<text x="84" y="26" font-size="17" font-weight="600" fill="#1f2328">p99 latency per operation — sweep-p1</text>
+<line x1="84" y1="416.0" x2="830" y2="416.0" stroke="#eaeef2"/>
+<text x="76" y="420.0" text-anchor="end" fill="#57606a">0.1</text>
+<line x1="84" y1="327.0" x2="830" y2="327.0" stroke="#eaeef2"/>
+<text x="76" y="331.0" text-anchor="end" fill="#57606a">1</text>
+<line x1="84" y1="238.0" x2="830" y2="238.0" stroke="#eaeef2"/>
+<text x="76" y="242.0" text-anchor="end" fill="#57606a">10</text>
+<line x1="84" y1="149.0" x2="830" y2="149.0" stroke="#eaeef2"/>
+<text x="76" y="153.0" text-anchor="end" fill="#57606a">100</text>
+<line x1="84" y1="60.0" x2="830" y2="60.0" stroke="#eaeef2"/>
+<text x="76" y="64.0" text-anchor="end" fill="#57606a">1k</text>
+<line x1="84.0" y1="60" x2="84.0" y2="416" stroke="#f0f2f4"/>
+<text x="84.0" y="434" text-anchor="middle" fill="#57606a">10</text>
+<line x1="523.1" y1="60" x2="523.1" y2="416" stroke="#f0f2f4"/>
+<text x="523.1" y="434" text-anchor="middle" fill="#57606a">100</text>
+<line x1="830.0" y1="60" x2="830.0" y2="416" stroke="#f0f2f4"/>
+<text x="830.0" y="434" text-anchor="middle" fill="#57606a">500</text>
+<rect x="84" y="60" width="746" height="356" fill="none" stroke="#d0d7de"/>
+<text x="457.0" y="466" text-anchor="middle" fill="#57606a">concurrent users (log)</text>
+<text x="18" y="238.0" text-anchor="middle" fill="#57606a" transform="rotate(-90 18 238.0)">p99 ms (log)</text>
+<path d="M84.0,216.7 L523.1,122.7 L830.0,71.2" fill="none" stroke="#c99700" stroke-width="2"/>
+<circle cx="84.0" cy="216.7" r="3" fill="#c99700"><title>admin_dashboard: 10 → 17.3536</title></circle>
+<circle cx="523.1" cy="122.7" r="3" fill="#c99700"><title>admin_dashboard: 100 → 197.266</title></circle>
+<circle cx="830.0" cy="71.2" r="3" fill="#c99700"><title>admin_dashboard: 500 → 748.045</title></circle>
+<line x1="848" y1="68" x2="870" y2="68" stroke="#c99700" stroke-width="2"/>
+<text x="876" y="72" fill="#1f2328">admin_dashboard</text>
+<path d="M84.0,249.6 L523.1,142.1 L830.0,82.3" fill="none" stroke="#0969da" stroke-width="2"/>
+<circle cx="84.0" cy="249.6" r="3" fill="#0969da"><title>checkout: 10 → 7.4134</title></circle>
+<circle cx="523.1" cy="142.1" r="3" fill="#0969da"><title>checkout: 100 → 119.576</title></circle>
+<circle cx="830.0" cy="82.3" r="3" fill="#0969da"><title>checkout: 500 → 561.603</title></circle>
+<line x1="848" y1="84" x2="870" y2="84" stroke="#0969da" stroke-width="2"/>
+<text x="876" y="88" fill="#1f2328">checkout</text>
+<path d="M84.0,274.7 L523.1,148.3 L830.0,96.0" fill="none" stroke="#cf222e" stroke-width="2"/>
+<circle cx="84.0" cy="274.7" r="3" fill="#cf222e"><title>restock: 10 → 3.8648</title></circle>
+<circle cx="523.1" cy="148.3" r="3" fill="#cf222e"><title>restock: 100 → 101.875</title></circle>
+<circle cx="830.0" cy="96.0" r="3" fill="#cf222e"><title>restock: 500 → 394.158</title></circle>
+<line x1="848" y1="100" x2="870" y2="100" stroke="#cf222e" stroke-width="2"/>
+<text x="876" y="104" fill="#1f2328">restock</text>
+<path d="M84.0,265.4 L523.1,153.1 L830.0,103.2" fill="none" stroke="#1a7f37" stroke-width="2"/>
+<circle cx="84.0" cy="265.4" r="3" fill="#1a7f37"><title>relogin: 10 → 4.9202</title></circle>
+<circle cx="523.1" cy="153.1" r="3" fill="#1a7f37"><title>relogin: 100 → 89.8553</title></circle>
+<circle cx="830.0" cy="103.2" r="3" fill="#1a7f37"><title>relogin: 500 → 326.76</title></circle>
+<line x1="848" y1="116" x2="870" y2="116" stroke="#1a7f37" stroke-width="2"/>
+<text x="876" y="120" fill="#1f2328">relogin</text>
+<path d="M84.0,270.0 L523.1,171.3 L830.0,119.6" fill="none" stroke="#8250df" stroke-width="2"/>
+<circle cx="84.0" cy="270.0" r="3" fill="#8250df"><title>add_to_cart: 10 → 4.3658</title></circle>
+<circle cx="523.1" cy="171.3" r="3" fill="#8250df"><title>add_to_cart: 100 → 56.2208</title></circle>
+<circle cx="830.0" cy="119.6" r="3" fill="#8250df"><title>add_to_cart: 500 → 213.765</title></circle>
+<line x1="848" y1="132" x2="870" y2="132" stroke="#8250df" stroke-width="2"/>
+<text x="876" y="136" fill="#1f2328">add_to_cart</text>
+<path d="M84.0,273.4 L523.1,177.4 L830.0,121.8" fill="none" stroke="#bf3989" stroke-width="2"/>
+<circle cx="84.0" cy="273.4" r="3" fill="#bf3989"><title>update_cart_item: 10 → 4.0008</title></circle>
+<circle cx="523.1" cy="177.4" r="3" fill="#bf3989"><title>update_cart_item: 100 → 47.9774</title></circle>
+<circle cx="830.0" cy="121.8" r="3" fill="#bf3989"><title>update_cart_item: 500 → 201.961</title></circle>
+<line x1="848" y1="148" x2="870" y2="148" stroke="#bf3989" stroke-width="2"/>
+<text x="876" y="152" fill="#1f2328">update_cart_item</text>
+<path d="M84.0,273.6 L523.1,173.6 L830.0,122.1" fill="none" stroke="#0a7ea4" stroke-width="2"/>
+<circle cx="84.0" cy="273.6" r="3" fill="#0a7ea4"><title>signup: 10 → 3.976</title></circle>
+<circle cx="523.1" cy="173.6" r="3" fill="#0a7ea4"><title>signup: 100 → 52.9268</title></circle>
+<circle cx="830.0" cy="122.1" r="3" fill="#0a7ea4"><title>signup: 500 → 200.59</title></circle>
+<line x1="848" y1="164" x2="870" y2="164" stroke="#0a7ea4" stroke-width="2"/>
+<text x="876" y="168" fill="#1f2328">signup</text>
+<path d="M84.0,275.1 L523.1,175.4 L830.0,122.5" fill="none" stroke="#9a6700" stroke-width="2"/>
+<circle cx="84.0" cy="275.1" r="3" fill="#9a6700"><title>session_check: 10 → 3.8265</title></circle>
+<circle cx="523.1" cy="175.4" r="3" fill="#9a6700"><title>session_check: 100 → 50.5363</title></circle>
+<circle cx="830.0" cy="122.5" r="3" fill="#9a6700"><title>session_check: 500 → 198.711</title></circle>
+<line x1="848" y1="180" x2="870" y2="180" stroke="#9a6700" stroke-width="2"/>
+<text x="876" y="184" fill="#1f2328">session_check</text>
+<path d="M84.0,276.5 L523.1,187.5 L830.0,124.9" fill="none" stroke="#57606a" stroke-width="2"/>
+<circle cx="84.0" cy="276.5" r="3" fill="#57606a"><title>update_profile: 10 → 3.6937</title></circle>
+<circle cx="523.1" cy="187.5" r="3" fill="#57606a"><title>update_profile: 100 → 36.9681</title></circle>
+<circle cx="830.0" cy="124.9" r="3" fill="#57606a"><title>update_profile: 500 → 186.667</title></circle>
+<line x1="848" y1="196" x2="870" y2="196" stroke="#57606a" stroke-width="2"/>
+<text x="876" y="200" fill="#1f2328">update_profile</text>
+<path d="M84.0,276.2 L523.1,179.2 L830.0,140.6" fill="none" stroke="#e16f24" stroke-width="2"/>
+<circle cx="84.0" cy="276.2" r="3" fill="#e16f24"><title>write_review: 10 → 3.7222</title></circle>
+<circle cx="523.1" cy="179.2" r="3" fill="#e16f24"><title>write_review: 100 → 45.7384</title></circle>
+<circle cx="830.0" cy="140.6" r="3" fill="#e16f24"><title>write_review: 500 → 124.399</title></circle>
+<line x1="848" y1="212" x2="870" y2="212" stroke="#e16f24" stroke-width="2"/>
+<text x="876" y="216" fill="#1f2328">write_review</text>
+<path d="M84.0,331.7 L523.1,196.2 L830.0,164.8" fill="none" stroke="#2da44e" stroke-width="2"/>
+<circle cx="84.0" cy="331.7" r="3" fill="#2da44e"><title>product_detail: 10 → 0.885</title></circle>
+<circle cx="523.1" cy="196.2" r="3" fill="#2da44e"><title>product_detail: 100 → 29.4748</title></circle>
+<circle cx="830.0" cy="164.8" r="3" fill="#2da44e"><title>product_detail: 500 → 66.466</title></circle>
+<line x1="848" y1="228" x2="870" y2="228" stroke="#2da44e" stroke-width="2"/>
+<text x="876" y="232" fill="#1f2328">product_detail</text>
+<path d="M84.0,322.7 L523.1,205.7 L830.0,165.7" fill="none" stroke="#6e40c9" stroke-width="2"/>
+<circle cx="84.0" cy="322.7" r="3" fill="#6e40c9"><title>recommend: 10 → 1.119</title></circle>
+<circle cx="523.1" cy="205.7" r="3" fill="#6e40c9"><title>recommend: 100 → 23.0796</title></circle>
+<circle cx="830.0" cy="165.7" r="3" fill="#6e40c9"><title>recommend: 500 → 64.9965</title></circle>
+<line x1="848" y1="244" x2="870" y2="244" stroke="#6e40c9" stroke-width="2"/>
+<text x="876" y="248" fill="#1f2328">recommend</text>
+<path d="M84.0,281.7 L523.1,181.6 L830.0,181.9" fill="none" stroke="#b35900" stroke-width="2"/>
+<circle cx="84.0" cy="281.7" r="3" fill="#b35900"><title>order_history: 10 → 3.2271</title></circle>
+<circle cx="523.1" cy="181.6" r="3" fill="#b35900"><title>order_history: 100 → 43.0716</title></circle>
+<circle cx="830.0" cy="181.9" r="3" fill="#b35900"><title>order_history: 500 → 42.6957</title></circle>
+<line x1="848" y1="260" x2="870" y2="260" stroke="#b35900" stroke-width="2"/>
+<text x="876" y="264" fill="#1f2328">order_history</text>
+<path d="M84.0,322.3 L523.1,192.0 L830.0,189.3" fill="none" stroke="#218bff" stroke-width="2"/>
+<circle cx="84.0" cy="322.3" r="3" fill="#218bff"><title>view_cart: 10 → 1.129</title></circle>
+<circle cx="523.1" cy="192.0" r="3" fill="#218bff"><title>view_cart: 100 → 32.8673</title></circle>
+<circle cx="830.0" cy="189.3" r="3" fill="#218bff"><title>view_cart: 500 → 35.2238</title></circle>
+<line x1="848" y1="276" x2="870" y2="276" stroke="#218bff" stroke-width="2"/>
+<text x="876" y="280" fill="#1f2328">view_cart</text>
+<path d="M84.0,265.8 L523.1,195.9 L830.0,190.7" fill="none" stroke="#a40e26" stroke-width="2"/>
+<circle cx="84.0" cy="265.8" r="3" fill="#a40e26"><title>browse: 10 → 4.8726</title></circle>
+<circle cx="523.1" cy="195.9" r="3" fill="#a40e26"><title>browse: 100 → 29.7173</title></circle>
+<circle cx="830.0" cy="190.7" r="3" fill="#a40e26"><title>browse: 500 → 33.9842</title></circle>
+<line x1="848" y1="292" x2="870" y2="292" stroke="#a40e26" stroke-width="2"/>
+<text x="876" y="296" fill="#1f2328">browse</text>
+<path d="M84.0,326.0 L523.1,212.5 L830.0,205.4" fill="none" stroke="#116329" stroke-width="2"/>
+<circle cx="84.0" cy="326.0" r="3" fill="#116329"><title>search_text: 10 → 1.0257</title></circle>
+<circle cx="523.1" cy="212.5" r="3" fill="#116329"><title>search_text: 100 → 19.3552</title></circle>
+<circle cx="830.0" cy="205.4" r="3" fill="#116329"><title>search_text: 500 → 23.2248</title></circle>
+<line x1="848" y1="308" x2="870" y2="308" stroke="#116329" stroke-width="2"/>
+<text x="876" y="312" fill="#1f2328">search_text</text>
+</svg>

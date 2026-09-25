@@ -88,7 +88,9 @@ pub(super) fn wait_vector_indexing_shared(shared: &Shared) -> Result<()> {
 /// WAL rotation must never overtake a group whose callers still depend on the
 /// current generation's sync result. Ordinary run-manifest publication may
 /// use the raw mutex because it does not replace the WAL.
+#[track_caller]
 pub(super) fn lock_commit_after_group_sync(shared: &Arc<Shared>) -> CommitGuard<'_> {
+
     loop {
         let guard = shared.commit.lock();
         let Some(group) = guard.wal_sync_group.clone() else {
@@ -152,7 +154,7 @@ pub(super) fn publish_catalog_generation_locked(
         catalog: Some(next.clone()),
     }
     .publish(&shared.dir)?;
-    state.set_catalog(next);
+    state.set_catalog(next, &shared.published_schemas);
     Ok(publication_sync_error(shared, "catalog manifest", outcome))
 }
 
@@ -245,7 +247,7 @@ pub(super) fn thaw_frozen_checkpoint_locked(shared: &Arc<Shared>) {
         return;
     };
     for (table, ids) in frozen.delta.iter() {
-        let active = state.index.delta.entry(table.clone()).or_default();
+        let active = Arc::make_mut(state.index.delta.entry(table.clone()).or_default());
         for (id, versions) in ids.iter() {
             active.merge_versions(id.clone(), versions);
         }
@@ -650,8 +652,7 @@ pub(super) fn flush_frozen_checkpoint_inner(
                     .is_some_and(|frozen_ids| ids.keys().any(|id| frozen_ids.contains_key(id)))
             });
         }
-        state
-            .readers
+        Arc::make_mut(&mut state.readers)
             .insert(seg_id, Arc::new(SegmentReader::new(segment_reader)));
         state.segments = new_segments;
         state.next_segment_id = seg_id + 1;
@@ -660,7 +661,7 @@ pub(super) fn flush_frozen_checkpoint_inner(
         }
         state.index.frozen = None;
         state.index.generation = generation;
-        state.index.runs.push(PrimaryRun {
+        Arc::make_mut(&mut state.index.runs).push(PrimaryRun {
             meta: primary_meta,
             index: primary_index,
         });
@@ -974,7 +975,7 @@ pub(super) fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> R
     {
         let mut st = shared.state.write().unwrap();
         if let Some((seg_id, _)) = &written {
-            st.readers.insert(
+            Arc::make_mut(&mut st.readers).insert(
                 *seg_id,
                 Arc::new(SegmentReader::new(
                     prepared_segment_reader
@@ -1006,7 +1007,7 @@ pub(super) fn checkpoint_locked(shared: &Arc<Shared>, cs: &mut CommitState) -> R
             shared
                 .primary_checkpoint_bytes_written
                 .fetch_add(meta.bytes, AtomicOrdering::Relaxed);
-            st.index.runs.push(PrimaryRun { meta, index });
+            Arc::make_mut(&mut st.index.runs).push(PrimaryRun { meta, index });
         }
     }
     cs.memtable_bytes = 0;
@@ -1069,7 +1070,8 @@ pub(super) fn schedule_frozen_derived(
             }
         }
         let mut text = Vec::new();
-        for (key, index) in &mut state.text {
+        for (key, index) in &state.text {
+            let mut index = index.write();
             let frozen = index
                 .frozen_delta()
                 .or_else(|| index.freeze_delta_background(version));
@@ -1093,7 +1095,8 @@ pub(super) fn schedule_frozen_derived(
             })
             .collect();
         let mut vector = Vec::new();
-        for (key, index) in &mut state.vector {
+        for (key, index) in &state.vector {
+            let mut index = index.write();
             let frozen = index.frozen_delta().or_else(|| {
                 vector_ready
                     .then(|| index.freeze_delta_background(version))
@@ -1237,7 +1240,7 @@ pub(super) fn flush_frozen_derived_inner(
         let mut writer = ExternalPagedWriter::new(&tmp, &temp_dir, generation, budget)?;
         writer.add(SECONDARY_FORMAT_KEY, SECONDARY_FORMAT_VALUE)?;
         for (value, ids) in &frozen_job.frozen.delta {
-            for id in ids {
+            for id in ids.iter() {
                 writer.add(
                     &secondary_pair_key(value, id),
                     &secondary_operation(generation, SECONDARY_ADD),
@@ -1245,7 +1248,7 @@ pub(super) fn flush_frozen_derived_inner(
             }
         }
         for (value, ids) in &frozen_job.frozen.removed {
-            for id in ids {
+            for id in ids.iter() {
                 writer.add(
                     &secondary_pair_key(value, id),
                     &secondary_operation(generation, SECONDARY_DELETE),
@@ -1339,7 +1342,7 @@ pub(super) fn flush_frozen_derived_inner(
                     "secondary frozen generation changed during background publication".into(),
                 ));
             }
-            index.runs.push(SecRun {
+            Arc::make_mut(&mut index.runs).push(SecRun {
                 meta: meta.clone(),
                 index: mapped,
             });
@@ -1391,12 +1394,13 @@ pub(super) fn flush_frozen_derived_inner(
         let (meta, manifest) = {
             let _commit = shared.commit.lock();
             let state = shared.state.read().unwrap();
-            let Some(index) = state.text.get(&frozen_job.key) else {
+            let Some(index) = state.text.get(&frozen_job.key).map(IndexCell::read) else {
                 drop(state);
                 let _ = fs::remove_file(&prepared);
                 continue;
             };
             if !index.frozen_matches(&frozen_job.frozen) {
+                drop(index);
                 drop(state);
                 let _ = fs::remove_file(&prepared);
                 continue;
@@ -1445,10 +1449,14 @@ pub(super) fn flush_frozen_derived_inner(
         };
         {
             let _commit = shared.commit.lock();
-            let mut state = shared.state.write().unwrap();
-            let index = state.text.get_mut(&frozen_job.key).ok_or_else(|| {
-                Error::Corrupt("text index disappeared during background publication".into())
-            })?;
+            let state = shared.state.write().unwrap();
+            let mut index = state
+                .text
+                .get(&frozen_job.key)
+                .map(IndexCell::write)
+                .ok_or_else(|| {
+                    Error::Corrupt("text index disappeared during background publication".into())
+                })?;
             if !index.frozen_matches(&frozen_job.frozen) {
                 return Err(Error::Corrupt(
                     "text frozen generation changed during background publication".into(),
@@ -1520,26 +1528,27 @@ pub(super) fn flush_frozen_derived_inner(
         let _cs = shared.commit.lock();
         let key = (frozen_job.table.clone(), frozen_job.def.column.clone());
         let manifest = {
-            let mut state = shared.state.write().unwrap();
-            let published = state
-                .vector
-                .get_mut(&key)
-                .is_some_and(|index| index.publish_frozen_loaded(&frozen_job.frozen, loaded));
+            let state = shared.state.write().unwrap();
+            let published = state.vector.get(&key).is_some_and(|index| {
+                index
+                    .write()
+                    .publish_frozen_loaded(&frozen_job.frozen, loaded)
+            });
             if !published {
                 None
             } else {
-                state
-                    .vector
-                    .get_mut(&key)
-                    .filter(|index| index.frozen_delta().is_none())
-                    .map(|index| {
-                        let manifest =
-                            vector_manifest_for(&key.0, &key.1, frozen_job.generation, index);
-                        if manifest.is_some() {
-                            index.durable_generation = Some(frozen_job.generation);
-                        }
-                        manifest
-                    })
+                state.vector.get(&key).and_then(|index| {
+                    let mut index = index.write();
+                    if index.frozen_delta().is_some() {
+                        return None;
+                    }
+                    let manifest =
+                        vector_manifest_for(&key.0, &key.1, frozen_job.generation, &index);
+                    if manifest.is_some() {
+                        index.durable_generation = Some(frozen_job.generation);
+                    }
+                    Some(manifest)
+                })
             }
         };
         match manifest {
@@ -1611,7 +1620,7 @@ pub(super) fn consolidate_derived_indexes(shared: &Arc<Shared>) -> Result<()> {
         let mut writer = ExternalPagedWriter::new(&tmp, &temp_dir, version, budget)?;
         writer.add(SECONDARY_FORMAT_KEY, SECONDARY_FORMAT_VALUE)?;
         for (value, ids) in &index.delta {
-            for id in ids {
+            for id in ids.iter() {
                 writer.add(
                     &secondary_pair_key(value, id),
                     &secondary_operation(version, SECONDARY_ADD),
@@ -1619,7 +1628,7 @@ pub(super) fn consolidate_derived_indexes(shared: &Arc<Shared>) -> Result<()> {
             }
         }
         for (value, ids) in &index.removed {
-            for id in ids {
+            for id in ids.iter() {
                 writer.add(
                     &secondary_pair_key(value, id),
                     &secondary_operation(version, SECONDARY_DELETE),
@@ -1640,7 +1649,7 @@ pub(super) fn consolidate_derived_indexes(shared: &Arc<Shared>) -> Result<()> {
         secondary_written = secondary_written.saturating_add(meta.bytes);
         let mapped = Arc::new(PagedIndex::open(&path)?);
         validate_secondary_run(&mapped)?;
-        index.runs.push(SecRun {
+        Arc::make_mut(&mut index.runs).push(SecRun {
             meta,
             index: mapped,
         });
@@ -1652,10 +1661,10 @@ pub(super) fn consolidate_derived_indexes(shared: &Arc<Shared>) -> Result<()> {
 
     let text_keys: Vec<_> = st.text.keys().cloned().collect();
     for key in text_keys {
-        let index = st.text.get_mut(&key).expect("text key collected above");
+        let mut index = st.text.get(&key).expect("text key collected above").write();
         if index.delta_memory_bytes() == 0 {
             index.generation = version;
-            publish_text_manifest(&shared.dir, &key.0, &key.1, version, index)?;
+            publish_text_manifest(&shared.dir, &key.0, &key.1, version, &index)?;
             continue;
         }
         let first = index.runs.is_empty();
@@ -1689,7 +1698,7 @@ pub(super) fn consolidate_derived_indexes(shared: &Arc<Shared>) -> Result<()> {
             index: mapped,
         });
         index.freeze_delta(version);
-        publish_text_manifest(&shared.dir, &key.0, &key.1, version, index)?;
+        publish_text_manifest(&shared.dir, &key.0, &key.1, version, &index)?;
     }
 
     // Freeze each mutable HNSW overlay independently. Existing mmap graphs are
@@ -1710,7 +1719,7 @@ pub(super) fn consolidate_derived_indexes(shared: &Arc<Shared>) -> Result<()> {
         .collect();
     for (table, def) in vector_defs {
         let key = (table.clone(), def.column.clone());
-        let Some(index) = st.vector.get_mut(&key) else {
+        let Some(mut index) = st.vector.get(&key).map(IndexCell::write) else {
             continue;
         };
         if index.delta_memory_bytes() > 0 {
@@ -1727,7 +1736,7 @@ pub(super) fn consolidate_derived_indexes(shared: &Arc<Shared>) -> Result<()> {
         // not yet cover `version`; the previous manifest stays valid as a
         // prefix and the next open replays the difference.
         if index.frozen_delta().is_none() {
-            publish_vector_manifest(&shared.dir, &table, &def.column, version, index)?;
+            publish_vector_manifest(&shared.dir, &table, &def.column, version, &mut index)?;
         }
     }
     if has_sorted_indexes {
@@ -1880,7 +1889,7 @@ pub(super) fn rebuild_derived_indexes_after_rewrite(
             total_len,
         )?;
         publish_text_manifest(&shared.dir, &table, &column, version, &index)?;
-        rebuilt_text.insert((table, column), index);
+        rebuilt_text.insert((table, column), IndexCell::new(index));
     }
     st.text = rebuilt_text;
 
@@ -1921,9 +1930,10 @@ pub(super) fn rebuild_derived_indexes_after_rewrite(
         }
         publish_vector_manifest(&shared.dir, &table, &def.column, version, &mut mapped)?;
         cleanup_vector_run_orphans(&shared.dir, &table, &def.column, &mapped);
-        rebuilt_vector.insert((table, def.column.clone()), mapped);
+        rebuilt_vector.insert((table, def.column.clone()), IndexCell::new(mapped));
     }
     st.vector = rebuilt_vector;
+
     fsync_dir(&idir)?;
     fsync_dir(&vdir)?;
     Ok(())

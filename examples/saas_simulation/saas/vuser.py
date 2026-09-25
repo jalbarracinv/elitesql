@@ -95,6 +95,17 @@ class VirtualUser:
             return out
         if op == "view_cart":
             out = service.view_cart(conn, self.user_id)
+            if len(out.data) >= service.VIEW_CART_LIMIT:
+                # A truncated view can only be checked item by item: every row
+                # shown must be one this user added, with its quantity. The
+                # full cart is unknown until it shrinks below the limit again.
+                if self.cart_known and any(
+                        self.expected_cart.get(product) != qty
+                        for product, qty in out.data.items()):
+                    self.consistency_violations += 1
+                self.expected_cart = dict(out.data)
+                self.cart_known = False
+                return out
             if self.cart_known and out.data != self.expected_cart:
                 self.consistency_violations += 1
             self.expected_cart = dict(out.data)

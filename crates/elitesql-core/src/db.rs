@@ -1,4 +1,5 @@
 mod commit;
+mod cow;
 mod maintenance;
 mod reads;
 mod secondary;
@@ -464,6 +465,14 @@ pub struct MaintenanceStats {
     /// the number of individual transactions they contained.
     pub coordinated_batches: u64,
     pub coordinated_commits: u64,
+    /// Times a coordinator leader handed the baton to a queued commit, and
+    /// the total time until that commit's thread started draining the queue.
+    pub coordinator_handoffs: u64,
+    pub coordinator_handoff_time: Duration,
+    /// Rows whose delta update (`col = col ± value`) was recomputed at commit
+    /// against a newer committed version instead of failing the transaction
+    /// with a write-write conflict.
+    pub delta_rebased_rows: u64,
     /// Point reads that yielded because active state writers had already
     /// filled the CPU-aware mixed-workload reader allowance.
     pub point_read_throttles: u64,
@@ -603,7 +612,9 @@ impl VersionEntry {
 /// metadata that used to require one heap allocation per record/version.
 struct PrimaryIdx {
     generation: u64,
-    runs: Vec<PrimaryRun>,
+    /// Shared with readers the same way as the delta; replaced on
+    /// publication and compaction.
+    runs: Arc<Vec<PrimaryRun>>,
     delta: PrimaryDelta,
     /// Immutable resident generation currently being written by the
     /// background checkpoint thread. Readers merge it with the new active
@@ -612,7 +623,9 @@ struct PrimaryIdx {
 }
 
 type VersionList = Vec<VersionEntry>;
-type PrimaryDelta = HashMap<String, PrimaryTableDelta>;
+/// Per table, shared with readers that took it out of the state lock
+/// (`PrimaryIdx::table_snapshot`); a write copies what they still hold.
+type PrimaryDelta = HashMap<String, Arc<PrimaryTableDelta>>;
 
 /// An append-oriented in-memory primary run. Monotonic ids stay contiguous;
 /// the first out-of-order id converts once to the fully general tree.
@@ -636,25 +649,39 @@ fn id_prefix(id: &str) -> IdPrefix {
     prefix
 }
 
-#[derive(Default)]
-struct PrimaryTableDelta {
-    monotonic: Vec<(String, VersionList)>,
-    /// `prefixes[i]` is the prefix of `monotonic[i].0`.
+/// Entries per chunk of a resident primary delta; a chunk splits in two past
+/// twice this. Small enough that copying one chunk costs little, large enough
+/// that a delta of a hundred thousand rows is under a thousand chunks.
+const DELTA_CHUNK_ENTRIES: usize = 128;
+
+/// One row of a resident delta: its id and its versions, shared between the
+/// chunks that hold it.
+type DeltaEntry = Arc<(String, VersionList)>;
+
+/// A sorted run of a resident delta's entries, shared between versions of
+/// the delta (see `PrimaryTableDelta`). Copying a shared chunk copies one
+/// reference per entry; only the entry a write changes is copied in full.
+/// Copying the entries themselves put every commit to a hot table behind
+/// a hundred allocations whenever a reader held the chunk, which it almost
+/// always did.
+#[derive(Clone, Default)]
+struct DeltaChunk {
+    entries: Vec<DeltaEntry>,
+    /// `prefixes[i]` is the prefix of `entries[i].0`.
     prefixes: Vec<IdPrefix>,
-    general: Option<BTreeMap<String, VersionList>>,
 }
 
-impl PrimaryTableDelta {
-    /// Position of `id` in `monotonic`, or where it would be inserted.
+impl DeltaChunk {
+    /// Position of `id` in this chunk, or where it would be inserted.
     fn search(&self, id: &str) -> std::result::Result<usize, usize> {
-        debug_assert_eq!(self.prefixes.len(), self.monotonic.len());
+        debug_assert_eq!(self.prefixes.len(), self.entries.len());
         let wanted = id_prefix(id);
         let mut low = 0usize;
         let mut high = self.prefixes.len();
         while low < high {
             let mid = low + (high - low) / 2;
             let order = match self.prefixes[mid].cmp(&wanted) {
-                std::cmp::Ordering::Equal => self.monotonic[mid].0.as_str().cmp(id),
+                std::cmp::Ordering::Equal => self.entries[mid].0.as_str().cmp(id),
                 other => other,
             };
             match order {
@@ -666,56 +693,141 @@ impl PrimaryTableDelta {
         Err(low)
     }
 
-    fn get(&self, id: &str) -> Option<&VersionList> {
-        if let Some(general) = &self.general {
-            return general.get(id);
+    fn insert(&mut self, at: usize, id: String, versions: VersionList) {
+        self.prefixes.insert(at, id_prefix(&id));
+        self.entries.insert(at, Arc::new((id, versions)));
+    }
+}
+
+/// One table's changes since the last published primary run: id -> versions
+/// in ascending commit order, sorted by id.
+///
+/// The entries live in chunks behind `Arc`, so a copy of the delta shares
+/// them: cloning costs one reference count per chunk, and a write to a
+/// shared chunk copies that chunk alone. That lets a reader take the delta
+/// out of the state lock and walk it after releasing the lock, while the
+/// next commit keeps writing to its own version. Ids almost always arrive in
+/// increasing order, so a write is usually an append to the last chunk; an
+/// id out of order is inserted into its chunk, which splits when it doubles.
+#[derive(Clone, Default)]
+struct PrimaryTableDelta {
+    chunks: Vec<Arc<DeltaChunk>>,
+    /// `firsts[c]` is the prefix of the first id of `chunks[c]`. Chunks are
+    /// never empty.
+    firsts: Vec<IdPrefix>,
+}
+
+impl PrimaryTableDelta {
+    /// The chunk that holds `id` if any chunk does: the last one whose first
+    /// id is not greater than `id`, or the first chunk.
+    fn chunk_for(&self, id: &str) -> usize {
+        let wanted = id_prefix(id);
+        let mut low = 0usize;
+        let mut high = self.chunks.len();
+        // Count the chunks whose first id is <= `id`.
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let first_not_greater = match self.firsts[mid].cmp(&wanted) {
+                std::cmp::Ordering::Equal => self.chunks[mid].entries[0].0.as_str() <= id,
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Greater => false,
+            };
+            if first_not_greater {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
         }
-        self.search(id).ok().map(|index| &self.monotonic[index].1)
+        low.saturating_sub(1)
+    }
+
+    /// `(chunk, position)` of `id`, or where it would be inserted.
+    fn locate(&self, id: &str) -> std::result::Result<(usize, usize), (usize, usize)> {
+        if self.chunks.is_empty() {
+            return Err((0, 0));
+        }
+        let chunk = self.chunk_for(id);
+        match self.chunks[chunk].search(id) {
+            Ok(at) => Ok((chunk, at)),
+            Err(at) => Err((chunk, at)),
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<&VersionList> {
+        let (chunk, at) = self.locate(id).ok()?;
+        Some(&self.chunks[chunk].entries[at].1)
     }
 
     fn get_mut(&mut self, id: &str) -> Option<&mut VersionList> {
-        // Resolve the position before taking any mutable borrow, so the
-        // search and the returned reference do not overlap.
-        let at = self
-            .general
-            .is_none()
-            .then(|| self.search(id).ok())
-            .flatten();
-        match at {
-            Some(at) => Some(&mut self.monotonic[at].1),
-            None => self.general.as_mut()?.get_mut(id),
-        }
-    }
-
-    fn make_general(&mut self) -> &mut BTreeMap<String, VersionList> {
-        if self.general.is_none() {
-            self.prefixes.clear();
-            self.general = Some(self.monotonic.drain(..).collect());
-        }
-        self.general
-            .as_mut()
-            .expect("general primary delta initialized")
+        let (chunk, at) = self.locate(id).ok()?;
+        Some(&mut Arc::make_mut(&mut Arc::make_mut(&mut self.chunks[chunk]).entries[at]).1)
     }
 
     fn push(&mut self, id: String, entry: VersionEntry) {
-        if let Some(general) = &mut self.general {
-            general.entry(id).or_default().push(entry);
+        // The common case: an id past every id so far, or the last one again.
+        if let Some(last_chunk) = self.chunks.last() {
+            let (last, _) = &**last_chunk.entries.last().expect("chunks are never empty");
+            match last.as_str().cmp(id.as_str()) {
+                std::cmp::Ordering::Less => {
+                    if last_chunk.entries.len() >= DELTA_CHUNK_ENTRIES {
+                        self.push_chunk(id, vec![entry]);
+                    } else {
+                        let chunk = Arc::make_mut(self.chunks.last_mut().expect("checked above"));
+                        chunk.prefixes.push(id_prefix(&id));
+                        chunk.entries.push(Arc::new((id, vec![entry])));
+                    }
+                    return;
+                }
+                std::cmp::Ordering::Equal => {
+                    let chunk = Arc::make_mut(self.chunks.last_mut().expect("checked above"));
+                    Arc::make_mut(chunk.entries.last_mut().expect("never empty"))
+                        .1
+                        .push(entry);
+                    return;
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        } else {
+            self.push_chunk(id, vec![entry]);
             return;
         }
-        match self
-            .monotonic
-            .last_mut()
-            .map(|(last, versions)| (last.as_str().cmp(id.as_str()), versions))
-        {
-            None | Some((std::cmp::Ordering::Less, _)) => {
-                self.prefixes.push(id_prefix(&id));
-                self.monotonic.push((id, vec![entry]));
+        match self.locate(&id) {
+            Ok((chunk, at)) => {
+                Arc::make_mut(&mut Arc::make_mut(&mut self.chunks[chunk]).entries[at])
+                    .1
+                    .push(entry);
             }
-            Some((std::cmp::Ordering::Equal, versions)) => versions.push(entry),
-            Some((std::cmp::Ordering::Greater, _)) => {
-                self.make_general().entry(id).or_default().push(entry);
+            Err((chunk, at)) => {
+                let target = Arc::make_mut(&mut self.chunks[chunk]);
+                target.insert(at, id, vec![entry]);
+                if at == 0 {
+                    self.firsts[chunk] = target.prefixes[0];
+                }
+                if target.entries.len() > 2 * DELTA_CHUNK_ENTRIES {
+                    self.split(chunk);
+                }
             }
         }
+    }
+
+    fn push_chunk(&mut self, id: String, versions: VersionList) {
+        let prefix = id_prefix(&id);
+        self.firsts.push(prefix);
+        self.chunks.push(Arc::new(DeltaChunk {
+            entries: vec![Arc::new((id, versions))],
+            prefixes: vec![prefix],
+        }));
+    }
+
+    fn split(&mut self, chunk: usize) {
+        let target = Arc::make_mut(&mut self.chunks[chunk]);
+        let half = target.entries.len() / 2;
+        let upper = DeltaChunk {
+            entries: target.entries.split_off(half),
+            prefixes: target.prefixes.split_off(half),
+        };
+        self.firsts.insert(chunk + 1, upper.prefixes[0]);
+        self.chunks.insert(chunk + 1, Arc::new(upper));
     }
 
     fn merge_versions(&mut self, id: String, versions: &VersionList) {
@@ -731,19 +843,18 @@ impl PrimaryTableDelta {
         merged.dedup_by_key(|entry| entry.version);
     }
 
-    fn iter(&self) -> Box<dyn Iterator<Item = (&String, &VersionList)> + '_> {
-        match &self.general {
-            Some(general) => Box::new(general.iter()),
-            None => Box::new(self.monotonic.iter().map(|(id, versions)| (id, versions))),
-        }
+    fn iter(&self) -> impl Iterator<Item = (&String, &VersionList)> + '_ {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.entries.iter().map(|entry| (&entry.0, &entry.1)))
     }
 
-    fn keys(&self) -> Box<dyn Iterator<Item = &String> + '_> {
-        Box::new(self.iter().map(|(id, _)| id))
+    fn keys(&self) -> impl Iterator<Item = &String> + '_ {
+        self.iter().map(|(id, _)| id)
     }
 
-    fn values(&self) -> Box<dyn Iterator<Item = &VersionList> + '_> {
-        Box::new(self.iter().map(|(_, versions)| versions))
+    fn values(&self) -> impl Iterator<Item = &VersionList> + '_ {
+        self.iter().map(|(_, versions)| versions)
     }
 
     fn contains_key(&self, id: &str) -> bool {
@@ -753,23 +864,116 @@ impl PrimaryTableDelta {
     fn range_after<'a>(
         &'a self,
         after: Option<&str>,
-    ) -> Box<dyn Iterator<Item = (&'a String, &'a VersionList)> + 'a> {
-        if let Some(general) = &self.general {
-            use std::ops::Bound::{Excluded, Unbounded};
-            return match after {
-                Some(after) => Box::new(general.range::<str, _>((Excluded(after), Unbounded))),
-                None => Box::new(general.iter()),
-            };
+    ) -> impl Iterator<Item = (&'a String, &'a VersionList)> + 'a {
+        let (first_chunk, first_at) = match after {
+            None => (0, 0),
+            Some(after) => match self.locate(after) {
+                Ok((chunk, at)) => (chunk, at + 1),
+                Err((chunk, at)) => (chunk, at),
+            },
+        };
+        self.chunks
+            .iter()
+            .enumerate()
+            .skip(first_chunk)
+            .flat_map(move |(index, chunk)| {
+                let skip = if index == first_chunk { first_at } else { 0 };
+                chunk.entries[skip..]
+                    .iter()
+                    .map(|entry| (&entry.0, &entry.1))
+            })
+    }
+}
+
+#[cfg(test)]
+mod primary_delta_tests {
+    use super::*;
+
+    fn entry(version: u64) -> VersionEntry {
+        VersionEntry {
+            version,
+            kind: VKind::MemTombstone,
         }
-        let start = after.map_or(0, |after| {
-            self.monotonic
-                .partition_point(|(id, _)| id.as_str() <= after)
-        });
-        Box::new(
-            self.monotonic[start..]
+    }
+
+    /// Random pushes, merges and range reads agree with a `BTreeMap`, and a
+    /// clone taken halfway keeps what it saw while the original moves on.
+    #[test]
+    fn chunked_delta_matches_a_sorted_map_and_clones_are_stable() {
+        let mut delta = PrimaryTableDelta::default();
+        let mut model: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut frozen: Option<(PrimaryTableDelta, BTreeMap<String, Vec<u64>>)> = None;
+        for step in 0..20_000u64 {
+            // Mostly increasing ids, like row keys, with some out of order
+            // and some repeats.
+            let id = match next() % 10 {
+                0..=6 => format!("k{:08}", step),
+                7 | 8 => format!("k{:08}", next() % (step + 1)),
+                _ => format!("q{:03}", next() % 50),
+            };
+            delta.push(id.clone(), entry(step));
+            model.entry(id).or_default().push(step);
+            if step == 10_000 {
+                frozen = Some((delta.clone(), model.clone()));
+            }
+        }
+        let check = |delta: &PrimaryTableDelta, model: &BTreeMap<String, Vec<u64>>| {
+            let got: Vec<(String, Vec<u64>)> = delta
                 .iter()
-                .map(|(id, versions)| (id, versions)),
-        )
+                .map(|(id, versions)| (id.clone(), versions.iter().map(|v| v.version).collect()))
+                .collect();
+            let want: Vec<(String, Vec<u64>)> = model
+                .iter()
+                .map(|(id, v)| (id.clone(), v.clone()))
+                .collect();
+            assert_eq!(got, want);
+            for (id, versions) in model.iter().step_by(37) {
+                let found: Vec<u64> = delta.get(id).unwrap().iter().map(|v| v.version).collect();
+                assert_eq!(&found, versions);
+                let after: Vec<&String> = delta
+                    .range_after(Some(id))
+                    .map(|(id, _)| id)
+                    .take(3)
+                    .collect();
+                let want_after: Vec<&String> = model
+                    .range::<str, _>((
+                        std::ops::Bound::Excluded(id.as_str()),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .map(|(id, _)| id)
+                    .take(3)
+                    .collect();
+                assert_eq!(after, want_after);
+            }
+            assert!(delta.get("zzz").is_none());
+            assert_eq!(delta.range_after(None).count(), model.len());
+            assert_eq!(delta.range_after(Some("a")).count(), model.len());
+            assert_eq!(delta.range_after(Some("zzz")).count(), 0);
+            for chunk in &delta.chunks {
+                assert!(
+                    !chunk.entries.is_empty() && chunk.entries.len() <= 2 * DELTA_CHUNK_ENTRIES
+                );
+            }
+        };
+        check(&delta, &model);
+        let (frozen_delta, frozen_model) = frozen.unwrap();
+        check(&frozen_delta, &frozen_model);
+        // Merging into the live delta leaves the clone alone.
+        let id = model.keys().nth(5).unwrap().clone();
+        delta.merge_versions(id.clone(), &vec![entry(1)]);
+        let versions = model.get_mut(&id).unwrap();
+        versions.push(1);
+        versions.sort_unstable();
+        versions.dedup();
+        check(&delta, &model);
+        check(&frozen_delta, &frozen_model);
     }
 }
 
@@ -913,16 +1117,154 @@ struct FrozenPrimary {
     delta: Arc<PrimaryDelta>,
 }
 
+#[derive(Clone)]
 struct PrimaryRun {
     meta: PrimaryRunMeta,
     index: Arc<PagedIndex>,
+}
+
+/// One table's primary directory taken out of the state lock by
+/// `PrimaryIdx::table_snapshot`. Holding it costs the writers nothing: they
+/// copy only the delta chunks they change while it is alive.
+#[derive(Clone)]
+struct PrimaryTableSnapshot {
+    runs: Arc<Vec<PrimaryRun>>,
+    frozen: Option<Arc<PrimaryTableDelta>>,
+    active: Option<Arc<PrimaryTableDelta>>,
+}
+
+impl PrimaryTableSnapshot {
+    /// `PrimaryIdx::table_view` over this snapshot.
+    fn view<'a>(&'a self, table: &str, key: &'a mut Vec<u8>) -> PrimaryTableView<'a> {
+        key.clear();
+        key.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        key.extend_from_slice(table.as_bytes());
+        PrimaryTableView {
+            runs: self.runs.as_slice(),
+            frozen: self.frozen.as_deref(),
+            active: self.active.as_deref(),
+            key,
+            prefix_len: key_prefix_len(table),
+        }
+    }
+
+    /// `PrimaryIdx::visit_table` over this snapshot.
+    fn visit(
+        &self,
+        table: &str,
+        after_id: Option<&str>,
+        visit: impl FnMut(&str, &[VersionEntry]) -> Result<bool>,
+    ) -> Result<()> {
+        visit_primary_table(
+            table,
+            &self.runs,
+            self.frozen.as_deref(),
+            self.active.as_deref(),
+            after_id,
+            visit,
+        )
+    }
+}
+
+/// Visit one table's rows in id order, merging the runs with the frozen and
+/// active deltas; `visit` gets every version of a row and returns `false`
+/// to stop.
+fn visit_primary_table(
+    table: &str,
+    runs: &[PrimaryRun],
+    frozen: Option<&PrimaryTableDelta>,
+    active: Option<&PrimaryTableDelta>,
+    after_id: Option<&str>,
+    mut visit: impl FnMut(&str, &[VersionEntry]) -> Result<bool>,
+) -> Result<()> {
+    let prefix = primary_table_prefix(table);
+    let after_key = after_id.map(|after| primary_key(table, after));
+    let mut cursors: Vec<_> = runs
+        .iter()
+        .map(|run| {
+            PrimaryTableCursor::new(
+                run.index.prefix_cursor_after(&prefix, after_key.as_deref()),
+                table,
+            )
+        })
+        .collect();
+    let mut heads: Vec<_> = cursors
+        .iter_mut()
+        .map(|cursor| cursor.next_group_into(Vec::new()))
+        .collect::<Result<_>>()?;
+    let mut deltas = Vec::with_capacity(2);
+    for ids in [frozen, active].into_iter().flatten() {
+        deltas.push(ids.range_after(after_id));
+    }
+    let mut delta_heads: Vec<_> = deltas.iter_mut().map(Iterator::next).collect();
+
+    // Ids are borrowed from the mapped runs and the delta chunks, both alive
+    // for the whole walk, and the merge reuses one version buffer across
+    // rows while every run cursor recycles its own, so a steady scan neither
+    // copies an id nor allocates per visited record.
+    let mut versions: Vec<VersionEntry> = Vec::new();
+    let control = crate::QueryControl::current();
+    let mut visited = 0usize;
+    loop {
+        if visited.is_multiple_of(256) {
+            if let Some(control) = &control {
+                control.check()?;
+            }
+        }
+        visited = visited.wrapping_add(1);
+        let run_id = heads
+            .iter()
+            .filter_map(|head| head.as_ref().map(|(id, _)| *id))
+            .min();
+        let delta_id = delta_heads
+            .iter()
+            .filter_map(|head| head.map(|(id, _)| id.as_str()))
+            .min();
+        let next_id = match (run_id, delta_id) {
+            (None, None) => break,
+            (Some(id), None) | (None, Some(id)) => id,
+            (Some(run), Some(delta)) => run.min(delta),
+        };
+        versions.clear();
+        for (cursor, head) in cursors.iter_mut().zip(&mut heads) {
+            if head.as_ref().is_some_and(|(id, _)| *id == next_id) {
+                let (_, mut run_versions) = head.take().expect("matching run head");
+                versions.append(&mut run_versions);
+                *head = cursor.next_group_into(run_versions)?;
+            }
+        }
+        for (delta, head) in deltas.iter_mut().zip(&mut delta_heads) {
+            if head.is_some_and(|(id, _)| id.as_str() == next_id) {
+                let (_, delta_versions) = head.take().expect("matching delta head");
+                versions.extend(delta_versions.iter().cloned());
+                *head = delta.next();
+            }
+        }
+        if after_id.is_some_and(|after| next_id <= after) {
+            continue;
+        }
+        // After a compaction almost every row has exactly one version,
+        // and sources hand theirs over in ascending order, so the merge
+        // is only needed when they actually interleave.
+        if versions
+            .windows(2)
+            .any(|pair| pair[0].version >= pair[1].version)
+        {
+            versions.sort_unstable_by_key(|entry| entry.version);
+            versions.dedup_by_key(|entry| entry.version);
+        }
+        if !visit(next_id, &versions)? {
+            break;
+        }
+    }
+    Ok(())
 }
 
 impl PrimaryIdx {
     fn empty() -> Self {
         Self {
             generation: 0,
-            runs: Vec::new(),
+            runs: Arc::new(Vec::new()),
             delta: HashMap::new(),
             frozen: None,
         }
@@ -931,7 +1273,7 @@ impl PrimaryIdx {
     fn resident(delta: PrimaryDelta) -> Self {
         Self {
             generation: 0,
-            runs: Vec::new(),
+            runs: Arc::new(Vec::new()),
             delta,
             frozen: None,
         }
@@ -967,7 +1309,7 @@ impl PrimaryIdx {
     fn paged_runs(generation: u64, runs: Vec<PrimaryRun>) -> Self {
         Self {
             generation,
-            runs,
+            runs: Arc::new(runs),
             delta: HashMap::new(),
             frozen: None,
         }
@@ -979,11 +1321,11 @@ impl PrimaryIdx {
 
     fn push(&mut self, table: &str, id: String, entry: VersionEntry) {
         if let Some(ids) = self.delta.get_mut(table) {
-            ids.push(id, entry);
+            Arc::make_mut(ids).push(id, entry);
         } else {
             let mut ids = PrimaryTableDelta::default();
             ids.push(id, entry);
-            self.delta.insert(table.to_owned(), ids);
+            self.delta.insert(table.to_owned(), Arc::new(ids));
         }
     }
 
@@ -1020,10 +1362,6 @@ impl PrimaryIdx {
             .sum()
     }
 
-    fn latest(&self, table: &str, id: &str) -> Result<Option<VersionEntry>> {
-        self.newest_at_or_before(table, id, u64::MAX)
-    }
-
     fn visible(&self, table: &str, id: &str, max_version: u64) -> Result<Option<VersionEntry>> {
         self.newest_at_or_before(table, id, max_version)
     }
@@ -1051,12 +1389,13 @@ impl PrimaryIdx {
         key.extend_from_slice(&(table.len() as u32).to_be_bytes());
         key.extend_from_slice(table.as_bytes());
         PrimaryTableView {
-            runs: &self.runs,
+            runs: self.runs.as_slice(),
             frozen: self
                 .frozen
                 .as_ref()
-                .and_then(|frozen| frozen.delta.get(table)),
-            active: self.delta.get(table),
+                .and_then(|frozen| frozen.delta.get(table))
+                .map(Arc::as_ref),
+            active: self.delta.get(table).map(Arc::as_ref),
             key,
             prefix_len: key_prefix_len(table),
         }
@@ -1120,7 +1459,7 @@ impl PrimaryIdx {
     /// the published runs hold.
     fn newest_in_runs_at(&self, key: &[u8], max_version: u64) -> Result<Option<VersionEntry>> {
         let mut newest: Option<VersionEntry> = None;
-        for run in &self.runs {
+        for run in self.runs.iter() {
             if !run.index.may_contain_key(key) {
                 continue;
             }
@@ -1143,105 +1482,36 @@ impl PrimaryIdx {
         &self,
         table: &str,
         after_id: Option<&str>,
-        mut visit: impl FnMut(&str, &[VersionEntry]) -> Result<bool>,
+        visit: impl FnMut(&str, &[VersionEntry]) -> Result<bool>,
     ) -> Result<()> {
-        let prefix = primary_table_prefix(table);
-        let after_key = after_id.map(|after| primary_key(table, after));
-        let mut cursors: Vec<_> = self
-            .runs
-            .iter()
-            .map(|run| {
-                PrimaryTableCursor::new(
-                    run.index.prefix_cursor_after(&prefix, after_key.as_deref()),
-                    table,
-                )
-            })
-            .collect();
-        let mut heads: Vec<_> = cursors
-            .iter_mut()
-            .map(|cursor| cursor.next_group_into(String::new(), Vec::new()))
-            .collect::<Result<_>>()?;
-        let mut deltas = Vec::with_capacity(2);
-        if let Some(ids) = self
-            .frozen
-            .as_ref()
-            .and_then(|frozen| frozen.delta.get(table))
-        {
-            deltas.push(ids.range_after(after_id));
-        }
-        if let Some(ids) = self.delta.get(table) {
-            deltas.push(ids.range_after(after_id));
-        }
-        let mut delta_heads: Vec<_> = deltas.iter_mut().map(Iterator::next).collect();
+        visit_primary_table(
+            table,
+            &self.runs,
+            self.frozen
+                .as_ref()
+                .and_then(|frozen| frozen.delta.get(table))
+                .map(Arc::as_ref),
+            self.delta.get(table).map(Arc::as_ref),
+            after_id,
+            visit,
+        )
+    }
 
-        // The merge reuses one id buffer and one version buffer across rows,
-        // and every run cursor recycles its own group buffers, so a steady
-        // scan performs no heap allocation per visited record.
-        let mut next_id = String::new();
-        let mut versions: Vec<VersionEntry> = Vec::new();
-        let control = crate::QueryControl::current();
-        let mut visited = 0usize;
-        loop {
-            if visited.is_multiple_of(256) {
-                if let Some(control) = &control {
-                    control.check()?;
-                }
-            }
-            visited = visited.wrapping_add(1);
-            let run_id = heads
-                .iter()
-                .filter_map(|head| head.as_ref().map(|(id, _)| id.as_str()))
-                .min();
-            let delta_id = delta_heads
-                .iter()
-                .filter_map(|head| head.as_ref().map(|(id, _)| id.as_str()))
-                .min();
-            let smallest = match (run_id, delta_id) {
-                (None, None) => break,
-                (Some(id), None) | (None, Some(id)) => id,
-                (Some(run), Some(delta)) => run.min(delta),
-            };
-            next_id.clear();
-            next_id.push_str(smallest);
-            versions.clear();
-            for (cursor, head) in cursors.iter_mut().zip(&mut heads) {
-                if head
-                    .as_ref()
-                    .is_some_and(|(id, _)| id.as_str() == next_id.as_str())
-                {
-                    let (id, mut run_versions) = head.take().expect("matching run head");
-                    versions.append(&mut run_versions);
-                    *head = cursor.next_group_into(id, run_versions)?;
-                }
-            }
-            for (delta, head) in deltas.iter_mut().zip(&mut delta_heads) {
-                if head
-                    .as_ref()
-                    .is_some_and(|(id, _)| id.as_str() == next_id.as_str())
-                {
-                    let (_, delta_versions) = head.take().expect("matching delta head");
-                    versions.extend(delta_versions.iter().cloned());
-                    *head = delta.next();
-                }
-            }
-            if after_id.is_some_and(|after| next_id.as_str() <= after) {
-                continue;
-            }
-            // After a compaction almost every row has exactly one version,
-            // and sources hand theirs over in ascending order, so the merge
-            // is only needed when they actually interleave.
-            if versions
-                .windows(2)
-                .any(|pair| pair[0].version >= pair[1].version)
-            {
-                versions.sort_unstable_by_key(|entry| entry.version);
-                versions.dedup_by_key(|entry| entry.version);
-            }
-            if !visit(&next_id, &versions)? {
-                break;
-            }
+    /// One table's directory as of now, detached from the state lock: the
+    /// caller releases the lock and walks it (`PrimaryTableSnapshot`). The
+    /// directory is multi-version, so rows committed afterwards only add
+    /// versions newer than any snapshot taken before them, which readers
+    /// already skip.
+    fn table_snapshot(&self, table: &str) -> PrimaryTableSnapshot {
+        PrimaryTableSnapshot {
+            runs: self.runs.clone(),
+            frozen: self
+                .frozen
+                .as_ref()
+                .and_then(|frozen| frozen.delta.get(table))
+                .cloned(),
+            active: self.delta.get(table).cloned(),
         }
-        Ok(())
     }
 
     #[cfg(test)]
@@ -1270,10 +1540,7 @@ impl PrimaryIdx {
 struct PrimaryTableCursor<'a> {
     cursor: PagedPrefixCursor<'a>,
     table: &'a str,
-    pending: Option<(String, VersionEntry)>,
-    /// Recycled id buffers, so grouping consecutive versions of one record
-    /// does not allocate a fresh `String` per index entry.
-    spare_ids: Vec<String>,
+    pending: Option<(&'a str, VersionEntry)>,
 }
 
 impl<'a> PrimaryTableCursor<'a> {
@@ -1282,49 +1549,37 @@ impl<'a> PrimaryTableCursor<'a> {
             cursor,
             table,
             pending: None,
-            spare_ids: Vec::new(),
         }
     }
 
-    /// Next record id with all of its versions in this run. `id` and
-    /// `versions` are caller-provided buffers whose capacity is reused; the
-    /// returned pair owns them until the caller hands them back.
+    /// Next record id with all of its versions in this run. The id borrows
+    /// the mapped run; `versions` is a caller-provided buffer whose capacity
+    /// is reused, and the returned pair owns it until the caller hands it
+    /// back.
     fn next_group_into(
         &mut self,
-        mut id: String,
         mut versions: Vec<VersionEntry>,
-    ) -> Result<Option<(String, Vec<VersionEntry>)>> {
+    ) -> Result<Option<(&'a str, Vec<VersionEntry>)>> {
         versions.clear();
         let first = match self.pending.take() {
             Some(entry) => Some(entry),
             None => self.next_entry()?,
         };
-        let Some((first_id, first)) = first else {
-            self.recycle(id);
+        let Some((id, first)) = first else {
             return Ok(None);
         };
-        id.clear();
-        id.push_str(&first_id);
-        self.recycle(first_id);
         versions.push(first);
         while let Some((next_id, entry)) = self.next_entry()? {
             if next_id != id {
                 self.pending = Some((next_id, entry));
                 break;
             }
-            self.recycle(next_id);
             versions.push(entry);
         }
         Ok(Some((id, versions)))
     }
 
-    fn recycle(&mut self, id: String) {
-        if self.spare_ids.len() < 4 {
-            self.spare_ids.push(id);
-        }
-    }
-
-    fn next_entry(&mut self) -> Result<Option<(String, VersionEntry)>> {
+    fn next_entry(&mut self) -> Result<Option<(&'a str, VersionEntry)>> {
         let Some((key, value)) = self.cursor.next()? else {
             return Ok(None);
         };
@@ -1334,16 +1589,25 @@ impl<'a> PrimaryTableCursor<'a> {
                 "primary index: table prefix mismatch".into(),
             ));
         }
-        let id = std::str::from_utf8(id)
-            .map_err(|_| Error::Corrupt("primary index: invalid id utf8".into()))?;
-        let mut owned = self.spare_ids.pop().unwrap_or_default();
-        owned.clear();
-        owned.push_str(id);
-        Ok(Some((owned, decode_primary_entry(value)?)))
+        Ok(Some((primary_id_str(id)?, decode_primary_entry(value)?)))
+
     }
 }
 
+/// A primary id read back from a run. Ids are almost always ASCII, and an
+/// ASCII check is a few word compares where full UTF-8 validation was an
+/// eighth of a full-table walk.
+#[inline]
+fn primary_id_str(id: &[u8]) -> Result<&str> {
+    if id.is_ascii() {
+        // SAFETY: every ASCII byte string is valid UTF-8.
+        return Ok(unsafe { std::str::from_utf8_unchecked(id) });
+    }
+    std::str::from_utf8(id).map_err(|_| Error::Corrupt("primary index: invalid id utf8".into()))
+}
+
 fn primary_table_prefix(table: &str) -> Vec<u8> {
+
     let mut key = Vec::with_capacity(4 + table.len());
     key.extend_from_slice(&(table.len() as u32).to_be_bytes());
     key.extend_from_slice(table.as_bytes());
@@ -1494,7 +1758,7 @@ fn cleanup_primary_run_orphans(dir: &Path) {
 
 fn primary_compaction_level(index: &PrimaryIdx) -> Option<u8> {
     let mut counts = BTreeMap::<u8, usize>::new();
-    for run in &index.runs {
+    for run in index.runs.iter() {
         if run.meta.level != PRIMARY_BASE_LEVEL {
             *counts.entry(run.meta.level).or_default() += 1;
         }
@@ -1638,11 +1902,9 @@ fn compact_one_primary_level(shared: &Arc<Shared>) -> Result<()> {
         let _ = fs::remove_file(&path);
         return Ok(());
     }
-    state
-        .index
-        .runs
+    Arc::make_mut(&mut state.index.runs)
         .retain(|run| !selected_names.contains(run.meta.file.as_str()));
-    state.index.runs.push(PrimaryRun {
+    Arc::make_mut(&mut state.index.runs).push(PrimaryRun {
         meta: output_meta,
         index: output_index,
     });
@@ -1668,7 +1930,7 @@ fn compact_one_primary_level(shared: &Arc<Shared>) -> Result<()> {
 fn secondary_compaction_target(state: &State) -> Option<((String, String), u8)> {
     state.secondary.iter().find_map(|(key, index)| {
         let mut counts = BTreeMap::<u8, usize>::new();
-        for run in &index.runs {
+        for run in index.runs.iter() {
             if run.meta.level != DERIVED_BASE_LEVEL {
                 *counts.entry(run.meta.level).or_default() += 1;
             }
@@ -1812,10 +2074,8 @@ fn compact_one_secondary_level(shared: &Arc<Shared>) -> Result<()> {
         let _ = fs::remove_file(&path);
         return Ok(());
     }
-    index
-        .runs
-        .retain(|run| !selected_names.contains(run.meta.file.as_str()));
-    index.runs.push(SecRun {
+    Arc::make_mut(&mut index.runs).retain(|run| !selected_names.contains(run.meta.file.as_str()));
+    Arc::make_mut(&mut index.runs).push(SecRun {
         meta: output_meta,
         index: output_index,
     });
@@ -1844,6 +2104,7 @@ fn compact_one_secondary_level(shared: &Arc<Shared>) -> Result<()> {
 
 fn text_compaction_target(state: &State) -> Option<((String, String), u8)> {
     state.text.iter().find_map(|(key, index)| {
+        let index = index.read();
         let mut counts = BTreeMap::<u8, usize>::new();
         for run in &index.runs {
             if run.meta.level != DERIVED_BASE_LEVEL {
@@ -1889,7 +2150,11 @@ fn compact_one_text_level(shared: &Arc<Shared>) -> Result<()> {
         let Some((key, level)) = text_compaction_target(&state) else {
             return Ok(());
         };
-        let index = state.text.get(&key).expect("text compaction target exists");
+        let index = state
+            .text
+            .get(&key)
+            .expect("text compaction target exists")
+            .read();
         let selected = index
             .runs
             .iter()
@@ -1929,7 +2194,7 @@ fn compact_one_text_level(shared: &Arc<Shared>) -> Result<()> {
     let manifest = {
         let _commit = shared.commit.lock();
         let state = shared.state.read().unwrap();
-        let Some(index) = state.text.get(&key) else {
+        let Some(index) = state.text.get(&key).map(IndexCell::read) else {
             drop(state);
             let _ = fs::remove_file(&path);
             return Ok(());
@@ -1939,6 +2204,7 @@ fn compact_one_text_level(shared: &Arc<Shared>) -> Result<()> {
                 .iter()
                 .all(|(meta, _)| index.runs.iter().any(|run| run.meta == *meta));
         if !still_current {
+            drop(index);
             drop(state);
             let _ = fs::remove_file(&path);
             return Ok(());
@@ -1968,8 +2234,8 @@ fn compact_one_text_level(shared: &Arc<Shared>) -> Result<()> {
     }
 
     let _commit = shared.commit.lock();
-    let mut state = shared.state.write().unwrap();
-    let Some(index) = state.text.get_mut(&key) else {
+    let state = shared.state.write().unwrap();
+    let Some(mut index) = state.text.get(&key).map(IndexCell::write) else {
         drop(state);
         let _ = fs::remove_file(&path);
         return Ok(());
@@ -1979,7 +2245,9 @@ fn compact_one_text_level(shared: &Arc<Shared>) -> Result<()> {
             .iter()
             .all(|(meta, _)| index.runs.iter().any(|run| run.meta == *meta));
     if !still_current {
-        publish_text_manifest(&shared.dir, &key.0, &key.1, index.generation, index)?;
+        let current_generation = index.generation;
+        publish_text_manifest(&shared.dir, &key.0, &key.1, current_generation, &index)?;
+        drop(index);
         drop(state);
         let _ = fs::remove_file(&path);
         return Ok(());
@@ -1991,7 +2259,9 @@ fn compact_one_text_level(shared: &Arc<Shared>) -> Result<()> {
         meta: output_meta,
         index: output_index,
     });
+    drop(index);
     let catalog = state.catalog.clone();
+
     drop(state);
 
     shared
@@ -2046,6 +2316,126 @@ fn primary_generation(committed_version: u64, segments: &[SegmentMeta], catalog:
     hash
 }
 
+/// Table name -> shared schema entry of one catalog.
+type SchemaMap = HashMap<String, Arc<TableSchema>>;
+
+/// What the reads need of the state, published at every release of the
+/// state's write lock (`Shared::state.view()`).
+///
+/// A reader that takes it holds the state as of that release without the
+/// lock: the directory of every table, every secondary index, the text and
+/// vector index cells, the segment handles. The structures are shared with
+/// the state (`PrimaryTableDelta`, `super::cow`), so publishing costs a few
+/// reference counts per table and index, and the next write copies only what
+/// it changes. The directory is multi-version, so a view also answers reads
+/// at any version up to its own.
+pub(crate) struct ReadView {
+    version: u64,
+    schemas: Arc<SchemaMap>,
+    tables: HashMap<String, PrimaryTableSnapshot>,
+    secondary: HashMap<(String, String), secondary::SecIdxView>,
+    text: HashMap<(String, String), IndexCell<TextIdx>>,
+    vector: HashMap<(String, String), IndexCell<VecIdx>>,
+    readers: Arc<SegmentReaders>,
+    /// The identity counters, the same objects the state holds.
+    identities: Arc<HashMap<String, Arc<AtomicI64>>>,
+    /// See `State::table_high_ids`.
+    table_high_ids: HashMap<String, String>,
+    /// The recent end of the state's change log.
+    change_tail: ChangeLogTail,
+}
+
+/// The read view once it covers `version`. A version a reader has seen is
+/// committed and was published inside the write section whose release
+/// publishes the view, so this waits a moment at most; `None` after that
+/// sends the caller to the locked path.
+fn view_covering(shared: &Shared, version: u64) -> Option<Arc<ReadView>> {
+    for _ in 0..64 {
+        let view = shared.state.view();
+        if view.version >= version {
+            return Some(view);
+        }
+        std::thread::yield_now();
+    }
+    None
+}
+
+impl ReadView {
+    fn of(st: &State) -> Self {
+        Self {
+            version: st.committed_version,
+            schemas: st.schemas.clone(),
+            tables: st
+                .catalog
+                .tables
+                .iter()
+                .map(|table| (table.name.clone(), st.index.table_snapshot(&table.name)))
+                .collect(),
+            secondary: st
+                .secondary
+                .iter()
+                .map(|(key, index)| (key.clone(), index.view()))
+                .collect(),
+            text: st.text.clone(),
+            vector: st.vector.clone(),
+            readers: st.readers.clone(),
+            identities: st.identity_high_water.clone(),
+            table_high_ids: st.table_high_ids.clone(),
+            change_tail: st.change_log.tail(),
+        }
+    }
+
+    /// `State::latest_owned` as of this view.
+    fn latest_owned(&self, table: &str, id: &str) -> Result<Option<VersionEntry>> {
+        let (Some(schema), Some(directory)) = (self.schemas.get(table), self.tables.get(table))
+        else {
+            return Ok(None);
+        };
+        let mut key = Vec::new();
+        Ok(directory
+            .view(table, &mut key)
+            .newest(id, u64::MAX)?
+            .filter(|entry| entry.version > schema.epoch))
+    }
+
+    /// `State::id_is_above_high_watermark` as of this view.
+    fn id_is_above_high_watermark(&self, table: &str, id: &str) -> bool {
+        self.table_high_ids
+            .get(table)
+            .is_none_or(|high| id > high.as_str())
+    }
+}
+
+/// A derived index behind its own lock, inside the state.
+///
+/// A search takes the state lock only to find the index and snapshot the
+/// table's directory, then walks the index holding this lock alone. A commit
+/// takes it for writing only when it changes that index, so the commits that
+/// do not (a checkout touching a product's stock, a session touch) no longer
+/// wait for searches in progress. Lock order: state, then index; a search
+/// never asks for the state lock while it holds an index.
+struct IndexCell<T>(Arc<RwLock<T>>);
+
+impl<T> IndexCell<T> {
+    fn new(index: T) -> Self {
+        Self(Arc::new(RwLock::new(index)))
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        self.0.read().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.0.write().unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+impl<T> Clone for IndexCell<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 struct State {
     catalog: Catalog,
     /// The catalog's table entries, shared. Resolving a statement used to
@@ -2053,13 +2443,13 @@ struct State {
     /// column, which on a three-column table was 130 ns of a 1.8 µs point
     /// read and more on a wide one. Rebuilt whenever the catalog is replaced,
     /// which happens on DDL and on open, never on a statement.
-    schemas: HashMap<String, Arc<TableSchema>>,
+    schemas: Arc<SchemaMap>,
     committed_version: u64,
     /// Highest reserved integer identity per table. Committed values are
     /// carried in the WAL and checkpoints copy the map into the manifest.
     /// Atomic so a reservation is a `fetch_add` under the shared lock: taking
     /// the exclusive lock per inserted row stalled every reader and committer.
-    identity_high_water: HashMap<String, AtomicI64>,
+    identity_high_water: Arc<HashMap<String, Arc<AtomicI64>>>,
     /// table -> id -> versions in ascending commit order.
     index: PrimaryIdx,
     /// Greatest primary key observed in the current table epoch. Keys above
@@ -2073,12 +2463,14 @@ struct State {
     /// (table, column) -> equality index over the latest committed state.
     secondary: HashMap<(String, String), SecIdx>,
     /// (table, column) -> ANN index over the latest committed state.
-    vector: HashMap<(String, String), VecIdx>,
+    vector: HashMap<(String, String), IndexCell<VecIdx>>,
     /// (table, column) -> full-text index over the latest committed state.
-    text: HashMap<(String, String), TextIdx>,
+    text: HashMap<(String, String), IndexCell<TextIdx>>,
     /// Directory for out-of-line blob chunks.
     blobs: PathBuf,
-    readers: SegmentReaders,
+    /// Shared with readers that take it out of the state lock; changed only
+    /// when segments are added or replaced.
+    readers: Arc<SegmentReaders>,
     segments: Vec<SegmentMeta>,
     next_segment_id: u32,
     /// Ids touched by recent commits; see `ChangeLog`.
@@ -2093,12 +2485,104 @@ struct State {
 /// snapshot (which may have carried the searched value at that snapshot), and
 /// re-reads each candidate at the snapshot version. When the snapshot predates
 /// what the log still holds, callers fall back to a scan.
+///
+/// Entries are kept in chunks behind `Arc` so the read view can hold the
+/// most recent ones (`ChangeLog::tail`) for a few reference counts.
 #[derive(Default)]
 struct ChangeLog {
-    entries: VecDeque<ChangeLogEntry>,
+    chunks: VecDeque<LogChunk>,
     total_ids: usize,
     /// Highest commit version whose ids were evicted or never recorded.
     unlogged_max: u64,
+}
+
+/// Entries per change-log chunk.
+const CHANGE_LOG_CHUNK: usize = 64;
+
+/// Chunks of the change log the read view holds: about two thousand recent
+/// commits, a few hundred milliseconds at the busiest measured load, which a
+/// statement inside a transaction rarely outlives.
+const CHANGE_LOG_VIEW_CHUNKS: usize = 32;
+
+type LogChunk = Arc<Vec<Arc<ChangeLogEntry>>>;
+
+/// The recent end of the change log, as the read view holds it. It answers
+/// `changed_after` for any version from where it starts on; older versions
+/// count as unlogged, which sends the caller to the locked path.
+#[derive(Clone, Default)]
+struct ChangeLogTail {
+    chunks: Vec<LogChunk>,
+    unlogged_max: u64,
+}
+
+/// Ids of `table` changed by the entries newer than `version`, newest first.
+fn changed_after_in<'a>(
+    chunks: impl DoubleEndedIterator<Item = &'a LogChunk>,
+    unlogged_max: u64,
+    table: &str,
+    version: u64,
+) -> Option<Vec<&'a str>> {
+    if unlogged_max > version {
+        return None;
+    }
+    let mut out = Vec::new();
+    for chunk in chunks.rev() {
+        for entry in chunk.iter().rev() {
+            if entry.version <= version {
+                return Some(out);
+            }
+            if entry.table == table {
+                out.extend(entry.ids.iter().map(String::as_str));
+            }
+        }
+    }
+    Some(out)
+}
+
+impl ChangeLogTail {
+    fn changed_after(&self, table: &str, version: u64) -> Option<Vec<&str>> {
+        changed_after_in(self.chunks.iter(), self.unlogged_max, table, version)
+    }
+}
+
+#[cfg(test)]
+mod change_log_tests {
+    use super::*;
+
+    /// The view's tail answers exactly like the whole log for versions it
+    /// covers, refuses older ones, and a tail taken earlier keeps its answers
+    /// while the log moves on.
+    #[test]
+    fn tail_matches_the_log_where_it_reaches_and_refuses_before() {
+        let mut log = ChangeLog::default();
+        for version in 1..=5_000u64 {
+            let table = if version % 3 == 0 { "b" } else { "a" };
+            log.push(version, table, vec![format!("id{version}")]);
+        }
+        let tail = log.tail();
+        // The tail starts after the last version of the chunk before it; the
+        // newest chunk may be partial, so that is a little later than 32
+        // full chunks back.
+        let reach = tail.unlogged_max;
+        assert!(reach >= 5_000 - (CHANGE_LOG_CHUNK * CHANGE_LOG_VIEW_CHUNKS) as u64);
+        assert!(reach <= 5_000 - (CHANGE_LOG_CHUNK * (CHANGE_LOG_VIEW_CHUNKS - 1)) as u64);
+
+        for version in [4_999, 4_900, reach + 1, reach] {
+            assert_eq!(
+                tail.changed_after("a", version),
+                log.changed_after("a", version),
+                "version {version}"
+            );
+        }
+        assert!(tail.changed_after("a", reach - 1).is_none());
+        assert!(log.changed_after("a", reach - 1).is_some());
+        let earlier = log.tail();
+        for version in 5_001..=5_100u64 {
+            log.push(version, "a", vec![format!("id{version}")]);
+        }
+        assert_eq!(earlier.changed_after("a", 4_990).unwrap().len(), 7);
+        assert_eq!(log.changed_after("a", 4_990).unwrap().len(), 107);
+    }
 }
 
 struct ChangeLogEntry {
@@ -2113,8 +2597,40 @@ const CHANGE_LOG_MAX_IDS: usize = 200_000;
 /// the state lock; bigger queries rank under the lock, streaming.
 const TEXT_COLLECT_MAX_POSTINGS: usize = 32_768;
 
-/// Ids visited per state-lock hold by indexed equality batches.
-const INDEX_LOCK_CHUNK_IDS: usize = 32;
+/// Ids taken per step from a detached index snapshot: the lock is not held,
+/// so a step only bounds the ids buffered at once.
+const INDEX_SNAPSHOT_CHUNK_IDS: usize = 512;
+
+/// Every id that may hold `column = value` at `version`: the current members
+/// of the column's secondary index plus the rows changed after `version`.
+/// `None` without such an index, or when the change log no longer reaches
+/// back to `version`.
+fn historical_eq_candidates(
+    st: &State,
+    table: &str,
+    column: &str,
+    value: &Value,
+    version: u64,
+) -> Result<Option<BTreeSet<String>>> {
+    let Some(index) = st.secondary.get(&single_secondary_index_key(table, column)) else {
+        return Ok(None);
+    };
+    let mut candidates = index.ids(&index_key(value))?;
+    // An identity column never changes after insert, so the index alone is
+    // exact for it.
+    let immutable = st
+        .catalog
+        .table(table)
+        .and_then(|schema| schema.column(column))
+        .is_some_and(|definition| definition.identity);
+    if !immutable {
+        let Some(changed) = st.change_log.changed_after(table, version) else {
+            return Ok(None);
+        };
+        candidates.extend(changed.into_iter().map(str::to_owned));
+    }
+    Ok(Some(candidates))
+}
 
 /// Retain the segment handles the prepared entries live in, so their
 /// payloads can be decoded after the state lock is released.
@@ -2123,11 +2639,19 @@ fn retain_segment_readers(
     prepared: &[(IdSpan, VKind)],
     readers: &mut SegmentReaders,
 ) -> Result<()> {
+    retain_segment_readers_from(&st.readers, prepared, readers)
+}
+
+/// `retain_segment_readers` from handles already taken out of the state.
+fn retain_segment_readers_from(
+    all: &SegmentReaders,
+    prepared: &[(IdSpan, VKind)],
+    readers: &mut SegmentReaders,
+) -> Result<()> {
     for (_, kind) in prepared {
         if let VKind::SegPut { segment, .. } = kind {
             if !readers.contains_key(segment) {
-                let reader = st
-                    .readers
+                let reader = all
                     .get(segment)
                     .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
                 readers.insert(*segment, reader.clone());
@@ -2135,6 +2659,43 @@ fn retain_segment_readers(
         }
     }
     Ok(())
+}
+
+/// Decode the rows an equality batch resolved, with the state lock released,
+/// stopping where the byte budget is spent. The caller resumes strictly
+/// after the last row it received.
+#[allow(clippy::too_many_arguments)]
+fn decode_prepared_batch(
+    blobs: &Path,
+    readers: &SegmentReaders,
+    projection: &RowProjection<'_>,
+    implicit_id: bool,
+    prepared: &[(IdSpan, VKind)],
+    prepared_ids: &str,
+    want_ids: bool,
+    byte_budget: Option<usize>,
+) -> Result<ScanBatch> {
+    let mut rows = Vec::with_capacity(prepared.len());
+    let mut ids = Vec::with_capacity(if want_ids { prepared.len() } else { 0 });
+    let mut retained_bytes = 0usize;
+    for (span, kind) in prepared {
+        let id = span.of(prepared_ids);
+        let mut record = read_record_kind_keep(blobs, readers, kind, projection)?;
+        if implicit_id {
+            record.insert(ID_COLUMN, Value::Text(id.to_owned()));
+        }
+        if !record_fits_batch(&record, id, byte_budget, &mut retained_bytes)? {
+            break;
+        }
+        if want_ids {
+            ids.push(id.to_owned());
+        }
+        rows.push(record);
+    }
+    let next = prepared
+        .get(rows.len().wrapping_sub(1))
+        .map(|(span, _)| span.of(prepared_ids).to_owned());
+    Ok(ScanBatch { rows, ids, next })
 }
 
 /// Query-memory reservation of a key-bounded statement (see `Db::query_admission_small_bytes`).
@@ -2146,17 +2707,39 @@ impl ChangeLog {
             return;
         }
         self.total_ids = self.total_ids.saturating_add(ids.len());
-        self.entries.push_back(ChangeLogEntry {
+        let entry = Arc::new(ChangeLogEntry {
             version,
             table: table.to_owned(),
             ids,
         });
+        match self.chunks.back_mut() {
+            Some(chunk) if chunk.len() < CHANGE_LOG_CHUNK => Arc::make_mut(chunk).push(entry),
+            _ => self.chunks.push_back(Arc::new(vec![entry])),
+        }
         while self.total_ids > CHANGE_LOG_MAX_IDS {
-            let Some(oldest) = self.entries.pop_front() else {
+            let Some(front) = self.chunks.front_mut() else {
                 break;
             };
+            let oldest = Arc::make_mut(front).remove(0);
+            if front.is_empty() {
+                self.chunks.pop_front();
+            }
             self.total_ids = self.total_ids.saturating_sub(oldest.ids.len());
             self.unlogged_max = self.unlogged_max.max(oldest.version);
+        }
+    }
+
+    /// The most recent `CHANGE_LOG_VIEW_CHUNKS` chunks, for the read view.
+    fn tail(&self) -> ChangeLogTail {
+        let skip = self.chunks.len().saturating_sub(CHANGE_LOG_VIEW_CHUNKS);
+        // Everything before the tail counts as unlogged for its reader.
+        let before = skip
+            .checked_sub(1)
+            .and_then(|last| self.chunks[last].last())
+            .map_or(0, |entry| entry.version);
+        ChangeLogTail {
+            chunks: self.chunks.iter().skip(skip).cloned().collect(),
+            unlogged_max: self.unlogged_max.max(before),
         }
     }
 
@@ -2168,19 +2751,7 @@ impl ChangeLog {
     /// Ids of `table` changed by commits newer than `version`, or `None` when
     /// some such commit is no longer (or was never) recorded.
     fn changed_after(&self, table: &str, version: u64) -> Option<Vec<&str>> {
-        if self.unlogged_max > version {
-            return None;
-        }
-        let mut out = Vec::new();
-        for entry in self.entries.iter().rev() {
-            if entry.version <= version {
-                break;
-            }
-            if entry.table == table {
-                out.extend(entry.ids.iter().map(String::as_str));
-            }
-        }
-        Some(out)
+        changed_after_in(self.chunks.iter(), self.unlogged_max, table, version)
     }
 }
 
@@ -2366,21 +2937,20 @@ impl State {
             .filter(|entry| entry.version > schema.epoch))
     }
 
-    /// Replace the catalog and the shared entries derived from it. Every
-    /// assignment to `catalog` must go through here.
-    fn set_catalog(&mut self, catalog: Catalog) {
-        self.schemas = catalog
-            .tables
-            .iter()
-            .map(|schema| (schema.name.clone(), Arc::new(schema.clone())))
-            .collect();
+    /// Replace the catalog and the shared entries derived from it, and
+    /// republish those entries for lookups that skip the state lock. Every
+    /// assignment to `catalog` must go through here, under the state write
+    /// guard.
+    fn set_catalog(&mut self, catalog: Catalog, published: &RwLock<Arc<SchemaMap>>) {
+        self.schemas = Arc::new(
+            catalog
+                .tables
+                .iter()
+                .map(|schema| (schema.name.clone(), Arc::new(schema.clone())))
+                .collect(),
+        );
         self.catalog = catalog;
-    }
-
-    /// The shared entry for one table, or `None` when the catalog has no such
-    /// table.
-    fn schema_arc(&self, table: &str) -> Option<Arc<TableSchema>> {
-        self.schemas.get(table).cloned()
+        *published.write().unwrap() = self.schemas.clone();
     }
 
     fn index_delta_memory_bytes(&self) -> usize {
@@ -2394,8 +2964,18 @@ impl State {
             .values()
             .map(SecIdx::delta_memory_bytes)
             .sum::<usize>()
-            .saturating_add(self.text.values().map(TextIdx::delta_memory_bytes).sum())
-            .saturating_add(self.vector.values().map(VecIdx::delta_memory_bytes).sum())
+            .saturating_add(
+                self.text
+                    .values()
+                    .map(|index| index.read().delta_memory_bytes())
+                    .sum(),
+            )
+            .saturating_add(
+                self.vector
+                    .values()
+                    .map(|index| index.read().delta_memory_bytes())
+                    .sum(),
+            )
     }
 
     fn derived_delta_memory_bytes_including_frozen(&self) -> usize {
@@ -2409,13 +2989,13 @@ impl State {
             .saturating_add(
                 self.text
                     .values()
-                    .map(TextIdx::frozen_delta_memory_bytes)
+                    .map(|index| index.read().frozen_delta_memory_bytes())
                     .sum(),
             )
             .saturating_add(
                 self.vector
                     .values()
-                    .map(VecIdx::frozen_delta_memory_bytes)
+                    .map(|index| index.read().frozen_delta_memory_bytes())
                     .sum(),
             )
     }
@@ -2425,11 +3005,11 @@ impl State {
             || self
                 .text
                 .values()
-                .any(|index| index.frozen_delta().is_some())
+                .any(|index| index.read().frozen_delta().is_some())
             || self
                 .vector
                 .values()
-                .any(|index| index.frozen_delta().is_some())
+                .any(|index| index.read().frozen_delta().is_some())
     }
 }
 
@@ -2464,6 +3044,9 @@ struct CommitState {
 struct CommitCoordinatorState {
     active: bool,
     queue: VecDeque<Arc<CoordinatedCommit>>,
+    /// When the last leader handed the baton on; the next leader measures
+    /// the gap in which nobody drained the queue.
+    promoted_at: Option<Instant>,
 }
 
 struct CoordinatedCommit {
@@ -2587,7 +3170,7 @@ impl<'a> PointReadAdmission<'a> {
     fn enter(shared: &'a Shared) -> Self {
         let mut throttled = false;
         loop {
-            let writers = shared.active_state_writers.load(AtomicOrdering::Relaxed);
+            let writers = shared.state_write_waiting.load(AtomicOrdering::Relaxed);
             if writers == 0 {
                 return Self {
                     shared,
@@ -2602,7 +3185,7 @@ impl<'a> PointReadAdmission<'a> {
             let previous = shared
                 .admitted_point_reads
                 .fetch_add(1, AtomicOrdering::Relaxed);
-            if shared.active_state_writers.load(AtomicOrdering::Relaxed) == 0
+            if shared.state_write_waiting.load(AtomicOrdering::Relaxed) == 0
                 || previous < reader_limit as u64
             {
                 return Self {
@@ -2644,8 +3227,39 @@ enum CommitMutex {
 }
 
 enum CommitGuard<'a> {
-    Safe(MutexGuard<'a, CommitState>),
-    Concurrent(ParkingMutexGuard<'a, CommitState>),
+    Safe(MutexGuard<'a, CommitState>, HoldProbe),
+    Concurrent(ParkingMutexGuard<'a, CommitState>, HoldProbe),
+}
+
+pub(crate) struct HoldProbe {
+    site: &'static std::panic::Location<'static>,
+    wait: Duration,
+    acquired: Instant,
+}
+
+pub(crate) static HOLD_PROBE: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
+
+impl Drop for HoldProbe {
+    fn drop(&mut self) {
+        let hold = self.acquired.elapsed().as_nanos() as u64;
+        let key = format!("{}:{}", self.site.file(), self.site.line());
+        let mut map = HOLD_PROBE.lock().unwrap();
+        let entry = map.get_or_insert_with(HashMap::new).entry(key).or_default();
+        entry.0 += 1;
+        entry.1 += self.wait.as_nanos() as u64;
+        entry.2 += hold;
+    }
+}
+
+pub(crate) fn dump_hold_probe() {
+    let map = HOLD_PROBE.lock().unwrap();
+    if let Some(map) = map.as_ref() {
+        let mut rows: Vec<_> = map.iter().collect();
+        rows.sort_by_key(|(_, v)| std::cmp::Reverse(v.2));
+        for (site, (count, wait, hold)) in rows {
+            eprintln!("HOLDPROBE {site} count={count} wait_ms={} hold_ms={}", wait / 1_000_000, hold / 1_000_000);
+        }
+    }
 }
 
 impl CommitMutex {
@@ -2657,10 +3271,19 @@ impl CommitMutex {
         }
     }
 
+    #[track_caller]
     fn lock(&self) -> CommitGuard<'_> {
+        let site = std::panic::Location::caller();
+        let started = Instant::now();
         match self {
-            Self::Safe(mutex) => CommitGuard::Safe(mutex.lock().unwrap()),
-            Self::Concurrent(mutex) => CommitGuard::Concurrent(mutex.lock()),
+            Self::Safe(mutex) => {
+                let guard = mutex.lock().unwrap();
+                CommitGuard::Safe(guard, HoldProbe { site, wait: started.elapsed(), acquired: Instant::now() })
+            }
+            Self::Concurrent(mutex) => {
+                let guard = mutex.lock();
+                CommitGuard::Concurrent(guard, HoldProbe { site, wait: started.elapsed(), acquired: Instant::now() })
+            }
         }
     }
 }
@@ -2670,8 +3293,8 @@ impl Deref for CommitGuard<'_> {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Safe(guard) => guard,
-            Self::Concurrent(guard) => guard,
+            Self::Safe(guard, _) => guard,
+            Self::Concurrent(guard, _) => guard,
         }
     }
 }
@@ -2679,8 +3302,8 @@ impl Deref for CommitGuard<'_> {
 impl DerefMut for CommitGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            Self::Safe(guard) => guard,
-            Self::Concurrent(guard) => guard,
+            Self::Safe(guard, _) => guard,
+            Self::Concurrent(guard, _) => guard,
         }
     }
 }
@@ -2688,8 +3311,9 @@ impl DerefMut for CommitGuard<'_> {
 impl CommitGuard<'_> {
     fn unlock_fair(self) {
         match self {
-            Self::Safe(guard) => drop(guard),
-            Self::Concurrent(guard) => ParkingMutexGuard::unlock_fair(guard),
+            Self::Safe(guard, _probe) => drop(guard),
+            Self::Concurrent(guard, _probe) => ParkingMutexGuard::unlock_fair(guard),
+
         }
     }
 }
@@ -2709,6 +3333,28 @@ struct TimedCommitGuard<'a> {
     total_nanos: &'a AtomicU64,
     waiters: &'a AtomicU64,
     fair_handoff: bool,
+    qos_previous: Option<u32>,
+}
+
+pub(crate) mod exp_qos {
+    pub(crate) const USER_INTERACTIVE: u32 = 0x21;
+    pub(crate) const DEFAULT: u32 = 0x15;
+    extern "C" {
+        pub(crate) fn qos_class_self() -> u32;
+        pub(crate) fn pthread_set_qos_class_self_np(class: u32, relative_priority: i32) -> i32;
+    }
+    pub(crate) fn raise() -> Option<u32> {
+        unsafe {
+            let class = qos_class_self();
+            (pthread_set_qos_class_self_np(USER_INTERACTIVE, 0) == 0).then_some(class)
+        }
+    }
+    pub(crate) fn restore(previous: u32) {
+        let class = if previous == 0 { DEFAULT } else { previous };
+        unsafe {
+            pthread_set_qos_class_self_np(class, 0);
+        }
+    }
 }
 
 impl Deref for TimedCommitGuard<'_> {
@@ -2734,7 +3380,13 @@ impl Drop for TimedCommitGuard<'_> {
         let guard = self.guard.take().expect("commit guard is held");
         if self.fair_handoff && self.waiters.load(AtomicOrdering::Acquire) > 0 {
             guard.unlock_fair();
+        } else {
+            drop(guard);
         }
+        if let Some(previous) = self.qos_previous.take() {
+            exp_qos::restore(previous);
+        }
+
     }
 }
 
@@ -2923,7 +3575,7 @@ struct Shared {
     /// std's queue-based lock: measured against `parking_lot::RwLock` on the
     /// mini-SaaS workload, the adaptive spinning of the latter burned the
     /// CPU of 1 000 oversubscribed client threads (2 900 vs 4 500 ops/s).
-    state: RwLock<State>,
+    state: crate::lock_probe::ProbedRwLock<State, ReadView>,
     /// Serializes commits, checkpoints and compaction. Writers stage in
     /// parallel without this lock and only meet here, at commit.
     commit: CommitMutex,
@@ -2969,8 +3621,6 @@ struct Shared {
     /// Committers currently queued for the serialization mutex. A group
     /// leader only opens a coalescing window when contention already exists,
     /// preserving single-writer latency.
-    /// Committers queued for the serialization mutex. A scan reads it before
-    /// every chunk: see `SCAN_LOCK_CHUNK_ROWS`.
     pub(super) commit_waiters: AtomicU64,
     wal_sync_count: AtomicU64,
     wal_sync_nanos: AtomicU64,
@@ -2982,6 +3632,9 @@ struct Shared {
     grouped_commit_count: AtomicU64,
     coordinated_batch_count: AtomicU64,
     coordinated_commit_count: AtomicU64,
+    delta_rebased_rows: AtomicU64,
+    coordinator_handoffs: AtomicU64,
+    coordinator_handoff_nanos: AtomicU64,
     /// CPU-aware admission used only while commits or identity reservations
     /// are active. Read-only workloads retain an unthrottled point-read path.
     point_read_parallelism: usize,
@@ -2993,7 +3646,22 @@ struct Shared {
     admitted_point_reads: AtomicU64,
     point_read_throttle_count: AtomicU64,
     /// version -> live snapshot refcount; compaction preserves these.
-    snapshots: Mutex<BTreeMap<u64, usize>>,
+    ///
+    /// A leaf lock: nothing waits for another lock while holding it. Taking
+    /// it inside a state guard is allowed (state -> snapshots); holding it
+    /// while waiting for the state lock is not, since a reader parked behind
+    /// a queued writer would stall every other snapshot and drop behind it.
+    snapshots: SnapshotRegistry,
+    /// The schema entries of the current catalog, republished by
+    /// `State::set_catalog`. Schema lookups read them here so they do not
+    /// queue for the state lock behind a waiting committer.
+    published_schemas: RwLock<Arc<SchemaMap>>,
+    /// Committers currently waiting for the state write guard.
+    state_write_waiting: AtomicU64,
+    /// Mirror of `State::committed_version`, stored under the state write
+    /// guard whenever that field changes. `Db::snapshot` registers from it
+    /// without taking the state lock.
+    published_version: AtomicU64,
     /// Last generated or observed ULID, used to keep implicit ids increasing.
     /// It is initialized from the largest persisted ULID when the database opens.
     last_generated_id: Mutex<Ulid>,
@@ -3090,6 +3758,8 @@ struct Shared {
     /// Snapshot versions that forced the most recently compacted segment set
     /// to retain an otherwise obsolete record version.
     compaction_retained_snapshots: Mutex<HashSet<u64>>,
+    /// Whether `compaction_retained_snapshots` may be non-empty.
+    compaction_retained_any: AtomicBool,
     /// A released snapshot can make a previously retained version obsolete.
     /// Recompute that debt once at the next maintenance boundary, rather than
     /// rescanning the full primary index after every checkpoint.
@@ -3104,6 +3774,8 @@ struct Shared {
 /// keeps the versions it needs.
 pub struct Snapshot {
     version: u64,
+    /// The registry shard this snapshot is counted in.
+    shard: u8,
     shared: Arc<Shared>,
 }
 
@@ -3135,36 +3807,27 @@ impl Snapshot {
     }
 }
 
+impl Snapshot {
+    /// Register a read position at `version` and hold it until dropped.
+    fn register(shared: &Arc<Shared>, version: u64) -> Self {
+        let shard = shared.snapshots.register(version);
+        Snapshot {
+            version,
+            shard,
+            shared: shared.clone(),
+        }
+    }
+}
+
 impl Clone for Snapshot {
     fn clone(&self) -> Self {
-        register_snapshot(&self.shared, self.version);
-        Snapshot {
-            version: self.version,
-            shared: self.shared.clone(),
-        }
+        Snapshot::register(&self.shared, self.version)
     }
 }
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
-        let mut snaps = self.shared.snapshots.lock().unwrap();
-        if let Some(count) = snaps.get_mut(&self.version) {
-            *count -= 1;
-            if *count == 0 {
-                snaps.remove(&self.version);
-                if self
-                    .shared
-                    .compaction_retained_snapshots
-                    .lock()
-                    .unwrap()
-                    .remove(&self.version)
-                {
-                    self.shared
-                        .compaction_refresh_needed
-                        .store(true, AtomicOrdering::Release);
-                }
-            }
-        }
+        release_snapshot(&self.shared, self.shard, self.version);
     }
 }
 
@@ -3176,8 +3839,104 @@ impl std::fmt::Debug for Snapshot {
     }
 }
 
-fn register_snapshot(shared: &Arc<Shared>, version: u64) {
-    *shared.snapshots.lock().unwrap().entry(version).or_insert(0) += 1;
+/// Shards of the snapshot registry. Every statement registers a snapshot
+/// and releases it, and one mutex for all of them was a fifth of an indexed
+/// point read and the busiest lock left on the read path. Each thread counts
+/// its snapshots in its own shard; the rare readers of the registry
+/// (compaction and its debt estimate) take the union.
+const SNAPSHOT_SHARDS: usize = 16;
+
+/// Live read positions: how many snapshots hold each version.
+pub(crate) struct SnapshotRegistry {
+    shards: [Mutex<BTreeMap<u64, usize>>; SNAPSHOT_SHARDS],
+}
+
+impl SnapshotRegistry {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn shard_of_this_thread() -> u8 {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        thread_local! {
+            static SHARD: u8 = (NEXT.fetch_add(1, AtomicOrdering::Relaxed) % SNAPSHOT_SHARDS) as u8;
+        }
+        SHARD.with(|shard| *shard)
+    }
+
+    /// Count one snapshot at `version`; returns the shard to release it in.
+    fn register(&self, version: u64) -> u8 {
+        let shard = Self::shard_of_this_thread();
+        *self.shards[shard as usize]
+            .lock()
+            .unwrap()
+            .entry(version)
+            .or_insert(0) += 1;
+        shard
+    }
+
+    /// Release one snapshot; true when its shard holds `version` no more.
+    fn release(&self, shard: u8, version: u64) -> bool {
+        let mut snaps = self.shards[shard as usize].lock().unwrap();
+        match snaps.get_mut(&version) {
+            Some(count) => {
+                *count -= 1;
+                if *count == 0 {
+                    snaps.remove(&version);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Whether any snapshot still holds `version`.
+    fn holds(&self, version: u64) -> bool {
+        self.shards
+            .iter()
+            .any(|shard| shard.lock().unwrap().contains_key(&version))
+    }
+
+    /// Every version some snapshot holds, ascending and without repeats.
+    fn versions(&self) -> Vec<u64> {
+        let mut versions: Vec<u64> = self
+            .shards
+            .iter()
+            .flat_map(|shard| shard.lock().unwrap().keys().copied().collect::<Vec<_>>())
+            .collect();
+        versions.sort_unstable();
+        versions.dedup();
+        versions
+    }
+}
+
+fn release_snapshot(shared: &Shared, shard: u8, version: u64) {
+    if !shared.snapshots.release(shard, version) {
+        return;
+    }
+    // The set is empty unless a compaction estimate is tracking retained
+    // versions, so the common release does not take its lock.
+    if !shared
+        .compaction_retained_any
+        .load(AtomicOrdering::Acquire)
+        || shared.snapshots.holds(version)
+    {
+        return;
+    }
+    if shared
+        .compaction_retained_snapshots
+        .lock()
+        .unwrap()
+        .remove(&version)
+    {
+        shared
+            .compaction_refresh_needed
+            .store(true, AtomicOrdering::Release);
+    }
 }
 
 /// Parameters for [`Db::search_hybrid`]: one or both modalities.
@@ -3215,6 +3974,56 @@ pub struct Txn {
     staged: Vec<(String, StagedTable)>,
     staged_bytes: usize,
     statement_savepoint: Option<StatementSavepoint>,
+    /// Rows this transaction returned to its caller; see `ObservedRows`.
+    observed: Mutex<ObservedRows>,
+}
+
+/// Past this many returned ids, a table counts as read in full.
+const OBSERVED_ROWS_PER_TABLE: usize = 1024;
+
+/// The rows a transaction handed back to its caller. A delta update of such
+/// a row is never recomputed at commit: the caller may have acted on the
+/// value it saw, so a newer committed version has to be a conflict, exactly
+/// as without delta updates. Reads a statement makes for its own purposes
+/// (the rows an UPDATE rewrites, the lookups of `update` and `delete`) are
+/// not observations.
+#[derive(Default)]
+struct ObservedRows {
+    tables: HashMap<String, ObservedTable>,
+}
+
+#[derive(Default)]
+struct ObservedTable {
+    all: bool,
+    ids: HashSet<String>,
+}
+
+impl ObservedRows {
+    fn mark<'a>(&mut self, table: &str, ids: impl ExactSizeIterator<Item = &'a str>) {
+        if ids.len() == 0 {
+            return;
+        }
+        if !self.tables.contains_key(table) {
+            self.tables
+                .insert(table.to_owned(), ObservedTable::default());
+        }
+        let observed = self.tables.get_mut(table).expect("inserted above");
+        if observed.all {
+            return;
+        }
+        if observed.ids.len().saturating_add(ids.len()) > OBSERVED_ROWS_PER_TABLE {
+            observed.all = true;
+            observed.ids = HashSet::new();
+            return;
+        }
+        observed.ids.extend(ids.map(str::to_owned));
+    }
+
+    fn contains(&self, table: &str, id: &str) -> bool {
+        self.tables
+            .get(table)
+            .is_some_and(|observed| observed.all || observed.ids.contains(id))
+    }
 }
 
 struct StatementSavepoint {
@@ -3245,14 +4054,22 @@ struct StagedTable {
     /// first use. Every statement used to copy the whole schema before it
     /// could resolve a column.
     shared_schema: Option<Arc<TableSchema>>,
-    /// High watermark observed when the table was first touched. IDs above it
-    /// were absent from this transaction's snapshot, so monotonic inserts do
+    /// High watermark observed at the transaction's first insert into the
+    /// table (`None` until then; the inner `None` for a table with no rows).
+    /// It is no lower than the watermark at the snapshot, so IDs above it
+    /// were absent from this transaction's snapshot and monotonic inserts do
     /// not need to reacquire the shared state lock per row. Commit validation
-    /// still catches a concurrent writer that inserts the same ID.
-    snapshot_high_id: Option<String>,
+    /// still catches a concurrent writer that inserts the same ID. It is read
+    /// lazily so statements that only read or update never take the state
+    /// lock to stage a table.
+    snapshot_high_id: Option<Option<String>>,
     operations: StagedOperations,
     next_position: usize,
 }
+
+/// A staged row as commit consumes it: id, final record (`None` deletes) and
+/// the delta updates to replay if the row changed after the snapshot.
+type OrderedOperation = (String, Option<Record>, Option<Vec<RebaseStep>>);
 
 /// Keeps the common append-only transaction in a compact ordered vector.
 /// The first out-of-order insertion converts once to the general hash-map
@@ -3362,15 +4179,14 @@ impl StagedOperations {
         Box::new(self.iter().map(|(_, operation)| operation))
     }
 
-    fn into_ordered(self) -> Vec<(String, Option<Record>)> {
+    fn into_ordered(self) -> Vec<OrderedOperation> {
         if let Some(general) = self.general {
             let operation_count = general.len();
-            let mut ordered: Vec<Option<(String, Option<Record>)>> =
-                std::iter::repeat_with(|| None)
-                    .take(operation_count)
-                    .collect();
+            let mut ordered: Vec<Option<OrderedOperation>> = std::iter::repeat_with(|| None)
+                .take(operation_count)
+                .collect();
             for (id, operation) in general {
-                ordered[operation.position] = Some((id, operation.operation));
+                ordered[operation.position] = Some((id, operation.operation, operation.rebase));
             }
             let mut ordered = ordered
                 .into_iter()
@@ -3383,7 +4199,7 @@ impl StagedOperations {
         } else {
             self.monotonic
                 .into_iter()
-                .map(|(id, operation)| (id, operation.operation))
+                .map(|(id, operation)| (id, operation.operation, operation.rebase))
                 .collect()
         }
     }
@@ -3398,7 +4214,24 @@ struct StagedOperation {
     /// Transaction-visible value that was removed. Cascades need this even
     /// when the row was inserted or updated earlier in the same transaction.
     deleted_record: Option<Record>,
+    /// Set only while every write to this row in the transaction was a delta
+    /// update (`Txn::update_with_rebase`), in statement order. Commit then
+    /// replays them over a newer committed version of the row instead of
+    /// failing with a write-write conflict. Any other write clears it.
+    rebase: Option<Vec<RebaseStep>>,
 }
+
+/// One delta update, re-run at commit over the latest committed version of
+/// its row. It receives the physical id and the committed record (without
+/// the implicit id column) and returns the updated record, or `None` when the
+/// statement's WHERE no longer holds for that version, which makes the
+/// commit a conflict as before.
+///
+/// A step must be a commutative change of the row (adding to or subtracting
+/// from numeric columns): the transaction's other reads stay at its snapshot,
+/// and only an order-independent change keeps "this update ran at commit"
+/// consistent with them.
+pub(crate) type RebaseStep = Arc<dyn Fn(&str, &Record) -> Result<Option<Record>> + Send + Sync>;
 
 struct PreparedTable {
     name: String,
@@ -3409,6 +4242,8 @@ struct PreparedTable {
 struct PreparedChange {
     id: String,
     operation: Option<Record>,
+    /// Delta updates to replay if the row changed after the snapshot.
+    rebase: Option<Vec<RebaseStep>>,
     /// `(offset, length)` into `PreparedCommit::payload_arena`.
     payload: Option<(u32, u32)>,
 }
@@ -3569,7 +4404,7 @@ fn finish_db(shared: Arc<Shared>) -> Db {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             while let Ok(job) = rx.recv() {
                 {
-                    let mut st = sh.state.write().unwrap();
+                    let st = sh.state.write().unwrap();
                     // A newer update/delete can commit before this background
                     // job runs. Never let an old queued vector resurrect or
                     // overwrite that newer canonical state.
@@ -3579,8 +4414,8 @@ fn finish_db(shared: Arc<Shared>) -> Db {
                         .flatten()
                         .is_some_and(|entry| entry.version == job.version && !entry.is_tombstone());
                     if still_current {
-                        if let Some(vidx) = st.vector.get_mut(&(job.table, job.column)) {
-                            vidx.insert(&job.id, &job.vector);
+                        if let Some(vidx) = st.vector.get(&(job.table, job.column)) {
+                            vidx.write().insert(&job.id, &job.vector);
                         }
                     }
                 }
@@ -4050,23 +4885,26 @@ impl Db {
             opts: opts.clone(),
             memory_governor,
             _lock_file: lock_file,
-            state: RwLock::new(State {
-                catalog: Catalog::new(),
-                schemas: HashMap::new(),
-                committed_version: 0,
-                identity_high_water: HashMap::new(),
-                index: PrimaryIdx::empty(),
-                table_high_ids: HashMap::new(),
-                superseded_segments: HashSet::new(),
-                secondary: HashMap::new(),
-                vector: HashMap::new(),
-                text: HashMap::new(),
-                blobs: blobs_dir,
-                readers: SegmentReaders::default(),
-                segments: Vec::new(),
-                next_segment_id: 1,
-                change_log: ChangeLog::default(),
-            }),
+            state: crate::lock_probe::ProbedRwLock::new(
+                State {
+                    catalog: Catalog::new(),
+                    schemas: Arc::default(),
+                    committed_version: 0,
+                    identity_high_water: Arc::default(),
+                    index: PrimaryIdx::empty(),
+                    table_high_ids: HashMap::new(),
+                    superseded_segments: HashSet::new(),
+                    secondary: HashMap::new(),
+                    vector: HashMap::new(),
+                    text: HashMap::new(),
+                    blobs: blobs_dir,
+                    readers: Arc::default(),
+                    segments: Vec::new(),
+                    next_segment_id: 1,
+                    change_log: ChangeLog::default(),
+                },
+                ReadView::of,
+            ),
             commit: CommitMutex::new(
                 CommitState {
                     wal,
@@ -4109,6 +4947,9 @@ impl Db {
             grouped_commit_count: AtomicU64::new(0),
             coordinated_batch_count: AtomicU64::new(0),
             coordinated_commit_count: AtomicU64::new(0),
+            delta_rebased_rows: AtomicU64::new(0),
+            coordinator_handoffs: AtomicU64::new(0),
+            coordinator_handoff_nanos: AtomicU64::new(0),
             point_read_parallelism: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
             statement_slots: StatementSlots::new(opts.max_concurrent_statements),
@@ -4116,7 +4957,10 @@ impl Db {
             safe_coalesce_budget: AtomicU64::new(0),
             admitted_point_reads: AtomicU64::new(0),
             point_read_throttle_count: AtomicU64::new(0),
-            snapshots: Mutex::new(BTreeMap::new()),
+            snapshots: SnapshotRegistry::new(),
+            published_schemas: RwLock::new(Arc::default()),
+            state_write_waiting: AtomicU64::new(0),
+            published_version: AtomicU64::new(0),
             last_generated_id: Mutex::new(Ulid::nil()),
             vector_tx: Mutex::new(None),
             vector_backlog: AtomicU64::new(0),
@@ -4192,6 +5036,7 @@ impl Db {
             automatic_compaction_failures: AtomicU64::new(0),
             automatic_compaction_bytes_reclaimed: AtomicU64::new(0),
             compaction_retained_snapshots: Mutex::new(HashSet::new()),
+            compaction_retained_any: AtomicBool::new(false),
             compaction_refresh_needed: AtomicBool::new(false),
             query_spill_files: AtomicU64::new(0),
             query_spilled_bytes: AtomicU64::new(0),
@@ -4395,9 +5240,7 @@ impl Db {
                                 opts.memory.index_delta_pool_bytes
                             )));
                         }
-                        index
-                            .entry(entry.table)
-                            .or_default()
+                        Arc::make_mut(index.entry(entry.table).or_default())
                             .push(entry.id, version);
                     }
                     Ok(())
@@ -4449,7 +5292,7 @@ impl Db {
                             opts.memory.index_delta_pool_bytes
                         )));
                     }
-                    index.entry(entry.table).or_default().push(
+                    Arc::make_mut(index.entry(entry.table).or_default()).push(
                         entry.id,
                         VersionEntry {
                             version: entry.version,
@@ -4731,30 +5574,43 @@ impl Db {
             opts: opts.clone(),
             memory_governor,
             _lock_file: lock_file,
-            state: RwLock::new(State {
-                schemas: catalog
-                    .tables
-                    .iter()
-                    .map(|schema| (schema.name.clone(), Arc::new(schema.clone())))
-                    .collect(),
-                catalog,
-                committed_version,
-                identity_high_water: identity_high_water
-                    .into_iter()
-                    .map(|(table, value)| (table, AtomicI64::new(value)))
-                    .collect(),
-                index: primary,
-                table_high_ids,
-                superseded_segments,
-                secondary,
-                vector,
-                text,
-                blobs: blobs_dir,
-                readers,
-                segments: manifest.segments,
-                next_segment_id,
-                change_log: ChangeLog::default(),
-            }),
+            state: crate::lock_probe::ProbedRwLock::new(
+                State {
+                    schemas: Arc::new(
+                        catalog
+                            .tables
+                            .iter()
+                            .map(|schema| (schema.name.clone(), Arc::new(schema.clone())))
+                            .collect(),
+                    ),
+                    catalog,
+                    committed_version,
+                    identity_high_water: Arc::new(
+                        identity_high_water
+                            .into_iter()
+                            .map(|(table, value)| (table, Arc::new(AtomicI64::new(value))))
+                            .collect(),
+                    ),
+                    index: primary,
+                    table_high_ids,
+                    superseded_segments,
+                    secondary,
+                    vector: vector
+                        .into_iter()
+                        .map(|(key, index)| (key, IndexCell::new(index)))
+                        .collect(),
+                    text: text
+                        .into_iter()
+                        .map(|(key, index)| (key, IndexCell::new(index)))
+                        .collect(),
+                    blobs: blobs_dir,
+                    readers: Arc::new(readers),
+                    segments: manifest.segments,
+                    next_segment_id,
+                    change_log: ChangeLog::default(),
+                },
+                ReadView::of,
+            ),
             commit: CommitMutex::new(
                 CommitState {
                     wal,
@@ -4797,6 +5653,9 @@ impl Db {
             grouped_commit_count: AtomicU64::new(0),
             coordinated_batch_count: AtomicU64::new(0),
             coordinated_commit_count: AtomicU64::new(0),
+            delta_rebased_rows: AtomicU64::new(0),
+            coordinator_handoffs: AtomicU64::new(0),
+            coordinator_handoff_nanos: AtomicU64::new(0),
             point_read_parallelism: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
             statement_slots: StatementSlots::new(opts.max_concurrent_statements),
@@ -4804,7 +5663,10 @@ impl Db {
             safe_coalesce_budget: AtomicU64::new(0),
             admitted_point_reads: AtomicU64::new(0),
             point_read_throttle_count: AtomicU64::new(0),
-            snapshots: Mutex::new(BTreeMap::new()),
+            snapshots: SnapshotRegistry::new(),
+            published_schemas: RwLock::new(Arc::default()),
+            state_write_waiting: AtomicU64::new(0),
+            published_version: AtomicU64::new(committed_version),
             last_generated_id: Mutex::new(last_generated_id),
             vector_tx: Mutex::new(None),
             vector_backlog: AtomicU64::new(0),
@@ -4880,11 +5742,16 @@ impl Db {
             automatic_compaction_failures: AtomicU64::new(0),
             automatic_compaction_bytes_reclaimed: AtomicU64::new(0),
             compaction_retained_snapshots: Mutex::new(HashSet::new()),
+            compaction_retained_any: AtomicBool::new(false),
             compaction_refresh_needed: AtomicBool::new(false),
             query_spill_files: AtomicU64::new(0),
             query_spilled_bytes: AtomicU64::new(0),
             query_peak_buffer_bytes: AtomicU64::new(0),
         }));
+        {
+            let st = db.shared.state.read().unwrap();
+            *db.shared.published_schemas.write().unwrap() = st.schemas.clone();
+        }
         if let Some(intent) = pending_ddl {
             db.apply_ddl(&intent)?;
             DdlIntent::clear(&db.shared.dir)?;
@@ -5070,12 +5937,14 @@ impl Db {
         for def in &schema.vector_indexes {
             st.vector.insert(
                 (schema.name.clone(), def.column.clone()),
-                VecIdx::new(def.clone()),
+                IndexCell::new(VecIdx::new(def.clone())),
             );
         }
         for def in &schema.text_indexes {
-            st.text
-                .insert((schema.name.clone(), def.column.clone()), TextIdx::new());
+            st.text.insert(
+                (schema.name.clone(), def.column.clone()),
+                IndexCell::new(TextIdx::new()),
+            );
         }
         publication_error.map_or(Ok(()), Err)
     }
@@ -5328,7 +6197,8 @@ impl Db {
         if vidx.total_len() == 0 {
             // Keep a brand-new empty graph mutable so subsequent inserts are
             // included in its first durable base at close/consolidation.
-            st.vector.insert((table.into(), column.into()), vidx);
+            st.vector
+                .insert((table.into(), column.into()), IndexCell::new(vidx));
             return publication_error.map_or(Ok(()), Err);
         }
         let post_publish = (|| -> Result<()> {
@@ -5346,7 +6216,8 @@ impl Db {
                 &mut mapped,
             )?;
             cleanup_vector_run_orphans(&self.shared.dir, table, column, &mapped);
-            st.vector.insert((table.into(), column.into()), mapped);
+            st.vector
+                .insert((table.into(), column.into()), IndexCell::new(mapped));
             Ok(())
         })();
         if let Err(error) = post_publish {
@@ -5456,7 +6327,8 @@ impl Db {
                 total_len,
             )?;
             publish_text_manifest(&self.shared.dir, table, column, version, &text)?;
-            st.text.insert((table.into(), column.into()), text);
+            st.text
+                .insert((table.into(), column.into()), IndexCell::new(text));
             Ok(())
         })();
         if let Err(error) = post_publish {
@@ -5534,7 +6406,7 @@ impl Db {
         next.tables.retain(|t| t.name != table);
         let publication_error =
             publish_catalog_generation_locked(&self.shared, &mut cs, &mut st, next)?;
-        st.identity_high_water.remove(table);
+        Arc::make_mut(&mut st.identity_high_water).remove(table);
         // Immutable primary pages may keep unreachable keys until compaction;
         // dropping only the bounded mutable delta avoids materializing the
         // complete mmap-backed primary index in RAM.
@@ -6305,19 +7177,14 @@ impl Db {
                 "text search request exceeds its per-query budget (top_k capacity {candidate_cap})"
             )));
         }
-        let _snapshot_guard: Snapshot;
-        let mut snapshots = self.shared.snapshots.lock().unwrap();
-        let mut st = self.shared.state.read().unwrap();
-        let snapshot_version = st.committed_version;
-        *snapshots.entry(snapshot_version).or_insert(0) += 1;
-        drop(snapshots);
-        _snapshot_guard = Snapshot {
-            version: snapshot_version,
-            shared: self.shared.clone(),
-        };
-        let schema = st
-            .catalog
-            .table(table)
+        // Everything below comes from the read view: no state lock.
+        let read_view = self.shared.state.view();
+        let snapshot_version = read_view.version;
+        let _snapshot_guard = Snapshot::register(&self.shared, snapshot_version);
+
+        let schema: &TableSchema = read_view
+            .schemas
+            .get(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
         if let Some(f) = filter {
             for key in f.keys() {
@@ -6328,27 +7195,58 @@ impl Db {
                 }
             }
         }
-        let tidx = st
+        let text_key = (table.to_owned(), column.to_owned());
+        let tidx = read_view
             .text
-            .get(&(table.to_owned(), column.to_owned()))
+            .get(&text_key)
             .ok_or_else(|| {
                 Error::InvalidArgument(format!(
                     "no text index on {table}.{column}; create one with create_text_index"
                 ))
-            })?;
-        // Visibility and filter check for one candidate, under the state
-        // lock. The accepted version travels back with the answer: resolving
-        // it again to decode the hit was a second full directory lookup for
+            })?
+            .clone();
+        // Copy the query's postings out with the text index's own lock and
+        // rank them with no lock at all: BM25 over every posting of a common
+        // term used to be one of the longest read sections, and every
+        // committer waited behind it. The survivors are validated against a
+        // snapshot of the table's directory taken now and decoded from the
+        // segment handles taken with it. The directory is multi-version and
+        // the registered snapshot keeps the segments alive.
+        let directory = read_view
+            .tables
+            .get(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        let all_readers = &read_view.readers;
+        let blobs = self.shared.blobs.clone();
+        let epoch = schema.epoch;
+        let implicit_id = schema.has_implicit_id();
+        let filter_projection = RowProjection::all(Some(schema));
+        // The public list is owned for callers' convenience; the projection
+        // wants slices, which costs one conversion per search, not per hit.
+        let wanted: Option<Vec<&str>> =
+            columns.map(|names| names.iter().map(String::as_str).collect());
+        let projection = RowProjection::new(Some(schema), wanted.as_deref());
+        // The state lock is never requested while the index is held.
+        let index = tidx.read();
+        let collected = index.collect_query(query, TEXT_COLLECT_MAX_POSTINGS)?;
+
+        drop(index);
+        let mut key = Vec::new();
+        let mut view = directory.view(table, &mut key);
+        // Visibility and filter check for one candidate against the snapshot.
+        // The accepted version travels back with the answer: resolving it
+        // again to decode the hit was a second full directory lookup for
         // every row returned.
-        let accept = |st: &State, id: &str| -> Result<Option<VKind>> {
-            let entry = st.latest_owned(table, id)?;
-            let Some(entry) = entry else { return Ok(None) };
-            if entry.is_tombstone() {
+        let mut accept = |id: &str| -> Result<Option<VKind>> {
+            let Some(entry) = view
+                .newest(id, u64::MAX)?
+                .filter(|entry| entry.version > epoch && !entry.is_tombstone())
+            else {
                 return Ok(None);
-            }
+            };
             if let Some(f) = filter {
-                let projection = RowProjection::all(st.catalog.table(table));
-                let rec = read_record_kind_keep(&st.blobs, &st.readers, &entry.kind, &projection)?;
+                let rec =
+                    read_record_kind_keep(&blobs, all_readers, &entry.kind, &filter_projection)?;
                 let ok = f.iter().all(|(k, want)| {
                     if k == ID_COLUMN {
                         matches!(want, Value::Text(t) if t == id)
@@ -6362,83 +7260,57 @@ impl Db {
             }
             Ok(Some(entry.kind))
         };
-        // Copy the query's postings out and rank them with the state lock
-        // released: BM25 over every posting of a common term used to be one of
-        // the longest read sections, and every committer waited behind it.
-        // Only the surviving top candidates are validated under the lock.
-        let ranked = match tidx.collect_query(query, TEXT_COLLECT_MAX_POSTINGS)? {
+        let ranked: Vec<(String, f32, VKind)> = match collected {
             Some(collected) => {
-                drop(st);
                 let mut candidates = collected.ranked();
-                st = self.shared.state.read().unwrap();
                 let mut ranked = Vec::with_capacity(top_k.min(candidates.len()));
                 while ranked.len() < top_k {
                     let Some((id, score)) = candidates.next_best() else {
                         break;
                     };
-                    if let Some(kind) = accept(&st, id)? {
+                    if let Some(kind) = accept(id)? {
                         // Only the handful that survives is copied out of
                         // the query's arena.
-                        ranked.push((id.to_owned(), score, Some(kind)));
+                        ranked.push((id.to_owned(), score, kind));
                     }
                 }
                 ranked
             }
-            None => tidx
-                .search_top_k(query, top_k, |id| Ok(accept(&st, id)?.is_some()))?
-                .into_iter()
-                .map(|(id, score)| (id, score, None))
-                .collect(),
+            None => {
+                // A query whose postings would not fit the copy streams its
+                // top-k under the index lock instead, validating as it goes.
+                let index = tidx.read();
+                let mut kinds = HashMap::new();
+                let ranked = index.search_top_k(query, top_k, |id| {
+                    Ok(match accept(id)? {
+                        Some(kind) => {
+                            kinds.insert(id.to_owned(), kind);
+                            true
+                        }
+                        None => false,
+                    })
+                })?;
+                drop(index);
+                ranked
+                    .into_iter()
+                    .map(|(id, score)| {
+                        let kind = kinds.remove(&id).expect("ranked ids were accepted");
+                        (id, score, kind)
+                    })
+                    .collect()
+            }
         };
-        // Decode the hits after releasing the state lock; the registered
-        // snapshot keeps their segments alive meanwhile.
-        let mut prepared = Vec::with_capacity(ranked.len());
-        let mut readers = SegmentReaders::default();
+        let mut hits = Vec::with_capacity(ranked.len());
         for (id, score, kind) in ranked {
-            let kind = match kind {
-                Some(kind) => kind,
-                None => {
-                    st.index
-                        .latest(table, &id)?
-                        .expect("ranked ids were validated above")
-                        .kind
-                }
-            };
-            if let VKind::SegPut { segment, .. } = &kind {
-                let reader = st
-                    .readers
-                    .get(segment)
-                    .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
-                readers.entry(*segment).or_insert_with(|| reader.clone());
-            }
-            prepared.push((id, score, kind));
-        }
-        let blobs = st.blobs.clone();
-        // The public list is owned for callers' convenience; the projection
-        // wants slices, which costs one conversion per search, not per hit.
-        let wanted: Option<Vec<&str>> =
-            columns.map(|names| names.iter().map(String::as_str).collect());
-        let projection = RowProjection::new(st.catalog.table(table), wanted.as_deref());
-        // Only a table that declares no id of its own surfaces the physical
-        // key as `id`. Putting it on every hit overwrote the declared column
-        // with a ULID, which is what hypothesis 41 fixed in the three other
-        // read paths and missed here.
-        let implicit_id = st
-            .catalog
-            .table(table)
-            .is_some_and(TableSchema::has_implicit_id);
-        drop(st);
-        let mut hits = Vec::with_capacity(prepared.len());
-        for (id, score, kind) in prepared {
-            let mut rec = read_record_kind_keep(&blobs, &readers, &kind, &projection)?;
+            let mut record = read_record_kind_keep(&blobs, all_readers, &kind, &projection)?;
+            // Only a table that declares no id of its own surfaces the
+            // physical key as `id`. Putting it on every hit overwrote the
+            // declared column with a ULID, which is what hypothesis 41 fixed
+            // in the three other read paths and missed here.
             if implicit_id {
-                rec.insert(ID_COLUMN, Value::Text(id.clone()));
+                record.insert(ID_COLUMN, Value::Text(id.clone()));
             }
-            hits.push(TextHit {
-                id,
-                score,
-                record: rec,
-            });
+            hits.push(TextHit { id, score, record });
         }
         Ok(hits)
     }
@@ -6536,10 +7408,11 @@ impl Db {
         if top_k == 0 {
             return Ok(Vec::new());
         }
-        let st = self.shared.state.read().unwrap();
-        let schema = st
-            .catalog
-            .table(table)
+        // Everything below comes from the read view: no state lock.
+        let read_view = self.shared.state.view();
+        let schema: &TableSchema = read_view
+            .schemas
+            .get(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
         let Some(col) = schema.column(column) else {
             return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
@@ -6566,14 +7439,15 @@ impl Db {
                 }
             }
         }
-        let vidx = st
+        let vcell = read_view
             .vector
             .get(&(table.to_owned(), column.to_owned()))
             .ok_or_else(|| {
                 Error::InvalidArgument(format!(
                     "no vector index on {table}.{column}; create one with create_vector_index"
                 ))
-            })?;
+            })?
+            .clone();
 
         // Candidate ids, distance heaps and the visited set are private query
         // memory. Metadata filtering may require over-fetching, but it must
@@ -6596,36 +7470,55 @@ impl Db {
         // quality curve remains at least as strong as the historical default,
         // while keeping construction cost and persisted graph size unchanged.
         let ef_base = requested_ef.saturating_mul(2).min(candidate_cap);
+        // The graph walk runs under the vector index's own lock, and the
+        // candidates are checked against a snapshot of the table's directory
+        // taken with it: a commit that does not change this index no longer
+        // waits for a search in progress. Decoding runs with no lock; an
+        // escalation walks the graph again under a fresh hold, and a row
+        // indexed after the snapshot is skipped, as a row committed after
+        // the search began would be. The registered snapshot keeps the
+        // segments alive.
+        let directory = read_view
+            .tables
+            .get(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        let all_readers = &read_view.readers;
+        let blobs = self.shared.blobs.clone();
+        let epoch = schema.epoch;
+        let projection = RowProjection::all(Some(schema));
+        // As in `search_text_inner`: the physical key is surfaced as `id`
+        // only for a table that declares none of its own.
+        let implicit_id = schema.has_implicit_id();
+        let _snapshot_guard = Snapshot::register(&self.shared, read_view.version);
+        // The state lock is never requested while the index is held.
+        let vidx = vcell.read();
+
         if vidx.live_len() == 0 {
             return Ok(Vec::new());
         }
         // Over-fetch to survive tombstones and metadata filtering, escalating
         // until enough hits pass or every backend label has been considered.
         let total = vidx.total_len();
-        let projection = RowProjection::all(st.catalog.table(table));
-        // As in `search_text_inner`: the physical key is surfaced as `id`
-        // only for a table that declares none of its own.
-        let implicit_id = st
-            .catalog
-            .table(table)
-            .is_some_and(TableSchema::has_implicit_id);
         let search_limit = total.min(candidate_cap);
         let mut fetch = top_k.saturating_mul(4).max(32).min(search_limit);
+        let mut raw = vidx.search_raw(query, fetch, ef_base.max(fetch));
+        drop(vidx);
+        let mut key = Vec::new();
+        let mut view = directory.view(table, &mut key);
         loop {
-            let raw = vidx.search_raw(query, fetch, ef_base.max(fetch));
             let mut hits: Vec<VectorHit> = Vec::with_capacity(top_k);
-            for (id, distance) in &raw {
-                let entry = st.latest_owned(table, id)?;
-                let Some(entry) = entry else { continue };
-                if entry.is_tombstone() {
+            for (id, distance) in raw {
+                let Some(entry) = view
+                    .newest(&id, u64::MAX)?
+                    .filter(|entry| entry.version > epoch && !entry.is_tombstone())
+                else {
                     continue;
-                }
-                let mut rec =
-                    read_record_kind_keep(&st.blobs, &st.readers, &entry.kind, &projection)?;
+                };
+                let mut rec = read_record_kind_keep(&blobs, all_readers, &entry.kind, &projection)?;
                 if let Some(filter) = &opts.filter {
                     let ok = filter.iter().all(|(k, want)| {
                         if k == ID_COLUMN {
-                            matches!(want, Value::Text(t) if t == id)
+                            matches!(want, Value::Text(t) if *t == id)
                         } else {
                             rec.get(k).unwrap_or(&Value::Null) == want
                         }
@@ -6638,8 +7531,8 @@ impl Db {
                     rec.insert(ID_COLUMN, Value::Text(id.clone()));
                 }
                 hits.push(VectorHit {
-                    id: id.clone(),
-                    distance: *distance,
+                    id,
+                    distance,
                     record: rec,
                 });
                 if hits.len() == top_k {
@@ -6650,6 +7543,7 @@ impl Db {
                 return Ok(hits);
             }
             fetch = fetch.saturating_mul(4).min(search_limit);
+            raw = vcell.read().search_raw(query, fetch, ef_base.max(fetch));
         }
     }
 
@@ -6678,8 +7572,12 @@ impl Db {
 
     /// The schema of a table, if it exists.
     pub fn table_schema(&self, table: &str) -> Option<Arc<TableSchema>> {
-        let st = self.shared.state.read().unwrap();
-        st.schema_arc(table)
+        self.shared
+            .published_schemas
+            .read()
+            .unwrap()
+            .get(table)
+            .cloned()
     }
 
     /// Execute one SQL statement from the deliberately small V1 dialect.
@@ -6772,31 +7670,36 @@ impl Db {
             staged: Vec::new(),
             staged_bytes: 0,
             statement_savepoint: None,
+            observed: Mutex::new(ObservedRows::default()),
         }
     }
 
     /// Take a stable read position at the current committed version.
     pub fn snapshot(&self) -> Snapshot {
-        let mut snaps = self.shared.snapshots.lock().unwrap();
-        let version = self.shared.state.read().unwrap().committed_version;
-        *snaps.entry(version).or_insert(0) += 1;
-        drop(snaps);
-        Snapshot {
-            version,
-            shared: self.shared.clone(),
+        // Registered without the state lock, so a snapshot never waits behind
+        // a queued writer. Compaction reads the committed version and then the
+        // registry while holding the commit lock, so a version that is still
+        // the published one after its registration is either in the registry
+        // compaction read or equal to the committed version it kept. When a
+        // commit published in between, retry at the newer version.
+        let shared = &self.shared;
+        let mut version = shared.published_version.load(AtomicOrdering::Acquire);
+        loop {
+            let snapshot = Snapshot::register(shared, version);
+            let current = shared.published_version.load(AtomicOrdering::Acquire);
+            if current == version {
+                return snapshot;
+            }
+            version = current;
         }
+
     }
 
     pub(crate) fn snapshot_with_identities(&self) -> (Snapshot, BTreeMap<String, i64>) {
-        let mut snaps = self.shared.snapshots.lock().unwrap();
         let state = self.shared.state.read().unwrap();
         let version = state.committed_version;
-        *snaps.entry(version).or_insert(0) += 1;
         (
-            Snapshot {
-                version,
-                shared: self.shared.clone(),
-            },
+            Snapshot::register(&self.shared, version),
             identity_manifest(&state),
         )
     }
@@ -6844,7 +7747,7 @@ impl Db {
                         "secondary index {table}.{index_id} is absent from catalog"
                     ))
                 })?;
-            for run in &index.runs {
+            for run in index.runs.iter() {
                 run.index.scan(|pair, _| {
                     if pair == SECONDARY_FORMAT_KEY {
                         return Ok(());
@@ -6860,7 +7763,7 @@ impl Db {
                 .chain(index.frozen.as_ref().map(|frozen| &frozen.delta))
             {
                 for (key, ids) in map {
-                    for id in ids {
+                    for id in ids.iter() {
                         if index.contains_pair(key, id)? {
                             visit(table, def, key, id)?;
                         }
@@ -6981,8 +7884,7 @@ impl Db {
         }
         let outcome = manifest.publish(&self.shared.dir)?;
         for (table, value) in manifest.identity_high_water {
-            state
-                .identity_high_water
+            Arc::make_mut(&mut state.identity_high_water)
                 .entry(table)
                 .or_default()
                 .fetch_max(value, AtomicOrdering::Relaxed);
@@ -7269,15 +8171,18 @@ impl Db {
         {
             let mut st = self.shared.state.write().unwrap();
             st.committed_version = version;
+            self.shared
+                .published_version
+                .store(version, AtomicOrdering::Release);
             st.change_log.note_unlogged(version);
             st.segments = new_segments;
-            st.readers.insert(
+            Arc::make_mut(&mut st.readers).insert(
                 next_segment_id,
                 Arc::new(SegmentReader::new(segment_reader)),
             );
             st.next_segment_id = next_segment_id.saturating_add(1);
             st.index.generation = generation;
-            st.index.runs.push(PrimaryRun {
+            Arc::make_mut(&mut st.index.runs).push(PrimaryRun {
                 meta: run_meta,
                 index: Arc::new(index),
             });
@@ -7534,7 +8439,22 @@ impl Db {
         )
     }
 
+    /// Every visible row of `table` as of `snapshot` that may pass `filter`,
+    /// streamed to `visit` without batching; see `reads::shared_scan_visit`.
+    pub(crate) fn scan_visit_at_unbudgeted(
+        &self,
+        snapshot: &Snapshot,
+        table: &str,
+        filter: Option<&ScanFilter>,
+        keep: Option<&[&str]>,
+        visit: impl FnMut(Record) -> Result<bool>,
+    ) -> Result<()> {
+        self.validate_snapshot_owner(snapshot)?;
+        reads::shared_scan_visit(&self.shared, table, snapshot.version, filter, keep, visit)
+    }
+
     fn validate_snapshot_owner(&self, snapshot: &Snapshot) -> Result<()> {
+
         if Arc::ptr_eq(&self.shared, &snapshot.shared) {
             Ok(())
         } else {
@@ -7562,27 +8482,60 @@ impl Db {
         column: &str,
         value: &Value,
     ) -> Result<Vec<(String, Record)>> {
-        // Register the exact generation while holding locks in the same order
-        // as compaction (snapshots -> state). This lets record decoding continue
-        // after the state lock is released without blob/segment GC invalidating
-        // the captured sources.
-        //
-        // Lock order also governs the guard's *drop*: `Snapshot::drop` takes
-        // the snapshot registry, so it must run after the state read guard is
-        // gone. Declaring the guard first makes it drop last. Holding the state
-        // lock while waiting for the registry deadlocked against
-        // `Db::snapshot` (registry held, state read blocked behind a queued
-        // writer that in turn waited for this reader).
+        // An indexed column is answered from the read view, with no lock.
+        let view = self.shared.state.view();
+        if let (Some(schema), Some(index), Some(directory)) = (
+            view.schemas.get(table),
+            view.secondary
+                .get(&single_secondary_index_key(table, column)),
+            view.tables.get(table),
+        ) {
+            if schema.column(column).is_some() {
+                if value.is_null() {
+                    return Ok(Vec::new());
+                }
+                let _snapshot_guard = Snapshot::register(&self.shared, view.version);
+                let mut ids = IdBatch::default();
+                index.ids_batch_into(&index_key(value), None, usize::MAX, &mut ids)?;
+                let mut key_buffer = Vec::new();
+                let mut table_view = directory.view(table, &mut key_buffer);
+                let mut prepared = Vec::with_capacity(ids.len());
+                for id in ids.iter() {
+                    if let Some(last) = table_view
+                        .newest(id, view.version)?
+                        .filter(|entry| entry.version > schema.epoch && !entry.is_tombstone())
+                    {
+                        prepared.push((id.to_owned(), last.kind));
+                    }
+                }
+                let projection = RowProjection::all(Some(schema));
+                let mut out = Vec::with_capacity(prepared.len());
+                for (id, kind) in prepared {
+                    let mut record = read_record_kind_keep(
+                        &self.shared.blobs,
+                        &view.readers,
+                        &kind,
+                        &projection,
+                    )?;
+                    if schema.has_implicit_id() {
+                        record.insert(ID_COLUMN, Value::Text(id.clone()));
+                    }
+                    out.push((id, record));
+                }
+                out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                return Ok(out);
+            }
+        }
+        drop(view);
+        // Register the exact generation under the state guard (state ->
+        // snapshots, the registry being a leaf lock). This lets record
+        // decoding continue after the state lock is released without
+        // blob/segment GC invalidating the captured sources.
         let _snapshot_guard: Snapshot;
-        let mut snapshots = self.shared.snapshots.lock().unwrap();
         let st = self.shared.state.read().unwrap();
         let version = st.committed_version;
-        *snapshots.entry(version).or_insert(0) += 1;
-        drop(snapshots);
-        _snapshot_guard = Snapshot {
-            version,
-            shared: self.shared.clone(),
-        };
+
+        _snapshot_guard = Snapshot::register(&self.shared, version);
         let schema = st
             .catalog
             .table(table)
@@ -7722,6 +8675,101 @@ impl Db {
         )
     }
 
+    /// `find_eq_batch_version` through the read view, with no state lock:
+    /// `None` when the view cannot answer (a snapshot other than the view's
+    /// version, a column without an index, an unknown table or column, for
+    /// which the locked path reports the error).
+    #[allow(clippy::too_many_arguments)]
+    fn find_eq_batch_from_view(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+        after_id: Option<&str>,
+        limit: usize,
+        version: Option<u64>,
+        keep: Option<&[&str]>,
+        want_ids: bool,
+    ) -> Result<Option<ScanBatch>> {
+        let view = self.shared.state.view();
+        // The index describes the latest committed state only.
+        if version.is_some_and(|version| version != view.version) {
+            return Ok(None);
+        }
+        let Some(schema) = view.schemas.get(table) else {
+            return Ok(None);
+        };
+        if schema.column(column).is_none() {
+            return Ok(None);
+        }
+        if value.is_null() || limit == 0 {
+            return Ok(Some(ScanBatch {
+                rows: Vec::new(),
+                ids: Vec::new(),
+                next: None,
+            }));
+        }
+        let (Some(index), Some(directory)) = (
+            view.secondary
+                .get(&single_secondary_index_key(table, column)),
+            view.tables.get(table),
+        ) else {
+            return Ok(None);
+        };
+        let _snapshot_guard = version.is_none().then(|| {
+            Snapshot::register(&self.shared, view.version)
+        });
+        let byte_budget = version.map(|_| (self.shared.opts.memory.query_working_bytes / 2).max(1));
+        let epoch = schema.epoch;
+        let key = index_key(value);
+        let mut prepared_ids = String::new();
+        let mut prepared: Vec<(IdSpan, VKind)> = Vec::new();
+        let mut readers = SegmentReaders::default();
+        let mut cursor: Option<String> = after_id.map(str::to_owned);
+        let mut key_buffer: Vec<u8> = Vec::new();
+        let mut ids = IdBatch::default();
+        loop {
+            let chunk = INDEX_SNAPSHOT_CHUNK_IDS.min(limit - prepared.len());
+            index.ids_batch_into(&key, cursor.as_deref(), chunk, &mut ids)?;
+            let exhausted = ids.len() < chunk;
+            let before = prepared.len();
+            let last_seen = ids.last().map(str::to_owned);
+            let mut table_view = directory.view(table, &mut key_buffer);
+            for id in ids.iter() {
+                let Some(entry) = table_view
+                    .newest(id, u64::MAX)?
+                    .filter(|entry| entry.version > epoch)
+                else {
+                    continue;
+                };
+                if entry.is_tombstone() {
+                    continue;
+                }
+                let span = push_id(&mut prepared_ids, id);
+                prepared.push((span, entry.kind));
+            }
+            if last_seen.is_some() {
+                cursor = last_seen;
+            }
+            retain_segment_readers_from(&view.readers, &prepared[before..], &mut readers)?;
+            if exhausted || prepared.len() >= limit {
+                break;
+            }
+        }
+        let projection = RowProjection::new(Some(schema), keep);
+        decode_prepared_batch(
+            &self.shared.blobs,
+            &readers,
+            &projection,
+            schema.has_implicit_id(),
+            &prepared,
+            &prepared_ids,
+            want_ids,
+            byte_budget,
+        )
+        .map(Some)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn find_eq_batch_version(
         &self,
@@ -7734,21 +8782,19 @@ impl Db {
         keep: Option<&[&str]>,
         want_ids: bool,
     ) -> Result<ScanBatch> {
+        if let Some(batch) = self.find_eq_batch_from_view(
+            table, column, value, after_id, limit, version, keep, want_ids,
+        )? {
+            return Ok(batch);
+        }
         // Without a caller snapshot, register one at the committed version so
         // decoding after the state lock is released cannot race segment GC
-        // (same lock order as `find_eq_unbudgeted`: snapshots, then state).
+        // (same lock order as `find_eq_unbudgeted`: state, then snapshots).
         let _snapshot_guard: Option<Snapshot>;
-        let snapshots = version
-            .is_none()
-            .then(|| self.shared.snapshots.lock().unwrap());
-        let mut st = self.shared.state.read().unwrap();
-        _snapshot_guard = snapshots.map(|mut snapshots| {
+        let st = self.shared.state.read().unwrap();
+        _snapshot_guard = version.is_none().then(|| {
             let version = st.committed_version;
-            *snapshots.entry(version).or_insert(0) += 1;
-            Snapshot {
-                version,
-                shared: self.shared.clone(),
-            }
+            Snapshot::register(&self.shared, version)
         });
         let schema = st
             .catalog
@@ -7791,48 +8837,108 @@ impl Db {
         let mut key_buffer: Vec<u8> = Vec::new();
         let mut complete = false;
         if index_usable(&st) {
+            // Everything this path reads is taken out of the lock at once:
+            // the value's ids in the index, the table's directory, the
+            // segment handles. The index lookups and the directory probes
+            // then run without it; they used to hold it in chunks of 32 ids,
+            // and committers waited for those chunks.
             let key = index_key(value);
+            let index = st
+                .secondary
+                .get(&indexed_key)
+                .expect("index_usable checked it")
+                .key_snapshot(&key);
+            let directory = st.index.table_snapshot(table);
+            let all_readers = st.readers.clone();
+            let blobs = st.blobs.clone();
+            let implicit_id = schema.has_implicit_id();
+            let projection = RowProjection::new(Some(schema), keep);
+            drop(st);
             let mut ids = IdBatch::default();
             loop {
-                let chunk = INDEX_LOCK_CHUNK_IDS.min(limit - prepared.len());
-                let Some(index) = st.secondary.get(&indexed_key).filter(|_| index_usable(&st))
-                else {
-                    break;
-                };
-                index.ids_batch_into(&key, cursor.as_deref(), chunk, &mut ids)?;
+                let chunk = INDEX_SNAPSHOT_CHUNK_IDS.min(limit - prepared.len());
+                index.ids_batch_into(cursor.as_deref(), chunk, &mut ids)?;
                 let exhausted = ids.len() < chunk;
                 let before = prepared.len();
-                // The continuation only needs the last id the chunk visited,
-                // visible or not; cloning every id to carry it cost one
-                // allocation per matched row.
                 let last_seen = ids.last().map(str::to_owned);
-                // One view of the table for the whole chunk: the hash-map
-                // lookups and the key prefix are resolved once, not per row.
-                if let Some((mut view, table_epoch)) = st.table_view(table, &mut key_buffer) {
-                    for id in ids.iter() {
+                let mut view = directory.view(table, &mut key_buffer);
+                for id in ids.iter() {
+                    let Some(entry) = view
+                        .newest(id, u64::MAX)?
+                        .filter(|entry| entry.version > epoch)
+                    else {
+                        continue;
+                    };
+                    if entry.is_tombstone() {
+                        continue;
+                    }
+                    let span = push_id(&mut prepared_ids, id);
+                    prepared.push((span, entry.kind));
+                }
+                if last_seen.is_some() {
+                    cursor = last_seen;
+                }
+                retain_segment_readers_from(&all_readers, &prepared[before..], &mut readers)?;
+                if exhausted || prepared.len() >= limit {
+                    break;
+                }
+            }
+            return decode_prepared_batch(
+                &blobs,
+                &readers,
+                &projection,
+                implicit_id,
+                &prepared,
+                &prepared_ids,
+                want_ids,
+                byte_budget,
+            );
+        }
+        // A snapshot that a commit has made historical cannot trust the
+        // index alone, but the index plus every row changed since the
+        // snapshot is a superset of its matches (the rule `Txn::find_eq`
+        // follows). Each candidate is then checked at its version visible to
+        // the snapshot, so only the directory lookups of that small set run
+        // under the lock instead of a walk of the whole table.
+        if !complete && prepared.len() < limit {
+            if let Some(version) = version.filter(|version| *version != st.committed_version) {
+                let predicate = encoded_eq_predicate(&st, table, column, value);
+                if let Some(candidates) =
+                    historical_eq_candidates(&st, table, column, value, version)?
+                {
+                    let before = prepared.len();
+                    let mut view = st.index.table_view(table, &mut key_buffer);
+                    for id in candidates.range::<str, _>((
+                        cursor
+                            .as_deref()
+                            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                        std::ops::Bound::Unbounded,
+                    )) {
                         let Some(entry) = view
-                            .newest(id, u64::MAX)?
-                            .filter(|entry| entry.version > table_epoch)
+                            .newest(id, version)?
+                            .filter(|entry| entry.version > epoch)
                         else {
                             continue;
                         };
                         if entry.is_tombstone() {
                             continue;
                         }
+                        let matched = with_payload(&st.readers, &entry.kind, |payload| {
+                            encoded_record_column_eq(payload, &predicate, &st.blobs)
+                        })?
+                        .unwrap_or(false);
+                        if !matched {
+                            continue;
+                        }
                         let span = push_id(&mut prepared_ids, id);
                         prepared.push((span, entry.kind));
+                        if prepared.len() >= limit {
+                            break;
+                        }
                     }
-                }
-                if last_seen.is_some() {
-                    cursor = last_seen;
-                }
-                retain_segment_readers(&st, &prepared[before..], &mut readers)?;
-                if exhausted || prepared.len() >= limit {
+                    retain_segment_readers(&st, &prepared[before..], &mut readers)?;
                     complete = true;
-                    break;
                 }
-                drop(st);
-                st = self.shared.state.read().unwrap();
             }
         }
         if !complete && prepared.len() < limit {
@@ -7875,51 +8981,63 @@ impl Db {
             .is_some_and(TableSchema::has_implicit_id);
         let projection = RowProjection::new(st.catalog.table(table), keep);
         drop(st);
-        let mut rows = Vec::with_capacity(prepared.len());
-        let mut ids = Vec::with_capacity(if want_ids { prepared.len() } else { 0 });
-        let mut retained_bytes = 0usize;
-        for (span, kind) in &prepared {
-            let id = span.of(&prepared_ids);
-            let mut record = read_record_kind_keep(&blobs, &readers, kind, &projection)?;
-            if implicit_id {
-                record.insert(ID_COLUMN, Value::Text(id.to_owned()));
-            }
-            if !record_fits_batch(&record, id, byte_budget, &mut retained_bytes)? {
-                break;
-            }
-            if want_ids {
-                ids.push(id.to_owned());
-            }
-            rows.push(record);
-        }
-        // The caller resumes strictly after the last row it received.
-        let next = prepared
-            .get(rows.len().wrapping_sub(1))
-            .map(|(span, _)| span.of(&prepared_ids).to_owned());
-        Ok(ScanBatch { rows, ids, next })
+        decode_prepared_batch(
+            &blobs,
+            &readers,
+            &projection,
+            implicit_id,
+            &prepared,
+            &prepared_ids,
+            want_ids,
+            byte_budget,
+        )
     }
 
     /// Current-state ordered walk of a secondary index. Historical snapshots
     /// deliberately use the established scan/sort path because secondary runs
     /// only model the latest committed membership.
+    #[cfg(test)]
     pub(crate) fn ordered_secondary_batch_current(
         &self,
         snapshot: &Snapshot,
         request: OrderedSecondaryRead<'_>,
     ) -> Result<Option<OrderedSecondaryBatch>> {
-        if request.limit == 0 {
-            return Ok(Some(OrderedSecondaryBatch {
-                rows: Vec::new(),
-                next: None,
-                skipped: 0,
-            }));
-        }
+        Ok(self
+            .ordered_secondary_batch_latest(Some(snapshot), request)?
+            .map(|(batch, _)| batch))
+    }
+
+    /// [`Self::ordered_secondary_batch_current`] for a caller that may still
+    /// choose its snapshot. With `pinned` absent the walk reads the latest
+    /// version and returns a snapshot registered at it under the same state
+    /// guard, so a commit cannot make the batch historical before it starts.
+    pub(crate) fn ordered_secondary_batch_latest(
+        &self,
+        pinned: Option<&Snapshot>,
+        request: OrderedSecondaryRead<'_>,
+    ) -> Result<Option<(OrderedSecondaryBatch, Option<Snapshot>)>> {
         let st = self.shared.state.read().unwrap();
         // Secondary runs describe only the latest membership. A caller that
         // has become historical while waiting for this lock must fall back to
         // the snapshot-aware primary scan and sort, before yielding any rows.
-        if st.committed_version != snapshot.version() {
-            return Ok(None);
+        let fresh = match pinned {
+            Some(snapshot) if st.committed_version != snapshot.version() => return Ok(None),
+            Some(_) => None,
+            None => {
+                Some(Snapshot::register(&self.shared, st.committed_version))
+            }
+        };
+        // Equal to the pinned snapshot's version when there is one.
+        let version = st.committed_version;
+        if request.limit == 0 {
+            return Ok(Some((
+                OrderedSecondaryBatch {
+                    rows: Vec::new(),
+                    next: None,
+                    skipped: 0,
+                },
+                fresh,
+            )));
         }
         let schema = st
             .catalog
@@ -7953,7 +9071,7 @@ impl Db {
         if let Some((mut view, epoch)) = st.table_view(request.table, &mut key_buffer) {
             for (position, entry) in entries.iter().enumerate().skip(skipped) {
                 let Some(version) = view
-                    .newest(entry.id(), snapshot.version())?
+                    .newest(entry.id(), version)?
                     .filter(|version| version.version > epoch)
                 else {
                     continue;
@@ -7996,11 +9114,14 @@ impl Db {
         let next = next_position.map(|position| std::mem::take(&mut entries[position].pair));
         // A stale index entry can produce no visible row; advancing through
         // it is still required to avoid repeating the empty batch forever.
-        Ok(Some(OrderedSecondaryBatch {
-            rows,
-            next,
-            skipped,
-        }))
+        Ok(Some((
+            OrderedSecondaryBatch {
+                rows,
+                next,
+                skipped,
+            },
+            fresh,
+        )))
     }
 
     // --- maintenance -----------------------------------------------------------
@@ -8053,12 +9174,20 @@ impl Db {
                 state.segments.len(),
                 state.index.runs.len(),
                 state.secondary.values().map(|index| index.runs.len()).sum(),
-                state.text.values().map(|index| index.runs.len()).sum(),
-                state.vector.values().map(VecIdx::mapped_run_count).sum(),
+                state
+                    .text
+                    .values()
+                    .map(|index| index.read().runs.len())
+                    .sum(),
                 state
                     .vector
                     .values()
-                    .map(VecIdx::mapped_metadata_bytes)
+                    .map(|index| index.read().mapped_run_count())
+                    .sum(),
+                state
+                    .vector
+                    .values()
+                    .map(|index| index.read().mapped_metadata_bytes())
                     .sum(),
             )
         };
@@ -8156,6 +9285,16 @@ impl Db {
                 .shared
                 .coordinated_commit_count
                 .load(AtomicOrdering::Relaxed),
+            delta_rebased_rows: self.shared.delta_rebased_rows.load(AtomicOrdering::Relaxed),
+            coordinator_handoffs: self
+                .shared
+                .coordinator_handoffs
+                .load(AtomicOrdering::Relaxed),
+            coordinator_handoff_time: Duration::from_nanos(
+                self.shared
+                    .coordinator_handoff_nanos
+                    .load(AtomicOrdering::Relaxed),
+            ),
             point_read_throttles: self
                 .shared
                 .point_read_throttle_count
@@ -8600,10 +9739,11 @@ impl Db {
         // below is the only thing that then has to be transformed.
         checkpoint_measured(shared, &mut cs)?;
 
+        // The commit lock holds `committed_version` still, and a snapshot
+        // registered after this read is at that version (see `Db::snapshot`).
         let watermarks: Vec<u64> = {
-            let snaps = shared.snapshots.lock().unwrap();
             let st = shared.state.read().unwrap();
-            let mut w: Vec<u64> = snaps.keys().copied().collect();
+            let mut w: Vec<u64> = shared.snapshots.versions();
             w.push(st.committed_version);
             w.sort_unstable();
             w.dedup();
@@ -8841,21 +9981,33 @@ impl Db {
         // propagating any disposable-index error.
         {
             let mut st = shared.state.write().unwrap();
-            st.set_catalog(new_catalog);
+            st.set_catalog(new_catalog, &shared.published_schemas);
             // Identities are reserved under the state lock, not the commit
             // mutex, so statements kept reserving while this rewrite ran.
             // Overwriting the map with the snapshot taken above re-issued
             // those values and the second commit failed its unique index.
             // Keep the higher of the rewritten and the live mark per table.
             let mut merged: HashMap<String, i64> = identity_high_water.into_iter().collect();
-            for (table, value) in std::mem::take(&mut st.identity_high_water) {
-                let high = merged.entry(rw.output_table(&table)).or_insert(0);
+            let live = std::mem::take(&mut st.identity_high_water);
+            for (table, value) in live.iter() {
+                let high = merged.entry(rw.output_table(table)).or_insert(0);
                 *high = (*high).max(value.load(AtomicOrdering::Relaxed));
             }
-            st.identity_high_water = merged
-                .into_iter()
-                .map(|(table, value)| (table, AtomicI64::new(value)))
-                .collect();
+            // A table keeps its counter object: a reader holding an older
+            // read view reserves from the same counter, never a second one.
+            st.identity_high_water = Arc::new(
+                merged
+                    .into_iter()
+                    .map(|(table, value)| {
+                        let counter = live
+                            .get(&table)
+                            .cloned()
+                            .unwrap_or_else(|| Arc::new(AtomicI64::new(0)));
+                        counter.fetch_max(value, AtomicOrdering::Relaxed);
+                        (table, counter)
+                    })
+                    .collect(),
+            );
             st.index = new_primary;
             st.table_high_ids = new_high_ids;
             st.superseded_segments = if new_segment_superseded && segment_position > 0 {
@@ -8863,7 +10015,7 @@ impl Db {
             } else {
                 HashSet::new()
             };
-            st.readers = new_readers;
+            st.readers = Arc::new(new_readers);
             st.segments = new_segments;
             st.next_segment_id = seg_id + 1;
             if rw.is_ddl() {
@@ -9062,6 +10214,7 @@ impl Txn {
         if let Some(existing) = staged_table.operations.get_mut(&id) {
             existing.operation = operation;
             existing.deleted_record = None;
+            existing.rebase = None;
         } else {
             let position = staged_table.next_position;
             staged_table.next_position = staged_table.next_position.saturating_add(1);
@@ -9071,6 +10224,7 @@ impl Txn {
                     position,
                     operation,
                     deleted_record: None,
+                    rebase: None,
                 },
             );
         }
@@ -9092,19 +10246,21 @@ impl Txn {
             if let Some(index) = self.staged.iter().position(|(name, _)| name == table) {
                 index
             } else {
-                let st = self.shared.state.read().unwrap();
-                let schema = st
-                    .catalog
-                    .table(table)
-                    .ok_or_else(|| Error::TableNotFound(table.into()))?
-                    .clone();
-                let snapshot_high_id = st.table_high_ids.get(table).cloned();
+                // The published schema entries, without the state lock.
+                let shared_schema = self
+                    .shared
+                    .published_schemas
+                    .read()
+                    .unwrap()
+                    .get(table)
+                    .cloned()
+                    .ok_or_else(|| Error::TableNotFound(table.into()))?;
                 self.staged.push((
                     table.to_owned(),
                     StagedTable {
-                        schema,
-                        shared_schema: None,
-                        snapshot_high_id,
+                        schema: (*shared_schema).clone(),
+                        shared_schema: Some(shared_schema),
+                        snapshot_high_id: None,
                         operations: StagedOperations::new(),
                         next_position: 0,
                     },
@@ -9180,6 +10336,31 @@ impl Txn {
 
     /// Read through this transaction: staged writes first, then the snapshot.
     pub fn get(&self, table: &str, id: &str) -> Result<Option<Record>> {
+        let record = self.get_unobserved(table, id)?;
+        if record.is_some() {
+            self.observe(table, std::iter::once(id));
+        }
+        Ok(record)
+    }
+
+    /// Record rows handed back to the caller (see `ObservedRows`).
+    fn observe<'a>(&self, table: &str, ids: impl ExactSizeIterator<Item = &'a str>) {
+        self.observed.lock().unwrap().mark(table, ids);
+    }
+
+    /// `observe` for rows a statement read without observing and then
+    /// returned to the caller.
+    pub(crate) fn observe_rows<'a>(
+        &self,
+        table: &str,
+        ids: impl ExactSizeIterator<Item = &'a str>,
+    ) {
+        self.observe(table, ids);
+    }
+
+    /// `get` for the transaction's own use: the row is not handed back to
+    /// the caller, so it does not count as observed.
+    pub(crate) fn get_unobserved(&self, table: &str, id: &str) -> Result<Option<Record>> {
         let has_implicit_id = self
             .staged
             .iter()
@@ -9217,6 +10398,13 @@ impl Txn {
     /// Scan through the transaction's stable snapshot with staged writes
     /// overlaid. This is also the view used to discover cascade targets.
     pub fn scan(&self, table: &str) -> Result<Vec<(String, Record)>> {
+        let rows = self.scan_unobserved(table)?;
+        self.observe(table, rows.iter().map(|(id, _)| id.as_str()));
+        Ok(rows)
+    }
+
+    /// `scan` whose rows do not count as observed.
+    pub(crate) fn scan_unobserved(&self, table: &str) -> Result<Vec<(String, Record)>> {
         let mut rows: BTreeMap<String, Record> =
             shared_scan_at(&self.shared, table, self.snapshot.version)?
                 .into_iter()
@@ -9240,12 +10428,94 @@ impl Txn {
         Ok(rows.into_iter().collect())
     }
 
+    /// What `find_eq_unobserved` needs, from a read view covering the
+    /// snapshot and without the state lock: `Some(None)` when the column has
+    /// no index, `None` when the view cannot answer (it does not cover the
+    /// snapshot, or its change-log tail does not reach back to it), which
+    /// sends the caller to the locked path.
+    #[allow(clippy::type_complexity)]
+    fn find_eq_parts_from_view(
+        &self,
+        table: &str,
+        column: &str,
+        key: &[u8],
+        version: u64,
+    ) -> Result<
+        Option<
+            Option<(
+                bool,
+                Vec<(String, VKind)>,
+                PathBuf,
+                SegmentReaders,
+                RowProjection<'static>,
+            )>,
+        >,
+    > {
+        let Some(view) = view_covering(&self.shared, version) else {
+            return Ok(None);
+        };
+        let (Some(schema), Some(directory)) = (view.schemas.get(table), view.tables.get(table))
+        else {
+            return Ok(None);
+        };
+        let Some(definition) = schema.column(column) else {
+            return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
+        };
+        let Some(index) = view
+            .secondary
+            .get(&single_secondary_index_key(table, column))
+        else {
+            return Ok(Some(None));
+        };
+        let mut ids = IdBatch::default();
+        index.ids_batch_into(key, None, usize::MAX, &mut ids)?;
+        let mut candidates: BTreeSet<String> = ids.iter().map(str::to_owned).collect();
+        // As on the locked path: an identity never changes, so the index alone
+        // is exact for it.
+        if !definition.identity {
+            let Some(changed) = view.change_tail.changed_after(table, version) else {
+                return Ok(None);
+            };
+            candidates.extend(changed.into_iter().map(str::to_owned));
+        }
+        let mut readers = SegmentReaders::default();
+        let mut prepared = Vec::with_capacity(candidates.len());
+        let mut key_buffer = Vec::new();
+        let mut table_view = directory.view(table, &mut key_buffer);
+        for id in candidates {
+            let Some(entry) = table_view
+                .newest(&id, version)?
+                .filter(|entry| entry.version > schema.epoch && !entry.is_tombstone())
+            else {
+                continue;
+            };
+            if let VKind::SegPut { segment, .. } = &entry.kind {
+                let reader = view
+                    .readers
+                    .get(segment)
+                    .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
+                readers.entry(*segment).or_insert_with(|| reader.clone());
+            }
+            prepared.push((id, entry.kind));
+        }
+        Ok(Some(Some((
+            schema.has_implicit_id(),
+            prepared,
+            self.shared.blobs.clone(),
+            readers,
+            RowProjection::all(Some(schema)),
+        ))))
+    }
+
     /// Equality lookup through this transaction: the rows of `table` whose
     /// `column` equals `value` as of the snapshot, with staged writes
     /// overlaid, ordered by id. Returns `None` when the exact indexed path is
     /// unavailable (no secondary index on the column, or the snapshot is older
     /// than the change log reaches); callers then fall back to `scan`.
-    pub(crate) fn find_eq(
+    ///
+    /// The rows are not marked as observed: the SQL layer marks what it
+    /// returns (`observe_rows`).
+    pub(crate) fn find_eq_unobserved(
         &self,
         table: &str,
         column: &str,
@@ -9256,67 +10526,72 @@ impl Txn {
         }
         let version = self.snapshot.version;
         let key = index_key(value);
-        let (implicit_id, prepared, blobs, readers, projection) = {
-            let st = self.shared.state.read().unwrap();
-            let schema = st
-                .catalog
-                .table(table)
-                .ok_or_else(|| Error::TableNotFound(table.into()))?;
-            if schema.column(column).is_none() {
-                return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
-            }
-            let Some(index) = st.secondary.get(&single_secondary_index_key(table, column)) else {
-                return Ok(None);
+        let (implicit_id, prepared, blobs, readers, projection) =
+            match self.find_eq_parts_from_view(table, column, &key, version)? {
+                Some(Some(parts)) => parts,
+                Some(None) => return Ok(None),
+                None => {
+                    let st = self.shared.state.read().unwrap();
+                    let schema = st
+                        .catalog
+                        .table(table)
+                        .ok_or_else(|| Error::TableNotFound(table.into()))?;
+                    if schema.column(column).is_none() {
+                        return Err(Error::SchemaViolation(format!("unknown column '{column}'")));
+                    }
+                    let Some(index) = st.secondary.get(&single_secondary_index_key(table, column))
+                    else {
+                        return Ok(None);
+                    };
+                    let mut candidates: BTreeSet<String> = index.ids(&key)?;
+                    // An identity column never changes after insert, so no row can
+                    // have carried this value at the snapshot and lost it since: the
+                    // index alone is exact and the change log (which grows with the
+                    // age of the snapshot) is not consulted for the hot `id = ?` case.
+                    let immutable_column = schema
+                        .column(column)
+                        .is_some_and(|definition| definition.identity);
+                    if !immutable_column {
+                        let Some(changed) = st.change_log.changed_after(table, version) else {
+                            return Ok(None);
+                        };
+                        candidates.extend(changed.into_iter().map(str::to_owned));
+                    }
+                    // Decoding runs after the state lock is released, like the
+                    // autocommit lookup; the transaction's registered snapshot keeps
+                    // the captured segments alive meanwhile.
+                    let mut readers = SegmentReaders::default();
+                    let mut prepared = Vec::with_capacity(candidates.len());
+                    let mut key_buffer = Vec::new();
+                    let epoch = schema.epoch;
+                    let mut view = st.index.table_view(table, &mut key_buffer);
+                    for id in candidates {
+                        let Some(entry) = view
+                            .newest(&id, version)?
+                            .filter(|entry| entry.version > epoch)
+                        else {
+                            continue;
+                        };
+                        if entry.is_tombstone() {
+                            continue;
+                        }
+                        if let VKind::SegPut { segment, .. } = &entry.kind {
+                            let reader = st.readers.get(segment).ok_or_else(|| {
+                                Error::Corrupt(format!("missing segment {segment}"))
+                            })?;
+                            readers.entry(*segment).or_insert_with(|| reader.clone());
+                        }
+                        prepared.push((id, entry.kind));
+                    }
+                    (
+                        schema.has_implicit_id(),
+                        prepared,
+                        st.blobs.clone(),
+                        readers,
+                        RowProjection::all(Some(schema)),
+                    )
+                }
             };
-            let mut candidates: BTreeSet<String> = index.ids(&key)?;
-            // An identity column never changes after insert, so no row can
-            // have carried this value at the snapshot and lost it since: the
-            // index alone is exact and the change log (which grows with the
-            // age of the snapshot) is not consulted for the hot `id = ?` case.
-            let immutable_column = schema
-                .column(column)
-                .is_some_and(|definition| definition.identity);
-            if !immutable_column {
-                let Some(changed) = st.change_log.changed_after(table, version) else {
-                    return Ok(None);
-                };
-                candidates.extend(changed.into_iter().map(str::to_owned));
-            }
-            // Decoding runs after the state lock is released, like the
-            // autocommit lookup; the transaction's registered snapshot keeps
-            // the captured segments alive meanwhile.
-            let mut readers = SegmentReaders::default();
-            let mut prepared = Vec::with_capacity(candidates.len());
-            let mut key_buffer = Vec::new();
-            let epoch = schema.epoch;
-            let mut view = st.index.table_view(table, &mut key_buffer);
-            for id in candidates {
-                let Some(entry) = view
-                    .newest(&id, version)?
-                    .filter(|entry| entry.version > epoch)
-                else {
-                    continue;
-                };
-                if entry.is_tombstone() {
-                    continue;
-                }
-                if let VKind::SegPut { segment, .. } = &entry.kind {
-                    let reader = st
-                        .readers
-                        .get(segment)
-                        .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
-                    readers.entry(*segment).or_insert_with(|| reader.clone());
-                }
-                prepared.push((id, entry.kind));
-            }
-            (
-                schema.has_implicit_id(),
-                prepared,
-                st.blobs.clone(),
-                readers,
-                RowProjection::all(Some(schema)),
-            )
-        };
         let mut rows: BTreeMap<String, Record> = BTreeMap::new();
         for (id, kind) in prepared {
             let mut record = read_record_kind_keep(&blobs, &readers, &kind, &projection)?;
@@ -9408,6 +10683,23 @@ impl Txn {
         } else {
             None
         };
+        if self.staged[table_index].1.snapshot_high_id.is_none() {
+            // From a read view at least as new as the snapshot, so the mark
+            // is no lower than the snapshot's.
+            let high = match view_covering(&self.shared, self.snapshot.version) {
+                Some(view) => view.table_high_ids.get(table).cloned(),
+                None => self
+                    .shared
+                    .state
+                    .read()
+                    .unwrap()
+                    .table_high_ids
+                    .get(table)
+                    .cloned(),
+            };
+            self.staged[table_index].1.snapshot_high_id = Some(high);
+        }
+
         let schema = &self.staged[table_index].1.schema;
         let id = if let Some(id) = restored_id {
             if id.is_empty() {
@@ -9499,18 +10791,19 @@ impl Txn {
             }
         }
         let normalized = normalize_record(schema, record)?;
-        let staged_table = &self.staged[table_index].1;
-        let exists = match staged_table
+        let staged_operation = self.staged[table_index]
+            .1
             .operations
             .get(&id)
-            .map(|staged| &staged.operation)
-        {
-            Some(Some(_)) => true,
-            Some(None) => false,
+            .map(|staged| staged.operation.is_some());
+        let exists = match staged_operation {
+            Some(present) => present,
             None => {
-                let above_snapshot_high = staged_table
+                let above_snapshot_high = self.staged[table_index]
+                    .1
                     .snapshot_high_id
-                    .as_deref()
+                    .as_ref()
+                    .and_then(Option::as_deref)
                     .is_none_or(|high| id.as_str() > high);
                 if above_snapshot_high {
                     false
@@ -9644,8 +10937,8 @@ impl Txn {
             ));
         }
         {
-            let st = self.shared.state.read().unwrap();
-            for schema in &st.catalog.tables {
+            let view = self.shared.state.view();
+            for schema in view.schemas.values() {
                 for foreign_key in &schema.foreign_keys {
                     if foreign_key.referenced_table == table
                         && patch.contains_key(&foreign_key.referenced_column)
@@ -9658,10 +10951,12 @@ impl Txn {
                 }
             }
         }
-        let mut current = self.get(table, id)?.ok_or_else(|| Error::RecordNotFound {
-            table: table.into(),
-            id: id.into(),
-        })?;
+        let mut current = self
+            .get_unobserved(table, id)?
+            .ok_or_else(|| Error::RecordNotFound {
+                table: table.into(),
+                id: id.into(),
+            })?;
         if has_implicit_id {
             current.remove(ID_COLUMN);
         }
@@ -9688,9 +10983,48 @@ impl Txn {
         self.stage(table, id.to_owned(), Some(current))
     }
 
+    /// `update` for a delta update: `patch` is `step` applied to the row
+    /// this transaction sees, and `step` can re-apply it at commit to a newer
+    /// committed version (see `RebaseStep`). The row keeps that ability only
+    /// while every write to it in this transaction is a delta update and the
+    /// transaction never returns it to the caller.
+    pub(crate) fn update_with_rebase(
+        &mut self,
+        table: &str,
+        id: &str,
+        patch: Record,
+        step: RebaseStep,
+    ) -> Result<()> {
+        // `None`: first write to the row in this transaction.
+        let earlier = self
+            .staged
+            .iter()
+            .find(|(name, _)| name == table)
+            .and_then(|(_, staged)| staged.operations.get(id))
+            .map(|operation| operation.rebase.clone());
+        self.update(table, id, patch)?;
+        let rebase = match earlier {
+            None => Some(vec![step]),
+            Some(Some(mut steps)) => {
+                steps.push(step);
+                Some(steps)
+            }
+            Some(None) => None,
+        };
+        if let Some(operation) = self
+            .staged
+            .iter_mut()
+            .find(|(name, _)| name == table)
+            .and_then(|(_, staged)| staged.operations.get_mut(id))
+        {
+            operation.rebase = rebase;
+        }
+        Ok(())
+    }
+
     pub fn delete(&mut self, table: &str, id: &str) -> Result<bool> {
         self.schema(table)?;
-        let Some(current) = self.get(table, id)? else {
+        let Some(current) = self.get_unobserved(table, id)? else {
             return Ok(false);
         };
         self.stage(table, id.to_owned(), None)?;
@@ -9715,6 +11049,22 @@ impl Txn {
 
     fn commit_uncontrolled(mut self) -> Result<u64> {
         self.expand_delete_cascades()?;
+        let observed = self.observed.get_mut().unwrap();
+        for (table, staged) in &mut self.staged {
+            if let Some(general) = &mut staged.operations.general {
+                for (id, operation) in general.iter_mut() {
+                    if operation.rebase.is_some() && observed.contains(table, id) {
+                        operation.rebase = None;
+                    }
+                }
+            } else {
+                for (id, operation) in &mut staged.operations.monotonic {
+                    if operation.rebase.is_some() && observed.contains(table, id) {
+                        operation.rebase = None;
+                    }
+                }
+            }
+        }
         commit_staged(&self.shared, self.snapshot.version, self.staged)
     }
 
@@ -9725,7 +11075,6 @@ impl Txn {
         const MAX_CASCADE_DEPTH: usize = 64;
         const MAX_CASCADE_ROWS: usize = 100_000;
 
-        let catalog = self.shared.state.read().unwrap().catalog.clone();
         let mut queue = VecDeque::new();
         let mut visited = HashSet::new();
         for (table, staged) in &self.staged {
@@ -9738,6 +11087,11 @@ impl Txn {
                 }
             }
         }
+        // Most commits delete nothing: skip the catalog copy and its lock.
+        if queue.is_empty() {
+            return Ok(());
+        }
+        let catalog = self.shared.state.read().unwrap().catalog.clone();
 
         while let Some((parent_table, _parent_id, parent_record, depth)) = queue.pop_front() {
             if depth >= MAX_CASCADE_DEPTH {
@@ -9758,7 +11112,7 @@ impl Txn {
                         continue;
                     }
                     let matches: Vec<_> = self
-                        .scan(&child_schema.name)?
+                        .scan_unobserved(&child_schema.name)?
                         .into_iter()
                         .filter(|(_, record)| record.get(&foreign_key.column) == Some(parent_value))
                         .collect();
@@ -9796,22 +11150,21 @@ impl Txn {
 }
 
 fn reserve_identity(shared: &Shared, table: &str, explicit: Option<i64>) -> Result<i64> {
-    // The common path reserves with one atomic under the shared lock. Only a
+    // The common path reserves with one atomic, found through the read view:
+    // the counters are shared with the state, so no lock is needed. Only a
     // table whose sequence has never been touched needs the exclusive lock,
     // once, to create its counter.
-    {
-        let st = shared.state.read().unwrap();
-        if let Some(high) = st.identity_high_water.get(table) {
-            return reserve_from(high, table, explicit);
-        }
+    if let Some(high) = shared.state.view().identities.get(table) {
+        return reserve_from(high, table, explicit);
     }
     let _active_state_writer = ActiveStateWriter::enter(shared);
     let mut st = shared.state.write().unwrap();
-    let high = st
-        .identity_high_water
+    let high = Arc::make_mut(&mut st.identity_high_water)
         .entry(table.to_owned())
-        .or_insert_with(|| AtomicI64::new(0));
-    reserve_from(high, table, explicit)
+        .or_default()
+        .clone();
+    drop(st);
+    reserve_from(&high, table, explicit)
 }
 
 fn reserve_from(high: &AtomicI64, table: &str, explicit: Option<i64>) -> Result<i64> {
@@ -9896,12 +11249,20 @@ fn obsolete_entry_bytes_estimate(table: &str, id: &str, entry: &VersionEntry) ->
 /// snapshot. Segment lengths also account for catalog-unreachable entries
 /// (for example a dropped table already pruned from the in-memory index).
 fn compaction_debt_estimate(shared: &Shared, track_retained_snapshots: bool) -> (u64, u64) {
-    let snapshots = shared.snapshots.lock().unwrap();
     let st = shared.state.read().unwrap();
-    let mut watermarks: Vec<u64> = snapshots.keys().copied().collect();
-    if track_retained_snapshots {
-        *shared.compaction_retained_snapshots.lock().unwrap() = snapshots.keys().copied().collect();
-    }
+    // Copy the registry and release it: the walk below visits every row and
+    // must not hold up snapshot registration and release meanwhile.
+    let mut watermarks: Vec<u64> = {
+        let snapshots = shared.snapshots.versions();
+        if track_retained_snapshots {
+            let mut retained = shared.compaction_retained_snapshots.lock().unwrap();
+            *retained = snapshots.iter().copied().collect();
+            shared
+                .compaction_retained_any
+                .store(!retained.is_empty(), AtomicOrdering::Release);
+        }
+        snapshots
+    };
     watermarks.push(st.committed_version);
     watermarks.sort_unstable();
     watermarks.dedup();
@@ -10415,8 +11776,8 @@ fn apply_one_owned(
                     continue;
                 }
                 if let Some(Value::Text(old)) = prior.get(&tdef.column) {
-                    if let Some(tidx) = st.text.get_mut(key) {
-                        tidx.remove(id_ref, old);
+                    if let Some(tidx) = st.text.get(key) {
+                        tidx.write().remove(id_ref, old);
                     }
                 }
             }
@@ -10440,8 +11801,8 @@ fn apply_one_owned(
                 continue;
             }
             if let Some(Value::Text(s)) = rec.get(&tdef.column) {
-                if let Some(tidx) = st.text.get_mut(key) {
-                    tidx.add(id_ref, s);
+                if let Some(tidx) = st.text.get(key) {
+                    tidx.write().add(id_ref, s);
                 }
             }
         }
@@ -10462,8 +11823,8 @@ fn apply_one_owned(
         match new_vec {
             Some(v) => match vdef.mode {
                 IndexingMode::Sync => {
-                    if let Some(vidx) = st.vector.get_mut(key) {
-                        vidx.insert(id_ref, v);
+                    if let Some(vidx) = st.vector.get(key) {
+                        vidx.write().insert(id_ref, v);
                     }
                 }
                 IndexingMode::Async => jobs.push(VecJob {
@@ -10475,8 +11836,8 @@ fn apply_one_owned(
                 }),
             },
             None => {
-                if let Some(vidx) = st.vector.get_mut(key) {
-                    vidx.remove(id_ref);
+                if let Some(vidx) = st.vector.get(key) {
+                    vidx.write().remove(id_ref);
                 }
             }
         }
@@ -11032,6 +12393,7 @@ fn vector_merge_target(
     rejected: &HashSet<String>,
 ) -> Option<((String, String), Vec<String>, usize)> {
     state.vector.iter().find_map(|(key, index)| {
+        let index = index.read();
         if index.durable_generation.is_none() || !index.mapped_runs_are_durable() {
             return None;
         }
@@ -11080,7 +12442,7 @@ fn plan_vector_merge(shared: &Shared) -> Option<VectorMergePlan> {
     let state = shared.state.read().unwrap();
     let (key, files, estimate_bytes) =
         vector_merge_target(&state, vector_merge_budget(shared), &rejected)?;
-    let index = state.vector.get(&key)?;
+    let index = state.vector.get(&key)?.read();
     let def = state
         .catalog
         .table(&key.0)?
@@ -11191,11 +12553,11 @@ fn publish_vector_merge(
     // overtake a compaction rebuild that replaced the whole run set.
     let _commit = shared.commit.lock();
     let manifest = {
-        let mut state = shared.state.write().unwrap();
+        let state = shared.state.write().unwrap();
         let replaced = state
             .vector
-            .get_mut(&plan.key)
-            .is_some_and(|index| index.replace_mapped_runs(&files, merged));
+            .get(&plan.key)
+            .is_some_and(|index| index.write().replace_mapped_runs(&files, merged));
         if !replaced {
             drop(state);
             if let Some(path) = new_path {
@@ -11204,8 +12566,9 @@ fn publish_vector_merge(
             return Ok(false);
         }
         state.vector.get(&plan.key).and_then(|index| {
+            let index = index.read();
             index.durable_generation.and_then(|generation| {
-                vector_manifest_for(&plan.key.0, &plan.key.1, generation, index)
+                vector_manifest_for(&plan.key.0, &plan.key.1, generation, &index)
             })
         })
     };
@@ -11219,7 +12582,7 @@ fn publish_vector_merge(
         .unwrap()
         .vector
         .get(&plan.key)
-        .and_then(|index| index.durable_generation)
+        .and_then(|index| index.read().durable_generation)
         .is_some();
     let published = match manifest {
         Some(manifest) => {
@@ -13006,7 +14369,7 @@ mod primary_index_tests {
             0
         );
 
-        db.shared.active_state_writers.store(
+        db.shared.state_write_waiting.store(
             db.shared.point_read_parallelism.max(1) as u64,
             AtomicOrdering::Release,
         );
@@ -13065,7 +14428,7 @@ mod primary_index_tests {
                 );
             }
         }
-        resident.insert("docs".to_owned(), ids);
+        resident.insert("docs".to_owned(), Arc::new(ids));
         let path = dir.path().join("primary.pidx");
         let mut catalog = Catalog::new();
         catalog.tables.push(TableSchema::new("docs", Vec::new()));
@@ -13636,6 +14999,7 @@ mod primary_index_tests {
             .vector
             .get(&("docs".to_owned(), "embedding".to_owned()))
             .unwrap()
+            .read()
             .contains_id("victim");
         assert!(!indexed);
     }
@@ -13929,14 +15293,16 @@ mod primary_index_tests {
                 .unwrap();
             state
                 .text
-                .get_mut(&("docs".into(), "body".into()))
+                .get(&("docs".into(), "body".into()))
                 .unwrap()
+                .write()
                 .freeze_delta_background(generation)
                 .unwrap();
             state
                 .vector
-                .get_mut(&("docs".into(), "embedding".into()))
+                .get(&("docs".into(), "embedding".into()))
                 .unwrap()
+                .write()
                 .freeze_delta_background(generation)
                 .unwrap();
             generation
@@ -13998,6 +15364,7 @@ mod primary_index_tests {
                 .text
                 .get(&("docs".into(), "body".into()))
                 .unwrap()
+                .read()
                 .runs
                 .last()
                 .unwrap()
@@ -14010,6 +15377,7 @@ mod primary_index_tests {
                 .vector
                 .get(&("docs".into(), "embedding".into()))
                 .unwrap()
+                .read()
                 .frozen_generation(),
             None
         );
@@ -15006,5 +16374,87 @@ mod projected_id_tests {
             matches!(batch.rows[0].get(ID_COLUMN), Some(Value::Text(text)) if *text == batch.ids[0]),
             "an implicit id must still travel in the row"
         );
+    }
+}
+
+#[cfg(test)]
+mod historical_equality_tests {
+    use super::*;
+
+    fn matches_at(db: &Db, snapshot: &Snapshot, k: i64) -> Vec<(String, Record)> {
+        db.scan_at(snapshot, "t")
+            .unwrap()
+            .into_iter()
+            .filter(|(_, record)| record.get("k") == Some(&Value::Int64(k)))
+            .collect()
+    }
+
+    fn paged_eq_at(db: &Db, snapshot: &Snapshot, k: i64, page: usize) -> Vec<(String, Record)> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let batch = db
+                .find_eq_batch_at_keep_unbudgeted(
+                    snapshot,
+                    "t",
+                    "k",
+                    &Value::Int64(k),
+                    after.as_deref(),
+                    page,
+                    None,
+                    true,
+                )
+                .unwrap();
+            out.extend(batch.ids.into_iter().zip(batch.rows));
+            match batch.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_historical_equality_batch_sees_the_snapshot_through_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create(dir.path().join("hist.esql")).unwrap();
+        db.query("CREATE TABLE t (k int64 NOT NULL, v int64 NOT NULL)")
+            .unwrap();
+        db.query("CREATE INDEX ON t (k)").unwrap();
+        for i in 0..40 {
+            db.query_params(
+                "INSERT INTO t (k, v) VALUES (?, ?)",
+                &[Value::Int64(i % 3), Value::Int64(i)],
+            )
+            .unwrap();
+            if i == 20 {
+                db.checkpoint().unwrap();
+            }
+        }
+        let snapshot = db.snapshot();
+        let before = matches_at(&db, &snapshot, 1);
+        assert!(before.len() > 5);
+        // Move rows out of and into k = 1, delete some, rewrite others in place.
+        db.query("UPDATE t SET k = 2 WHERE v IN (1, 4)").unwrap();
+        db.query("UPDATE t SET k = 1 WHERE v IN (0, 3)").unwrap();
+        db.query("DELETE FROM t WHERE v IN (7, 10)").unwrap();
+        db.query("UPDATE t SET v = v + 100 WHERE v IN (13, 16)")
+            .unwrap();
+        db.query_params(
+            "INSERT INTO t (k, v) VALUES (?, ?)",
+            &[Value::Int64(1), Value::Int64(999)],
+        )
+        .unwrap();
+        assert_ne!(
+            db.shared.state.read().unwrap().committed_version,
+            snapshot.version()
+        );
+        for page in [1, 3, 64] {
+            assert_eq!(paged_eq_at(&db, &snapshot, 1, page), before, "page {page}");
+        }
+        // The current state reads the new membership.
+        let now = db.snapshot();
+        assert_eq!(paged_eq_at(&db, &now, 1, 4), matches_at(&db, &now, 1));
+        assert_ne!(matches_at(&db, &now, 1), before);
     }
 }

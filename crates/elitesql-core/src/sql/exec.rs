@@ -39,7 +39,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::collate::Collation;
-use crate::db::{Db, OrderedSecondaryRead, Record, ScanBatch, ScanCmp, ScanFilter, Snapshot, Txn};
+use crate::db::{
+    Db, OrderedSecondaryRead, RebaseStep, Record, ScanBatch, ScanCmp, ScanFilter, Snapshot, Txn,
+};
 use crate::error::{Error, Result};
 use crate::memory::MemoryPermit;
 use crate::schema::{TableSchema, ID_COLUMN};
@@ -180,11 +182,12 @@ impl QueryCursor<'_> {
             // Each batch takes an execution slot; an idle cursor holds none.
             let _slot = self.db.statement_slot();
             // A key-driven batch holds a handful of rows; only a scan can fill
-            // the whole working budget. Reserve accordingly and grow below if
-            // the fetched batch turns out larger.
+            // the whole working budget. Reserve accordingly and settle below
+            // on twice what the fetched batch holds.
             let reservation = match &self.driver {
-                TableDriver::Empty | TableDriver::Id(_) => self.db.query_admission_small_bytes(),
-                TableDriver::Equality(..) => self.db.query_admission_medium_bytes(),
+                TableDriver::Empty | TableDriver::Id(_) | TableDriver::Equality(..) => {
+                    admission_bytes(self.db, AdmissionTier::Small)
+                }
                 TableDriver::Scan => self.db.memory_options().query_working_bytes,
             };
             let mut memory = match self.db.acquire_query_memory_bytes(reservation) {
@@ -269,10 +272,16 @@ impl QueryCursor<'_> {
                 self.done = true;
                 return Some(Err(Error::MemoryLimit("cursor batch exceeds query working memory; lower scan_batch_rows or raise query_working_bytes".into())));
             }
-            if bytes > memory.bytes() {
-                // The batch outgrew its tier: account for what it really holds.
+            // Held while the caller consumes the batch: twice what it holds,
+            // as every measured statement keeps (`GrowingReservation`).
+            let target = bytes
+                .saturating_mul(2)
+                .min(self.db.memory_options().query_working_bytes)
+                .max(bytes);
+            if target > memory.bytes() {
+                // The batch outgrew its reservation.
                 drop(memory);
-                memory = match self.db.acquire_query_memory_bytes(bytes) {
+                memory = match self.db.acquire_query_memory_bytes(target) {
                     Ok(memory) => memory,
                     Err(error) => {
                         self.done = true;
@@ -280,7 +289,7 @@ impl QueryCursor<'_> {
                     }
                 };
             } else {
-                memory.shrink_to(bytes);
+                memory.shrink_to(target);
             }
             self._memory = Some(memory);
             self.after_id = Some(last_id);
@@ -396,17 +405,19 @@ enum AdmissionTier {
     Full,
 }
 
-fn admit(db: &Db, tier: AdmissionTier) -> Result<MemoryPermit> {
-    let bytes = match tier {
-        AdmissionTier::Small => db.query_admission_small_bytes(),
-        AdmissionTier::Medium => db.query_admission_medium_bytes(),
-        AdmissionTier::Full => db.memory_options().query_working_bytes,
-    };
-    db.acquire_query_memory_bytes(bytes)
-}
+/// What a small or medium statement reserves before it has measured
+/// anything: a point lookup or a key-bounded write retains one or a few
+/// records, and twice that fits here. Anything larger grows the reservation
+/// from what it measures (`GrowingReservation`).
+const QUERY_ADMISSION_FLOOR_BYTES: usize = 32 * 1024;
 
-fn admit_statement(db: &Db, statement: &Statement) -> Result<MemoryPermit> {
-    admit(db, statement_tier(db, statement))
+/// The first reservation of a statement of `tier`.
+fn admission_bytes(db: &Db, tier: AdmissionTier) -> usize {
+    let working = db.memory_options().query_working_bytes;
+    match tier {
+        AdmissionTier::Small | AdmissionTier::Medium => QUERY_ADMISSION_FLOOR_BYTES.min(working),
+        AdmissionTier::Full => working,
+    }
 }
 
 /// Tier of a SELECT whose plan is already resolved. Resolving costs a schema
@@ -420,7 +431,17 @@ fn resolved_select_tier(stmt: &SelectStmt, resolved: &ResolvedQuery) -> Admissio
         ..
     } = resolved;
     if *is_aggregate || stmt.having.is_some() {
-        return AdmissionTier::Full;
+        // A single-table aggregate streams its rows in scan batches and keeps
+        // one state per aggregate (per group with GROUP BY). It is admitted
+        // with the small reservation and grows it to twice what it measures
+        // it retains (`GrowingReservation`). Holding the full budget from the
+        // start made dashboard counts queue for the three full-budget slots
+        // of the default pool until admission timed out.
+        return if aggregate_grows_its_reservation(tables.len(), stmt) {
+            AdmissionTier::Small
+        } else {
+            AdmissionTier::Full
+        };
     }
     match tables.len() {
         1 => {
@@ -470,6 +491,71 @@ fn resolved_select_tier(stmt: &SelectStmt, resolved: &ResolvedQuery) -> Admissio
             }
         }
         _ => AdmissionTier::Full,
+    }
+}
+
+fn aggregate_has_distinct(stmt: &SelectStmt) -> bool {
+    stmt.projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Aggregate { distinct: true, .. }))
+}
+
+/// Whether a single-table aggregate is admitted with the small reservation
+/// and grows it from what it measures (`GrowingReservation`). DISTINCT keeps
+/// the full budget from the start: its value sets are sorted externally.
+fn aggregate_grows_its_reservation(table_count: usize, stmt: &SelectStmt) -> bool {
+    table_count == 1 && !aggregate_has_distinct(stmt)
+}
+
+/// Query memory that follows what a statement measures it retains: it
+/// starts at the statement's admission (`admission_bytes`) and keeps at
+/// least twice the retained bytes (the batch in hand, the output rows built
+/// so far, a sort buffer), up to the per-query budget. The margin covers what
+/// the measurement leaves out (allocator slack, values being projected).
+struct GrowingReservation<'a> {
+    db: &'a Db,
+    held: usize,
+    permits: Vec<MemoryPermit>,
+}
+
+impl<'a> GrowingReservation<'a> {
+    /// Admission: wait for the first reservation of a statement of `tier`.
+    fn admit(db: &'a Db, tier: AdmissionTier) -> Result<Self> {
+        let permit = db.acquire_query_memory_bytes(admission_bytes(db, tier))?;
+        Ok(Self {
+            db,
+            held: permit.bytes(),
+            permits: vec![permit],
+        })
+    }
+
+    /// A reservation of `held` bytes the caller already holds.
+    fn held_by_caller(db: &'a Db, held: usize) -> Self {
+        Self {
+            db,
+            held,
+            permits: Vec::new(),
+        }
+    }
+
+    /// Hold at least twice `retained` bytes, capped at the per-query budget.
+    fn cover(&mut self, retained: usize) -> Result<()> {
+        let working = self.db.memory_options().query_working_bytes;
+        self.ensure(retained.saturating_mul(2).min(working))
+    }
+
+    /// Hold at least `bytes`. A growth reaches an eighth past `bytes`, so a
+    /// steadily growing statement (a hash of groups) asks the pool again only
+    /// after that much more, and holds at most 2.25 times what it retains.
+    fn ensure(&mut self, bytes: usize) -> Result<()> {
+        while self.held < bytes {
+            let permit = self
+                .db
+                .acquire_query_memory_bytes(bytes - self.held + bytes / 8)?;
+            self.held = self.held.saturating_add(permit.bytes());
+            self.permits.push(permit);
+        }
+        Ok(())
     }
 }
 
@@ -628,10 +714,10 @@ fn execute_statement(
     if let Statement::Select(stmt) = &statement {
         let _slot = db.statement_slot();
         let resolved = resolve_query(db, stmt)?;
-        let _memory = admit(db, resolved_select_tier(stmt, &resolved))?;
-        return exec_select_resolved(db, stmt, resolved);
+        let mut reservation = GrowingReservation::admit(db, resolved_select_tier(stmt, &resolved))?;
+        return exec_select_resolved(db, stmt, resolved, &mut reservation);
     }
-    let _memory = admit_statement(db, &statement)?;
+    let mut reservation = GrowingReservation::admit(db, statement_tier(db, &statement))?;
     match statement {
         Statement::CreateTable { name, columns } => {
             let mut cols = Vec::with_capacity(columns.len());
@@ -728,11 +814,11 @@ fn execute_statement(
             table,
             sets,
             where_clause,
-        } => exec_update(db, &table, &sets, where_clause.as_ref()),
+        } => exec_update(db, &table, &sets, where_clause.as_ref(), &mut reservation),
         Statement::Delete {
             table,
             where_clause,
-        } => exec_delete(db, &table, where_clause.as_ref()),
+        } => exec_delete(db, &table, where_clause.as_ref(), &mut reservation),
     }
 }
 
@@ -1788,6 +1874,21 @@ impl Drop for SpillFiles {
     }
 }
 
+/// Bytes a fetched batch of records holds.
+fn batch_heap_bytes(rows: &Vec<Record>) -> usize {
+    rows.iter()
+        .map(record_heap_bytes)
+        .sum::<usize>()
+        .saturating_add(rows.capacity() * size_of::<Record>())
+}
+
+/// Bytes one projected output row holds.
+fn output_row_bytes(values: &[Value]) -> usize {
+    size_of::<Vec<Value>>()
+        + size_of_val(values)
+        + values.iter().map(value_heap_bytes).sum::<usize>()
+}
+
 fn record_heap_bytes(record: &Record) -> usize {
     size_of::<Record>()
         + record
@@ -2158,10 +2259,12 @@ fn exec_single_table_select(
     stmt: &SelectStmt,
     pushed: &[RExpr],
     residual: &[RExpr],
+    reservation: &mut GrowingReservation<'_>,
 ) -> Result<QueryOutput> {
-    exec_single_table_select_at(db, &db.snapshot(), tables, stmt, pushed, residual)
+    exec_single_table_select_in(db, None, tables, stmt, pushed, residual, reservation)
 }
 
+#[cfg(test)]
 fn exec_single_table_select_at(
     db: &Db,
     snapshot: &Snapshot,
@@ -2169,6 +2272,34 @@ fn exec_single_table_select_at(
     stmt: &SelectStmt,
     pushed: &[RExpr],
     residual: &[RExpr],
+) -> Result<QueryOutput> {
+    let mut reservation =
+        GrowingReservation::held_by_caller(db, db.memory_options().query_working_bytes);
+    exec_single_table_select_in(
+        db,
+        Some(snapshot),
+        tables,
+        stmt,
+        pushed,
+        residual,
+        &mut reservation,
+    )
+}
+
+/// Attempts an autocommit ordered walk makes, each at the latest version,
+/// before falling back to the scan and sort.
+const ORDERED_SNAPSHOT_ATTEMPTS: usize = 3;
+
+/// `pinned` is the caller's snapshot; without one the statement owns its
+/// snapshot and takes it as late as the access path allows.
+fn exec_single_table_select_in(
+    db: &Db,
+    pinned: Option<&Snapshot>,
+    tables: &[TableCtx],
+    stmt: &SelectStmt,
+    pushed: &[RExpr],
+    residual: &[RExpr],
+    reservation: &mut GrowingReservation<'_>,
 ) -> Result<QueryOutput> {
     let (columns, extract) = projection_plan(tables, &stmt.projection)?;
     let offset = limit_to_usize(stmt.offset.as_ref()).unwrap_or(0);
@@ -2195,25 +2326,47 @@ fn exec_single_table_select_at(
         .collect::<Result<_>>()?;
     let keep = needed_columns(tables, 0, stmt, &[pushed, residual], &[]);
     let mut ordered_fallback = false;
+    let mut owned: Option<Snapshot> = None;
     if let Some(plan) = ordered_secondary_plan(&tables[0], 0, pushed, &order_keys, limit.is_some())
     {
-        if let Some(output) = exec_ordered_secondary_select(
-            db,
-            snapshot,
-            tables,
-            &columns,
-            &extract,
-            pushed,
-            residual,
-            &plan,
-            offset,
-            limit,
-            keep.as_deref(),
-        )? {
-            return Ok(output);
+        // A statement that owns its snapshot has yielded nothing yet, so each
+        // attempt may start over at the latest version, which the walk
+        // registers under the state guard it reads with. Only a commit landing
+        // between two batches of one attempt sends it round again.
+        let attempts = if pinned.is_some() {
+            1
+        } else {
+            ORDERED_SNAPSHOT_ATTEMPTS
+        };
+        for _ in 0..attempts {
+            if let Some(output) = exec_ordered_secondary_select(
+                db,
+                pinned,
+                &mut owned,
+                tables,
+                &columns,
+                &extract,
+                pushed,
+                residual,
+                &plan,
+                offset,
+                limit,
+                keep.as_deref(),
+                reservation,
+            )? {
+                return Ok(output);
+            }
         }
         ordered_fallback = true;
     }
+    let taken;
+    let snapshot = match pinned {
+        Some(snapshot) => snapshot,
+        None => {
+            taken = owned.unwrap_or_else(|| db.snapshot());
+            &taken
+        }
+    };
     let mut sorter = if order_keys.is_empty() {
         None
     } else {
@@ -2241,6 +2394,7 @@ fn exec_single_table_select_at(
     let mut sequence = 0u64;
     let mut skipped = 0usize;
     let mut out = Vec::new();
+    let mut out_bytes = 0usize;
     // When the access path already enforces every predicate and no sort is
     // pending, a bounded query needs at most `offset + limit` rows in total.
     // The last batch is trimmed to that remainder instead of decoding a full
@@ -2278,6 +2432,11 @@ fn exec_single_table_select_at(
             break;
         };
         cursor = Some(next);
+        reservation.cover(
+            batch_heap_bytes(&batch.rows)
+                .saturating_add(out_bytes)
+                .saturating_add(sorter.as_ref().map_or(0, SpillSorter::buffered_bytes)),
+        )?;
         for record in batch.rows {
             row[0] = Some(record);
             if !eval_all(&row, pushed)? || !eval_all(&row, residual)? {
@@ -2312,11 +2471,13 @@ fn exec_single_table_select_at(
                 skipped += 1;
                 continue;
             }
-            out.push(if consume {
+            let values = if consume {
                 project_row_owned(&mut row, &extract)
             } else {
                 project_row(&row, &extract)
-            });
+            };
+            out_bytes = out_bytes.saturating_add(output_row_bytes(&values));
+            out.push(values);
             if limit.is_some_and(|n| out.len() == n) {
                 return Ok(QueryOutput::Rows { columns, rows: out });
             }
@@ -2336,13 +2497,15 @@ fn exec_single_table_select_at(
 }
 
 /// Execute the proven ordered-secondary subset without materializing a sort.
-/// If a commit makes the captured snapshot historical before any index
-/// batch is acquired, return `None` so the caller restarts on its existing
-/// snapshot through the normal scan-and-sort path.
+/// If a commit makes the snapshot historical between index batches, return
+/// `None` so the caller restarts, finally on that snapshot through the normal
+/// scan-and-sort path. With no `pinned` snapshot, the first batch registers
+/// one at the version it reads and leaves it in `owned` for the rest.
 #[allow(clippy::too_many_arguments)]
 fn exec_ordered_secondary_select(
     db: &Db,
-    snapshot: &Snapshot,
+    pinned: Option<&Snapshot>,
+    owned: &mut Option<Snapshot>,
     tables: &[TableCtx],
     columns: &[String],
     extract: &[(usize, &str)],
@@ -2352,6 +2515,7 @@ fn exec_ordered_secondary_select(
     offset: usize,
     limit: Option<usize>,
     keep: Option<&[&str]>,
+    reservation: &mut GrowingReservation<'_>,
 ) -> Result<Option<QueryOutput>> {
     let memory = db.memory_options();
     let batch_rows = memory
@@ -2361,6 +2525,7 @@ fn exec_ordered_secondary_select(
     let mut after: Option<Vec<u8>> = None;
     let mut skipped = 0usize;
     let mut out = Vec::new();
+    let mut out_bytes = 0usize;
     let mut row: ExecRow = vec![None];
     let control = crate::QueryControl::current();
     let mut visited = 0usize;
@@ -2376,7 +2541,12 @@ fn exec_ordered_secondary_select(
                 .max(1),
             None => batch_rows,
         };
-        let Some(batch) = db.ordered_secondary_batch_current(
+        let snapshot = match pinned {
+            Some(snapshot) => Some(snapshot),
+            None if after.is_some() => owned.as_ref(),
+            None => None,
+        };
+        let Some((batch, fresh)) = db.ordered_secondary_batch_latest(
             snapshot,
             OrderedSecondaryRead {
                 table: &tables[0].schema.name,
@@ -2396,11 +2566,15 @@ fn exec_ordered_secondary_select(
         else {
             return Ok(None);
         };
+        if fresh.is_some() {
+            *owned = fresh;
+        }
         let Some(next) = batch.next else {
             break;
         };
         after = Some(next);
         skipped += batch.skipped;
+        reservation.cover(batch_heap_bytes(&batch.rows).saturating_add(out_bytes))?;
         for record in batch.rows {
             if visited.is_multiple_of(256) {
                 if let Some(control) = &control {
@@ -2416,11 +2590,13 @@ fn exec_ordered_secondary_select(
                 skipped += 1;
                 continue;
             }
-            out.push(if consume {
+            let values = if consume {
                 project_row_owned(&mut row, extract)
             } else {
                 project_row(&row, extract)
-            });
+            };
+            out_bytes = out_bytes.saturating_add(output_row_bytes(&values));
+            out.push(values);
             if limit.is_some_and(|limit| out.len() == limit) {
                 return Ok(Some(QueryOutput::Rows {
                     columns: columns.to_vec(),
@@ -2547,6 +2723,22 @@ fn visit_single_table_rows_at(
     pushed: &[RExpr],
     residual: &[RExpr],
     keep: Option<&[&str]>,
+    visit: impl FnMut(&ExecRow) -> Result<bool>,
+) -> Result<()> {
+    visit_single_table_rows_measured(db, snapshot, table, pushed, residual, keep, None, visit)
+}
+
+/// `visit_single_table_rows_at` that also reports the bytes each fetched
+/// batch holds to `on_batch`, before its rows are visited.
+#[allow(clippy::too_many_arguments)]
+fn visit_single_table_rows_measured(
+    db: &Db,
+    snapshot: &Snapshot,
+    table: &TableCtx,
+    pushed: &[RExpr],
+    residual: &[RExpr],
+    keep: Option<&[&str]>,
+    mut on_batch: Option<&mut dyn FnMut(usize) -> Result<()>>,
     mut visit: impl FnMut(&ExecRow) -> Result<bool>,
 ) -> Result<()> {
     let memory = db.memory_options();
@@ -2556,9 +2748,27 @@ fn visit_single_table_rows_at(
     let driver = table_driver(table, 0, pushed);
     let filter = scan_filter_from(table, 0, pushed);
     let single_row = driver_yields_at_most_one_row(table, &driver);
-    let mut cursor: Option<String> = None;
     let mut row: ExecRow = vec![None];
+    if matches!(driver, TableDriver::Scan) {
+        // A full scan streams: the visitor keeps no row, so there is no
+        // batch to hold or to measure beyond the one row in hand.
+        if let Some(on_batch) = on_batch.as_mut() {
+            on_batch(0)?;
+        }
+        return db.scan_visit_at_unbudgeted(
+            snapshot,
+            &table.schema.name,
+            filter.as_ref(),
+            keep,
+            |record| {
+                row[0] = Some(record);
+                Ok(!(eval_all(&row, pushed)? && eval_all(&row, residual)? && !visit(&row)?))
+            },
+        );
+    }
+    let mut cursor: Option<String> = None;
     loop {
+
         let batch = driven_batch(
             db,
             snapshot,
@@ -2572,6 +2782,9 @@ fn visit_single_table_rows_at(
         let Some(next) = batch.next else {
             return Ok(());
         };
+        if let Some(on_batch) = on_batch.as_mut() {
+            on_batch(batch_heap_bytes(&batch.rows))?;
+        }
         cursor = Some(next);
         let last_batch = single_row;
         for record in batch.rows {
@@ -2638,6 +2851,7 @@ fn exec_single_indexed_join_select(
     stmt: &SelectStmt,
     pushdown: &[Vec<RExpr>],
     residual: &[RExpr],
+    reservation: &mut GrowingReservation<'_>,
 ) -> Result<Option<QueryOutput>> {
     let join = &stmt.joins[0];
     let left = resolve_col(tables, &join.on.0)?;
@@ -2707,6 +2921,8 @@ fn exec_single_indexed_join_select(
     let right_keep = needed_columns(tables, 1, stmt, &[&pushdown[1], residual], &[&fresh.1]);
     let mut left_cursor: Option<String> = None;
     let mut output = Vec::new();
+    // Bytes of `output`, counted as its rows are pushed.
+    let mut output_bytes = 0usize;
     let mut skipped = 0usize;
     let mut sequence = 0u64;
     let mut complete = false;
@@ -2726,6 +2942,12 @@ fn exec_single_indexed_join_select(
             break;
         };
         left_cursor = Some(next);
+        let left_bytes = batch_heap_bytes(&batch.rows);
+        reservation.cover(
+            left_bytes
+                .saturating_add(output_bytes)
+                .saturating_add(sorter.as_ref().map_or(0, SpillSorter::buffered_bytes)),
+        )?;
         for left_record in batch.rows {
             let mut left_row = vec![Some(left_record)];
             if !eval_all(&left_row, &pushdown[0])? {
@@ -2779,6 +3001,12 @@ fn exec_single_indexed_join_select(
                     break;
                 };
                 right_cursor = Some(next_right);
+                reservation.cover(
+                    left_bytes
+                        .saturating_add(batch_heap_bytes(&matches.rows))
+                        .saturating_add(output_bytes)
+                        .saturating_add(sorter.as_ref().map_or(0, SpillSorter::buffered_bytes)),
+                )?;
                 for right_record in matches.rows {
                     let mut row = vec![None, Some(right_record)];
                     if !eval_all(&row, &pushdown[1])? {
@@ -2807,7 +3035,9 @@ fn exec_single_indexed_join_select(
                     } else if skipped < offset {
                         skipped += 1;
                     } else {
-                        output.push(project_row(&row, &extract));
+                        let values = project_row(&row, &extract);
+                        output_bytes = output_bytes.saturating_add(output_row_bytes(&values));
+                        output.push(values);
                         if limit.is_some_and(|value| output.len() == value) {
                             complete = true;
                         }
@@ -2842,7 +3072,9 @@ fn exec_single_indexed_join_select(
                 } else if skipped < offset {
                     skipped += 1;
                 } else {
-                    output.push(project_row(&row, &extract));
+                    let values = project_row(&row, &extract);
+                    output_bytes = output_bytes.saturating_add(output_row_bytes(&values));
+                    output.push(values);
                     if limit.is_some_and(|value| output.len() == value) {
                         complete = true;
                         break;
@@ -2931,13 +3163,17 @@ fn resolve_query(db: &Db, stmt: &SelectStmt) -> Result<ResolvedQuery> {
 
 fn exec_select(db: &Db, stmt: &SelectStmt) -> Result<QueryOutput> {
     let resolved = resolve_query(db, stmt)?;
-    exec_select_resolved(db, stmt, resolved)
+    // Reached from `execute_statement` holding the full budget.
+    let mut reservation =
+        GrowingReservation::held_by_caller(db, db.memory_options().query_working_bytes);
+    exec_select_resolved(db, stmt, resolved, &mut reservation)
 }
 
 fn exec_select_resolved(
     db: &Db,
     stmt: &SelectStmt,
     resolved: ResolvedQuery,
+    reservation: &mut GrowingReservation<'_>,
 ) -> Result<QueryOutput> {
     let ResolvedQuery {
         tables,
@@ -2948,13 +3184,20 @@ fn exec_select_resolved(
 
     if tables.len() == 1 {
         if is_aggregate {
-            return exec_single_table_aggregate(db, &tables, stmt, &pushdown[0], &residual);
+            return exec_single_table_aggregate(
+                db,
+                &tables,
+                stmt,
+                &pushdown[0],
+                &residual,
+                reservation,
+            );
         }
-        return exec_single_table_select(db, &tables, stmt, &pushdown[0], &residual);
+        return exec_single_table_select(db, &tables, stmt, &pushdown[0], &residual, reservation);
     }
     if tables.len() == 2 && !is_aggregate {
         if let Some(output) =
-            exec_single_indexed_join_select(db, &tables, stmt, &pushdown, &residual)?
+            exec_single_indexed_join_select(db, &tables, stmt, &pushdown, &residual, reservation)?
         {
             return Ok(output);
         }
@@ -3538,6 +3781,7 @@ fn hash_aggregate_single_table(
     specs: &[AggSpec],
     budget: usize,
     keep: Option<&[&str]>,
+    mut reservation: Option<&mut GrowingReservation<'_>>,
 ) -> Result<Option<Vec<HashedGroup>>> {
     let mut slots: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut groups: Vec<HashedGroup> = Vec::new();
@@ -3545,51 +3789,72 @@ fn hash_aggregate_single_table(
     let mut bytes = 0usize;
     let mut sequence = 0u64;
     let mut within_budget = true;
-    visit_single_table_rows_at(db, snapshot, table, pushed, residual, keep, |row| {
-        key.clear();
-        for (ti, column) in group_cols {
-            encode_value(&mut key, col_value_ref(row, *ti, column));
-        }
-        let slot = match slots.get(key.as_slice()) {
-            Some(&slot) => slot,
-            None => {
-                let values: Vec<Value> = group_cols
-                    .iter()
-                    .map(|(ti, column)| col_value(row, *ti, column))
-                    .collect();
-                let states: Vec<AggState> = specs.iter().map(AggState::new).collect();
-                bytes += key.len()
-                    + size_of::<Vec<u8>>()
-                    + size_of::<usize>()
-                    + 16
-                    + size_of::<HashedGroup>()
-                    + values.iter().map(value_heap_bytes).sum::<usize>()
-                    + states.len() * size_of::<AggState>();
-                slots.insert(key.clone(), groups.len());
-                groups.push(HashedGroup {
-                    values,
-                    states,
-                    first_sequence: sequence,
-                });
-                groups.len() - 1
+    let batch_bytes = std::cell::Cell::new(0usize);
+    let mut record_batch = |bytes: usize| {
+        batch_bytes.set(bytes);
+        Ok(())
+    };
+    let on_batch: Option<&mut dyn FnMut(usize) -> Result<()>> = match reservation {
+        Some(_) => Some(&mut record_batch),
+        None => None,
+    };
+    visit_single_table_rows_measured(
+        db,
+        snapshot,
+        table,
+        pushed,
+        residual,
+        keep,
+        on_batch,
+        |row| {
+            key.clear();
+            for (ti, column) in group_cols {
+                encode_value(&mut key, col_value_ref(row, *ti, column));
             }
-        };
-        let group = &mut groups[slot];
-        for (index, spec) in specs.iter().enumerate() {
-            let value = spec
-                .arg
-                .as_ref()
-                .map(|(ti, column)| col_value_ref(row, *ti, column))
-                .unwrap_or(&NULL_VALUE);
-            bytes += group.states[index].update_value(spec, value)?;
-        }
-        sequence = sequence.saturating_add(1);
-        if bytes > budget {
-            within_budget = false;
-            return Ok(false);
-        }
-        Ok(true)
-    })?;
+            let slot = match slots.get(key.as_slice()) {
+                Some(&slot) => slot,
+                None => {
+                    let values: Vec<Value> = group_cols
+                        .iter()
+                        .map(|(ti, column)| col_value(row, *ti, column))
+                        .collect();
+                    let states: Vec<AggState> = specs.iter().map(AggState::new).collect();
+                    bytes += key.len()
+                        + size_of::<Vec<u8>>()
+                        + size_of::<usize>()
+                        + 16
+                        + size_of::<HashedGroup>()
+                        + values.iter().map(value_heap_bytes).sum::<usize>()
+                        + states.len() * size_of::<AggState>();
+                    slots.insert(key.clone(), groups.len());
+                    groups.push(HashedGroup {
+                        values,
+                        states,
+                        first_sequence: sequence,
+                    });
+                    groups.len() - 1
+                }
+            };
+            let group = &mut groups[slot];
+            for (index, spec) in specs.iter().enumerate() {
+                let value = spec
+                    .arg
+                    .as_ref()
+                    .map(|(ti, column)| col_value_ref(row, *ti, column))
+                    .unwrap_or(&NULL_VALUE);
+                bytes += group.states[index].update_value(spec, value)?;
+            }
+            sequence = sequence.saturating_add(1);
+            if bytes > budget {
+                within_budget = false;
+                return Ok(false);
+            }
+            if let Some(reservation) = reservation.as_deref_mut() {
+                reservation.cover(bytes.saturating_add(batch_bytes.get()))?;
+            }
+            Ok(true)
+        },
+    )?;
     db.record_query_buffer(bytes);
     Ok(within_budget.then_some(groups))
 }
@@ -3605,6 +3870,7 @@ fn exec_single_table_aggregate(
     stmt: &SelectStmt,
     pushed: &[RExpr],
     residual: &[RExpr],
+    reservation: &mut GrowingReservation<'_>,
 ) -> Result<QueryOutput> {
     let AggregatePlan {
         group_cols,
@@ -3687,17 +3953,22 @@ fn exec_single_table_aggregate(
                 }
             }
         } else {
-            visit_single_table_rows(
+            // One state per aggregate: what the statement retains is the
+            // scan batch in hand.
+            let mut cover = |bytes: usize| reservation.cover(bytes);
+            visit_single_table_rows_measured(
                 db,
+                &db.snapshot(),
                 &tables[0],
                 pushed,
                 residual,
                 agg_keep.as_deref(),
+                Some(&mut cover),
                 |row| {
                     for (index, spec) in specs.iter().enumerate() {
                         states[index].update(spec, row)?;
                     }
-                    Ok(())
+                    Ok(true)
                 },
             )?;
         }
@@ -3713,8 +3984,8 @@ fn exec_single_table_aggregate(
         )?;
     } else {
         let snapshot = db.snapshot();
-        let budget = db.memory_options().query_working_bytes;
-        if let Some(groups) = hash_aggregate_single_table(
+        let working = db.memory_options().query_working_bytes;
+        let hashed = hash_aggregate_single_table(
             db,
             &snapshot,
             &tables[0],
@@ -3722,9 +3993,17 @@ fn exec_single_table_aggregate(
             residual,
             &group_cols,
             &specs,
-            budget,
+            working,
             agg_keep.as_deref(),
-        )? {
+            Some(&mut *reservation),
+        )?;
+        if hashed.is_none() {
+            // The groups outgrew the per-query budget: the external sort
+            // below holds that budget, as the statement would have from the
+            // start without a growing reservation.
+            reservation.ensure(working)?;
+        }
+        if let Some(groups) = hashed {
             for group in groups {
                 queue_aggregate_group(
                     &mut output_sorter,
@@ -4596,6 +4875,7 @@ fn exec_update(
     table: &str,
     sets: &[(String, SetValue)],
     where_clause: Option<&Expr>,
+    reservation: &mut GrowingReservation<'_>,
 ) -> Result<QueryOutput> {
     let schema = db
         .table_schema(table)
@@ -4642,6 +4922,7 @@ fn exec_update(
         label: table.to_owned(),
     }];
     let conjuncts = resolve_where(&tables, where_clause)?;
+    let delta = DeltaUpdate::plan(&tables[0].schema, sets, &conjuncts)?;
 
     let deadline = Instant::now() + WRITE_RETRY_BUDGET;
     let mut attempt = 0u32;
@@ -4654,6 +4935,8 @@ fn exec_update(
         // Conflict and a retry — never into a lost update.
         let mut txn = db.begin();
         let matching = fetch_table(db, &tables[0], 0, &conjuncts)?;
+        // The matched rows and their staged replacements.
+        reservation.cover(batch_heap_bytes(&matching).saturating_mul(2))?;
         let mut count = 0u64;
         for rec in &matching {
             let id = physical_row_id(rec)?;
@@ -4672,7 +4955,11 @@ fn exec_update(
                 };
                 patch.insert(column.clone(), value);
             }
-            match txn.update(table, id, patch) {
+            let updated = match &delta {
+                Some(delta) => txn.update_with_rebase(table, id, patch, delta.step()),
+                None => txn.update(table, id, patch),
+            };
+            match updated {
                 Ok(()) => count += 1,
                 Err(Error::RecordNotFound { .. }) => {} // deleted concurrently
                 Err(e) => return Err(e),
@@ -4781,24 +5068,28 @@ fn validate_txn_sets(schema: &TableSchema, table: &str, sets: &[(String, SetValu
 /// Rows of one table as the transaction sees them, narrowed by the same
 /// access path the autocommit executor would choose (physical id, indexed
 /// equality, or scan); every conjunct is re-checked afterwards.
+/// The rows of one table matching `conjuncts`, through the transaction.
+/// `observe` says whether they are handed back to the caller, which stops a
+/// later delta update of them from being replayed at commit (`ObservedRows`).
 fn fetch_table_txn(
     txn: &Txn,
     ctx: &TableCtx,
     conjuncts: &[RExpr],
+    observe: bool,
 ) -> Result<Vec<(String, Record)>> {
     let table = ctx.schema.name.as_str();
     let rows: Vec<(String, Record)> = match table_driver(ctx, 0, conjuncts) {
         TableDriver::Empty => Vec::new(),
         TableDriver::Id(id) => txn
-            .get(table, &id)?
+            .get_unobserved(table, &id)?
             .into_iter()
             .map(|record| (id.clone(), record))
             .collect(),
-        TableDriver::Equality(column, key) => match txn.find_eq(table, &column, &key)? {
+        TableDriver::Equality(column, key) => match txn.find_eq_unobserved(table, &column, &key)? {
             Some(rows) => rows,
-            None => txn.scan(table)?,
+            None => txn.scan_unobserved(table)?,
         },
-        TableDriver::Scan => txn.scan(table)?,
+        TableDriver::Scan => txn.scan_unobserved(table)?,
     };
     let mut out = Vec::with_capacity(rows.len());
     for (id, record) in rows {
@@ -4807,7 +5098,78 @@ fn fetch_table_txn(
             out.push((id, take_single(row, 0)));
         }
     }
+    if observe {
+        txn.observe_rows(table, out.iter().map(|(id, _)| id.as_str()));
+    }
     Ok(out)
+}
+
+/// An UPDATE whose every SET adds to or subtracts from its own numeric
+/// column (`stock = stock - ?`), kept to be re-run at commit over a newer
+/// committed version of a row it changed (`RebaseStep`). Such a change is
+/// commutative, which is what lets it land after a concurrent one.
+struct DeltaUpdate {
+    sets: Vec<(String, ArithmeticOp, Value)>,
+    conjuncts: Vec<RExpr>,
+    implicit_id: bool,
+}
+
+impl DeltaUpdate {
+    /// `Some` when every SET is `col = col + v` or `col = col - v`.
+    fn plan(
+        schema: &TableSchema,
+        sets: &[(String, SetValue)],
+        conjuncts: &[RExpr],
+    ) -> Result<Option<Arc<Self>>> {
+        let mut delta = Vec::with_capacity(sets.len());
+        for (column, set) in sets {
+            let SetValue::Arithmetic {
+                op: op @ (ArithmeticOp::Add | ArithmeticOp::Subtract),
+                right,
+                ..
+            } = set
+            else {
+                return Ok(None);
+            };
+            let target = schema.column(column).expect("validated by the caller");
+            delta.push((
+                column.clone(),
+                *op,
+                literal_to_value(right, target.ty, column)?,
+            ));
+        }
+        Ok(Some(Arc::new(Self {
+            sets: delta,
+            conjuncts: conjuncts.to_vec(),
+            implicit_id: schema.has_implicit_id(),
+        })))
+    }
+
+    /// The statement re-run on `record`, the latest committed version of row
+    /// `id`: `None` when its WHERE no longer holds there.
+    fn apply(&self, id: &str, record: &Record) -> Result<Option<Record>> {
+        let mut candidate = record.clone();
+        if self.implicit_id {
+            candidate.insert(ID_COLUMN, Value::Text(id.to_owned()));
+        }
+        if !eval_all(&vec![Some(candidate)], &self.conjuncts)? {
+            return Ok(None);
+        }
+        let mut next = record.clone();
+        for (column, op, right) in &self.sets {
+            let left = record.get(column).ok_or_else(|| {
+                Error::Corrupt(format!("record is missing declared column '{column}'"))
+            })?;
+            let value = arithmetic_value(left, right, *op, column)?;
+            next.insert(column.clone(), value);
+        }
+        Ok(Some(next))
+    }
+
+    fn step(self: &Arc<Self>) -> RebaseStep {
+        let plan = self.clone();
+        Arc::new(move |id: &str, record: &Record| plan.apply(id, record))
+    }
 }
 
 fn exec_update_txn(
@@ -4823,10 +5185,11 @@ fn exec_update_txn(
         label: table.to_owned(),
     }];
     let predicates = resolve_where(&tables, where_clause)?;
+    let delta = DeltaUpdate::plan(&tables[0].schema, sets, &predicates)?;
     // The physical row key travels with the tuple: with a declared `id`
     // column (`id int AUTO_INCREMENT PRIMARY KEY`) `record["id"]` is the SQL
     // value, not the ULID.
-    let matching = fetch_table_txn(txn, &tables[0], &predicates)?;
+    let matching = fetch_table_txn(txn, &tables[0], &predicates, false)?;
     let mut affected = 0u64;
     for (id, record) in matching {
         let id = &id;
@@ -4846,7 +5209,10 @@ fn exec_update_txn(
             };
             patch.insert(column.clone(), value);
         }
-        txn.update(table, id, patch)?;
+        match &delta {
+            Some(delta) => txn.update_with_rebase(table, id, patch, delta.step())?,
+            None => txn.update(table, id, patch)?,
+        }
         affected += 1;
     }
     Ok(QueryOutput::Affected(affected))
@@ -4859,7 +5225,7 @@ fn exec_delete_txn(txn: &mut Txn, table: &str, where_clause: Option<&Expr>) -> R
         label: table.to_owned(),
     }];
     let predicates = resolve_where(&tables, where_clause)?;
-    let ids: Vec<String> = fetch_table_txn(txn, &tables[0], &predicates)?
+    let ids: Vec<String> = fetch_table_txn(txn, &tables[0], &predicates, true)?
         .into_iter()
         .map(|(id, _)| id)
         .collect();
@@ -4895,7 +5261,7 @@ fn exec_select_txn(txn: &mut Txn, statement: &SelectStmt) -> Result<QueryOutput>
             .unwrap_or_else(|| statement.from.name.clone()),
     }];
     let predicates = resolve_where(&tables, statement.where_clause.as_ref())?;
-    let mut records: Vec<Record> = fetch_table_txn(txn, &tables[0], &predicates)?
+    let mut records: Vec<Record> = fetch_table_txn(txn, &tables[0], &predicates, true)?
         .into_iter()
         .map(|(_, record)| record)
         .collect();
@@ -4960,7 +5326,12 @@ fn exec_select_txn(txn: &mut Txn, statement: &SelectStmt) -> Result<QueryOutput>
     Ok(QueryOutput::Rows { columns, rows })
 }
 
-fn exec_delete(db: &Db, table: &str, where_clause: Option<&Expr>) -> Result<QueryOutput> {
+fn exec_delete(
+    db: &Db,
+    table: &str,
+    where_clause: Option<&Expr>,
+    reservation: &mut GrowingReservation<'_>,
+) -> Result<QueryOutput> {
     let schema = db
         .table_schema(table)
         .ok_or_else(|| Error::TableNotFound(table.into()))?;
@@ -4978,6 +5349,7 @@ fn exec_delete(db: &Db, table: &str, where_clause: Option<&Expr>) -> Result<Quer
         // and `begin()` is deleted anyway with no conflict raised.
         let mut txn = db.begin();
         let matching = fetch_table(db, &tables[0], 0, &conjuncts)?;
+        reservation.cover(batch_heap_bytes(&matching))?;
         let mut count = 0u64;
         for rec in &matching {
             let id = physical_row_id(rec)?;

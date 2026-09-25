@@ -1,0 +1,8 @@
+results → /Users/jalbarracin/elitesql/benchmark-results/optimization-2026-09-19/iteration-04/ab-p2-100/A-1
+database → /private/var/folders/z_/dcnr0h75667d0d42ldb92hb00000gn/T/saas-sim-kmqrfdgq/saas.esql
+seeded 20000 accounts, 5000 products in 1.15 s (13.1 MiB)
+ users     ops/s    p50ms     p99ms   usr p99   succ%  retry% srvCPU genCPU  inv   wall
+   100   17393.3    1.976    38.283    38.284  99.997   0.507   4.88   2.01   ok  21.17
+   errors: {'conflict_exhausted': 14}
+offline check: ok (7.2 s); after kill: 0 errors, 224556 warnings
+report → /Users/jalbarracin/elitesql/benchmark-results/optimization-2026-09-19/iteration-04/ab-p2-100/A-1/report.md

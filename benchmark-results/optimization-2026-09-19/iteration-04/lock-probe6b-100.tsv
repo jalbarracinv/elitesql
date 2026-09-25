@@ -1,0 +1,46 @@
+kind	count	total_hold_us	max_hold_us	over50us	total_wait_us	max_wait_us	blame_us	site
+R	2585033	23106930	7232	28561	32382210	55280	5197508	crates/elitesql-core/src/db/reads.rs:254
+R	39793	4677264	4771	37430	10694941	29063	1733337	crates/elitesql-core/src/db.rs:6378
+R	34723	3943660	5759	34718	6112374	33121	1419045	crates/elitesql-core/src/db.rs:6606
+R	587722	4075118	3630	3196	67559502	58122	1150970	crates/elitesql-core/src/db.rs:7854
+R	98909	2566421	4660	2330	24992784	47337	766531	crates/elitesql-core/src/db.rs:8084
+R	184720	1651130	5273	1701	3816067	21027	440608	crates/elitesql-core/src/db.rs:9452
+R	168304	924945	6294	2583	631031	41628	225162	crates/elitesql-core/src/db/commit.rs:324
+R	39321	769988	2662	325	1883831	28127	211776	crates/elitesql-core/src/db.rs:7945
+R	727525	739015	2536	216	46412001	52030	182698	crates/elitesql-core/src/db/reads.rs:22
+R	430242	622004	2988	183	70443311	65011	157622	crates/elitesql-core/src/db.rs:9287
+R	62950	434420	5335	319	11989568	50776	121599	crates/elitesql-core/src/db.rs:7692
+R	39793	472622	1980	190	4947925	32976	112895	crates/elitesql-core/src/db.rs:6440
+R	24371	183530	1819	30	1802834	21661	43529	crates/elitesql-core/src/db.rs:9936
+R	168310	58964	3065	15	10013581	31837	12447	crates/elitesql-core/src/db/commit.rs:263
+R	134903	60048	375	15	8396689	31418	12160	crates/elitesql-core/src/db/reads.rs:212
+R	191089	34689	1349	9	12732943	48498	6955	crates/elitesql-core/src/db.rs:9999
+R	271245	22261	288	8	2234035	37665	3489	crates/elitesql-core/src/db.rs:9839
+W	35514	1086818	291	6334	6084925	8267	0	crates/elitesql-core/src/db/commit.rs:106
+R	5782	813805	3725	3830	512	65	0	crates/elitesql-core/src/db/commit.rs:562
+W	6	4	1	0	1	0	0	crates/elitesql-core/src/db.rs:10005
+R	33027	981561	2216	6298	2391	141	0	crates/elitesql-core/src/db/commit.rs:948
+R	6	5384	1239	6	0	0	0	crates/elitesql-core/src/db/commit.rs:1030
+W	6	12144	3231	6	2433	1677	0	crates/elitesql-core/src/db/maintenance.rs:1059
+R	386	195844	1245	376	216	196	0	crates/elitesql-core/src/db/commit.rs:1405
+
+writer wait histogram (bucket_us_upper count total_us)
+<0us	5	0
+<0us	754	31
+<0us	2214	230
+<0us	1485	266
+<0us	196	77
+<1us	616	467
+<2us	1474	2063
+<4us	71	236
+<8us	455	2942
+<16us	1410	17262
+<32us	2674	65342
+<64us	4655	228646
+<128us	7937	750328
+<256us	5704	1048538
+<512us	3563	1299197
+<1024us	1700	1226234
+<2048us	595	834840
+<4096us	173	473393
+<8192us	29	164996

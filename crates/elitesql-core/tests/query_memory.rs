@@ -703,3 +703,191 @@ fn index_creation_and_primary_recovery_spill_with_a_tiny_maintenance_pool() {
     );
     assert!(db.global_memory_stats().index_delta_bytes <= 4 * 1024);
 }
+
+#[test]
+fn global_aggregates_stream_without_the_full_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("dashboard")).unwrap();
+    db.query("CREATE TABLE orders(total int, created int, kind text)")
+        .unwrap();
+    let mut txn = db.begin();
+    for n in 0..5_000 {
+        let mut row = Record::new();
+        row.insert("total", Value::Int64(n));
+        row.insert("created", Value::Int64(n));
+        row.insert("kind", Value::Text(format!("k{}", n % 7)));
+        txn.insert("orders", row).unwrap();
+    }
+    txn.commit().unwrap();
+    let working = MemoryOptions::default().query_working_bytes as u64;
+    // The reservation of a key-bounded statement.
+    let small = 256 * 1024;
+
+    // count/sum over a filtered scan keep one state per aggregate and hold a
+    // scan batch of narrow rows: twice that fits the small reservation.
+    assert_eq!(
+        rows(
+            db.query_params(
+                "SELECT count(*), sum(total) FROM orders WHERE created >= ?",
+                &[Value::Int64(4_990)],
+            )
+            .unwrap()
+        ),
+        vec![vec![Value::Int64(10), Value::Int64((4_990..5_000).sum())]]
+    );
+    let peak = db.global_memory_stats().query_peak_bytes;
+    assert!(
+        peak > 0 && peak <= small,
+        "global aggregate reserved {peak}"
+    );
+
+    // A GROUP BY with few groups hashes them within the same reservation.
+    assert_eq!(
+        rows(
+            db.query("SELECT kind, count(*) FROM orders GROUP BY kind ORDER BY kind")
+                .unwrap()
+        )
+        .len(),
+        7
+    );
+    let peak = db.global_memory_stats().query_peak_bytes;
+    assert!(peak <= small, "a small GROUP BY reserved {peak}");
+
+    // Wide rows make the batch heavier: the reservation grows past the small
+    // tier to cover it, and stays under the full budget.
+    let dir_wide = tempfile::tempdir().unwrap();
+    let wide = Db::create(dir_wide.path().join("wide")).unwrap();
+    wide.query("CREATE TABLE notes(body text)").unwrap();
+    let mut txn = wide.begin();
+    for _ in 0..2_000 {
+        let mut row = Record::new();
+        row.insert("body", Value::Text("x".repeat(2_000)));
+        txn.insert("notes", row).unwrap();
+    }
+    txn.commit().unwrap();
+    assert_eq!(
+        rows(
+            wide.query("SELECT count(*) FROM notes WHERE body >= 'x'")
+                .unwrap()
+        ),
+        vec![vec![Value::Int64(2_000)]]
+    );
+    let stats = wide.global_memory_stats();
+    assert!(
+        stats.query_peak_bytes > small && stats.query_peak_bytes < working,
+        "wide global aggregate reserved {}",
+        stats.query_peak_bytes
+    );
+    assert_eq!(stats.query_in_use_bytes, 0);
+
+    // COUNT(DISTINCT) keeps the full budget from the start.
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = Db::create(dir.path().join("fresh")).unwrap();
+    fresh
+        .query("CREATE TABLE orders(total int, created int, kind text)")
+        .unwrap();
+    fresh
+        .query("INSERT INTO orders (total, created, kind) VALUES (1, 1, 'a')")
+        .unwrap();
+    fresh
+        .query("SELECT count(DISTINCT kind) FROM orders")
+        .unwrap();
+    assert_eq!(fresh.global_memory_stats().query_peak_bytes, working);
+}
+
+/// Groups that outgrow the medium reservation take the full budget and
+/// still produce every group, whether they then fit in memory or spill.
+#[test]
+fn grouped_aggregates_escalate_when_their_groups_outgrow_the_reservation() {
+    for (working, groups) in [(64 * 1024, 2_000), (8 * 1024, 2_000)] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::create_with(
+            dir.path().join("groups"),
+            DbOptions {
+                memory: MemoryOptions {
+                    query_working_bytes: working,
+                    ..MemoryOptions::default()
+                },
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
+        db.query("CREATE TABLE events(user_id int, amount int)")
+            .unwrap();
+        let mut txn = db.begin();
+        for n in 0..(groups * 3) {
+            let mut row = Record::new();
+            row.insert("user_id", Value::Int64((n % groups) as i64));
+            row.insert("amount", Value::Int64(1));
+            txn.insert("events", row).unwrap();
+        }
+        txn.commit().unwrap();
+        let result = rows(
+            db.query("SELECT user_id, sum(amount) AS total FROM events GROUP BY user_id ORDER BY user_id")
+                .unwrap(),
+        );
+        assert_eq!(result.len(), groups, "working {working}");
+        for (index, row) in result.iter().enumerate() {
+            assert_eq!(row, &vec![Value::Int64(index as i64), Value::Int64(3)]);
+        }
+        let stats = db.global_memory_stats();
+        assert_eq!(stats.query_in_use_bytes, 0);
+        assert!(
+            stats.query_peak_bytes > working as u64 / 8,
+            "working {working}: the groups had to take more than the medium tier"
+        );
+    }
+}
+
+/// Key-bounded and equality reads reserve about twice what they hold, not a
+/// fixed tier: a point lookup stays at the admission floor, and a category
+/// page sorted by price stays far below the 2 MiB it used to hold.
+#[test]
+fn equality_reads_reserve_what_they_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(dir.path().join("catalogue")).unwrap();
+    db.query("CREATE TABLE products(category text, price int, name text)")
+        .unwrap();
+    db.query("CREATE INDEX ON products (category)").unwrap();
+    let mut txn = db.begin();
+    for n in 0..3_390 {
+        let mut row = Record::new();
+        row.insert("category", Value::Text(format!("c{}", n % 10)));
+        row.insert("price", Value::Int64(n));
+        row.insert("name", Value::Text(format!("product {n}")));
+        txn.insert("products", row).unwrap();
+    }
+    txn.commit().unwrap();
+    let id = match db.query("SELECT id FROM products LIMIT 1").unwrap() {
+        QueryOutput::Rows { rows, .. } => match &rows[0][0] {
+            Value::Text(id) => id.clone(),
+            other => panic!("unexpected id {other:?}"),
+        },
+        other => panic!("unexpected output {other:?}"),
+    };
+    drop(db);
+    // Reopened, so the peak below counts only these two reads.
+    let fresh = Db::open(dir.path().join("catalogue")).unwrap();
+    fresh
+        .query_params("SELECT name FROM products WHERE id = ?", &[Value::Text(id)])
+        .unwrap();
+    let point = fresh.global_memory_stats().query_peak_bytes;
+    assert!(point <= 32 * 1024, "a point lookup reserved {point}");
+
+    let page = rows(
+        fresh
+            .query_params(
+                "SELECT name, price FROM products WHERE category = ? ORDER BY price LIMIT 20 OFFSET 40",
+                &[Value::Text("c3".into())],
+            )
+            .unwrap(),
+    );
+    assert_eq!(page.len(), 20);
+    assert_eq!(page[0][1], Value::Int64(403));
+    let peak = fresh.global_memory_stats().query_peak_bytes;
+    assert!(
+        peak < 1024 * 1024,
+        "a category page of 339 rows reserved {peak}"
+    );
+    assert_eq!(fresh.global_memory_stats().query_in_use_bytes, 0);
+}

@@ -610,9 +610,14 @@ impl<'a> PagedPrefixCursor<'a> {
                 }
                 let key = take(&self.index.mmap, &mut self.pos, key_len)?;
                 let value = take(&self.index.mmap, &mut self.pos, value_len)?;
-                if self.after.as_deref().is_some_and(|after| key <= after) {
-                    continue;
+                if let Some(after) = self.after.as_deref() {
+                    if key <= after {
+                        continue;
+                    }
+                    // Keys ascend, so every later key is past the bound too.
+                    self.after = None;
                 }
+
                 if key.starts_with(&self.prefix) {
                     return Ok(Some((key, value)));
                 }

@@ -272,6 +272,10 @@ def add_to_cart(conn, user_id: int, product_id: int, qty: int) -> Outcome:
     return Outcome(business=business, retries=retries)
 
 
+# Rows `view_cart` returns at most (its LIMIT); a larger cart is shown truncated.
+VIEW_CART_LIMIT = 100
+
+
 def view_cart(conn, user_id: int) -> Outcome:
     cart = conn.execute("SELECT id FROM carts WHERE user_id = ? AND status = 'open' LIMIT 1",
                         [user_id]).one
@@ -306,8 +310,9 @@ def checkout(conn, user_id: int) -> Outcome:
 
     Stock is decremented with a guarded UPDATE (``stock >= qty``); a product
     that ran out fails the whole checkout with ``out_of_stock`` and nothing is
-    published. Concurrent checkouts of the same hot product meet at commit and
-    the loser reruns the unit.
+    published. On EliteSQL the decrement is a delta update: concurrent
+    checkouts of the same hot product both commit while the guard holds on the
+    newer version, and only a guard that fails there reruns the unit.
     """
     def unit(tx):
         cart_id = _open_cart(tx, user_id)

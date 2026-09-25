@@ -9,19 +9,30 @@ pub(super) const SECONDARY_ENTRY_TAG: u8 = 1;
 pub(super) const SECONDARY_DELETE: u8 = 0;
 pub(super) const SECONDARY_ADD: u8 = 1;
 
+#[derive(Clone)]
 pub(super) struct SecRun {
     pub(super) meta: DerivedRunMeta,
     pub(super) index: Arc<PagedIndex>,
 }
 
+/// The ids an overlay holds for one value. Shared with readers that took
+/// the value's ids out of the state lock (`SecIdx::key_snapshot`); a write
+/// copies only a set a reader still holds.
+pub(super) type IdSet = super::cow::CowSet<String>;
+
+/// Value -> ids, for the mutable and frozen overlays. Shared with the read
+/// view like the sets it holds (`super::cow`).
+pub(super) type IdMap = super::cow::CowMap<Vec<u8>, IdSet>;
+
 pub(super) struct SecIdx {
     pub(super) generation: u64,
-    pub(super) runs: Vec<SecRun>,
+    /// Shared with readers like the overlay sets; replaced on publication.
+    pub(super) runs: Arc<Vec<SecRun>>,
     /// Final additions since the last immutable run was published.
-    pub(super) delta: BTreeMap<Vec<u8>, BTreeSet<String>>,
+    pub(super) delta: IdMap,
     /// Final removals since publication. Tombstones are required even when
     /// the matching add lives in a non-base level.
-    pub(super) removed: BTreeMap<Vec<u8>, BTreeSet<String>>,
+    pub(super) removed: IdMap,
     /// Immutable in-memory overlay being written by background maintenance.
     /// New commits land in `delta`/`removed` and therefore never mutate the
     /// generation owned by the worker.
@@ -30,8 +41,8 @@ pub(super) struct SecIdx {
 
 pub(super) struct FrozenSecDelta {
     pub(super) generation: u64,
-    pub(super) delta: BTreeMap<Vec<u8>, BTreeSet<String>>,
-    pub(super) removed: BTreeMap<Vec<u8>, BTreeSet<String>>,
+    pub(super) delta: IdMap,
+    pub(super) removed: IdMap,
 }
 
 /// Ids of one equality batch, packed end to end.
@@ -131,21 +142,16 @@ impl<'a> OrderedRunCursor<'a> {
 }
 
 struct OrderedMemCursor<'a> {
-    entries: std::collections::btree_map::Range<'a, Vec<u8>, BTreeSet<String>>,
+    entries: Box<dyn Iterator<Item = (&'a Vec<u8>, &'a IdSet)> + 'a>,
     prefix: &'a [u8],
     after: Option<&'a [u8]>,
     current_key: Option<&'a Vec<u8>>,
-    ids: Option<std::collections::btree_set::Range<'a, String>>,
+    ids: Option<Box<dyn Iterator<Item = &'a String> + 'a>>,
     head: Option<Vec<u8>>,
 }
 
 impl<'a> OrderedMemCursor<'a> {
-    fn new(
-        map: &'a BTreeMap<Vec<u8>, BTreeSet<String>>,
-        prefix: &'a [u8],
-        after: Option<&'a [u8]>,
-    ) -> Self {
-        use std::ops::Bound::{Included, Unbounded};
+    fn new(map: &'a IdMap, prefix: &'a [u8], after: Option<&'a [u8]>) -> Self {
         // Resume at the tuple itself; restarting at the equality prefix made
         // successive batches rescan and allocate every earlier pair again.
         let start = after
@@ -154,7 +160,7 @@ impl<'a> OrderedMemCursor<'a> {
             .filter(|key| *key >= prefix)
             .unwrap_or(prefix);
         let mut cursor = Self {
-            entries: map.range::<[u8], _>((Included(start), Unbounded)),
+            entries: Box::new(map.range_from(start, true)),
             prefix,
             after,
             current_key: None,
@@ -193,16 +199,12 @@ impl<'a> OrderedMemCursor<'a> {
                 return;
             }
             self.current_key = Some(key);
-            use std::ops::Bound::{Excluded, Unbounded};
             let after_id = self
                 .after
                 .and_then(|pair| secondary_pair_parts(pair).ok())
                 .filter(|(after_key, _)| *after_key == key.as_slice())
                 .map(|(_, id)| id);
-            self.ids = Some(match after_id {
-                Some(id) => ids.range::<str, _>((Excluded(id), Unbounded)),
-                None => ids.range::<str, _>((Unbounded, Unbounded)),
-            });
+            self.ids = Some(ids.range_after(after_id));
         }
     }
 }
@@ -244,13 +246,203 @@ impl<'a> SecPairCursor<'a> {
     }
 }
 
+/// A whole secondary index as the read view holds it (`SecIdx::view`).
+#[derive(Clone)]
+pub(super) struct SecIdxView {
+    runs: Arc<Vec<SecRun>>,
+    frozen: Option<Arc<FrozenSecDelta>>,
+    delta: IdMap,
+    removed: IdMap,
+}
+
+impl SecIdxView {
+    /// `SecIdx::ids_batch_into` over the view.
+    pub(super) fn ids_batch_into(
+        &self,
+        key: &[u8],
+        after: Option<&str>,
+        limit: usize,
+        out: &mut IdBatch,
+    ) -> Result<()> {
+        ids_batch_from(
+            &self.runs,
+            self.frozen.as_deref(),
+            self.delta.get(key),
+            self.removed.get(key),
+            key,
+            after,
+            limit,
+            out,
+        )
+    }
+}
+
+/// One value's ids in a secondary index, taken out of the state lock by
+/// `SecIdx::key_snapshot`.
+pub(super) struct SecKeySnapshot {
+    key: Vec<u8>,
+    runs: Arc<Vec<SecRun>>,
+    frozen: Option<Arc<FrozenSecDelta>>,
+    delta: Option<IdSet>,
+    removed: Option<IdSet>,
+}
+
+impl SecKeySnapshot {
+    /// `SecIdx::ids_batch_into` for this snapshot's value.
+    pub(super) fn ids_batch_into(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        out: &mut IdBatch,
+    ) -> Result<()> {
+        ids_batch_from(
+            &self.runs,
+            self.frozen.as_deref(),
+            self.delta.as_ref(),
+            self.removed.as_ref(),
+            &self.key,
+            after,
+            limit,
+            out,
+        )
+    }
+}
+
+/// Ids holding `key`, merged from the runs and the frozen and mutable
+/// overlays; see `SecIdx::ids_batch_into`.
+#[allow(clippy::too_many_arguments)]
+fn ids_batch_from(
+    runs: &[SecRun],
+    frozen: Option<&FrozenSecDelta>,
+    delta: Option<&IdSet>,
+    removed: Option<&IdSet>,
+    key: &[u8],
+    after: Option<&str>,
+    limit: usize,
+    out: &mut IdBatch,
+) -> Result<()> {
+    out.clear();
+    if limit == 0 {
+        return Ok(());
+    }
+    let prefix = secondary_pair_prefix(key);
+    let mut cursors = runs
+        .iter()
+        .filter(|run| run.index.may_contain_prefix(&prefix))
+        .map(|run| SecPairCursor::new(&run.index, key, after))
+        .collect::<Result<Vec<_>>>()?;
+    let mut added = delta.map(|ids| ids.range_after(after).peekable());
+    let mut removed = removed.map(|ids| ids.range_after(after).peekable());
+    let mut frozen_added = frozen
+        .and_then(|frozen| frozen.delta.get(key))
+        .map(|ids| ids.range_after(after).peekable());
+    let mut frozen_removed = frozen
+        .and_then(|frozen| frozen.removed.get(key))
+        .map(|ids| ids.range_after(after).peekable());
+    loop {
+        let next_persisted = cursors.iter().filter_map(SecPairCursor::head_id).min();
+        let next_added = added
+            .as_mut()
+            .and_then(|iter| iter.peek().map(|id| id.as_str()));
+        let next_removed = removed
+            .as_mut()
+            .and_then(|iter| iter.peek().map(|id| id.as_str()));
+        let next_frozen_added = frozen_added
+            .as_mut()
+            .and_then(|iter| iter.peek().map(|id| id.as_str()));
+        let next_frozen_removed = frozen_removed
+            .as_mut()
+            .and_then(|iter| iter.peek().map(|id| id.as_str()));
+        let Some(next) = next_persisted
+            .into_iter()
+            .chain(next_frozen_added)
+            .chain(next_frozen_removed)
+            .chain(next_added)
+            .chain(next_removed)
+            .min()
+        else {
+            break;
+        };
+        // Copied out of the heads so they can be advanced below; the
+        // buffer is the same one on every pass.
+        out.scratch.clear();
+        out.scratch.push_str(next);
+        let id = std::mem::take(&mut out.scratch);
+        let mut newest: Option<(u64, u8)> = None;
+        for cursor in &mut cursors {
+            while cursor.head_id() == Some(id.as_str()) {
+                let (version, operation) = cursor.head.take().expect("matching secondary head");
+                if newest.is_none_or(|current| (version, operation) > current) {
+                    newest = Some((version, operation));
+                }
+                cursor.advance()?;
+            }
+        }
+        let frozen_generation = frozen.map(|frozen| frozen.generation);
+        if frozen_added.as_mut().is_some_and(|iter| {
+            iter.peek()
+                .is_some_and(|candidate| candidate.as_str() == id)
+        }) {
+            frozen_added.as_mut().expect("checked above").next();
+            let operation = (
+                frozen_generation.expect("frozen iterator has generation"),
+                SECONDARY_ADD,
+            );
+            if newest.is_none_or(|current| operation.0 > current.0) {
+                newest = Some(operation);
+            }
+        }
+        if frozen_removed.as_mut().is_some_and(|iter| {
+            iter.peek()
+                .is_some_and(|candidate| candidate.as_str() == id)
+        }) {
+            frozen_removed.as_mut().expect("checked above").next();
+            let generation = frozen_generation.expect("frozen iterator has generation");
+            if newest.is_none_or(|current| generation >= current.0) {
+                newest = Some((generation, SECONDARY_DELETE));
+            }
+        }
+        if added.as_mut().is_some_and(|iter| {
+            iter.peek()
+                .is_some_and(|candidate| candidate.as_str() == id)
+        }) {
+            added.as_mut().expect("checked above").next();
+            newest = Some((u64::MAX, SECONDARY_ADD));
+        }
+        if removed.as_mut().is_some_and(|iter| {
+            iter.peek()
+                .is_some_and(|candidate| candidate.as_str() == id)
+        }) {
+            removed.as_mut().expect("checked above").next();
+            newest = Some((u64::MAX, SECONDARY_DELETE));
+        }
+        let keep = newest.is_some_and(|(_, operation)| operation == SECONDARY_ADD);
+        if keep {
+            out.push(&id);
+        }
+        // Give the buffer back whether the id was kept or not, so the
+        // next pass writes into the same allocation.
+        out.scratch = id;
+        if keep && out.len() == limit {
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl SecIdx {
     pub(super) fn resident(map: BTreeMap<Vec<u8>, BTreeSet<String>>) -> Self {
         Self {
             generation: 0,
-            runs: Vec::new(),
-            delta: map,
-            removed: BTreeMap::new(),
+            runs: Arc::new(Vec::new()),
+            delta: {
+                let mut delta = IdMap::default();
+                for (key, ids) in map {
+                    delta.insert(key, ids.into_iter().collect());
+                }
+                delta
+            },
+            removed: IdMap::default(),
             frozen: None,
         }
     }
@@ -261,9 +453,9 @@ impl SecIdx {
         }
         Ok(Self {
             generation,
-            runs,
-            delta: BTreeMap::new(),
-            removed: BTreeMap::new(),
+            runs: Arc::new(runs),
+            delta: IdMap::default(),
+            removed: IdMap::default(),
             frozen: None,
         })
     }
@@ -294,7 +486,7 @@ impl SecIdx {
     pub(super) fn persisted_pair(&self, key: &[u8], id: &str) -> Result<bool> {
         let mut newest = None;
         let pair = secondary_pair_key(key, id);
-        for run in &self.runs {
+        for run in self.runs.iter() {
             run.index.visit_key(&pair, |encoded| {
                 let operation = decode_secondary_operation(encoded)?;
                 if newest.is_none_or(|current| operation > current) {
@@ -338,128 +530,41 @@ impl SecIdx {
         limit: usize,
         out: &mut IdBatch,
     ) -> Result<()> {
-        use std::ops::Bound::{Excluded, Unbounded};
+        ids_batch_from(
+            &self.runs,
+            self.frozen.as_deref(),
+            self.delta.get(key),
+            self.removed.get(key),
+            key,
+            after,
+            limit,
+            out,
+        )
+    }
 
-        out.clear();
-        if limit == 0 {
-            return Ok(());
+    /// The index for the read view: copies share their storage with this
+    /// one, so a later write copies only what it changes.
+    pub(super) fn view(&self) -> SecIdxView {
+        SecIdxView {
+            runs: self.runs.clone(),
+            frozen: self.frozen.clone(),
+            delta: self.delta.clone(),
+            removed: self.removed.clone(),
         }
-        let prefix = secondary_pair_prefix(key);
-        let mut cursors = self
-            .runs
-            .iter()
-            .filter(|run| run.index.may_contain_prefix(&prefix))
-            .map(|run| SecPairCursor::new(&run.index, key, after))
-            .collect::<Result<Vec<_>>>()?;
-        let mut added = self.delta.get(key).map(|ids| match after {
-            Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
-            None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
-        });
-        let mut removed = self.removed.get(key).map(|ids| match after {
-            Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
-            None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
-        });
-        let mut frozen_added = self.frozen.as_ref().and_then(|frozen| {
-            frozen.delta.get(key).map(|ids| match after {
-                Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
-                None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
-            })
-        });
-        let mut frozen_removed = self.frozen.as_ref().and_then(|frozen| {
-            frozen.removed.get(key).map(|ids| match after {
-                Some(after) => ids.range::<str, _>((Excluded(after), Unbounded)).peekable(),
-                None => ids.range::<str, _>((Unbounded, Unbounded)).peekable(),
-            })
-        });
-        loop {
-            let next_persisted = cursors.iter().filter_map(SecPairCursor::head_id).min();
-            let next_added = added
-                .as_mut()
-                .and_then(|iter| iter.peek().map(|id| id.as_str()));
-            let next_removed = removed
-                .as_mut()
-                .and_then(|iter| iter.peek().map(|id| id.as_str()));
-            let next_frozen_added = frozen_added
-                .as_mut()
-                .and_then(|iter| iter.peek().map(|id| id.as_str()));
-            let next_frozen_removed = frozen_removed
-                .as_mut()
-                .and_then(|iter| iter.peek().map(|id| id.as_str()));
-            let Some(next) = next_persisted
-                .into_iter()
-                .chain(next_frozen_added)
-                .chain(next_frozen_removed)
-                .chain(next_added)
-                .chain(next_removed)
-                .min()
-            else {
-                break;
-            };
-            // Copied out of the heads so they can be advanced below; the
-            // buffer is the same one on every pass.
-            out.scratch.clear();
-            out.scratch.push_str(next);
-            let id = std::mem::take(&mut out.scratch);
-            let mut newest: Option<(u64, u8)> = None;
-            for cursor in &mut cursors {
-                while cursor.head_id() == Some(id.as_str()) {
-                    let (version, operation) = cursor.head.take().expect("matching secondary head");
-                    if newest.is_none_or(|current| (version, operation) > current) {
-                        newest = Some((version, operation));
-                    }
-                    cursor.advance()?;
-                }
-            }
-            let frozen_generation = self.frozen.as_ref().map(|frozen| frozen.generation);
-            if frozen_added.as_mut().is_some_and(|iter| {
-                iter.peek()
-                    .is_some_and(|candidate| candidate.as_str() == id)
-            }) {
-                frozen_added.as_mut().expect("checked above").next();
-                let operation = (
-                    frozen_generation.expect("frozen iterator has generation"),
-                    SECONDARY_ADD,
-                );
-                if newest.is_none_or(|current| operation.0 > current.0) {
-                    newest = Some(operation);
-                }
-            }
-            if frozen_removed.as_mut().is_some_and(|iter| {
-                iter.peek()
-                    .is_some_and(|candidate| candidate.as_str() == id)
-            }) {
-                frozen_removed.as_mut().expect("checked above").next();
-                let generation = frozen_generation.expect("frozen iterator has generation");
-                if newest.is_none_or(|current| generation >= current.0) {
-                    newest = Some((generation, SECONDARY_DELETE));
-                }
-            }
-            if added.as_mut().is_some_and(|iter| {
-                iter.peek()
-                    .is_some_and(|candidate| candidate.as_str() == id)
-            }) {
-                added.as_mut().expect("checked above").next();
-                newest = Some((u64::MAX, SECONDARY_ADD));
-            }
-            if removed.as_mut().is_some_and(|iter| {
-                iter.peek()
-                    .is_some_and(|candidate| candidate.as_str() == id)
-            }) {
-                removed.as_mut().expect("checked above").next();
-                newest = Some((u64::MAX, SECONDARY_DELETE));
-            }
-            let keep = newest.is_some_and(|(_, operation)| operation == SECONDARY_ADD);
-            if keep {
-                out.push(&id);
-            }
-            // Give the buffer back whether the id was kept or not, so the
-            // next pass writes into the same allocation.
-            out.scratch = id;
-            if keep && out.len() == limit {
-                break;
-            }
+    }
+
+    /// Everything that decides which ids hold `key`, detached from the state
+    /// lock: the caller releases the lock and pages through the ids with
+    /// `SecKeySnapshot::ids_batch_into`. The index describes the latest
+    /// committed state, so the snapshot is that state as of this call.
+    pub(super) fn key_snapshot(&self, key: &[u8]) -> SecKeySnapshot {
+        SecKeySnapshot {
+            key: key.to_vec(),
+            runs: self.runs.clone(),
+            frozen: self.frozen.clone(),
+            delta: self.delta.get(key).cloned(),
+            removed: self.removed.get(key).cloned(),
         }
-        Ok(())
     }
 
     /// Merge immutable runs plus mutable/frozen overlays in physical tuple
@@ -576,17 +681,31 @@ impl SecIdx {
     }
 
     pub(super) fn add(&mut self, key: Vec<u8>, id: &str) {
-        if let Some(removed) = self.removed.get_mut(&key) {
+        // Checked through a shared borrow first: a mutable one copies what a
+        // reader holds, and most adds find no tombstone to clear.
+        if self
+            .removed
+            .get(key.as_slice())
+            .is_some_and(|removed| removed.contains(id))
+        {
+            let removed = self.removed.get_mut(key.as_slice()).expect("checked above");
             removed.remove(id);
             if removed.is_empty() {
-                self.removed.remove(&key);
+                self.removed.remove(key.as_slice());
             }
         }
-        self.delta.entry(key).or_default().insert(id.to_owned());
+        if !self
+            .delta
+            .get(key.as_slice())
+            .is_some_and(|ids| ids.contains(id))
+        {
+            self.delta.get_or_insert_default(key).insert(id.to_owned());
+        }
     }
 
     pub(super) fn remove(&mut self, key: &[u8], id: &str) {
-        if let Some(delta) = self.delta.get_mut(key) {
+        if self.delta.get(key).is_some_and(|delta| delta.contains(id)) {
+            let delta = self.delta.get_mut(key).expect("checked above");
             delta.remove(id);
             if delta.is_empty() {
                 self.delta.remove(key);
@@ -600,16 +719,16 @@ impl SecIdx {
         // A read failure here keeps the old, conservative tombstone.
         if (!self.runs.is_empty() || self.frozen.is_some())
             && self.persisted_pair(key, id).unwrap_or(true)
+            && !self.removed.get(key).is_some_and(|ids| ids.contains(id))
         {
             self.removed
-                .entry(key.to_vec())
-                .or_default()
+                .get_or_insert_default(key.to_vec())
                 .insert(id.to_owned());
         }
     }
 
     pub(super) fn delta_memory_bytes(&self) -> usize {
-        fn map_bytes(map: &BTreeMap<Vec<u8>, BTreeSet<String>>) -> usize {
+        fn map_bytes(map: &IdMap) -> usize {
             map.iter()
                 .map(|(key, ids)| {
                     key.len() + 96 + ids.iter().map(|id| id.len() + 48).sum::<usize>()
@@ -620,7 +739,7 @@ impl SecIdx {
     }
 
     pub(super) fn frozen_delta_memory_bytes(&self) -> usize {
-        fn map_bytes(map: &BTreeMap<Vec<u8>, BTreeSet<String>>) -> usize {
+        fn map_bytes(map: &IdMap) -> usize {
             map.iter()
                 .map(|(key, ids)| {
                     key.len() + 96 + ids.iter().map(|id| id.len() + 48).sum::<usize>()

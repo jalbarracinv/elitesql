@@ -51,6 +51,7 @@
 
 mod backup;
 mod check;
+mod lock_probe;
 mod query_control;
 pub use query_control::QueryControl;
 mod collate;

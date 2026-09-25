@@ -95,16 +95,44 @@ pub(super) fn record_wal_sync(shared: &Shared, elapsed: Duration, commits: u64, 
     }
 }
 
+/// The state write guard for publishing a commit, counted in
+/// `state_write_waiting` while it is being waited for (the point-read
+/// admission reads it).
+#[track_caller]
+pub(super) fn write_state_for_commit(
+    shared: &Shared,
+) -> crate::lock_probe::ProbedWriteGuard<'_, State, ReadView> {
+    shared
+        .state_write_waiting
+        .fetch_add(1, AtomicOrdering::AcqRel);
+    let guard = shared.state.write().unwrap();
+    shared
+        .state_write_waiting
+        .fetch_sub(1, AtomicOrdering::AcqRel);
+    guard
+}
+
+#[track_caller]
 pub(super) fn lock_commit_for_transaction(shared: &Shared) -> TimedCommitGuard<'_> {
+    let guard = Some(shared.commit.lock());
+    let qos_previous = if std::env::var_os("ELITESQL_EXP_HOLDQOS").is_some() {
+        super::exp_qos::raise()
+    } else {
+        None
+    };
     TimedCommitGuard {
-        guard: Some(shared.commit.lock()),
+        guard,
+        qos_previous,
         started: Instant::now(),
+
         total_nanos: &shared.commit_lock_hold_nanos,
         waiters: &shared.commit_waiters,
         // Safe group commit benefits from allowing the current CPU to append
         // several queued records before the elected leader fsyncs them. Fast
         // and Balanced need fair handoff to bound mutex-tail latency instead.
-        fair_handoff: shared.opts.durability != Durability::Safe,
+        fair_handoff: shared.opts.durability != Durability::Safe
+            && std::env::var_os("ELITESQL_EXP_UNFAIR").is_none(),
+
     }
 }
 
@@ -132,8 +160,11 @@ pub(super) fn commit_staged(
     // the mutex did, and the queueing hop costs five times the median latency
     // (7.6 ms against 1.4 at 500 in-flight requests) for throughput inside
     // run-to-run noise. The queue has to shorten, not move.
-    if is_coordinated_insert_candidate(&prepared) {
+    if std::env::var_os("ELITESQL_EXP_NO_COORD").is_none()
+        && is_coordinated_insert_candidate(&prepared)
+    {
         coordinate_commit(shared, prepared)
+
     } else {
         finish_prepared_commit(shared, prepared)
     }
@@ -159,9 +190,11 @@ pub(super) fn commit_staged(
 /// second, because the contended writes gained a queueing hop and won nothing.
 pub(super) fn is_coordinated_insert_candidate(prepared: &PreparedCommit) -> bool {
     prepared.preencoded_wal.is_some()
-        && prepared.staged.iter().all(|table| {
-            table.schema.text_indexes.is_empty() && table.schema.vector_indexes.is_empty()
-        })
+        && (std::env::var_os("ELITESQL_EXP_GATE").is_some()
+            || prepared.staged.iter().all(|table| {
+                table.schema.text_indexes.is_empty() && table.schema.vector_indexes.is_empty()
+            }))
+
 }
 
 /// One staged table's superseded versions: for each change, the version it
@@ -199,7 +232,7 @@ pub(super) fn prepare_commit(
         let ordered = staged_table.operations.into_ordered();
         let mut changes = Vec::with_capacity(operation_count);
         let record_encode_started = Instant::now();
-        for (id, operation) in ordered {
+        for (id, operation, rebase) in ordered {
             let payload = match &operation {
                 Some(record) => {
                     let start = u32::try_from(payload_arena.len()).map_err(|_| {
@@ -225,6 +258,7 @@ pub(super) fn prepare_commit(
             changes.push(PreparedChange {
                 id,
                 operation,
+                rebase,
                 payload,
             });
         }
@@ -245,13 +279,13 @@ pub(super) fn prepare_commit(
     // the frame; recovery keeps the maximum across records anyway.
     let wal_encode_started = Instant::now();
     let identity_marks: Vec<(String, i64)> = {
-        let state = shared.state.read().unwrap();
+        // The counters are shared with the read view, so no lock is taken.
+        let view = shared.state.view();
         staged
             .iter()
             .filter(|table| table.schema.columns.iter().any(|column| column.identity))
             .filter_map(|table| {
-                state
-                    .identity_high_water
+                view.identities
                     .get(&table.name)
                     .map(|value| (table.name.clone(), value.load(AtomicOrdering::Relaxed)))
             })
@@ -306,8 +340,11 @@ pub(super) fn prepare_commit(
             || !table.schema.vector_indexes.is_empty()
     });
     let (incoming_index_bytes, optimistic_prior_records) = if has_derived_indexes {
-        let state = shared.state.read().unwrap();
-        let incoming_index_bytes = estimate_staged_index_bytes(&state, &staged)?;
+        // From the read view: these are estimates and a cache, both checked
+        // again under the commit mutex, so a view a commit behind is fine and
+        // the state lock is not taken.
+        let state = shared.state.view();
+        let incoming_index_bytes = estimate_staged_index_bytes(shared, &state, &staged)?;
         let records = staged
             .iter()
             .map(|table| {
@@ -325,13 +362,16 @@ pub(super) fn prepare_commit(
                             state.latest_owned(&table.name, &change.id)?
                         };
                         // A record that already moved past this snapshot can
-                        // only fail validation; report the conflict now, from
-                        // under the shared lock, instead of after queueing for
+                        // only fail validation; report the conflict now,
+                        // instead of after queueing for
                         // the commit mutex and spending its time to learn it.
                         // The locked validation below remains authoritative.
-                        if previous
-                            .as_ref()
-                            .is_some_and(|entry| entry.version > snap_version)
+                        // A delta update is replayed over the newer version
+                        // instead, so it goes on to the locked validation.
+                        if change.rebase.is_none()
+                            && previous
+                                .as_ref()
+                                .is_some_and(|entry| entry.version > snap_version)
                         {
                             return Err(Error::Conflict(format!(
                                 "{}/{} changed after this transaction began",
@@ -342,7 +382,7 @@ pub(super) fn prepare_commit(
                             Some(entry) if !entry.is_tombstone() => Ok(Some((
                                 entry.version,
                                 read_prior_for_indexes(
-                                    &state.blobs,
+                                    &shared.blobs,
                                     &state.readers,
                                     &entry.kind,
                                     &table.schema,
@@ -400,6 +440,38 @@ pub(super) fn prepare_commit(
     })
 }
 
+pub(super) mod cycle_probe {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::Duration;
+    pub static N: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    pub static D: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    pub fn dadd(i: usize, d: Duration) {
+        D[i].fetch_add(d.as_nanos() as u64, Relaxed);
+    }
+    pub fn ddump() {
+        let v: Vec<u64> = D.iter().map(|a| a.load(Relaxed)).collect();
+        let n = v[0].max(1);
+        eprintln!(
+            "DIRECTPROBE n={} us/commit: validate={} maintloop={} wal={} statewait={} apply={} publish={} post={} aside_overlap={} aside_changed={} aside_changed_rebasable={} set_aside={}",
+            v[0], v[1] / n / 1000, v[2] / n / 1000, v[3] / n / 1000, v[4] / n / 1000, v[5] / n / 1000, v[6] / n / 1000, v[7] / n / 1000, v[8], v[9], v[10], super::commit::cycle_probe::N[14].load(Relaxed)
+
+        );
+    }
+    pub fn add(i: usize, d: Duration) {
+        N[i].fetch_add(d.as_nanos() as u64, Relaxed);
+    }
+    pub fn inc(i: usize, by: u64) {
+        N[i].fetch_add(by, Relaxed);
+    }
+    pub fn dump() {
+        let v: Vec<u64> = N.iter().map(|a| a.load(Relaxed)).collect();
+        eprintln!(
+            "CYCLEPROBE cycles={} members={} take_ns={} batch_ok_ns={} fallbacks={} fallback_ns={} complete_ns={} promote_ns={} cycle_ns={} lockwait_ns={} locked_ns={} post_ns={} prelock_ns={} r_small={} r_pool={}",
+            v[0], v[15], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13]
+        );
+    }
+}
+
 pub(super) fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Result<u64> {
     let request = Arc::new(CoordinatedCommit::new(prepared));
     let mut leader = {
@@ -415,6 +487,7 @@ pub(super) fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) 
 
     loop {
         if leader {
+            let cycle_started = Instant::now();
             if should_coalesce_safe_batch(shared) {
                 let coalesce_started = Instant::now();
                 std::thread::sleep(Duration::from_micros(
@@ -425,17 +498,60 @@ pub(super) fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) 
                     AtomicOrdering::Relaxed,
                 );
             }
+            let take_started = Instant::now();
             let batch = {
                 let mut coordinator = shared.commit_coordinator.lock().unwrap();
+                if let Some(promoted) = coordinator.promoted_at.take() {
+                    shared
+                        .coordinator_handoffs
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    shared
+                        .coordinator_handoff_nanos
+                        .fetch_add(elapsed_nanos(promoted.elapsed()), AtomicOrdering::Relaxed);
+                }
                 let take = coordinator.queue.len().min(COMMIT_COORDINATOR_MAX_BATCH);
                 coordinator.queue.drain(..take).collect::<Vec<_>>()
             };
-            process_coordinated_batch(shared, batch);
-            let mut coordinator = shared.commit_coordinator.lock().unwrap();
-            if let Some(next) = coordinator.queue.front() {
-                next.promote_to_leader();
-            } else {
-                coordinator.active = false;
+            cycle_probe::add(1, take_started.elapsed());
+            cycle_probe::inc(15, batch.len() as u64);
+            // The next leader is woken as soon as this one holds the commit
+            // mutex, not after it finished: waking a parked thread on a busy
+            // machine takes about as long as a batch, and this way it takes
+            // its batch and queues for the mutex while this batch runs.
+            // There is never more than one such successor, because only the
+            // leader holding the mutex promotes.
+            let early = std::env::var_os("ELITESQL_EXP_EARLY").is_some();
+            let promoted = std::cell::Cell::new(false);
+            let promote = || {
+                if !early || promoted.get() {
+                    return;
+                }
+                let mut coordinator = shared.commit_coordinator.lock().unwrap();
+                if let Some(next) = coordinator.queue.front().cloned() {
+                    coordinator.promoted_at = Some(Instant::now());
+                    next.promote_to_leader();
+                    promoted.set(true);
+                }
+            };
+            process_coordinated_batch(shared, batch, &promote);
+            let promote_started = Instant::now();
+            if !promoted.get() {
+                let mut coordinator = shared.commit_coordinator.lock().unwrap();
+                if let Some(next) = coordinator.queue.front().cloned() {
+                    coordinator.promoted_at = Some(Instant::now());
+                    next.promote_to_leader();
+                } else {
+                    coordinator.active = false;
+                }
+            }
+            cycle_probe::add(6, promote_started.elapsed());
+            cycle_probe::add(7, cycle_started.elapsed());
+            if cycle_probe::N[0].fetch_add(1, AtomicOrdering::Relaxed) % 2000 == 1999 {
+                cycle_probe::dump();
+                super::dump_hold_probe();
+                cycle_probe::ddump();
+
+
             }
         }
         if let Some(result) = request.take_result() {
@@ -449,6 +565,7 @@ pub(super) fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) 
 }
 
 pub(super) fn should_coalesce_safe_batch(shared: &Shared) -> bool {
+
     if shared.opts.durability != Durability::Safe || shared.opts.safe_group_commit_delay_us == 0 {
         return false;
     }
@@ -470,8 +587,12 @@ pub(super) fn should_coalesce_safe_batch(shared: &Shared) -> bool {
         .is_ok()
 }
 
-pub(super) fn process_coordinated_batch(shared: &Arc<Shared>, batch: Vec<Arc<CoordinatedCommit>>) {
-    let mut prepared = batch
+pub(super) fn process_coordinated_batch(
+    shared: &Arc<Shared>,
+    batch: Vec<Arc<CoordinatedCommit>>,
+    promote: &dyn Fn(),
+) {
+    let prepared = batch
         .iter()
         .map(|request| {
             request
@@ -487,30 +608,302 @@ pub(super) fn process_coordinated_batch(shared: &Arc<Shared>, batch: Vec<Arc<Coo
         .map(|request| request.queued_at.elapsed())
         .fold(Duration::ZERO, Duration::saturating_add);
 
-    if let Some(results) = finish_coordinated_insert_batch(shared, &mut prepared, queue_wait) {
-        debug_assert_eq!(batch.len(), results.len());
-        for (request, result) in batch.into_iter().zip(results) {
-            request.complete(result);
+    let finish_started = Instant::now();
+    match finish_coordinated_insert_batch(shared, prepared, queue_wait, promote) {
+        Ok(outcome) => {
+            cycle_probe::add(2, finish_started.elapsed());
+            let complete_started = Instant::now();
+            for (member, result) in outcome.results {
+                batch[member].complete(result);
+            }
+            cycle_probe::add(5, complete_started.elapsed());
+            // Members the batch set aside commit one by one after it, in
+            // queue order, exactly as a batch that could not form at all.
+            if !outcome.set_aside.is_empty() {
+                cycle_probe::inc(14, outcome.set_aside.len() as u64);
+            }
+            for (member, prepared) in outcome.set_aside {
+                batch[member].complete(finish_prepared_commit(shared, prepared));
+            }
         }
-        return;
-    }
-    for (request, prepared) in batch.into_iter().zip(prepared) {
-        request.complete(finish_prepared_commit(shared, prepared));
+        Err(prepared) => {
+            promote();
+            cycle_probe::inc(3, 1);
+            for (request, prepared) in batch.into_iter().zip(prepared) {
+                request.complete(finish_prepared_commit(shared, prepared));
+            }
+            cycle_probe::add(4, finish_started.elapsed());
+        }
     }
 }
 
-/// Coordinated path for disjoint inserts into unconstrained tables.
-/// Validation still happens under the serialization mutex, every transaction
-/// receives its own version and WAL frame, and readers see the complete batch
-/// only after the vectored append and one state publication finish. `Safe`
-/// batches issue one strict durability barrier before any member returns.
+/// Records a batch member replays: `(table, change, record)` for each delta
+/// update whose row changed after the member's snapshot.
+type Replayed = Vec<(usize, usize, Record)>;
+
+/// The superseded versions of every change of `commit`, with the delta
+/// updates it has to replay over a newer version, or `None` when the batch
+/// has to set it aside: it writes a row in `taken`, one of its rows changed
+/// after its snapshot without a delta to replay, or a read failed. Every
+/// fallible read happens here, before the WAL durability point, exactly as
+/// the single path requires.
+fn batch_member_previous(
+    state: &State,
+    commit: &PreparedCommit,
+    taken: &HashSet<(&str, &str)>,
+) -> Option<(Vec<PreviousEntries>, Replayed)> {
+    let mut replayed = Vec::new();
+    let mut commit_previous = Vec::with_capacity(commit.staged.len());
+    for (table_index, table) in commit.staged.iter().enumerate() {
+        let mut table_previous = Vec::with_capacity(table.changes.len());
+        for (change_index, change) in table.changes.iter().enumerate() {
+            if taken.contains(&(table.name.as_str(), change.id.as_str())) {
+                cycle_probe::D[8].fetch_add(1, AtomicOrdering::Relaxed);
+                return None;
+            }
+            let previous = if state.id_is_above_high_watermark(&table.name, &change.id) {
+                None
+            } else {
+                state.latest_owned(&table.name, &change.id).ok()?
+            };
+            // Write-write conflict, or a delta update to replay, against this
+            // member's own snapshot: the single path does both.
+            if let Some(last) = previous
+                .as_ref()
+                .filter(|last| last.version > commit.snap_version)
+            {
+                cycle_probe::D[9].fetch_add(1, AtomicOrdering::Relaxed);
+                let record = rebase_change(state, &table.schema, change, last).ok()??;
+                cycle_probe::D[10].fetch_add(1, AtomicOrdering::Relaxed);
+                replayed.push((table_index, change_index, record));
+            }
+            let prior_record = match &previous {
+                Some(entry)
+                    if !entry.is_tombstone()
+                        && (!table.schema.indexes.is_empty()
+                            || !table.schema.text_indexes.is_empty()) =>
+                {
+                    match &commit.optimistic_prior_records[table_index][change_index] {
+                        Some((version, record)) if *version == entry.version => {
+                            Some(record.clone())
+                        }
+                        _ => Some(
+                            read_prior_for_indexes(
+                                &state.blobs,
+                                &state.readers,
+                                &entry.kind,
+                                &table.schema,
+                            )
+                            .ok()?,
+                        ),
+                    }
+                }
+                _ => None,
+            };
+            table_previous.push((previous, prior_record));
+        }
+        commit_previous.push(table_previous);
+    }
+    Some((commit_previous, replayed))
+}
+
+/// Put a batch member's replayed records in place of the staged ones: new
+/// payloads in its arena and a new WAL frame, as the single path does at its
+/// durability point. Identity marks are read again from the committed state;
+/// they only grow, and recovery keeps the maximum.
+fn replay_batch_member(state: &State, commit: &mut PreparedCommit, replayed: Replayed) -> Result<()> {
+    let arena = Arc::make_mut(&mut commit.payload_arena);
+    for (table_index, change_index, record) in replayed {
+        let table = &mut commit.staged[table_index];
+        let start = u32::try_from(arena.len()).map_err(|_| {
+            Error::InvalidArgument("transaction payload arena exceeds the 4-GiB WAL limit".into())
+        })?;
+        encode_record_ordered_into(arena, &table.schema, &record, None)?;
+        let end = u32::try_from(arena.len()).map_err(|_| {
+            Error::InvalidArgument("transaction payload arena exceeds the 4-GiB WAL limit".into())
+        })?;
+        let change = &mut table.changes[change_index];
+        change.payload = Some((start, end - start));
+        change.operation = Some(record);
+    }
+    let identity_marks: Vec<(&str, i64)> = commit
+        .staged
+        .iter()
+        .filter(|table| table.schema.columns.iter().any(|column| column.identity))
+        .filter_map(|table| {
+            state
+                .identity_high_water
+                .get(&table.name)
+                .map(|value| (table.name.as_str(), value.load(AtomicOrdering::Relaxed)))
+        })
+        .collect();
+    let arena = &commit.payload_arena;
+    let wal_changes: Vec<(&str, &str, Option<&[u8]>)> = commit
+        .staged
+        .iter()
+        .flat_map(|table| {
+            table.changes.iter().map(|change| {
+                let payload = change.payload.map(|(start, len)| {
+                    let start = start as usize;
+                    &arena[start..start + len as usize]
+                });
+                (table.name.as_str(), change.id.as_str(), payload)
+            })
+        })
+        .collect();
+    let frame = encode_commit(0, &wal_changes, &identity_marks)?;
+    commit.preencoded_wal = Some(frame);
+    Ok(())
+}
+
+
+/// Count what one applied change makes obsolete, for auto-compaction.
+fn count_obsolete(
+    table: &str,
+    change: &PreparedChange,
+    previous: Option<&VersionEntry>,
+    operations: &mut u64,
+    bytes: &mut u64,
+) {
+    if let Some(previous) = previous {
+        // An update, delete, or reinsert supersedes one previously visible
+        // record version. Count rows, not SQL statements.
+        *operations += 1;
+        *bytes = bytes.saturating_add(obsolete_entry_bytes_estimate(table, &change.id, previous));
+    } else if change.operation.is_none() {
+        // Insert-then-delete inside one transaction leaves only a tombstone,
+        // which compaction can discard completely.
+        *operations += 1;
+    }
+}
+
+fn record_obsolete(shared: &Shared, operations: u64, bytes: u64) {
+    if operations > 0 {
+        let mut auto = shared.auto_compaction_state.lock().unwrap();
+        auto.debt_operations = auto.debt_operations.saturating_add(operations);
+        auto.estimated_reclaimable_bytes = auto.estimated_reclaimable_bytes.saturating_add(bytes);
+    }
+}
+
+/// Hand the asynchronous vector indexing a commit produced to the worker.
+fn send_vector_jobs(shared: &Shared, jobs: Vec<VecJob>) {
+    if jobs.is_empty() {
+        return;
+    }
+    let tx = shared.vector_tx.lock().unwrap();
+    if let Some(tx) = tx.as_ref() {
+        shared
+            .vector_backlog
+            .fetch_add(jobs.len() as u64, AtomicOrdering::SeqCst);
+        for job in jobs {
+            if tx.send(job).is_err() {
+                *shared
+                    .vector_worker_error
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(
+                    "vector indexing worker stopped before accepting committed work".into(),
+                );
+                // Keep the backlog charged: the vector is committed but not
+                // searchable. A waiter must report the dead worker, not claim
+                // that indexing completed successfully.
+            }
+        }
+    }
+}
+
+/// Whether to publish derived deltas in the background: once the shared
+/// delta pool is half full, but only when they are worth a run. The pool is
+/// shared with the primary memtable, and publishing a few thousand vectors
+/// every commit while the memtable is what fills it would create tiny HNSW
+/// runs faster than background merges can fold them. One sixteenth of the
+/// pool is about the largest run four of which a merge can still rebuild
+/// within its half of the maintenance pool. Hard pool pressure still
+/// publishes whatever exists.
+fn derived_schedule_needed(shared: &Arc<Shared>, commit_version: u64) -> bool {
+    let memory = shared.memory_governor.stats();
+    memory.index_delta_bytes >= memory.index_delta_capacity_bytes / 2
+        && sampled_derived_delta_bytes(shared, commit_version) as u64
+            >= (memory.index_delta_capacity_bytes / DERIVED_PUBLICATION_MIN_DIVISOR).max(1)
+}
+
+/// Background work a commit may have to schedule once it released the
+/// commit mutex: derived delta publication and the primary checkpoint.
+fn post_commit_maintenance(
+    shared: &Arc<Shared>,
+    maintenance_needed: bool,
+    derived_schedule_needed: bool,
+    commit_version: u64,
+) -> Result<()> {
+    if !(maintenance_needed || derived_schedule_needed) {
+        return Ok(());
+    }
+    let mut cs = lock_commit_after_group_sync(shared);
+    if derived_schedule_needed && !shared.background_derived.lock().unwrap().running {
+        let derived_bytes = shared.state.read().unwrap().derived_delta_memory_bytes();
+        shared
+            .derived_delta_size_walks
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        if let Some(memory) = try_acquire_frozen_lease(shared, derived_bytes) {
+            let _ = schedule_frozen_derived(shared, memory)?;
+            // The overlays this sample described have just been frozen for
+            // publication. Leaving the old figure standing would keep asking
+            // for a job that has already been taken, and the extra runs that
+            // produces are real work.
+            reset_derived_delta_sample(shared, commit_version);
+        }
+    }
+    if cs.memtable_bytes >= shared.opts.memtable_max_bytes {
+        // The derived worker owns the sole maintenance reservation and needs
+        // this mutex for its final publication. Defer the soft-threshold
+        // primary checkpoint instead of waiting for that reservation while
+        // holding the mutex. A later commit schedules it; hard index pressure
+        // waits outside the mutex.
+        if shared.background_derived.lock().unwrap().running {
+            return Ok(());
+        }
+        let frozen_running = shared.state.read().unwrap().index.frozen.is_some();
+        if !frozen_running {
+            let memory = acquire_frozen_lease(shared, cs.memtable_bytes as usize);
+            let _ = schedule_frozen_checkpoint(shared, &mut cs, memory)?;
+        }
+    }
+    Ok(())
+}
+
+/// What a coordinated batch did with its members: the result of each one it
+
+
+/// committed, and the ones it set aside for the single-commit path, each with
+/// its position in the batch.
+pub(super) struct BatchOutcome {
+    results: Vec<(usize, Result<u64>)>,
+    set_aside: Vec<(usize, PreparedCommit)>,
+}
+
+/// Coordinated path: many commits under one hold of the serialization mutex.
+/// Validation still happens under that mutex, every transaction receives its
+/// own version and WAL frame, and readers see the complete batch only after
+/// the vectored append and one state publication finish. `Safe` batches
+/// issue one strict durability barrier before any member returns.
+///
+/// A member the batch cannot take as it is (it touches a row an earlier
+/// member already writes, its row changed after its snapshot, or reading its
+/// prior version failed) is set aside and returned to the caller, which
+/// commits it on the single-commit path after the batch: that path replays
+/// delta updates and raises conflicts with the message callers expect. The
+/// rest of the batch goes ahead without it. `Err` hands every member back
+/// when no batch can form at all.
 pub(super) fn finish_coordinated_insert_batch(
     shared: &Arc<Shared>,
-    prepared: &mut [PreparedCommit],
+    mut prepared: Vec<PreparedCommit>,
     queue_wait: Duration,
-) -> Option<Vec<Result<u64>>> {
-    if prepared.len() < 2 {
-        return None;
+    promote: &dyn Fn(),
+) -> std::result::Result<BatchOutcome, Vec<PreparedCommit>> {
+    let prelock_started = Instant::now();
+    let min_members = if std::env::var_os("ELITESQL_EXP_EARLY").is_some() { 1 } else { 2 };
+    if prepared.len() < min_members {
+        cycle_probe::inc(12, 1);
+        return Err(prepared);
     }
     debug_assert!(prepared.iter().all(is_coordinated_insert_candidate));
     if shared
@@ -520,117 +913,160 @@ pub(super) fn finish_coordinated_insert_batch(
         .last_error
         .is_some()
     {
-        return None;
+        return Err(prepared);
     }
-    let incoming_bytes = prepared.iter().try_fold(0usize, |total, commit| {
+    let Some(incoming_bytes) = prepared.iter().try_fold(0usize, |total, commit| {
         total.checked_add(commit.incoming_index_bytes)
-    })?;
+    }) else {
+        return Err(prepared);
+    };
     if shared.memory_governor.index_would_exceed(incoming_bytes) {
-        return None;
+        cycle_probe::inc(13, 1);
+        return Err(prepared);
     }
+
+    cycle_probe::add(11, prelock_started.elapsed());
 
     let lock_started = Instant::now();
     shared.commit_waiters.fetch_add(1, AtomicOrdering::AcqRel);
     let mut cs = lock_commit_for_transaction(shared);
     shared.commit_waiters.fetch_sub(1, AtomicOrdering::AcqRel);
+    cycle_probe::add(8, lock_started.elapsed());
+    promote();
+
+    let locked_started = Instant::now();
     let lock_wait = lock_started.elapsed().saturating_add(queue_wait);
     let locked_prepare_started = Instant::now();
-    // Members must touch disjoint rows. That is what lets each of them be
-    // validated exactly as the single-commit path validates it: with no row
-    // in common, no member can be another's prior version or invalidate its
-    // conflict check. Anything overlapping falls back to the general path.
-    let mut ids = HashSet::new();
-    // Per commit, per table, per change: the version this change supersedes
-    // and, when a derived index has to drop its old keys, that record.
-    let mut previous_entries: Vec<Vec<PreviousEntries>> = Vec::with_capacity(prepared.len());
+    // Members of the batch touch disjoint rows. That is what lets each of
+    // them be validated exactly as the single-commit path validates it: with
+    // no row in common, no member can be another's prior version or
+    // invalidate its conflict check. A member that overlaps one already taken
+    // is set aside, not the batch.
+    let mut ids: HashSet<(&str, &str)> = HashSet::new();
+    let mut rebases: Vec<Vec<(usize, usize, Record)>> = Vec::with_capacity(prepared.len());
+    let mut rebased_rows = 0u64;
+    // Per member: `None` when it is set aside, otherwise per table, per
+    // change, the version this change supersedes and, when a derived index
+    // has to drop its old keys, that record.
+    let mut previous_entries: Vec<Option<Vec<PreviousEntries>>> =
+        Vec::with_capacity(prepared.len());
     let start_version = {
         let state = shared.state.read().unwrap();
         for commit in prepared.iter() {
-            let mut commit_previous = Vec::with_capacity(commit.staged.len());
-            for (table_index, table) in commit.staged.iter().enumerate() {
-                if state.catalog.table(&table.name) != Some(&table.schema) {
-                    return None;
-                }
-                let mut table_previous = Vec::with_capacity(table.changes.len());
-                for (change_index, change) in table.changes.iter().enumerate() {
-                    if !ids.insert((table.name.clone(), change.id.clone())) {
-                        return None;
-                    }
-                    let previous = if state.id_is_above_high_watermark(&table.name, &change.id) {
-                        None
-                    } else {
-                        match state.latest_owned(&table.name, &change.id) {
-                            Ok(previous) => previous,
-                            Err(_) => return None,
-                        }
-                    };
-                    // Write-write conflict, against this member's own
-                    // snapshot. Falling back lets the general path raise it
-                    // with the message and the retry the caller expects.
-                    if previous
-                        .as_ref()
-                        .is_some_and(|last| last.version > commit.snap_version)
-                    {
-                        return None;
-                    }
-                    // Every fallible read happens here, before the WAL
-                    // durability point, exactly as the single path requires.
-                    let prior_record = match &previous {
-                        Some(entry)
-                            if !entry.is_tombstone()
-                                && (!table.schema.indexes.is_empty()
-                                    || !table.schema.text_indexes.is_empty()) =>
-                        {
-                            match &commit.optimistic_prior_records[table_index][change_index] {
-                                Some((version, record)) if *version == entry.version => {
-                                    Some(record.clone())
-                                }
-                                _ => match read_prior_for_indexes(
-                                    &state.blobs,
-                                    &state.readers,
-                                    &entry.kind,
-                                    &table.schema,
-                                ) {
-                                    Ok(record) => Some(record),
-                                    Err(_) => return None,
-                                },
-                            }
-                        }
-                        _ => None,
-                    };
-                    table_previous.push((previous, prior_record));
-                }
-                commit_previous.push(table_previous);
+            if commit
+                .staged
+                .iter()
+                .any(|table| state.catalog.table(&table.name) != Some(&table.schema))
+            {
+                drop(state);
+                drop(cs);
+                return Err(prepared);
             }
-            previous_entries.push(commit_previous);
+            match batch_member_previous(&state, commit, &ids) {
+                Some((previous, replayed)) => {
+                    for table in &commit.staged {
+                        for change in &table.changes {
+                            ids.insert((table.name.as_str(), change.id.as_str()));
+                        }
+                    }
+                    previous_entries.push(Some(previous));
+                    rebases.push(replayed);
+                }
+                None => {
+                    previous_entries.push(None);
+                    rebases.push(Vec::new());
+                }
+            }
         }
-        // Uniqueness and foreign keys over the whole batch at once: these
+        drop(ids);
+        // Delta updates replayed over a newer version replace their staged
+        // record, payload and WAL frame before anything validates them.
+        for ((commit, replayed), previous) in prepared
+            .iter_mut()
+            .zip(rebases)
+            .zip(previous_entries.iter_mut())
+        {
+            if replayed.is_empty() {
+                continue;
+            }
+            let rows = replayed.len() as u64;
+            match replay_batch_member(&state, commit, replayed) {
+                Ok(()) => rebased_rows += rows,
+                Err(_) => *previous = None,
+            }
+        }
+        // Uniqueness and foreign keys over the members taken, at once: these
         // already check a slice of staged tables against the committed state
         // and against itself, which is exactly what members needing to not
         // collide with each other means.
         let borrowed: Vec<&PreparedTable> = prepared
             .iter()
-            .flat_map(|commit| commit.staged.iter())
+            .zip(&previous_entries)
+            .filter(|(_, previous)| previous.is_some())
+            .flat_map(|(commit, _)| commit.staged.iter())
             .collect();
         if validate_unique(&state, &borrowed).is_err()
             || validate_foreign_keys(&state, &borrowed).is_err()
         {
-            return None;
+            drop(borrowed);
+            drop(state);
+            drop(cs);
+            return Err(prepared);
         }
         state.committed_version
     };
+    if rebased_rows > 0 {
+        shared
+            .delta_rebased_rows
+            .fetch_add(rebased_rows, AtomicOrdering::Relaxed);
+    }
+    let mut members = Vec::with_capacity(prepared.len());
+    let mut set_aside = Vec::new();
+    let mut taken = Vec::with_capacity(prepared.len());
+    let mut taken_previous = Vec::with_capacity(prepared.len());
+    for (member, (commit, previous)) in prepared.into_iter().zip(previous_entries).enumerate() {
+        match previous {
+            Some(previous) => {
+                members.push(member);
+                taken.push(commit);
+                taken_previous.push(previous);
+            }
+            None => set_aside.push((member, commit)),
+        }
+    }
+    let mut prepared = taken;
+    let previous_entries = taken_previous;
+    if prepared.is_empty() {
+        drop(cs);
+        return Ok(BatchOutcome {
+            results: Vec::new(),
+            set_aside,
+        });
+    }
+    // Members set aside charge the pool themselves when they commit.
+    let incoming_bytes = prepared
+        .iter()
+        .fold(0usize, |total, commit| total.saturating_add(commit.incoming_index_bytes));
+
     let batch_len = u64::try_from(prepared.len()).expect("coordinator batch length fits u64");
     let Some(end_version) = start_version.checked_add(batch_len) else {
-        return Some(
-            (0..prepared.len())
-                .map(|_| {
-                    Err(Error::InvalidArgument(
-                        "commit version space is exhausted".into(),
-                    ))
+        drop(cs);
+        return Ok(BatchOutcome {
+            results: members
+                .into_iter()
+                .map(|member| {
+                    (
+                        member,
+                        Err(Error::InvalidArgument(
+                            "commit version space is exhausted".into(),
+                        )),
+                    )
                 })
                 .collect(),
-        );
+            set_aside,
+        });
     };
+
     let versions = ((start_version + 1)..=end_version).collect::<Vec<_>>();
     let locked_prepare_time = locked_prepare_started.elapsed();
 
@@ -662,17 +1098,22 @@ pub(super) fn finish_coordinated_insert_batch(
     if let Err(error) = cs.wal().append_commits_unflushed(&records) {
         drop(cs);
         let message = error.to_string();
-        return Some(
-            versions
+        return Ok(BatchOutcome {
+            results: members
                 .into_iter()
-                .map(|_| {
-                    Err(Error::Io(std::io::Error::other(format!(
-                        "coordinated WAL append failed: {message}"
-                    ))))
+                .map(|member| {
+                    (
+                        member,
+                        Err(Error::Io(std::io::Error::other(format!(
+                            "coordinated WAL append failed: {message}"
+                        )))),
+                    )
                 })
                 .collect(),
-        );
+            set_aside,
+        });
     }
+
     shared
         .wal_appended_bytes
         .fetch_add(synced_bytes, AtomicOrdering::Relaxed);
@@ -693,9 +1134,12 @@ pub(super) fn finish_coordinated_insert_batch(
 
     let apply_started = Instant::now();
     let mut added = 0u64;
+    let mut obsolete_operations = 0u64;
+    let mut obsolete_bytes = 0u64;
+    let mut jobs: Vec<VecJob> = Vec::new();
     {
         let write_wait_started = Instant::now();
-        let mut state = shared.state.write().unwrap();
+        let mut state = write_state_for_commit(shared);
         shared.commit_state_write_wait_nanos.fetch_add(
             elapsed_nanos(write_wait_started.elapsed()),
             AtomicOrdering::Relaxed,
@@ -722,6 +1166,13 @@ pub(super) fn finish_coordinated_insert_batch(
                 for (change, (previous, prior_record)) in
                     table.changes.into_iter().zip(table_previous)
                 {
+                    count_obsolete(
+                        &table.name,
+                        &change,
+                        previous.as_ref(),
+                        &mut obsolete_operations,
+                        &mut obsolete_bytes,
+                    );
                     if let Some(VersionEntry {
                         kind: VKind::SegPut { segment, .. },
                         ..
@@ -737,9 +1188,6 @@ pub(super) fn finish_coordinated_insert_batch(
                         .as_ref()
                         .zip(payload.as_ref())
                         .map(|(record, payload)| (payload, record));
-                    // The gate keeps vector-indexed tables out, so nothing
-                    // here asks for background indexing.
-                    let mut jobs = Vec::new();
                     apply_one_owned(
                         &mut state,
                         *version,
@@ -753,7 +1201,6 @@ pub(super) fn finish_coordinated_insert_batch(
                         &keys,
                         &mut jobs,
                     );
-                    debug_assert!(jobs.is_empty(), "a batch member asked for indexing work");
                     added =
                         added.saturating_add(change.payload.map_or(0, |(_, len)| len as u64) + 32);
                 }
@@ -763,33 +1210,40 @@ pub(super) fn finish_coordinated_insert_batch(
             state.committed_version = *version;
         }
     }
+    // Only now, with the read view that covers the batch published by the
+    // guard's release, do new snapshots move to it. Storing the version
+    // under the guard handed readers a snapshot no view covered yet, and
+    // they waited for the state lock behind the rest of the batch. The
+    // commit mutex is still held, so compaction sees the two agree.
+    shared
+        .published_version
+        .store(end_version, AtomicOrdering::Release);
     let apply_time = apply_started.elapsed();
+    record_obsolete(shared, obsolete_operations, obsolete_bytes);
+    send_vector_jobs(shared, jobs);
     cs.memtable_bytes = cs.memtable_bytes.saturating_add(added);
     shared.memory_governor.add_index_delta_bytes(incoming_bytes);
     let maintenance_needed = cs.memtable_bytes >= shared.opts.memtable_max_bytes;
+    let derived_schedule_needed = derived_schedule_needed(shared, end_version);
     drop(cs);
+    cycle_probe::add(9, locked_started.elapsed());
+    let post_started = Instant::now();
     let wal_time = wal_started.elapsed();
 
     let maintenance_started = Instant::now();
-    if maintenance_needed {
-        let result = (|| -> Result<()> {
-            let mut cs = lock_commit_after_group_sync(shared);
-            if cs.memtable_bytes >= shared.opts.memtable_max_bytes
-                && shared.state.read().unwrap().index.frozen.is_none()
-                && !shared.background_derived.lock().unwrap().running
-            {
-                let memory = acquire_frozen_lease(shared, cs.memtable_bytes as usize);
-                let _ = schedule_frozen_checkpoint(shared, &mut cs, memory)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            let mut status = shared.background_checkpoint.lock().unwrap();
-            status.commit_unknown = matches!(&error, Error::CommitUnknown(_));
-            status.last_error = Some(format!("post-commit maintenance failed: {error}"));
-        }
+    let result = post_commit_maintenance(
+        shared,
+        maintenance_needed,
+        derived_schedule_needed,
+        end_version,
+    );
+    if let Err(error) = result {
+        let mut status = shared.background_checkpoint.lock().unwrap();
+        status.commit_unknown = matches!(&error, Error::CommitUnknown(_));
+        status.last_error = Some(format!("post-commit maintenance failed: {error}"));
     }
     let maintenance_wait_time = maintenance_started.elapsed();
+
 
     let elapsed_nanos = |duration: Duration| duration.as_nanos().min(u64::MAX as u128) as u64;
     let count = prepared.len() as u64;
@@ -869,24 +1323,34 @@ pub(super) fn finish_coordinated_insert_batch(
         .coordinated_commit_count
         .fetch_add(count, AtomicOrdering::Relaxed);
 
+    cycle_probe::add(10, post_started.elapsed());
     let sync_error = match sync_outcome {
         Some((WalAppendOutcome::SyncFailed(error), _)) => {
             fence_after_wal_sync_failure(shared, &error);
+
             Some(error.to_string())
         }
         _ => None,
     };
-    Some(
-        versions
+    Ok(BatchOutcome {
+        results: members
             .into_iter()
-            .map(|version| match &sync_error {
-                Some(error) => Err(Error::CommitUnknown(format!(
-                    "version {version} was published, but syncing its coordinated WAL batch failed: {error}"
-                ))),
-                None => Ok(version),
+            .zip(versions)
+            .map(|(member, version)| {
+                (
+                    member,
+                    match &sync_error {
+                        Some(error) => Err(Error::CommitUnknown(format!(
+                            "version {version} was published, but syncing its coordinated WAL batch failed: {error}"
+                        ))),
+                        None => Ok(version),
+                    },
+                )
             })
             .collect(),
-    )
+        set_aside,
+    })
+
 }
 
 pub(super) fn finish_prepared_commit(
@@ -895,9 +1359,9 @@ pub(super) fn finish_prepared_commit(
 ) -> Result<u64> {
     let PreparedCommit {
         snap_version,
-        staged,
-        payload_arena,
-        preencoded_wal,
+        mut staged,
+        mut payload_arena,
+        mut preencoded_wal,
         optimistic_prior_records,
         incoming_index_bytes,
         outside_prepare_time,
@@ -912,12 +1376,14 @@ pub(super) fn finish_prepared_commit(
     let mut locked_prepare_time = Duration::ZERO;
     let mut validation_time = Duration::ZERO;
     let mut maintenance_wait_time = Duration::ZERO;
+    let mut rebased_rows;
     let (mut cs, previous_entries, commit_version, incoming_index_bytes, identity_high_water) = loop {
         let lock_started = Instant::now();
         shared.commit_waiters.fetch_add(1, AtomicOrdering::AcqRel);
         let mut cs = lock_commit_for_transaction(shared);
         shared.commit_waiters.fetch_sub(1, AtomicOrdering::AcqRel);
         lock_wait = lock_wait.saturating_add(lock_started.elapsed());
+        let seg_started = Instant::now();
         // Surface asynchronous I/O failure before this transaction reaches
         // its WAL durability point; reporting it after apply would make the
         // commit outcome ambiguous to the caller.
@@ -926,6 +1392,9 @@ pub(super) fn finish_prepared_commit(
         let validation_started = Instant::now();
         let mut previous_entries: Vec<Vec<(Option<VersionEntry>, Option<Record>)>> =
             Vec::with_capacity(staged.len());
+        // `(table, change, record)` for each delta update replayed over a
+        // version committed after the snapshot.
+        let mut rebased: Vec<(usize, usize, Record)> = Vec::new();
         let (commit_version, identity_high_water) = {
             let st = shared.state.read().unwrap();
             for (table_index, table) in staged.iter().enumerate() {
@@ -946,10 +1415,15 @@ pub(super) fn finish_prepared_commit(
                     };
                     if let Some(last) = &previous {
                         if last.version > snap_version {
-                            return Err(Error::Conflict(format!(
-                                "{}/{} changed after this transaction began",
-                                table.name, change.id
-                            )));
+                            match rebase_change(&st, &table.schema, change, last)? {
+                                Some(record) => rebased.push((table_index, change_index, record)),
+                                None => {
+                                    return Err(Error::Conflict(format!(
+                                        "{}/{} changed after this transaction began",
+                                        table.name, change.id
+                                    )))
+                                }
+                            }
                         }
                     }
                     // Complete every fallible read before the WAL durability
@@ -980,6 +1454,32 @@ pub(super) fn finish_prepared_commit(
                 }
                 previous_entries.push(table_previous);
             }
+            // A replayed row replaces the staged record and its payload, so
+            // the frame encoded before the mutex no longer matches: it is
+            // encoded again at the durability point. Uniqueness and foreign
+            // keys below see the replayed records.
+            rebased_rows = rebased.len() as u64;
+            if !rebased.is_empty() {
+                let arena = Arc::make_mut(&mut payload_arena);
+                for (table_index, change_index, record) in rebased {
+                    let table = &mut staged[table_index];
+                    let start = u32::try_from(arena.len()).map_err(|_| {
+                        Error::InvalidArgument(
+                            "transaction payload arena exceeds the 4-GiB WAL limit".into(),
+                        )
+                    })?;
+                    encode_record_ordered_into(arena, &table.schema, &record, None)?;
+                    let end = u32::try_from(arena.len()).map_err(|_| {
+                        Error::InvalidArgument(
+                            "transaction payload arena exceeds the 4-GiB WAL limit".into(),
+                        )
+                    })?;
+                    let change = &mut table.changes[change_index];
+                    change.payload = Some((start, end - start));
+                    change.operation = Some(record);
+                }
+                preencoded_wal = None;
+            }
             let borrowed: Vec<&PreparedTable> = staged.iter().collect();
             validate_unique(&st, &borrowed)?;
             validate_foreign_keys(&st, &borrowed)?;
@@ -996,6 +1496,8 @@ pub(super) fn finish_prepared_commit(
         };
         validation_time = validation_time.saturating_add(validation_started.elapsed());
         locked_prepare_time = locked_prepare_time.saturating_add(locked_prepare_started.elapsed());
+        cycle_probe::dadd(1, seg_started.elapsed());
+        let maint_started = Instant::now();
         if shared
             .memory_governor
             .index_would_exceed(incoming_index_bytes)
@@ -1061,6 +1563,7 @@ pub(super) fn finish_prepared_commit(
             maintenance_wait_time =
                 maintenance_wait_time.saturating_add(maintenance_wait_started.elapsed());
         }
+        cycle_probe::dadd(2, maint_started.elapsed());
         break (
             cs,
             previous_entries,
@@ -1099,6 +1602,11 @@ pub(super) fn finish_prepared_commit(
     wal_encode_time = wal_encode_time.saturating_add(wal_encode_started.elapsed());
     let wal_append_started = Instant::now();
     cs.wal().append_commit_unflushed(&bytes)?;
+    if rebased_rows > 0 {
+        shared
+            .delta_rebased_rows
+            .fetch_add(rebased_rows, AtomicOrdering::Relaxed);
+    }
     shared
         .wal_appended_bytes
         .fetch_add(bytes.len() as u64, AtomicOrdering::Relaxed);
@@ -1126,15 +1634,19 @@ pub(super) fn finish_prepared_commit(
     } else {
         None
     };
+    cycle_probe::dadd(3, wal_started.elapsed());
     // Publish atomically to readers.
     let apply_started = Instant::now();
     let mut added = 0u64;
     let mut obsolete_operations = 0u64;
     let mut obsolete_bytes = 0u64;
     let mut jobs: Vec<VecJob> = Vec::new();
+    let publish_started;
     {
         let write_wait_started = Instant::now();
-        let mut st = shared.state.write().unwrap();
+        let mut st = write_state_for_commit(shared);
+        cycle_probe::dadd(4, write_wait_started.elapsed());
+        let apply_inner = Instant::now();
         shared.commit_state_write_wait_nanos.fetch_add(
             elapsed_nanos(write_wait_started.elapsed()),
             AtomicOrdering::Relaxed,
@@ -1153,20 +1665,13 @@ pub(super) fn finish_prepared_commit(
                 .collect();
             for (change, (previous, prior_record)) in table.changes.into_iter().zip(table_previous)
             {
-                if let Some(previous) = &previous {
-                    // An update, delete, or reinsert supersedes one previously
-                    // visible record version. Count rows, not SQL statements.
-                    obsolete_operations += 1;
-                    obsolete_bytes = obsolete_bytes.saturating_add(obsolete_entry_bytes_estimate(
-                        &table.name,
-                        &change.id,
-                        previous,
-                    ));
-                } else if change.operation.is_none() {
-                    // Insert-then-delete inside one transaction leaves only a
-                    // tombstone, which compaction can discard completely.
-                    obsolete_operations += 1;
-                }
+                count_obsolete(
+                    &table.name,
+                    &change,
+                    previous.as_ref(),
+                    &mut obsolete_operations,
+                    &mut obsolete_bytes,
+                );
                 if let Some(VersionEntry {
                     kind: VKind::SegPut { segment, .. },
                     ..
@@ -1200,56 +1705,28 @@ pub(super) fn finish_prepared_commit(
             st.change_log.push(commit_version, &table.name, changed_ids);
         }
         st.committed_version = commit_version;
+        cycle_probe::dadd(5, apply_inner.elapsed());
+        publish_started = Instant::now();
     }
+    cycle_probe::dadd(6, publish_started.elapsed());
+    // After the read view is published; see the coordinated batch.
+    shared
+        .published_version
+        .store(commit_version, AtomicOrdering::Release);
+
+    let post_started = Instant::now();
     let apply_time = apply_started.elapsed();
-    if obsolete_operations > 0 {
-        let mut auto = shared.auto_compaction_state.lock().unwrap();
-        auto.debt_operations = auto.debt_operations.saturating_add(obsolete_operations);
-        auto.estimated_reclaimable_bytes = auto
-            .estimated_reclaimable_bytes
-            .saturating_add(obsolete_bytes);
-    }
-    if !jobs.is_empty() {
-        let tx = shared.vector_tx.lock().unwrap();
-        if let Some(tx) = tx.as_ref() {
-            shared
-                .vector_backlog
-                .fetch_add(jobs.len() as u64, AtomicOrdering::SeqCst);
-            for job in jobs {
-                if tx.send(job).is_err() {
-                    *shared
-                        .vector_worker_error
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner()) = Some(
-                        "vector indexing worker stopped before accepting committed work".into(),
-                    );
-                    // Keep the backlog charged: the vector is committed but
-                    // not searchable. A waiter must report the dead worker,
-                    // not claim that indexing completed successfully.
-                }
-            }
-        }
-    }
+    record_obsolete(shared, obsolete_operations, obsolete_bytes);
+    send_vector_jobs(shared, jobs);
     cs.memtable_bytes += added;
     shared
         .memory_governor
         .add_index_delta_bytes(incoming_index_bytes);
     let maintenance_needed = cs.memtable_bytes >= shared.opts.memtable_max_bytes;
-    // Publish derived deltas in the background once the shared delta pool is
-    // half full, but only when they are worth a run: the pool is shared with
-    // the primary memtable, and publishing a few thousand vectors every commit
-    // while the memtable is what fills it would create tiny HNSW runs faster
-    // than background merges can fold them. One sixteenth of the pool is about
-    // the largest run four of which a merge can still rebuild within its half
-    // of the maintenance pool. Hard pool pressure still publishes whatever
-    // exists.
-    let derived_schedule_needed = {
-        let memory = shared.memory_governor.stats();
-        memory.index_delta_bytes >= memory.index_delta_capacity_bytes / 2
-            && sampled_derived_delta_bytes(shared, commit_version) as u64
-                >= (memory.index_delta_capacity_bytes / DERIVED_PUBLICATION_MIN_DIVISOR).max(1)
-    };
+    let derived_schedule_needed = derived_schedule_needed(shared, commit_version);
     drop(cs);
+    cycle_probe::dadd(7, post_started.elapsed());
+    cycle_probe::D[0].fetch_add(1, AtomicOrdering::Relaxed);
 
     let waited_for_sync = sync_group.is_some();
     let sync_wait_started = Instant::now();
@@ -1264,41 +1741,12 @@ pub(super) fn finish_prepared_commit(
     let wal_time = wal_started.elapsed();
 
     let maintenance_started = Instant::now();
-    let maintenance_result = (|| -> Result<()> {
-        if maintenance_needed || derived_schedule_needed {
-            let mut cs = lock_commit_after_group_sync(shared);
-            if derived_schedule_needed && !shared.background_derived.lock().unwrap().running {
-                let derived_bytes = shared.state.read().unwrap().derived_delta_memory_bytes();
-                shared
-                    .derived_delta_size_walks
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                if let Some(memory) = try_acquire_frozen_lease(shared, derived_bytes) {
-                    let _ = schedule_frozen_derived(shared, memory)?;
-                    // The overlays this sample described have just been frozen
-                    // for publication. Leaving the old figure standing would
-                    // keep asking for a job that has already been taken, and
-                    // the extra runs that produces are real work.
-                    reset_derived_delta_sample(shared, commit_version);
-                }
-            }
-            if cs.memtable_bytes >= shared.opts.memtable_max_bytes {
-                // The derived worker owns the sole maintenance reservation
-                // and needs this mutex for its final publication. Defer the
-                // soft-threshold primary checkpoint instead of waiting for
-                // that reservation while holding the mutex. A later commit
-                // schedules it; hard index pressure waits outside the mutex.
-                if shared.background_derived.lock().unwrap().running {
-                    return Ok(());
-                }
-                let frozen_running = shared.state.read().unwrap().index.frozen.is_some();
-                if !frozen_running {
-                    let memory = acquire_frozen_lease(shared, cs.memtable_bytes as usize);
-                    let _ = schedule_frozen_checkpoint(shared, &mut cs, memory)?;
-                }
-            }
-        }
-        Ok(())
-    })();
+    let maintenance_result = post_commit_maintenance(
+        shared,
+        maintenance_needed,
+        derived_schedule_needed,
+        commit_version,
+    );
     maintenance_wait_time = maintenance_wait_time.saturating_add(maintenance_started.elapsed());
     if let Err(error) = maintenance_result {
         // The transaction is already in the WAL and visible. Never turn a
@@ -1405,7 +1853,47 @@ fn reset_derived_delta_sample(shared: &Arc<Shared>, version: u64) {
         .store(version, AtomicOrdering::Relaxed);
 }
 
-pub(super) fn estimate_staged_index_bytes(st: &State, staged: &[PreparedTable]) -> Result<usize> {
+/// A change's delta updates replayed over `latest`, the version committed
+/// after the transaction's snapshot; `None` when the conflict stands.
+///
+/// The conflict stands when the change has no delta updates, the row was
+/// deleted, a statement's WHERE fails on the new version (the stock ran out)
+/// or the arithmetic fails there (overflow): the retry then meets the new
+/// version at statement time and reports the real outcome. Tables with blob
+/// columns are left out because re-encoding under the commit mutex must not
+/// write blob files.
+fn rebase_change(
+    st: &State,
+    schema: &TableSchema,
+    change: &PreparedChange,
+    latest: &VersionEntry,
+) -> Result<Option<Record>> {
+    let Some(steps) = &change.rebase else {
+        return Ok(None);
+    };
+    if latest.is_tombstone()
+        || schema
+            .columns
+            .iter()
+            .any(|column| column.ty == ColumnType::Blob)
+    {
+        return Ok(None);
+    }
+    let mut record = read_record_kind(&st.blobs, &st.readers, &latest.kind, schema)?;
+    for step in steps {
+        match step(&change.id, &record) {
+            Ok(Some(next)) => record = next,
+            Ok(None) | Err(_) => return Ok(None),
+        }
+    }
+    Ok(Some(record))
+}
+
+pub(super) fn estimate_staged_index_bytes(
+    shared: &Shared,
+    st: &ReadView,
+    staged: &[PreparedTable],
+) -> Result<usize> {
     let mut bytes = 0usize;
     for table in staged {
         for change in &table.changes {
@@ -1456,8 +1944,12 @@ pub(super) fn estimate_staged_index_bytes(st: &State, staged: &[PreparedTable]) 
             }
             if let Some(previous) = st.latest_owned(&table.name, &change.id)? {
                 if !previous.is_tombstone() {
-                    let record =
-                        read_record_kind(&st.blobs, &st.readers, &previous.kind, &table.schema)?;
+                    let record = read_record_kind(
+                        &shared.blobs,
+                        &st.readers,
+                        &previous.kind,
+                        &table.schema,
+                    )?;
                     charge_record(&record);
                 }
             }

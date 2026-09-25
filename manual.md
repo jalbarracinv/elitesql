@@ -33,6 +33,15 @@ General rules:
 - Line comments with `--` and block comments with `/* ... */`.
 - SELECT reads the latest committed state (read committed). For snapshot-consistent reads use the Rust API (`db.snapshot()` + `scan_at`/`get_at`).
 - UPDATE/DELETE run inside a transaction with automatic retries on optimistic conflict. A multi-row INSERT is a single atomic commit: all rows land or none do.
+- An UPDATE whose every SET adds to or subtracts from its own numeric column
+  (`stock = stock - ?`, `credits = credits + 10`) is a *delta update*. If
+  another transaction commits a change to the same row first, the delta is
+  applied at commit on top of that newer version, and its WHERE is checked
+  again there, instead of failing with a conflict. So two checkouts of one
+  product both commit while `WHERE stock >= ?` still holds. The conflict
+  stands, as for any other write, when the WHERE fails on the newer version,
+  the row was deleted, the same transaction also read the row or wrote it in
+  any other way (assignment, `*`, `/`), or the table has a blob column.
 - Inside an explicit transaction, a failed INSERT/UPDATE/DELETE restores the
   writes that preceded that statement. Earlier successful statements remain
   staged and can still be committed. Rollback bookkeeping shares the transaction

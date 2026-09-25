@@ -18,6 +18,29 @@ pub(super) fn shared_get_at_keep(
     max_version: u64,
     keep: Option<&[&str]>,
 ) -> Result<Option<Record>> {
+    // Through the read view when it covers the version asked for: no state
+    // lock, and so no admission throttle either, which only exists to keep
+    // point reads from crowding a committer out of that lock.
+    if let Some(view) = view_covering(shared, max_version) {
+        if let (Some(schema), Some(directory)) = (view.schemas.get(table), view.tables.get(table)) {
+            let mut key = Vec::new();
+            let entry = directory
+                .view(table, &mut key)
+                .newest(id, max_version)?
+                .filter(|entry| entry.version > schema.epoch && !entry.is_tombstone());
+            let Some(entry) = entry else {
+                return Ok(None);
+            };
+            let projection = RowProjection::new(Some(schema), keep);
+            let mut record = decode_entry(shared, &view.readers, &entry.kind, &projection)?;
+            if let Some(record) = record.as_mut() {
+                if schema.has_implicit_id() {
+                    record.insert(ID_COLUMN, Value::Text(id.to_owned()));
+                }
+            }
+            return Ok(record);
+        }
+    }
     let _admission = PointReadAdmission::enter(shared);
     let st = shared.state.read().unwrap();
     let schema = st
@@ -65,6 +88,31 @@ pub(super) fn shared_get_at_keep(
     Ok(Some(record))
 }
 
+/// The record a directory entry holds, decoded with `projection`; `None`
+/// for a tombstone.
+fn decode_entry(
+    shared: &Shared,
+    readers: &SegmentReaders,
+    kind: &VKind,
+    projection: &RowProjection<'_>,
+) -> Result<Option<Record>> {
+    let blobs = Some(shared.blobs.as_path());
+    Ok(Some(match kind {
+        VKind::MemPut(payload) => decode_record_keep(payload, blobs, projection)?,
+        VKind::SegPut {
+            segment,
+            payload_offset,
+            payload_len,
+        } => readers
+            .get(segment)
+            .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?
+            .with_payload(*payload_offset, *payload_len, |bytes| {
+                decode_record_keep(bytes, blobs, projection)
+            })?,
+        VKind::MemTombstone | VKind::SegTombstone => return Ok(None),
+    }))
+}
+
 pub(super) fn shared_scan_at(
     shared: &Shared,
     table: &str,
@@ -99,39 +147,15 @@ pub(super) fn shared_scan_batch_at(
     shared_scan_batch_at_bytes(shared, table, max_version, after_id, limit, None)
 }
 
-/// Rows of the primary directory are visited in chunks, releasing the shared
-/// state lock between them: a scan batch used to hold the lock for its whole
-/// `limit`, and every committer (which needs the write lock) queued behind it
-/// while every other reader queued behind the committer. The snapshot version
-/// keeps the chunks consistent with each other.
+/// Rows of the primary directory are visited in chunks of this many ids.
 ///
-/// The right chunk depends on whether anyone is waiting. Resuming rebuilds a
-/// cursor into every run, a binary search and a page load each, so a long
-/// chunk scans faster: 65 ns a row against 71 at a quarter of it. But a long
-/// chunk also holds the lock longer, and a committer blocks on it while
-/// holding the serialization mutex, so every other committer queues behind
-/// that. At 500 in-flight requests the short chunk cut the commit's wait for
-/// the state lock from 143 µs to 92 and the whole convoy by a third, worth
-/// nine per cent of throughput.
-///
-/// So the scan reads both numbers off the engine: with no committer queued it
-/// takes the long chunk and the faster scan, and with one waiting it shortens
-/// to give the lock back sooner. A scan that starts alone and meets a writer
-/// mid-way shortens on its next chunk.
-const SCAN_LOCK_CHUNK_ROWS: usize = 256;
-
-/// The chunk a scan falls back to while a committer is queued.
-const SCAN_LOCK_CHUNK_ROWS_CONTENDED: usize = 64;
-
-/// How many rows the next chunk should visit before giving the state lock
-/// back. See [`SCAN_LOCK_CHUNK_ROWS`].
-fn scan_lock_chunk_rows(shared: &Shared) -> usize {
-    if shared.commit_waiters.load(AtomicOrdering::Relaxed) > 0 {
-        SCAN_LOCK_CHUNK_ROWS_CONTENDED
-    } else {
-        SCAN_LOCK_CHUNK_ROWS
-    }
-}
+/// Chunks used to be where the shared state lock was released, so that a
+/// committer waited for at most one chunk of directory visits; one of 1 024
+/// rows measured best from 10 to 500 connections. The walk now runs over a
+/// detached snapshot of the directory (`PrimaryIdx::table_snapshot`) without
+/// the lock, and a chunk only bounds the ids buffered before the filter and
+/// the batch limit are applied.
+const SCAN_LOCK_CHUNK_ROWS: usize = 1024;
 
 pub(super) fn shared_scan_batch_at_bytes(
     shared: &Shared,
@@ -169,8 +193,8 @@ pub(crate) struct ScanBatch {
 }
 
 /// Up to `limit` visible rows after `after_id`, decoded from retained segment
-/// handles with the state lock released. The directory is visited in short
-/// chunks with the lock dropped between them, and an optional `ScanFilter` is
+/// handles with the state lock released. The directory is walked over a
+/// snapshot taken with the lock held only for that, and an optional `ScanFilter` is
 /// evaluated on each encoded row before it counts toward `limit` or gets
 /// decoded, so a selective range scan neither holds the lock nor
 /// materializes the rows it rejects. The snapshot version keeps the chunks
@@ -200,29 +224,17 @@ pub(super) fn shared_scan_batch(
     if limit == 0 {
         return Ok(empty());
     }
-    let (epoch, implicit_id, blobs, filter_ordinal, projection) = {
-        let st = shared.state.read().unwrap();
-        let schema = st
-            .catalog
-            .table(table)
-            .ok_or_else(|| Error::TableNotFound(table.into()))?;
-        let ordinal = filter.and_then(|filter| {
-            schema
-                .columns
-                .iter()
-                .position(|column| column.name == filter.column)
-        });
-        (
-            schema.epoch,
-            schema.has_implicit_id(),
-            st.blobs.clone(),
-            ordinal,
-            // Resolved once for the whole batch: with the column names out of
-            // the payload, deciding what to decode is no longer per row.
-            RowProjection::new(Some(schema), keep),
-        )
-    };
+    let ScanParts {
+        epoch,
+        implicit_id,
+        blobs,
+        filter_ordinal,
+        projection,
+        directory,
+        all_readers,
+    } = scan_parts(shared, table, max_version, filter, keep)?;
     let limit = max_bytes.map_or(limit, |bytes| limit.min((bytes / 256).max(1)));
+
     // Ids of the rows that passed the filter, packed end to end; `prepared`
     // holds the span of each one.
     let mut prepared_ids = String::new();
@@ -235,49 +247,34 @@ pub(super) fn shared_scan_batch(
     let mut chunk_ids = String::new();
     let mut chunk_entries: Vec<(IdSpan, VKind)> = Vec::with_capacity(SCAN_LOCK_CHUNK_ROWS);
     loop {
-        let chunk = scan_lock_chunk_rows(shared)
-            .min(limit - prepared.len())
-            .max(1);
+        let chunk = SCAN_LOCK_CHUNK_ROWS.min(limit - prepared.len()).max(1);
+
         let mut visited = 0usize;
         chunk_entries.clear();
         chunk_ids.clear();
         {
-            let st = shared.state.read().unwrap();
-            // A schema change mid-scan (new epoch) would make the continuation
-            // meaningless; the statement fails and the caller may retry.
-            let current = st
-                .catalog
-                .table(table)
-                .ok_or_else(|| Error::TableNotFound(table.into()))?;
-            if current.epoch != epoch {
-                return Err(Error::Conflict(format!(
-                    "schema for {table} changed during a scan"
-                )));
-            }
-            st.index
-                .visit_table(table, cursor.as_deref(), |id, versions| {
-                    visited += 1;
-                    // Every id visited is a candidate cursor, so the walk can
-                    // resume past a run of invisible or filtered rows.
-                    last_visited.clear();
-                    last_visited.push_str(id);
-                    let Some(entry) = versions
-                        .iter()
-                        .rev()
-                        .find(|entry| entry.version <= max_version && entry.version > epoch)
-                        .filter(|entry| !entry.is_tombstone())
-                    else {
-                        return Ok(visited < chunk);
-                    };
-                    let span = push_id(&mut chunk_ids, id);
-                    chunk_entries.push((span, entry.kind.clone()));
-                    Ok(visited < chunk)
-                })?;
+            directory.visit(table, cursor.as_deref(), |id, versions| {
+                visited += 1;
+                // Every id visited is a candidate cursor, so the walk can
+                // resume past a run of invisible or filtered rows.
+                last_visited.clear();
+                last_visited.push_str(id);
+                let Some(entry) = versions
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.version <= max_version && entry.version > epoch)
+                    .filter(|entry| !entry.is_tombstone())
+                else {
+                    return Ok(visited < chunk);
+                };
+                let span = push_id(&mut chunk_ids, id);
+                chunk_entries.push((span, entry.kind.clone()));
+                Ok(visited < chunk)
+            })?;
             for (_, kind) in &chunk_entries {
                 if let VKind::SegPut { segment, .. } = kind {
                     if !readers.contains_key(segment) {
-                        let reader = st
-                            .readers
+                        let reader = all_readers
                             .get(segment)
                             .ok_or_else(|| Error::Corrupt(format!("missing segment {segment}")))?;
                         readers.insert(*segment, reader.clone());
@@ -372,6 +369,181 @@ pub(super) fn shared_scan_batch(
         Some(last_visited)
     };
     Ok(ScanBatch { rows, ids, next })
+}
+
+/// What a scan needs from the committed state, taken once: from the read
+/// view when it covers the version asked for, so the scan takes no lock at
+/// all, and otherwise with the state lock held only for this.
+struct ScanParts<'k> {
+    epoch: u64,
+    implicit_id: bool,
+    blobs: PathBuf,
+    filter_ordinal: Option<usize>,
+    projection: RowProjection<'k>,
+    directory: PrimaryTableSnapshot,
+    all_readers: Arc<SegmentReaders>,
+}
+
+fn scan_parts<'k>(
+    shared: &Shared,
+    table: &str,
+    max_version: u64,
+    filter: Option<&ScanFilter>,
+    keep: Option<&'k [&'k str]>,
+) -> Result<ScanParts<'k>> {
+    // The directory and the segment handles are taken once, with the lock
+    // held only for that; the walk below runs without it. A committer used to
+    // wait for every chunk of every scan in progress, and scans were the
+    // largest share of what committers waited for.
+    let filter_ordinal_in = |schema: &TableSchema| {
+        filter.and_then(|filter| {
+            schema
+                .columns
+                .iter()
+                .position(|column| column.name == filter.column)
+        })
+    };
+    // From the read view when it covers the version asked for, so the scan
+    // takes no lock at all.
+    let view = view_covering(shared, max_version);
+    let from_view = view
+        .as_ref()
+        .and_then(|view| {
+            view.schemas
+                .get(table)
+                .zip(view.tables.get(table))
+                .map(|parts| (view, parts))
+        })
+        .map(|(view, (schema, directory))| {
+            (
+                schema.epoch,
+                schema.has_implicit_id(),
+                shared.blobs.clone(),
+                filter_ordinal_in(schema),
+                RowProjection::new(Some(schema), keep),
+                directory.clone(),
+                view.readers.clone(),
+            )
+        });
+    let (epoch, implicit_id, blobs, filter_ordinal, projection, directory, all_readers) =
+        if let Some(parts) = from_view {
+            parts
+        } else {
+            let st = shared.state.read().unwrap();
+
+            let schema = st
+                .catalog
+                .table(table)
+                .ok_or_else(|| Error::TableNotFound(table.into()))?;
+            let ordinal = filter.and_then(|filter| {
+                schema
+                    .columns
+                    .iter()
+                    .position(|column| column.name == filter.column)
+            });
+            (
+                schema.epoch,
+                schema.has_implicit_id(),
+                st.blobs.clone(),
+                ordinal,
+                // Resolved once for the whole batch: with the column names out of
+                // the payload, deciding what to decode is no longer per row.
+                RowProjection::new(Some(schema), keep),
+                st.index.table_snapshot(table),
+                st.readers.clone(),
+            )
+        };
+    drop(view);
+    Ok(ScanParts {
+        epoch,
+        implicit_id,
+        blobs,
+        filter_ordinal,
+        projection,
+        directory,
+        all_readers,
+    })
+}
+
+/// Rows a streaming scan visits over one directory snapshot before it takes
+/// a fresh one and resumes after the last id. A snapshot keeps the delta
+/// chunks and segment handles it saw alive; renewing it bounds what a long
+/// scan with a slow consumer holds back from checkpoints and compaction,
+/// while one resume per this many rows costs nothing measurable.
+const SCAN_VISIT_SNAPSHOT_ROWS: usize = 16 * 1024;
+
+/// Every visible row of `table` as of `max_version`, in id order, decoded
+/// with `keep` and handed to `visit` one at a time; `visit` returns `false`
+/// to stop. `filter` rules rows out on their encoded payload before they are
+/// decoded, exactly as in `shared_scan_batch`, and the caller still has to
+/// re-check it.
+///
+/// This is the batch scan without the batch: no id is copied, no row is
+/// buffered, and the run cursors are opened once per snapshot instead of
+/// once per batch. An aggregate over a table visits every row and keeps
+/// none of them, and for it the batch machinery was most of the cost: in
+/// the SaaS workload a dashboard of three aggregates, one call in a hundred,
+/// was 30 % of the server's CPU.
+pub(super) fn shared_scan_visit(
+    shared: &Shared,
+    table: &str,
+    max_version: u64,
+    filter: Option<&ScanFilter>,
+    keep: Option<&[&str]>,
+    mut visit: impl FnMut(Record) -> Result<bool>,
+) -> Result<()> {
+    let mut cursor: Option<String> = None;
+    loop {
+        let ScanParts {
+            epoch,
+            implicit_id,
+            blobs,
+            filter_ordinal,
+            projection,
+            directory,
+            all_readers,
+        } = scan_parts(shared, table, max_version, filter, keep)?;
+        let mut visited = 0usize;
+        let mut stopped = false;
+        let mut resume: Option<String> = None;
+        directory.visit(table, cursor.as_deref(), |id, versions| {
+            visited += 1;
+            if visited >= SCAN_VISIT_SNAPSHOT_ROWS {
+                resume = Some(id.to_owned());
+            }
+            let more = || Ok(visited < SCAN_VISIT_SNAPSHOT_ROWS);
+            let Some(entry) = versions
+                .iter()
+                .rev()
+                .find(|entry| entry.version <= max_version && entry.version > epoch)
+                .filter(|entry| !entry.is_tombstone())
+            else {
+                return more();
+            };
+            if let Some(filter) = filter {
+                let may_match = with_payload(&all_readers, &entry.kind, |payload| {
+                    scan_filter_may_match(payload, filter, filter_ordinal, &blobs)
+                })?
+                .unwrap_or(false);
+                if !may_match {
+                    return more();
+                }
+            }
+            let mut record = read_record_kind_keep(&blobs, &all_readers, &entry.kind, &projection)?;
+            if implicit_id {
+                record.insert(ID_COLUMN, Value::Text(id.to_owned()));
+            }
+            if !visit(record)? {
+                stopped = true;
+                return Ok(false);
+            }
+            more()
+        })?;
+        match resume {
+            Some(id) if !stopped => cursor = Some(id),
+            _ => return Ok(()),
+        }
+    }
 }
 
 /// A span of the id arena a batch packs its ids into.
