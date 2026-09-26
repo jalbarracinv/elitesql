@@ -93,8 +93,23 @@ popular 5 %, so some rows are genuinely contended.
 service code and workload run on each: `embedded` (one thread-safe `EliteSQL`
 handle per process), `sidecar` (`SidecarClient` connections to
 `elitesql serve` over a Unix socket) and `sqlite` (`sqlite3`, WAL,
-`synchronous=NORMAL`, FTS5 for text search; vector recommendations degrade to
+`synchronous=NORMAL` by default, FTS5 for text search; vector recommendations degrade to
 "best sellers of the same category").
+
+`--durability` applies to both engines: `fast` selects SQLite WAL/OFF,
+`balanced` WAL/NORMAL, and `safe` WAL/FULL with `fullfsync` and
+`checkpoint_fullfsync` enabled. On macOS those flags request F_FULLFSYNC,
+matching EliteSQL Safe's requested durability barrier. Each SQLite connection
+reads its settings back; stages retain them in `summary.json`. Balanced/NORMAL
+do not provide the same loss-window contract as strict per-commit durability.
+
+The read/write shares above classify application operations. `session_check`
+is counted as a read operation but also updates the session; the mix is not
+76% read-only requests. User p99 includes each request's connection-pool wait,
+combined with its query time before percentile calculation.
+
+For the strict-durability comparison, including a SQLite FIFO control and
+recovery checks, see [the central-advantage report](../../docs/central-advantage.md).
 
 ## The load generator
 

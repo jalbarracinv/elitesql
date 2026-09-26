@@ -1,0 +1,294 @@
+{
+  "correctness_passed": true,
+  "stricter_gate_passed": true,
+  "rows": [
+    {
+      "users": 10,
+      "engines": {
+        "sidecar": {
+          "ops_s": [
+            3226.3,
+            3157.7,
+            2935.5
+          ],
+          "median_ops_s": 3157.7,
+          "db_p99_ms": [
+            14.017,
+            14.8937,
+            16.8164
+          ],
+          "user_p99_upper_bound_ms": [
+            14.076,
+            14.927700000000002,
+            16.890400000000003
+          ],
+          "exact_user_p99_ms": null
+        },
+        "sqlite": {
+          "ops_s": [
+            659.4,
+            592.0,
+            604.3
+          ],
+          "median_ops_s": 604.3,
+          "db_p99_ms": [
+            239.01979999999998,
+            387.4472,
+            296.4685
+          ],
+          "user_p99_upper_bound_ms": [
+            239.0418,
+            387.4792,
+            296.4795
+          ],
+          "exact_user_p99_ms": null
+        },
+        "pooled": {
+          "ops_s": [
+            643.9,
+            624.6,
+            613.7
+          ],
+          "median_ops_s": 624.6,
+          "db_p99_ms": [
+            6.0185,
+            6.269,
+            6.9053
+          ],
+          "user_p99_upper_bound_ms": [
+            43.3385,
+            55.588,
+            49.707300000000004
+          ],
+          "exact_user_p99_ms": [
+            30.143900000000002,
+            31.1549,
+            31.132099999999998
+          ]
+        }
+      },
+      "advantage_over_best_sqlite": 5.055555555555555,
+      "paired_advantages": [
+        4.892781316348196,
+        5.055555555555555,
+        4.783281733746129
+      ],
+      "conservative_p99_advantage_bounds": [
+        2.141510372264848,
+        2.087052928448455,
+        1.8431831099322686
+      ]
+    },
+    {
+      "users": 100,
+      "engines": {
+        "sidecar": {
+          "ops_s": [
+            15040.2,
+            15147.5,
+            15503.7
+          ],
+          "median_ops_s": 15147.5,
+          "db_p99_ms": [
+            34.35,
+            33.3478,
+            33.1999
+          ],
+          "user_p99_upper_bound_ms": [
+            34.488,
+            33.500800000000005,
+            33.2369
+          ],
+          "exact_user_p99_ms": null
+        },
+        "sqlite": {
+          "ops_s": [
+            458.3,
+            504.7,
+            572.9
+          ],
+          "median_ops_s": 504.7,
+          "db_p99_ms": [
+            4483.5358,
+            4207.2967,
+            3754.0717
+          ],
+          "user_p99_upper_bound_ms": [
+            4483.5608,
+            4207.3757000000005,
+            3754.1127
+          ],
+          "exact_user_p99_ms": null
+        },
+        "pooled": {
+          "ops_s": [
+            605.8,
+            642.4,
+            633.7
+          ],
+          "median_ops_s": 633.7,
+          "db_p99_ms": [
+            7.025600000000001,
+            5.8435,
+            6.5309
+          ],
+          "user_p99_upper_bound_ms": [
+            359.9636,
+            221.7555,
+            227.3709
+          ],
+          "exact_user_p99_ms": [
+            263.1978,
+            203.93789999999998,
+            205.1324
+          ]
+        }
+      },
+      "advantage_over_best_sqlite": 23.90326652990374,
+      "paired_advantages": [
+        24.82700561241334,
+        23.579545454545457,
+        24.465362158750196
+      ],
+      "conservative_p99_advantage_bounds": [
+        7.631576200417536,
+        6.087553133059507,
+        6.171827095788115
+      ]
+    },
+    {
+      "users": 500,
+      "engines": {
+        "sidecar": {
+          "ops_s": [
+            16956.4,
+            16470.7,
+            16962.7
+          ],
+          "median_ops_s": 16956.4,
+          "db_p99_ms": [
+            157.1199,
+            169.33939999999998,
+            167.8024
+          ],
+          "user_p99_upper_bound_ms": [
+            157.4529,
+            169.7034,
+            168.9134
+          ],
+          "exact_user_p99_ms": null
+        },
+        "sqlite": {
+          "ops_s": [
+            464.7,
+            500.0,
+            534.1
+          ],
+          "median_ops_s": 500.0,
+          "db_p99_ms": [
+            15653.8342,
+            13889.825,
+            16374.734699999999
+          ],
+          "user_p99_upper_bound_ms": [
+            15653.886199999999,
+            13889.865,
+            16374.8097
+          ],
+          "exact_user_p99_ms": null
+        },
+        "pooled": {
+          "ops_s": [
+            620.2,
+            623.1,
+            633.4
+          ],
+          "median_ops_s": 623.1,
+          "db_p99_ms": [
+            6.5803,
+            6.5371999999999995,
+            6.1177
+          ],
+          "user_p99_upper_bound_ms": [
+            957.5563000000001,
+            973.7262,
+            940.9557
+          ],
+          "exact_user_p99_ms": [
+            923.1924,
+            945.0275,
+            914.3128
+          ]
+        }
+      },
+      "advantage_over_best_sqlite": 27.212967420959718,
+      "paired_advantages": [
+        27.340212834569495,
+        26.433477772428184,
+        26.78039153773287
+      ],
+      "conservative_p99_advantage_bounds": [
+        5.863292451266378,
+        5.568701039578465,
+        5.412908626550647
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "users": 10,
+      "engine": "sidecar",
+      "median_mean_total_cpu_cores": 1.06,
+      "median_mean_total_rss_mib": 375.5
+    },
+    {
+      "users": 10,
+      "engine": "sqlite",
+      "median_mean_total_cpu_cores": 0.2,
+      "median_mean_total_rss_mib": 334.77
+    },
+    {
+      "users": 10,
+      "engine": "pooled",
+      "median_mean_total_cpu_cores": 0.23,
+      "median_mean_total_rss_mib": 36.34
+    },
+    {
+      "users": 100,
+      "engine": "sidecar",
+      "median_mean_total_cpu_cores": 5.16,
+      "median_mean_total_rss_mib": 591.87
+    },
+    {
+      "users": 100,
+      "engine": "sqlite",
+      "median_mean_total_cpu_cores": 0.24,
+      "median_mean_total_rss_mib": 364.05
+    },
+    {
+      "users": 100,
+      "engine": "pooled",
+      "median_mean_total_cpu_cores": 0.24,
+      "median_mean_total_rss_mib": 40.69
+    },
+    {
+      "users": 500,
+      "engine": "sidecar",
+      "median_mean_total_cpu_cores": 7.47,
+      "median_mean_total_rss_mib": 804.56
+    },
+    {
+      "users": 500,
+      "engine": "sqlite",
+      "median_mean_total_cpu_cores": 0.35,
+      "median_mean_total_rss_mib": 442.98
+    },
+    {
+      "users": 500,
+      "engine": "pooled",
+      "median_mean_total_cpu_cores": 0.26,
+      "median_mean_total_rss_mib": 57.22
+    }
+  ],
+  "latency_method": "main DB p99 exact; EliteSQL true user p99 conservatively bounded by DB p99 + max pool wait; pooled SQLite exact paired samples"
+}

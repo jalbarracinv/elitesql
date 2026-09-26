@@ -1,0 +1,9 @@
+results → /Users/jalbarracin/Code/elitesql/benchmark-results/durable-advantage-2026-09-26/r1-sidecar
+database → /private/var/folders/wf/3gnfq1cs66j1wjyc0ty6vfrw0000gq/T/esql-proof-vwhvzx8b/saas.esql
+seeded 20000 accounts, 5000 products in 1.11 s (12.9 MiB)
+ users     ops/s    p50ms     p99ms   usr p99   succ%  retry% srvCPU genCPU  inv   wall
+    10    3226.3    0.381    14.017    14.018   100.0     0.0   0.71   0.35   ok  40.06
+   100   15040.2    0.863     34.35    34.351   100.0     0.0    3.6   1.49   ok   40.2
+   500   16956.4     2.13    157.12   157.121   100.0     0.0   5.65   1.88   ok   40.3
+offline check: ok (20.74 s); after kill: 0 errors, 701866 warnings
+report → /Users/jalbarracin/Code/elitesql/benchmark-results/durable-advantage-2026-09-26/r1-sidecar/report.md

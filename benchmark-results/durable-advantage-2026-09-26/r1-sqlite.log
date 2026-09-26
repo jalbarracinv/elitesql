@@ -1,0 +1,9 @@
+results → /Users/jalbarracin/Code/elitesql/benchmark-results/durable-advantage-2026-09-26/r1-sqlite
+database → /private/var/folders/wf/3gnfq1cs66j1wjyc0ty6vfrw0000gq/T/esql-proof-5rdsohoe/saas.sqlite
+seeded 20000 accounts, 5000 products in 0.19 s (4.6 MiB)
+ users     ops/s    p50ms     p99ms   usr p99   succ%  retry% srvCPU genCPU  inv   wall
+    10     659.4    0.429    239.02   239.022   100.0     0.0   None   0.18   ok  40.21
+   100     458.3    0.615  4483.536  4483.539   100.0     0.0   None   0.23   ok  41.13
+   500     464.7    0.599 15653.834 15653.837   100.0     0.0   None   0.33   ok  43.52
+offline check: ok (0.01 s)
+report → /Users/jalbarracin/Code/elitesql/benchmark-results/durable-advantage-2026-09-26/r1-sqlite/report.md

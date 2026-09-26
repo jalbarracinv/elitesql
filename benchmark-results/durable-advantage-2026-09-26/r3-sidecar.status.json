@@ -1,0 +1,63 @@
+{
+  "name": "r3-sidecar",
+  "argv": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "/Users/jalbarracin/Code/elitesql/examples/saas_simulation/sweep.py",
+    "--transport",
+    "sidecar",
+    "--levels",
+    "10,100,500",
+    "--duration",
+    "30",
+    "--warmup",
+    "5",
+    "--ramp",
+    "5",
+    "--think",
+    "0",
+    "--processes",
+    "10",
+    "--durability",
+    "safe",
+    "--products",
+    "5000",
+    "--accounts",
+    "20000",
+    "--scenario",
+    "baseline",
+    "--seed",
+    "3",
+    "--out",
+    "/Users/jalbarracin/Code/elitesql/benchmark-results/durable-advantage-2026-09-26/r3-sidecar",
+    "--db-dir",
+    "/var/folders/wf/3gnfq1cs66j1wjyc0ty6vfrw0000gq/T/esql-proof-y42ucx0i"
+  ],
+  "before": {
+    "utc": "2026-09-26T12:04:55Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "returncode": 0,
+  "seconds": 167.4388092920417,
+  "after": {
+    "utc": "2026-09-26T12:07:42Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  }
+}

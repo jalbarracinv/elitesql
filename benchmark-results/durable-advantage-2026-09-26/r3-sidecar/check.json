@@ -1,0 +1,28 @@
+{
+ "tool": "elitesql check",
+ "ok": true,
+ "after_kill": {
+  "tool": "elitesql check",
+  "ok": false,
+  "exit_code": 3,
+  "warnings": 712128,
+  "errors": 0,
+  "output": "ok: database validates with 712128 warning(s); derived indexes may be rebuilt on open",
+  "seconds": 13.15,
+  "note": "server stopped with SIGTERM; no clean close"
+ },
+ "reopen": {
+  "users": 27865,
+  "seconds": 15.91
+ },
+ "after_reopen": {
+  "tool": "elitesql check",
+  "ok": true,
+  "exit_code": 0,
+  "warnings": 0,
+  "errors": 0,
+  "output": "ok: database validates",
+  "seconds": 8.04
+ },
+ "seconds": 21.19
+}

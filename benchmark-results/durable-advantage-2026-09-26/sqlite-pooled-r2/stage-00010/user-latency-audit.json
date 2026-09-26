@@ -1,0 +1,13 @@
+{
+  "raw_sha256": {
+    "samples-00.csv.gz": "1d7478bf65769242b1b6333a711e747846604cc80c95e407abea577e83663834"
+  },
+  "count": 18738,
+  "original_reported_p99_us": 35202.1,
+  "exact_p99_us": 31154.9,
+  "window_ms": [
+    10000,
+    40000
+  ],
+  "formula": "percentile(latency_us + wait_us, .99) before separate sorting"
+}

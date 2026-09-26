@@ -2,6 +2,8 @@
 
 Fresh measurements of EliteSQL against SQLite, including the mini-SaaS simulator. EliteSQL leads in SQL point reads and concurrent-writer throughput; SQLite is faster in the smaller load cases and in the isolated SaaS operation mix. SaaS throughput favors EliteSQL at 100 users, while the 500-user ranges overlap. Results are specific to the workloads below.
 
+The strongest demonstrated advantage is [durable concurrent transactions](#durable-mini-saas): the same Mini-SaaS with strict commit synchronization, including a FIFO control for SQLite.
+
 ## How to read the results
 
 Values are medians across independent fresh runs (see the recorded repetition count below). Brackets show the minimum–maximum across runs, not confidence intervals. **Ratio = SQLite time / EliteSQL time**, or equivalently **EliteSQL throughput / SQLite throughput**: above 1 favors EliteSQL; below 1 favors SQLite. Each p99 is the median of per-run p99 values, not a percentile of pooled requests.
@@ -93,11 +95,51 @@ EliteSQL checks immediately after stopping the sidecar without a clean close ret
 
 Simulator runs: [saas-r1-sidecar/report.md](benchmark-results/sqlite-comparison-2026-09-26/saas-r1-sidecar/report.md), [saas-r1-sqlite/report.md](benchmark-results/sqlite-comparison-2026-09-26/saas-r1-sqlite/report.md), [saas-r2-sqlite/report.md](benchmark-results/sqlite-comparison-2026-09-26/saas-r2-sqlite/report.md), [saas-r2-sidecar/report.md](benchmark-results/sqlite-comparison-2026-09-26/saas-r2-sidecar/report.md), [saas-r3-sidecar/report.md](benchmark-results/sqlite-comparison-2026-09-26/saas-r3-sidecar/report.md), [saas-r3-sqlite/report.md](benchmark-results/sqlite-comparison-2026-09-26/saas-r3-sqlite/report.md).
 
+### Durable Mini-SaaS
+
+The same baseline service, seed sizes, fifteen operations and 10/100/500-user
+levels above, with `safe` on EliteSQL and SQLite WAL/FULL. SQLite enables
+`fullfsync` and `checkpoint_fullfsync` to match EliteSQL's requested macOS
+durability barrier. Automatic checkpoints remain enabled. Three fresh
+repetitions, alternating engine order, 5 s ramp + 5 s warmup + 30 s measured
+per level. A second SQLite configuration uses one generator process and one
+FIFO pooled connection; this improves admission fairness and shares its cache,
+while each transaction still commits independently.
+
+| Users | EliteSQL ops/s | SQLite direct ops/s | SQLite FIFO ops/s | EliteSQL / best SQLite | EliteSQL user p99 upper bound ms | SQLite FIFO user p99 ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 3,158 | 604 | 625 | 5.06× | 15.0 | 31.1 |
+| 100 | 15,148 | 505 | 634 | 23.90× | 33.6 | 205.1 |
+| 500 | 16,956 | 500 | 623 | 27.21× | 169.0 | 923.2 |
+
+Medians of three runs; no confidence-interval claim. User latency includes
+pool wait. SQLite FIFO p99 is computed from paired raw request samples.
+EliteSQL p99 uses a conservative bound: median of each run's exact DB p99
+plus its maximum pool wait. The original aggregator combined separately
+sorted latency/wait lists; the bound avoids that error, and the current
+simulator fixes it. Both engines had zero failed operations, zero
+read-your-writes violations and passing business/reopened integrity checks
+at every level. EliteSQL averaged about 25/39 commits per WAL synchronization
+over the full 100/500-user stages, including ramp and warmup.
+
+At 500 users, median mean CPU/RSS for server plus generators was 7.47 cores /
+805 MiB for EliteSQL and 0.26 cores / 57 MiB for pooled SQLite. These describe
+their different achieved capacities and accumulated data, not efficiency at
+equal work. EliteSQL reopening plus a clean integrity check took about 16 s
+outside the throughput window. This is a capacity/latency advantage for
+strictly durable small transactions on this machine; the earlier NORMAL and
+isolated-operation results remain relevant to other requirements.
+
+[Reviewed report and limits](docs/central-advantage.md),
+[raw runs and reproduction](benchmark-results/durable-advantage-2026-09-26/README.md),
+[independent audit](benchmark-results/durable-advantage-2026-09-26/audit.json).
+
 ## Environment and reproduction
 
 - Apple M5, 10 logical CPUs, 16 GiB RAM; macOS-26.6.2-arm64-arm-64bit-Mach-O.
 - 3 repetitions per engine and workload.
-- Source commit: `5ff119005c8fe6581b1721cce990cb756540c30f`. Measured source/binary hashes and local changes: [metadata.json](benchmark-results/sqlite-comparison-2026-09-26/metadata.json), [source.patch](benchmark-results/sqlite-comparison-2026-09-26/source.patch).
+- Original load/read/write and NORMAL-SaaS suite source: `5ff119005c8fe6581b1721cce990cb756540c30f`. Measured source/binary hashes and local changes: [metadata.json](benchmark-results/sqlite-comparison-2026-09-26/metadata.json), [source.patch](benchmark-results/sqlite-comparison-2026-09-26/source.patch).
+- Durable Mini-SaaS source: release `3de0ce4f6cc4d1ec7442564ce08aca1fc4fc63f6`, with simulator durability corrections and no production Rust changes. Its [metadata](benchmark-results/durable-advantage-2026-09-26/metadata.json) and [measured source patch](benchmark-results/durable-advantage-2026-09-26/source.patch) identify that separate suite.
 - rustc 1.93.1 (01f6ddf75 2026-02-11) (Homebrew); Python 3.14.7. SQLite 3.45.0 is bundled with the Rust suite; Python uses SQLite 3.53.4 for SaaS. These are separate benchmark suites.
 - Builds finished before measurement. Jobs ran sequentially on AC power; power/thermal observations are recorded at job boundaries. Caches were warmed or left to the OS; no disk-cold or cache-eviction claim is made.
 

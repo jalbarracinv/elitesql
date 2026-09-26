@@ -1,0 +1,46 @@
+{
+  "correct": true,
+  "gate_passed": false,
+  "rows": [
+    {
+      "users": 10,
+      "elite_ops": [
+        3028.1
+      ],
+      "sqlite_ops": [
+        605.9
+      ],
+      "elite_p99_ms": [
+        14.999
+      ],
+      "sqlite_p99_ms": [
+        386.0523
+      ],
+      "throughput_ratio": 4.997689387687737,
+      "p99_ratio": 25.738535902393494,
+      "paired_throughput_ratios": [
+        4.997689387687737
+      ]
+    },
+    {
+      "users": 100,
+      "elite_ops": [
+        16098.2
+      ],
+      "sqlite_ops": [
+        491.1
+      ],
+      "elite_p99_ms": [
+        31.5566
+      ],
+      "sqlite_p99_ms": [
+        3851.4622000000004
+      ],
+      "throughput_ratio": 32.77988189778049,
+      "p99_ratio": 122.04933991621405,
+      "paired_throughput_ratios": [
+        32.77988189778049
+      ]
+    }
+  ]
+}

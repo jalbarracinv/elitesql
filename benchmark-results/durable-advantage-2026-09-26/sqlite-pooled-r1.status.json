@@ -1,0 +1,66 @@
+{
+  "name": "sqlite-pooled-r1",
+  "argv": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "/Users/jalbarracin/Code/elitesql/examples/saas_simulation/sweep.py",
+    "--transport",
+    "sqlite",
+    "--levels",
+    "10,100,500",
+    "--duration",
+    "30",
+    "--ramp",
+    "5",
+    "--warmup",
+    "5",
+    "--think",
+    "0",
+    "--processes",
+    "1",
+    "--connections",
+    "1",
+    "--durability",
+    "safe",
+    "--accounts",
+    "20000",
+    "--products",
+    "5000",
+    "--scenario",
+    "baseline",
+    "--seed",
+    "1",
+    "--keep-samples",
+    "--out",
+    "/Users/jalbarracin/Code/elitesql/benchmark-results/durable-advantage-2026-09-26/sqlite-pooled-r1",
+    "--db-dir",
+    "/var/folders/wf/3gnfq1cs66j1wjyc0ty6vfrw0000gq/T/esql-pool-control-v0urt72b"
+  ],
+  "before": {
+    "utc": "2026-09-26T12:10:16Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "returncode": 0,
+  "seconds": 127.10996254102793,
+  "after": {
+    "utc": "2026-09-26T12:12:23Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  }
+}

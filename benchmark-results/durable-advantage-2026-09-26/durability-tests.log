@@ -1,0 +1,27 @@
+   Compiling elitesql-core v0.1.0 (/Users/jalbarracin/Code/elitesql/crates/elitesql-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.97s
+     Running tests/crash_kill.rs (target/debug/deps/crash_kill-64d7b0bd532b8f0a)
+
+running 2 tests
+test crash_worker ... ok
+test kill9_recovers_to_last_committed_state ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s
+
+     Running tests/group_commit.rs (target/debug/deps/group_commit-f842cd0ff81a23a7)
+
+running 2 tests
+test concurrent_safe_commits_share_syncs_and_survive_reopen ... ok
+test safe_group_commits_remain_durable_across_concurrent_checkpoints ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+     Running tests/group_commit_crash.rs (target/debug/deps/group_commit_crash-9a2f462f41c32183)
+
+running 2 tests
+test grouped_crash_worker ... ok
+SIGKILL: 12 rounds with confirmed shared syncs; at least 392 new acknowledgements verified
+test acknowledged_group_commits_survive_sigkill_and_remain_atomic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s
+

@@ -1,0 +1,48 @@
+{
+ "config": {
+  "rebuild_report": null,
+  "reverify_db": null,
+  "transport": "sqlite",
+  "levels": [
+   10,
+   100,
+   500
+  ],
+  "duration": 30.0,
+  "warmup": 5.0,
+  "ramp": 5.0,
+  "think": [
+   0.0,
+   0.0
+  ],
+  "processes": 1,
+  "connections": 1,
+  "durability": "safe",
+  "max_statements": 0,
+  "memory_mib": 0,
+  "products": 5000,
+  "accounts": 20000,
+  "scenario": "baseline",
+  "seed": 1,
+  "fresh_per_stage": false,
+  "keep_samples": true,
+  "out": "/Users/jalbarracin/Code/elitesql/benchmark-results/durable-advantage-2026-09-26/sqlite-pooled-r1",
+  "db_dir": "/var/folders/wf/3gnfq1cs66j1wjyc0ty6vfrw0000gq/T/esql-pool-control-v0urt72b",
+  "elitesql_bin": null,
+  "compare_with": [],
+  "db_path": "/private/var/folders/wf/3gnfq1cs66j1wjyc0ty6vfrw0000gq/T/esql-pool-control-v0urt72b/saas.sqlite",
+  "socket": "/var/folders/wf/3gnfq1cs66j1wjyc0ty6vfrw0000gq/T/saas-sim-85854.sock"
+ },
+ "environment": {
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "cpu_count": 10,
+  "python": "3.14.7",
+  "date": "2026-09-26T07:10:16",
+  "git_commit": "3de0ce4",
+  "hw.memsize": "17179869184",
+  "kern.num_taskthreads": "4096",
+  "hw.perflevel0.physicalcpu": "4",
+  "sqlite_version": "3.53.4"
+ }
+}

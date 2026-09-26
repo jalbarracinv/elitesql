@@ -28,6 +28,12 @@ db = EliteSQL("app.esql")
 
 ## Why EliteSQL
 
+- **Durable concurrent writes without application batching.** In `safe` mode,
+  independent transactions share WAL synchronization before acknowledgement.
+  The [durable Mini-SaaS comparison](benchmark.md#durable-mini-saas) measured
+  24×/27× SQLite's best tested throughput at 100/500 users on an M5 Mac,
+  including a SQLite FIFO connection-pool control. This advantage requires
+  strict per-commit durability and concurrent writers; it uses more CPU and RAM.
 - **Concurrent transaction preparation.** SQLite permits one writer at a time. EliteSQL uses MVCC and optimistic validation: writers stage transactions in parallel, then coordinate publication at commit. Snapshots preserve stable reads while other transactions commit.
 - **Native vectors**: `vector<float32, N>` and an HNSW index as a first-class type, not a bolted-on extension.
 - **A bounded resource footprint.** SQL operators, scalar/text/vector indexes,
@@ -105,6 +111,13 @@ EliteSQL runs over a Unix-socket sidecar in this concurrent test; SQLite is
 embedded in the generator processes. The isolated embedded-operation mix
 favors SQLite (45.19 µs versus EliteSQL's 72.84 µs weighted median cost).
 These are local workload measurements, not a maximum-user capacity claim.
+
+With strict durability on both engines, the same service shows a much larger
+advantage: 15,148/16,956 ops/s at 100/500 users versus SQLite's best tested
+634/623 ops/s. SQLite uses WAL/FULL with macOS fullfsync; its FIFO control
+includes connection-pool wait in user latency. See the
+[central-advantage report](docs/central-advantage.md) for repeated measurements,
+resource costs, crash checks and the limits of that claim.
 
 See [examples/saas_simulation/README.md](examples/saas_simulation/README.md)
 for simulator options and

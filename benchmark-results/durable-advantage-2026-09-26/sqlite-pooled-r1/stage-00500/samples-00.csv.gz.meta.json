@@ -1,0 +1,1 @@
+{"worker": 0, "users": 500, "pool": 1, "errors": {}, "reconnects": 0, "consistency_violations": 0, "connect_refusals": 0, "pool_open_seconds": 0.0, "sqlite_settings": {"journal_mode": "wal", "synchronous": 2, "fullfsync": 1, "checkpoint_fullfsync": 1, "wal_autocheckpoint": 1000, "busy_timeout": 60000}}

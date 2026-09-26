@@ -121,7 +121,8 @@ def _connect(cfg: StageConfig):
                 time.sleep(delay + random.random() * delay)
                 delay = min(delay * 2, 1.0)
     if cfg.transport == "sqlite":
-        return drivers.SqliteConnection(cfg.db_path, timeout_s=cfg.sidecar_timeout)
+        return drivers.SqliteConnection(cfg.db_path, timeout_s=cfg.sidecar_timeout,
+                                        durability=cfg.durability)
     raise ValueError(cfg.transport)
 
 
@@ -151,6 +152,8 @@ def worker_main(cfg_dict: dict, worker_index: int, user_indexes: list[int],
     errors: dict[str, dict] = {}
     stats = {"reconnects": 0, "consistency_violations": 0,
              "connect_refusals": _connect_refusals[0], "pool_open_seconds": round(time.time() - t_open, 2)}
+    if cfg.transport == "sqlite":
+        stats["sqlite_settings"] = pool._all[0].durability_settings
     stats_lock = threading.Lock()
 
     def run_user(vu: VirtualUser, start_delay: float) -> None:
@@ -344,9 +347,14 @@ def aggregate(stage_dir: Path, cfg: StageConfig, monitor_samples: list[dict],
     total_in_window = 0
     total_all = 0
     read_ops = write_ops = 0
+    sqlite_settings = None
     for sample_file in sorted(stage_dir.glob("samples-*.csv.gz")):
         with open(str(sample_file) + ".meta.json") as fh:
             meta = json.load(fh)
+        if "sqlite_settings" in meta:
+            if sqlite_settings is not None and sqlite_settings != meta["sqlite_settings"]:
+                raise RuntimeError("workers used different SQLite durability settings")
+            sqlite_settings = meta["sqlite_settings"]
         reconnects += meta.get("reconnects", 0)
         violations += meta.get("consistency_violations", 0)
         connect_refusals += meta.get("connect_refusals", 0)
@@ -415,6 +423,9 @@ def aggregate(stage_dir: Path, cfg: StageConfig, monitor_samples: list[dict],
         vals = [s[key] for s in monitor_samples if s.get(key) is not None]
         return {"mean": round(statistics.fmean(vals), 2), "max": round(max(vals), 2)} if vals else None
 
+    # Preserve each request's latency/wait pairing: the marginal summaries
+    # below sort their lists in place and would destroy that correlation.
+    user_p99 = round(percentile(sorted(a + b for a, b in zip(all_lat, all_wait)), 0.99), 1) if all_lat else None
     lat_summary = summarize_latencies(all_lat)
     wait_summary = summarize_latencies(all_wait)
     summary = {
@@ -426,7 +437,7 @@ def aggregate(stage_dir: Path, cfg: StageConfig, monitor_samples: list[dict],
         "throughput_per_user": round(total_in_window / duration / max(1, cfg.users), 3),
         "read_ops_s": round(read_ops / duration, 1), "write_ops_s": round(write_ops / duration, 1),
         "latency": lat_summary, "pool_wait": wait_summary,
-        "user_latency_p99_us": round(percentile(sorted(a + b for a, b in zip(all_lat, all_wait)), 0.99), 1) if all_lat else None,
+        "user_latency_p99_us": user_p99,
         "success_rate_pct": round(100 * ok / max(1, total_in_window), 3),
         "failed_ops": failed,
         "conflict_retries": retries_total, "ops_that_retried": ops_with_retry,
@@ -442,6 +453,8 @@ def aggregate(stage_dir: Path, cfg: StageConfig, monitor_samples: list[dict],
         "wall": wall,
         "per_op": per_op_rows,
     }
+    if sqlite_settings is not None:
+        summary["sqlite_settings"] = sqlite_settings
     with open(stage_dir / "summary.json", "w") as fh:
         json.dump(summary, fh, indent=1, default=str)
     with open(stage_dir / "per-op.csv", "w", newline="") as fh:
@@ -561,7 +574,7 @@ def prepare_database(transport: str, db_path: str, durability: str, products: in
             if extra.exists():
                 extra.unlink()
     if transport == "sqlite":
-        conn = drivers.SqliteConnection(db_path)
+        conn = drivers.SqliteConnection(db_path, durability=durability)
         sqlite = True
     else:
         conn = drivers.open_embedded(db_path, durability)

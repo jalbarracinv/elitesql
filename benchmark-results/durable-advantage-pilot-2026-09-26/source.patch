@@ -1,0 +1,350 @@
+diff --git a/examples/saas_simulation/runner.py b/examples/saas_simulation/runner.py
+index 2b26fd5..78d5238 100644
+--- a/examples/saas_simulation/runner.py
++++ b/examples/saas_simulation/runner.py
+@@ -121,7 +121,8 @@ def _connect(cfg: StageConfig):
+                 time.sleep(delay + random.random() * delay)
+                 delay = min(delay * 2, 1.0)
+     if cfg.transport == "sqlite":
+-        return drivers.SqliteConnection(cfg.db_path, timeout_s=cfg.sidecar_timeout)
++        return drivers.SqliteConnection(cfg.db_path, timeout_s=cfg.sidecar_timeout,
++                                        durability=cfg.durability)
+     raise ValueError(cfg.transport)
+ 
+ 
+@@ -151,6 +152,8 @@ def worker_main(cfg_dict: dict, worker_index: int, user_indexes: list[int],
+     errors: dict[str, dict] = {}
+     stats = {"reconnects": 0, "consistency_violations": 0,
+              "connect_refusals": _connect_refusals[0], "pool_open_seconds": round(time.time() - t_open, 2)}
++    if cfg.transport == "sqlite":
++        stats["sqlite_settings"] = pool._all[0].durability_settings
+     stats_lock = threading.Lock()
+ 
+     def run_user(vu: VirtualUser, start_delay: float) -> None:
+@@ -344,9 +347,14 @@ def aggregate(stage_dir: Path, cfg: StageConfig, monitor_samples: list[dict],
+     total_in_window = 0
+     total_all = 0
+     read_ops = write_ops = 0
++    sqlite_settings = None
+     for sample_file in sorted(stage_dir.glob("samples-*.csv.gz")):
+         with open(str(sample_file) + ".meta.json") as fh:
+             meta = json.load(fh)
++        if "sqlite_settings" in meta:
++            if sqlite_settings is not None and sqlite_settings != meta["sqlite_settings"]:
++                raise RuntimeError("workers used different SQLite durability settings")
++            sqlite_settings = meta["sqlite_settings"]
+         reconnects += meta.get("reconnects", 0)
+         violations += meta.get("consistency_violations", 0)
+         connect_refusals += meta.get("connect_refusals", 0)
+@@ -442,6 +450,8 @@ def aggregate(stage_dir: Path, cfg: StageConfig, monitor_samples: list[dict],
+         "wall": wall,
+         "per_op": per_op_rows,
+     }
++    if sqlite_settings is not None:
++        summary["sqlite_settings"] = sqlite_settings
+     with open(stage_dir / "summary.json", "w") as fh:
+         json.dump(summary, fh, indent=1, default=str)
+     with open(stage_dir / "per-op.csv", "w", newline="") as fh:
+@@ -561,7 +571,7 @@ def prepare_database(transport: str, db_path: str, durability: str, products: in
+             if extra.exists():
+                 extra.unlink()
+     if transport == "sqlite":
+-        conn = drivers.SqliteConnection(db_path)
++        conn = drivers.SqliteConnection(db_path, durability=durability)
+         sqlite = True
+     else:
+         conn = drivers.open_embedded(db_path, durability)
+diff --git a/examples/saas_simulation/saas/drivers.py b/examples/saas_simulation/saas/drivers.py
+index ddeb6ec..04ffa50 100644
+--- a/examples/saas_simulation/saas/drivers.py
++++ b/examples/saas_simulation/saas/drivers.py
+@@ -5,7 +5,7 @@ same workload run against each of them:
+ 
+ - ``embedded``: one ``EliteSQL`` handle shared by every thread of a process.
+ - ``sidecar``:  one ``SidecarClient`` per connection to ``elitesql serve``.
+-- ``sqlite``:   one ``sqlite3`` connection per pool slot (WAL, NORMAL sync),
++- ``sqlite``:   one ``sqlite3`` connection per pool slot (WAL, configurable sync),
+                 the baseline every EliteSQL benchmark in this repo compares to.
+ 
+ A *connection* exposes ``execute``, ``transaction``, ``search_vector`` and
+@@ -224,12 +224,32 @@ class SqliteConnection:
+     supports_vectors = False
+     supports_fulltext = True  # FTS5
+ 
+-    def __init__(self, path: str, timeout_s: float = 5.0):
++    def __init__(self, path: str, timeout_s: float = 5.0, durability: str = "balanced"):
++        synchronous = {"fast": "OFF", "balanced": "NORMAL", "safe": "FULL"}
++        if durability not in synchronous:
++            raise ValueError(f"unknown durability: {durability}")
+         self._c = sqlite3.connect(path, timeout=timeout_s, isolation_level=None,
+                                   check_same_thread=False)
+         self._c.execute("PRAGMA journal_mode=WAL")
+-        self._c.execute("PRAGMA synchronous=NORMAL")
++        self._c.execute(f"PRAGMA synchronous={synchronous[durability]}")
++        # EliteSQL Safe uses F_FULLFSYNC on macOS. SQLite's default fsync
++        # would give it a weaker power-loss contract on the same machine.
++        strict = 1 if durability == "safe" else 0
++        self._c.execute(f"PRAGMA fullfsync={strict}")
++        self._c.execute(f"PRAGMA checkpoint_fullfsync={strict}")
+         self._c.execute(f"PRAGMA busy_timeout={int(timeout_s * 1000)}")
++        self.durability_settings = {
++            name: self._c.execute(f"PRAGMA {name}").fetchone()[0]
++            for name in ("journal_mode", "synchronous", "fullfsync",
++                         "checkpoint_fullfsync", "wal_autocheckpoint", "busy_timeout")
++        }
++        expected = {"fast": 0, "balanced": 1, "safe": 2}[durability]
++        if (self.durability_settings["journal_mode"] != "wal"
++                or self.durability_settings["synchronous"] != expected
++                or self.durability_settings["fullfsync"] != strict
++                or self.durability_settings["checkpoint_fullfsync"] != strict):
++            self._c.close()
++            raise RuntimeError(f"SQLite rejected durability settings: {self.durability_settings}")
+ 
+     def execute(self, sql: str, params=None) -> Result:
+         try:
+diff --git a/examples/saas_simulation/tests/test_durability.py b/examples/saas_simulation/tests/test_durability.py
+new file mode 100644
+index 0000000..d6a4d5f
+--- /dev/null
++++ b/examples/saas_simulation/tests/test_durability.py
+@@ -0,0 +1,63 @@
++"""Guard the durability contract of benchmark connections, not just labels."""
++
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import runner
++from saas.drivers import SqliteConnection
++
++
++class DurabilityTests(unittest.TestCase):
++    def test_profiles_apply_and_read_back_pragmas(self):
++        with tempfile.TemporaryDirectory() as directory:
++            for profile, sync in (("fast", 0), ("balanced", 1), ("safe", 2)):
++                with self.subTest(profile=profile):
++                    conn = SqliteConnection(str(Path(directory) / f"{profile}.sqlite"),
++                                            durability=profile)
++                    try:
++                        actual = conn.durability_settings
++                        self.assertEqual(actual["journal_mode"], "wal")
++                        self.assertEqual(actual["synchronous"], sync)
++                        self.assertEqual(actual["fullfsync"], int(profile == "safe"))
++                        self.assertEqual(actual["checkpoint_fullfsync"], int(profile == "safe"))
++                    finally:
++                        conn.close()
++
++    def test_stage_connections_honor_safe(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = runner.StageConfig(transport="sqlite", users=1,
++                                     db_path=str(Path(directory) / "stage.sqlite"),
++                                     durability="safe")
++            conn = runner._connect(cfg)
++            try:
++                self.assertEqual(conn.durability_settings["synchronous"], 2)
++                self.assertEqual(conn.durability_settings["fullfsync"], 1)
++                conn.execute("CREATE TABLE proof (id INTEGER PRIMARY KEY)")
++                tx = conn.transaction()
++                tx.execute("INSERT INTO proof VALUES (?)", [1])
++                tx.commit()
++                self.assertEqual(conn.execute("SELECT count(*) FROM proof").scalar, 1)
++            finally:
++                conn.close()
++
++    def test_default_keeps_existing_normal_profile(self):
++        with tempfile.TemporaryDirectory() as directory:
++            conn = SqliteConnection(str(Path(directory) / "default.sqlite"))
++            try:
++                self.assertEqual(conn.durability_settings["synchronous"], 1)
++            finally:
++                conn.close()
++
++    def test_invalid_profile_fails_before_creating_database(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "invalid.sqlite"
++            with self.assertRaises(ValueError):
++                SqliteConnection(str(path), durability="typo")
++            self.assertFalse(path.exists())
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/scripts/prove-durable-advantage.py b/scripts/prove-durable-advantage.py
+new file mode 100644
+index 0000000..dab2064
+--- /dev/null
++++ b/scripts/prove-durable-advantage.py
+@@ -0,0 +1,171 @@
++#!/usr/bin/env python3
++"""Reproduce the durable Mini-SaaS hypothesis without changing the operation mix.
++
++Build first: cargo build --locked --release -p elitesql-cli -p elitesql-ffi
++Then: python3 scripts/prove-durable-advantage.py --output <unused directory>
++The JSON gate is deliberately fixed before running: >=2x throughput AND >=2x
++better p99 at both 100 and 500 users, every paired repetition favors EliteSQL,
++and no correctness failures. A failing hypothesis keeps all its evidence.
++"""
++
++import argparse
++import hashlib
++import importlib.util
++import json
++import os
++from pathlib import Path
++import platform
++import statistics
++import subprocess
++import sys
++import tempfile
++import time
++
++ROOT = Path(__file__).resolve().parents[1]
++spec = importlib.util.spec_from_file_location("comparison", ROOT / "scripts/compare-sqlite.py")
++comparison = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(comparison)
++
++
++def save(path, value):
++    path.write_text(json.dumps(value, indent=2) + "\n")
++
++
++def cell(values, digits=1):
++    return f"{statistics.median(values):,.{digits}f} [{min(values):,.{digits}f}–{max(values):,.{digits}f}]"
++
++
++def summarize(output, repetitions, levels):
++    rows = []
++    correct = True
++    for users in levels:
++        elite, sqlite, paired_ratios = [], [], []
++        for repetition in range(1, repetitions + 1):
++            pair = []
++            for transport in ("sidecar", "sqlite"):
++                directory = output / f"r{repetition}-{transport}"
++                summary = json.loads((directory / f"stage-{users:05d}/summary.json").read_text())
++                check = json.loads((directory / "check.json").read_text())
++                ok = (summary["failed_ops"] == 0 and not summary["errors"]
++                      and summary["consistency_violations"] == 0
++                      and summary["invariants"]["ok"] and check["ok"])
++                if transport == "sqlite":
++                    actual = summary.get("sqlite_settings", {})
++                    ok &= (actual.get("journal_mode") == "wal"
++                           and actual.get("synchronous") == 2
++                           and actual.get("fullfsync") == 1
++                           and actual.get("checkpoint_fullfsync") == 1)
++                correct &= ok
++                pair.append(summary)
++            elite.append(pair[0])
++            sqlite.append(pair[1])
++            paired_ratios.append(pair[0]["throughput_ops_s"] / pair[1]["throughput_ops_s"])
++        e = [s["throughput_ops_s"] for s in elite]
++        q = [s["throughput_ops_s"] for s in sqlite]
++        ep = [s["user_latency_p99_us"] / 1000 for s in elite]
++        qp = [s["user_latency_p99_us"] / 1000 for s in sqlite]
++        rows.append(dict(users=users, elite_ops=e, sqlite_ops=q, elite_p99_ms=ep,
++                         sqlite_p99_ms=qp, throughput_ratio=statistics.median(e) / statistics.median(q),
++                         p99_ratio=statistics.median(qp) / statistics.median(ep),
++                         paired_throughput_ratios=paired_ratios))
++    target = [row for row in rows if row["users"] in (100, 500)]
++    gate = (correct and repetitions >= 3 and len(target) == 2
++            and all(row["throughput_ratio"] >= 2 and row["p99_ratio"] >= 2
++                    and min(row["paired_throughput_ratios"]) > 1 for row in target))
++    save(output / "summary.json", dict(correct=correct, gate_passed=gate, rows=rows))
++    lines = ["# Durable Mini-SaaS: EliteSQL vs SQLite", "",
++             "Medians [minimum–maximum], not confidence intervals. User p99 includes pool wait.", "",
++             "| Users | EliteSQL ops/s | SQLite ops/s | Throughput ratio | EliteSQL p99 ms | SQLite p99 ms |",
++             "| ---: | ---: | ---: | ---: | ---: | ---: |"]
++    for row in rows:
++        lines.append(f"| {row['users']} | {cell(row['elite_ops'])} | {cell(row['sqlite_ops'])} | "
++                     f"{row['throughput_ratio']:.2f}× | {cell(row['elite_p99_ms'])} | {cell(row['sqlite_p99_ms'])} |")
++    lines += ["", f"Correctness gate: **{correct}**. Predeclared performance gate: **{gate}**.", "",
++              "Safe vs WAL/FULL; fullfsync and checkpoint_fullfsync enabled on SQLite. "
++              "Automatic checkpoints stay enabled; EliteSQL uses its default resource budgets. "
++              "Same baseline service, 20K accounts, 5K products, 15 operations; recommendations excluded. "
++              "Text rankings are engine-specific. Sidecar vs embedded SQLite; transport differs. "
++              "Ten generator processes, no think time. Fresh database per repetition; levels accumulate.", "",
++              "See jobs.json for exact commands, metadata.json for source/binary hashes, each stage's "
++              "summary.json/resources.csv/timeseries.csv for latency, CPU, RSS, errors and group-commit "
++              "counters; check.json records recovery outside the timed window. Engine counters cover "
++              "the entire stage, including ramp and warmup, rather than only the measurement window."]
++    (output / "results.md").write_text("\n".join(lines) + "\n")
++    print("\n".join(lines[:9]), flush=True)
++    return gate
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output", required=True, type=Path)
++    parser.add_argument("--repetitions", type=int, default=3)
++    parser.add_argument("--duration", type=float, default=30)
++    parser.add_argument("--levels", default="10,100,500")
++    parser.add_argument("--summarize-only", action="store_true")
++    args = parser.parse_args()
++    output = args.output.resolve()
++    levels = list(map(int, args.levels.split(",")))
++    if args.summarize_only:
++        summarize(output, args.repetitions, levels)
++        return
++    if output.exists() and any(output.iterdir()):
++        parser.error("output must be empty; existing evidence will not be overwritten")
++    output.mkdir(parents=True, exist_ok=True)
++    sources = {name: comparison.refresh.digest(ROOT / name) for name in comparison.source_files()}
++    binaries = [ROOT / "target/release/elitesql", ROOT / "target/release/libelitesql.dylib"]
++    hashes = {str(path.relative_to(ROOT)): comparison.refresh.digest(path) for path in binaries}
++    metadata = dict(git_commit=comparison.refresh.capture(["git", "rev-parse", "HEAD"]),
++                    git_status=comparison.refresh.capture(["git", "status", "--short"]),
++                    source_sha256=sources, binary_sha256=hashes, platform=platform.platform(),
++                    python=sys.version, start=comparison.refresh.observations(),
++                    repetitions=args.repetitions, duration=args.duration, levels=levels,
++                    hypothesis="durable small transactions: >=2x throughput and >=2x better p99 at 100/500",
++                    gate="3+ repetitions, every pair favors EliteSQL, zero failures, RYW and invariants pass")
++    save(output / "metadata.json", metadata)
++    patch = subprocess.check_output(["git", "diff", "--binary", "HEAD"])
++    for name in sources:
++        if subprocess.run(["git", "ls-files", "--error-unmatch", name], capture_output=True).returncode:
++            patch += subprocess.run(["git", "diff", "--no-index", "--binary", "/dev/null", name],
++                                    capture_output=True).stdout
++    (output / "source.patch").write_bytes(patch)
++    jobs = []
++    for repetition in range(1, args.repetitions + 1):
++        for transport in (("sidecar", "sqlite") if repetition % 2 else ("sqlite", "sidecar")):
++            name = f"r{repetition}-{transport}"
++            argv = [sys.executable, str(ROOT / "examples/saas_simulation/sweep.py"),
++                    "--transport", transport, "--levels", args.levels, "--duration", str(args.duration),
++                    "--warmup", "5", "--ramp", "5", "--think", "0", "--processes", "10",
++                    "--durability", "safe", "--products", "5000", "--accounts", "20000",
++                    "--scenario", "baseline", "--seed", str(repetition), "--out", str(output / name)]
++            jobs.append(dict(name=name, argv=argv))
++    save(output / "jobs.json", jobs)
++    env = dict(os.environ, SAAS_SIM_DROP_OPS="recommend",
++               ELITESQL_LIB=str(binaries[1]), PYTHONPATH=str(ROOT / "bindings/python"))
++    for index, job in enumerate(jobs):
++        print(f"[{index + 1}/{len(jobs)}] {job['name']}", flush=True)
++        started = time.monotonic()
++        status = dict(job, before=comparison.refresh.observations())
++        with tempfile.TemporaryDirectory(prefix="esql-proof-") as database:
++            argv = [*job["argv"], "--db-dir", database]
++            status["argv"] = argv
++            with (output / f"{job['name']}.log").open("w") as log:
++                with (output / f"{job['name']}.resources.txt").open("w") as resources:
++                    result = subprocess.run(["/usr/bin/time", "-l" if platform.system() == "Darwin" else "-v",
++                                             *argv], stdout=log, stderr=resources, env=env, cwd=ROOT)
++        status.update(returncode=result.returncode, seconds=time.monotonic() - started,
++                      after=comparison.refresh.observations())
++        save(output / f"{job['name']}.status.json", status)
++        if result.returncode:
++            raise SystemExit(f"job failed: {job['name']}; see retained logs")
++    if any(comparison.refresh.digest(ROOT / name) != value for name, value in sources.items()):
++        raise SystemExit("sources changed during measurement; results cannot establish the hypothesis")
++    if any(comparison.refresh.digest(ROOT / name) != value for name, value in hashes.items()):
++        raise SystemExit("binaries changed during measurement")
++    metadata["end"] = comparison.refresh.observations()
++    metadata["sources_and_binaries_unchanged"] = True
++    save(output / "metadata.json", metadata)
++    summarize(output, args.repetitions, levels)
++
++
++if __name__ == "__main__":
++    main()

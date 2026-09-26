@@ -1,0 +1,4 @@
+users,transport,processes,connections,throughput_ops_s,read_ops_s,write_ops_s,p50_ms,p95_ms,p99_ms,p999_ms,max_ms,user_p99_ms,pool_wait_p99_ms,success_rate_pct,failed_ops,conflict_retries,conflict_retry_rate_pct,reconnects,connect_refusals,pool_open_s,consistency_violations,invariants_ok,server_cpu_cores,server_rss_mib_max,clients_cpu_cores,throughput_cv,seconds_with_zero_ops,db_mib_after,orders_total,stage_wall_s,commit_lock_wait_us,commit_lock_hold_us,commit_state_write_wait_us,query_admission_waits
+10,sqlite,1,1,643.9,486.5,157.5,0.622,4.096,6.019,8.903,10.331,30.144,28.034,100.0,0,0,0.0,0,0,0.0,0,True,,,0.24,0.098,0,4.9,786,40.1,,,,
+100,sqlite,1,1,605.8,458.9,146.8,0.636,4.21,7.026,9.887,30.078,263.198,259.73,100.0,0,0,0.0,0,0,0.0,0,True,,,0.24,0.089,0,5.1,1523,40.28,,,,
+500,sqlite,1,1,620.2,468.3,151.9,0.63,4.132,6.58,9.696,11.703,923.192,922.111,100.0,0,0,0.0,0,0,0.0,0,True,,,0.25,0.065,0,5.5,2192,40.96,,,,

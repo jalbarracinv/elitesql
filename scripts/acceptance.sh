@@ -11,6 +11,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo build --workspace --locked
 python3 -m unittest discover -s bindings/python/tests
+python3 -m unittest discover -s examples/saas_simulation/tests
 node bindings/node/test.js
 node bindings/node/test-integration.js
 

@@ -5,7 +5,7 @@ same workload run against each of them:
 
 - ``embedded``: one ``EliteSQL`` handle shared by every thread of a process.
 - ``sidecar``:  one ``SidecarClient`` per connection to ``elitesql serve``.
-- ``sqlite``:   one ``sqlite3`` connection per pool slot (WAL, NORMAL sync),
+- ``sqlite``:   one ``sqlite3`` connection per pool slot (WAL, configurable sync),
                 the baseline every EliteSQL benchmark in this repo compares to.
 
 A *connection* exposes ``execute``, ``transaction``, ``search_vector`` and
@@ -224,12 +224,32 @@ class SqliteConnection:
     supports_vectors = False
     supports_fulltext = True  # FTS5
 
-    def __init__(self, path: str, timeout_s: float = 5.0):
+    def __init__(self, path: str, timeout_s: float = 5.0, durability: str = "balanced"):
+        synchronous = {"fast": "OFF", "balanced": "NORMAL", "safe": "FULL"}
+        if durability not in synchronous:
+            raise ValueError(f"unknown durability: {durability}")
         self._c = sqlite3.connect(path, timeout=timeout_s, isolation_level=None,
                                   check_same_thread=False)
         self._c.execute("PRAGMA journal_mode=WAL")
-        self._c.execute("PRAGMA synchronous=NORMAL")
+        self._c.execute(f"PRAGMA synchronous={synchronous[durability]}")
+        # EliteSQL Safe uses F_FULLFSYNC on macOS. SQLite's default fsync
+        # would give it a weaker power-loss contract on the same machine.
+        strict = 1 if durability == "safe" else 0
+        self._c.execute(f"PRAGMA fullfsync={strict}")
+        self._c.execute(f"PRAGMA checkpoint_fullfsync={strict}")
         self._c.execute(f"PRAGMA busy_timeout={int(timeout_s * 1000)}")
+        self.durability_settings = {
+            name: self._c.execute(f"PRAGMA {name}").fetchone()[0]
+            for name in ("journal_mode", "synchronous", "fullfsync",
+                         "checkpoint_fullfsync", "wal_autocheckpoint", "busy_timeout")
+        }
+        expected = {"fast": 0, "balanced": 1, "safe": 2}[durability]
+        if (self.durability_settings["journal_mode"] != "wal"
+                or self.durability_settings["synchronous"] != expected
+                or self.durability_settings["fullfsync"] != strict
+                or self.durability_settings["checkpoint_fullfsync"] != strict):
+            self._c.close()
+            raise RuntimeError(f"SQLite rejected durability settings: {self.durability_settings}")
 
     def execute(self, sql: str, params=None) -> Result:
         try:

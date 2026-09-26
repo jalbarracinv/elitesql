@@ -1,0 +1,32 @@
+{
+  "script_sha256": "dc80bcac2482475e899835d656e0eeba063272570fc5e59d7e09c3f16875ef7e",
+  "start": {
+    "utc": "2026-09-26T12:10:16Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "rationale": "one SQLite connection, FIFO queue, include pool wait",
+  "end": {
+    "utc": "2026-09-26T12:16:37Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "sources_unchanged": true,
+  "correctness_passed": true
+}
