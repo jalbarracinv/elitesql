@@ -88,9 +88,7 @@ pub(super) fn wait_vector_indexing_shared(shared: &Shared) -> Result<()> {
 /// WAL rotation must never overtake a group whose callers still depend on the
 /// current generation's sync result. Ordinary run-manifest publication may
 /// use the raw mutex because it does not replace the WAL.
-#[track_caller]
 pub(super) fn lock_commit_after_group_sync(shared: &Arc<Shared>) -> CommitGuard<'_> {
-
     loop {
         let guard = shared.commit.lock();
         let Some(group) = guard.wal_sync_group.clone() else {

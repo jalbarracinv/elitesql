@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+<rect width="1080" height="480" fill="#ffffff"/>
+<text x="84" y="26" font-size="17" font-weight="600" fill="#1f2328">Operation latency vs concurrent users</text>
+<text x="84" y="44" fill="#57606a">database call only; p50 dashed, p99 solid</text>
+<line x1="84" y1="416.0" x2="830" y2="416.0" stroke="#eaeef2"/>
+<text x="76" y="420.0" text-anchor="end" fill="#57606a">0.01</text>
+<line x1="84" y1="356.7" x2="830" y2="356.7" stroke="#eaeef2"/>
+<text x="76" y="360.7" text-anchor="end" fill="#57606a">0.1</text>
+<line x1="84" y1="297.3" x2="830" y2="297.3" stroke="#eaeef2"/>
+<text x="76" y="301.3" text-anchor="end" fill="#57606a">1</text>
+<line x1="84" y1="238.0" x2="830" y2="238.0" stroke="#eaeef2"/>
+<text x="76" y="242.0" text-anchor="end" fill="#57606a">10</text>
+<line x1="84" y1="178.7" x2="830" y2="178.7" stroke="#eaeef2"/>
+<text x="76" y="182.7" text-anchor="end" fill="#57606a">100</text>
+<line x1="84" y1="119.3" x2="830" y2="119.3" stroke="#eaeef2"/>
+<text x="76" y="123.3" text-anchor="end" fill="#57606a">1k</text>
+<line x1="84" y1="60.0" x2="830" y2="60.0" stroke="#eaeef2"/>
+<text x="76" y="64.0" text-anchor="end" fill="#57606a">10k</text>
+<line x1="84.0" y1="60" x2="84.0" y2="416" stroke="#f0f2f4"/>
+<text x="84.0" y="434" text-anchor="middle" fill="#57606a">10</text>
+<line x1="408.2" y1="60" x2="408.2" y2="416" stroke="#f0f2f4"/>
+<text x="408.2" y="434" text-anchor="middle" fill="#57606a">100</text>
+<line x1="634.8" y1="60" x2="634.8" y2="416" stroke="#f0f2f4"/>
+<text x="634.8" y="434" text-anchor="middle" fill="#57606a">500</text>
+<line x1="732.4" y1="60" x2="732.4" y2="416" stroke="#f0f2f4"/>
+<text x="732.4" y="434" text-anchor="middle" fill="#57606a">1k</text>
+<line x1="830.0" y1="60" x2="830.0" y2="416" stroke="#f0f2f4"/>
+<text x="830.0" y="434" text-anchor="middle" fill="#57606a">2k</text>
+<rect x="84" y="60" width="746" height="356" fill="none" stroke="#d0d7de"/>
+<text x="457.0" y="466" text-anchor="middle" fill="#57606a">concurrent users (log)</text>
+<text x="18" y="238.0" text-anchor="middle" fill="#57606a" transform="rotate(-90 18 238.0)">latency ms (log)</text>
+<path d="M84.0,257.7 L408.2,178.7 L634.8,116.9 L732.4,99.9 L830.0,83.4" fill="none" stroke="#c99700" stroke-width="2"/>
+<circle cx="84.0" cy="257.7" r="3" fill="#c99700"><title>run-2-sqlite p99: 10 → 4.647</title></circle>
+<circle cx="408.2" cy="178.7" r="3" fill="#c99700"><title>run-2-sqlite p99: 100 → 99.71</title></circle>
+<circle cx="634.8" cy="116.9" r="3" fill="#c99700"><title>run-2-sqlite p99: 500 → 1097.95</title></circle>
+<circle cx="732.4" cy="99.9" r="3" fill="#c99700"><title>run-2-sqlite p99: 1k → 2125.06</title></circle>
+<circle cx="830.0" cy="83.4" r="3" fill="#c99700"><title>run-2-sqlite p99: 2k → 4026.88</title></circle>
+<line x1="848" y1="68" x2="870" y2="68" stroke="#c99700" stroke-width="2"/>
+<text x="876" y="72" fill="#1f2328">run-2-sqlite p99</text>
+<path d="M84.0,358.8 L408.2,336.2 L634.8,322.4 L732.4,311.7 L830.0,308.2" fill="none" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="84.0" cy="358.8" r="3" fill="#0969da"><title>run-2-sqlite p50: 10 → 0.092</title></circle>
+<circle cx="408.2" cy="336.2" r="3" fill="#0969da"><title>run-2-sqlite p50: 100 → 0.221</title></circle>
+<circle cx="634.8" cy="322.4" r="3" fill="#0969da"><title>run-2-sqlite p50: 500 → 0.378</title></circle>
+<circle cx="732.4" cy="311.7" r="3" fill="#0969da"><title>run-2-sqlite p50: 1k → 0.573</title></circle>
+<circle cx="830.0" cy="308.2" r="3" fill="#0969da"><title>run-2-sqlite p50: 2k → 0.657</title></circle>
+<line x1="848" y1="84" x2="870" y2="84" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="876" y="88" fill="#1f2328">run-2-sqlite p50</text>
+</svg>

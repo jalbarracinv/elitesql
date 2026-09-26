@@ -483,9 +483,7 @@ pub(crate) fn decode_value(
         TAG_FLOAT64 => Ok(Value::Float64(f64::from_le_bytes(read_array(buf, pos)?))),
         TAG_TEXT => {
             let bytes = read_len_prefixed(buf, pos)?;
-            let s = std::str::from_utf8(bytes)
-                .map_err(|_| Error::Corrupt("invalid utf8 in text value".into()))?;
-            Ok(Value::Text(s.to_owned()))
+            Ok(Value::Text(text_str(bytes)?.to_owned()))
         }
         TAG_BLOB => Ok(Value::Blob(read_len_prefixed(buf, pos)?.to_vec())),
         TAG_TIMESTAMP => Ok(Value::Timestamp(i64::from_le_bytes(read_array(buf, pos)?))),
@@ -548,10 +546,9 @@ pub(crate) fn encoded_value_eq(
         }
         (TAG_TEXT, Value::Text(expected)) => {
             let bytes = read_len_prefixed(buf, pos)?;
-            let actual = std::str::from_utf8(bytes)
-                .map_err(|_| Error::Corrupt("invalid utf8 in text value".into()))?;
-            Some(actual == expected)
+            Some(text_str(bytes)? == expected)
         }
+
         (TAG_BLOB, Value::Blob(expected)) => Some(read_len_prefixed(buf, pos)? == expected),
         (TAG_TIMESTAMP, Value::Timestamp(expected)) => {
             Some(i64::from_le_bytes(read_array(buf, pos)?) == *expected)
@@ -678,6 +675,18 @@ pub(crate) fn read_len_prefixed<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'
         .ok_or_else(|| Error::Corrupt("unexpected end of data".into()))?;
     *pos = end;
     Ok(slice)
+}
+
+/// A stored text value. Most text is ASCII, and checking that is a few word
+/// compares, where full UTF-8 validation was a named cost of every decoded
+/// row that carries a name or a label.
+#[inline]
+fn text_str(bytes: &[u8]) -> Result<&str> {
+    if bytes.is_ascii() {
+        // SAFETY: every ASCII byte string is valid UTF-8.
+        return Ok(unsafe { std::str::from_utf8_unchecked(bytes) });
+    }
+    std::str::from_utf8(bytes).map_err(|_| Error::Corrupt("invalid utf8 in text value".into()))
 }
 
 #[cfg(test)]

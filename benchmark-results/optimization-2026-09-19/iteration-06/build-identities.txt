@@ -1,0 +1,4 @@
+base    = 92e0290 (git worktree, cargo build --release -p elitesql-cli)
+current = working tree 2026-09-25 (HEAD a26bf2f + uncommitted changes, probes removed)
+d82c21d1577f326bbb2ae661d43f2d58c52a61cd153df296c8d86b477b42c21c  base-elitesql
+280426cfdd88fcdaeb0e290858a91b327bc4f606fc36887b27f4fa245df17f1b  current-elitesql

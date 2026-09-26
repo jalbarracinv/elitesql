@@ -753,8 +753,9 @@ fn global_aggregates_stream_without_the_full_budget() {
     let peak = db.global_memory_stats().query_peak_bytes;
     assert!(peak <= small, "a small GROUP BY reserved {peak}");
 
-    // Wide rows make the batch heavier: the reservation grows past the small
-    // tier to cover it, and stays under the full budget.
+    // A full scan streams its rows to the aggregate one at a time, so wide
+    // rows do not add up: the reservation covers the row in hand and stays
+    // in the small tier.
     let dir_wide = tempfile::tempdir().unwrap();
     let wide = Db::create(dir_wide.path().join("wide")).unwrap();
     wide.query("CREATE TABLE notes(body text)").unwrap();
@@ -774,10 +775,11 @@ fn global_aggregates_stream_without_the_full_budget() {
     );
     let stats = wide.global_memory_stats();
     assert!(
-        stats.query_peak_bytes > small && stats.query_peak_bytes < working,
+        stats.query_peak_bytes > 0 && stats.query_peak_bytes <= small,
         "wide global aggregate reserved {}",
         stats.query_peak_bytes
     );
+
     assert_eq!(stats.query_in_use_bytes, 0);
 
     // COUNT(DISTINCT) keeps the full budget from the start.

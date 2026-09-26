@@ -8,6 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::OnceLock;
 
 use memmap2::{Advice, Mmap, MmapOptions};
 use ulid::Ulid;
@@ -83,6 +84,43 @@ pub(crate) struct PagedIndex {
     /// this mapping. The file is immutable after publication, so re-hashing
     /// the same page on every lookup only cost CPU under the state lock.
     verified: Vec<AtomicU64>,
+    /// Page fences for keys laid out as `[u32 table length][table][id]`,
+    /// built on the first lookup that asks for them; see `KeyFences`.
+    fences: OnceLock<Option<KeyFences>>,
+}
+
+/// Where each table's pages are and, per page, the first eight bytes of the
+/// id in its last key as a big-endian integer.
+///
+/// A primary run holds every table, so a binary search over its last keys
+/// compared the same table prefix at every probe, one `memcmp` call each: in
+/// a profile of an indexed read that returns a few hundred rows, finding the
+/// page of each id was a sixth of the statement. With the table's page range
+/// known, the search compares integers and only follows a key into the
+/// mapping when the first eight id bytes tie. Zero padding keeps the integer
+/// order the byte order: zero is the smallest byte, and a shorter id that is
+/// a prefix of a longer one sorts first either way.
+struct KeyFences {
+    /// `(table prefix, first page, end page)` for the pages whose last key
+    /// belongs to that table, in key order.
+    tables: Vec<(Box<[u8]>, usize, usize)>,
+    ids: Vec<u64>,
+}
+
+fn id_fence(id: &[u8]) -> u64 {
+    let mut bytes = [0u8; 8];
+    let take = id.len().min(8);
+    bytes[..take].copy_from_slice(&id[..take]);
+    u64::from_be_bytes(bytes)
+}
+
+/// `(table prefix, id)` of a key in the primary layout, or `None` for any
+/// other. The prefix keeps the length in front of the name, because that is
+/// how the keys sort: by name length first.
+fn split_table_key(key: &[u8]) -> Option<(&[u8], &[u8])> {
+    let len = u32::from_be_bytes(key.get(..4)?.try_into().ok()?) as usize;
+    let end = 4usize.checked_add(len).filter(|end| *end <= key.len())?;
+    Some((&key[..end], &key[end..]))
 }
 
 pub(crate) struct PagedPrefixCursor<'a> {
@@ -265,6 +303,7 @@ impl PagedIndex {
             dump_version,
             entry_count,
             verified,
+            fences: OnceLock::new(),
         };
         if format != FORMAT {
             index.validate_legacy_navigation()?;
@@ -402,14 +441,89 @@ impl PagedIndex {
         low
     }
 
+    fn build_fences(&self) -> Option<KeyFences> {
+        let mut tables: Vec<(Box<[u8]>, usize, usize)> = Vec::new();
+        let mut ids = Vec::with_capacity(self.last_key_spans.len());
+        for position in 0..self.last_key_spans.len() {
+            let (table, id) = split_table_key(self.last_key_at(position))?;
+            ids.push(id_fence(id));
+            match tables.last_mut() {
+                Some((last, _, end)) if **last == *table => *end = position + 1,
+                Some((last, _, _)) if **last > *table => return None,
+                _ => tables.push((table.into(), position, position + 1)),
+            }
+        }
+        Some(KeyFences { tables, ids })
+    }
+
+    /// `first_page_for(key, false)` for a key in the primary layout, through
+    /// the page fences; any other key takes the plain search.
+    fn first_page_for_table_key(&self, key: &[u8]) -> usize {
+        let Some(fences) = self.fences.get_or_init(|| self.build_fences()).as_ref() else {
+            return self.first_page_for(key, false);
+        };
+        let Some((table, id)) = split_table_key(key) else {
+            return self.first_page_for(key, false);
+        };
+        let (mut low, mut high) = match fences
+            .tables
+            .binary_search_by(|(candidate, _, _)| (**candidate).cmp(table))
+        {
+            Ok(at) => (fences.tables[at].1, fences.tables[at].2),
+            // No page ends inside this table: the first page ending in a
+            // later table is the only one that can hold the key.
+            Err(at) => {
+                return fences
+                    .tables
+                    .get(at)
+                    .map_or(self.last_key_spans.len(), |(_, start, _)| *start)
+            }
+        };
+        let wanted = id_fence(id);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let before = match fences.ids[mid].cmp(&wanted) {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => self.last_key_at(mid) < key,
+            };
+            if before {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
+    }
+
+    /// `visit_key` for a key in the primary layout `[u32 table length]
+    /// [table][id]`, locating its page through the fences.
+    pub(crate) fn visit_table_key(
+        &self,
+        key: &[u8],
+        visit: impl FnMut(&[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        let first = self.first_page_for_table_key(key);
+        self.visit_key_from(first, key, visit)
+    }
+
     /// Visit values for one key in sorted order. Returning `false` stops at
     /// once, apart from the already checksummed page currently being parsed.
     pub(crate) fn visit_key(
         &self,
         key: &[u8],
-        mut visit: impl FnMut(&[u8]) -> Result<bool>,
+        visit: impl FnMut(&[u8]) -> Result<bool>,
     ) -> Result<()> {
         let first = self.first_page_for(key, false);
+        self.visit_key_from(first, key, visit)
+    }
+
+    fn visit_key_from(
+        &self,
+        first: usize,
+        key: &[u8],
+        mut visit: impl FnMut(&[u8]) -> Result<bool>,
+    ) -> Result<()> {
         for position in first..self.pages.len() {
             let page = self.page_at(position);
             if page.first_key > key {

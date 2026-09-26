@@ -364,7 +364,30 @@ struct HnswIndex {
     link_entries: usize,
     /// Number of adjacency lists (one per node level) in `links`.
     link_lists: usize,
+    /// Layer-0 links pointing at each node. Used to break distance ties; see
+    /// `order_ties_by_in_degree`.
+    in_degree: Vec<u32>,
 }
+
+/// Layer-0 in-degree of every node, counted from its adjacency lists.
+fn layer0_in_degree(links: &[Vec<Vec<u32>>]) -> Vec<u32> {
+    let mut in_degree = vec![0u32; links.len()];
+    for levels in links {
+        if let Some(level0) = levels.first() {
+            for &neighbor in level0 {
+                in_degree[neighbor as usize] += 1;
+            }
+        }
+    }
+    in_degree
+}
+
+/// Of the neighbors a node selects at one distance, at most this many may be
+/// exact duplicates of it (distance zero) in the diversity pass. Without a
+/// cap the rule accepts every duplicate, since each is exactly as far from
+/// the others as from the new node, and a vector repeated many times ends up
+/// linked only to its copies.
+const MAX_ZERO_DISTANCE_NEIGHBORS: usize = 2;
 
 impl HnswIndex {
     fn new(metric: VectorMetric, m: usize, ef_construction: usize, quantized: bool) -> HnswIndex {
@@ -392,6 +415,7 @@ impl HnswIndex {
             entry: None,
             top_level: 0,
             rng: 0x9E37_79B9_7F4A_7C15,
+            in_degree: Vec::new(),
             link_entries: 0,
             link_lists: 0,
         }
@@ -558,14 +582,37 @@ impl HnswIndex {
         })
     }
 
+    /// Stable-sort runs of equal distance so the least-linked node comes
+    /// first. Distances only tie in practice between exact duplicates, and
+    /// there the old order (insertion order) kept every link to the oldest
+    /// copies: once their lists were full, a new copy lost each backlink it
+    /// got, and the last copies of a vector repeated fifty times ended with no
+    /// incoming link at all, members of the index that no search could reach.
+    fn order_ties_by_in_degree(&self, candidates: &mut [(f32, u32)]) {
+        candidates.sort_by(|a, b| {
+            a.0.total_cmp(&b.0).then_with(|| {
+                let degree = |label: u32| self.in_degree.get(label as usize).copied().unwrap_or(0);
+                degree(a.1).cmp(&degree(b.1))
+            })
+        });
+    }
+
     /// Algorithm 4: diversity-preserving neighbor selection, with pruned
     /// candidates kept as fill so nodes never end up under-connected.
     fn select_neighbors(&self, candidates: &[(f32, u32)], m: usize) -> Vec<u32> {
         let mut selected: Vec<(f32, u32)> = Vec::with_capacity(m);
         let mut skipped: Vec<(f32, u32)> = Vec::new();
+        let mut zero_distance = 0usize;
         for &(d, c) in candidates {
             if selected.len() >= m {
                 break;
+            }
+            if d <= 0.0 {
+                if zero_distance >= MAX_ZERO_DISTANCE_NEIGHBORS {
+                    skipped.push((d, c));
+                    continue;
+                }
+                zero_distance += 1;
             }
             let diverse = selected.iter().all(|&(_, s)| self.dist_between(c, s) >= d);
             if diverse {
@@ -593,6 +640,7 @@ impl HnswIndex {
         self.norms.push(stored_norm);
         self.links
             .push((0..=level as usize).map(|_| Vec::new()).collect());
+        self.in_degree.push(0);
         self.link_lists += level as usize + 1;
 
         let Some(entry) = self.entry else {
@@ -612,17 +660,28 @@ impl HnswIndex {
         // Connect on each layer from min(level, top) down to 0.
         let mut eps = vec![(ep_dist, ep)];
         for l in (0..=level.min(self.top_level) as usize).rev() {
-            let candidates = self.search_layer(v, norm, &eps, self.ef_construction, l);
+            let mut candidates = self.search_layer(v, norm, &eps, self.ef_construction, l);
             let mmax = if l == 0 { self.m0 } else { self.m };
+            if l == 0 {
+                self.order_ties_by_in_degree(&mut candidates);
+            }
             let neighbors = self.select_neighbors(&candidates, self.m);
             for &n in &neighbors {
                 self.links[n as usize][l].push(label);
                 self.link_entries += 1;
+                if l == 0 {
+                    self.in_degree[label as usize] += 1;
+                }
                 if self.links[n as usize][l].len() > mmax {
                     self.prune(n, l, mmax);
                 }
             }
             self.link_entries += neighbors.len();
+            if l == 0 {
+                for &n in &neighbors {
+                    self.in_degree[n as usize] += 1;
+                }
+            }
             self.links[label as usize][l] = neighbors;
             eps = candidates;
         }
@@ -640,8 +699,20 @@ impl HnswIndex {
             .into_iter()
             .map(|n| (self.dist_between(node, n), n))
             .collect();
-        with_dist.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if layer == 0 {
+            for &(_, n) in &with_dist {
+                self.in_degree[n as usize] -= 1;
+            }
+            self.order_ties_by_in_degree(&mut with_dist);
+        } else {
+            with_dist.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
         let selected = self.select_neighbors(&with_dist, mmax);
+        if layer == 0 {
+            for &n in &selected {
+                self.in_degree[n as usize] += 1;
+            }
+        }
         self.link_entries += selected.len();
         self.links[node as usize][layer] = selected;
     }
@@ -866,6 +937,7 @@ impl VecIdx {
             .saturating_add(link_bytes)
             .saturating_add(label_bytes)
             .saturating_add(self.backend.norms.len() * std::mem::size_of::<f32>())
+            .saturating_add(self.backend.in_degree.len() * std::mem::size_of::<u32>())
             .saturating_add(self.deleted.len().div_ceil(8))
             .saturating_add(self.frozen_removed_bytes)
     }
@@ -2331,6 +2403,7 @@ impl VecIdx {
             ml: 1.0 / (m as f64).ln(),
             store,
             norms,
+            in_degree: layer0_in_degree(&links),
             links,
             entry,
             top_level,
@@ -2338,6 +2411,7 @@ impl VecIdx {
             link_entries,
             link_lists,
         };
+
         Ok((
             VecIdx {
                 mapped: Vec::new(),
@@ -2354,5 +2428,77 @@ impl VecIdx {
             },
             dump_version,
         ))
+    }
+}
+
+#[cfg(test)]
+mod duplicate_reachability_tests {
+    use super::*;
+
+    fn rand_vec(seed: &mut u64, dim: usize) -> Vec<f32> {
+        (0..dim)
+            .map(|_| {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                (*seed % 1000) as f32 / 1000.0
+            })
+            .collect()
+    }
+
+    /// Labels of the copies of one vector repeated `copies` times, inserted
+    /// among `total` random vectors in the given arrangement.
+    fn build(
+        metric: VectorMetric,
+        total: usize,
+        copies: usize,
+        arrangement: &str,
+    ) -> (HnswIndex, Vec<u32>, Vec<f32>) {
+        let mut index = HnswIndex::new(metric, default_m(), default_ef_construction(), false);
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let far = vec![9.0f32; 16];
+        let mut labels = Vec::new();
+        let start = match arrangement {
+            "first" => 0,
+            "middle" => total / 2,
+            _ => total - copies,
+        };
+        for i in 0..total {
+            let copy = if arrangement == "interleaved" {
+                i % (total / copies) == 0 && labels.len() < copies
+            } else {
+                (start..start + copies).contains(&i)
+            };
+            if copy {
+                labels.push(index.insert(&far));
+            } else {
+                index.insert(&rand_vec(&mut seed, 16));
+            }
+        }
+        (index, labels, far)
+    }
+
+    /// A vector stored many times must stay reachable in every copy: each
+    /// copy is an exact answer for a query at that vector. A background
+    /// merge rebuilds a graph from its runs in order, so the copies of an
+    /// updated vector usually arrive together.
+    #[test]
+    fn every_copy_of_a_repeated_vector_stays_reachable() {
+        let mut failures = Vec::new();
+        for metric in [VectorMetric::Cosine, VectorMetric::L2] {
+            for arrangement in ["first", "middle", "last", "interleaved"] {
+                let (index, copies, far) = build(metric, 6_000, 50, arrangement);
+                let found: HashSet<u32> = index
+                    .search(&far, copies.len(), copies.len())
+                    .into_iter()
+                    .map(|(label, _)| label)
+                    .collect();
+                let unreachable = copies.iter().filter(|label| !found.contains(label)).count();
+                if unreachable > 0 {
+                    failures.push(format!("{metric:?}/{arrangement}: {unreachable}/50"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "unreachable copies: {failures:?}");
     }
 }

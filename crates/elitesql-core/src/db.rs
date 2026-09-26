@@ -6,9 +6,9 @@ mod secondary;
 use commit::*;
 use maintenance::*;
 pub(crate) use reads::json_heap_bytes;
-pub(crate) use reads::ScanBatch;
 use reads::*;
 pub(crate) use reads::{push_id, IdSpan};
+pub(crate) use reads::{RowHandles, ScanBatch};
 use secondary::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -1096,8 +1096,9 @@ impl PrimaryTableView<'_> {
             if !run.index.may_contain_key(self.key) {
                 continue;
             }
-            run.index.visit_key(self.key, |value| {
+            run.index.visit_table_key(self.key, |value| {
                 let entry = decode_primary_entry(value)?;
+
                 if entry.version <= max_version
                     && newest
                         .as_ref()
@@ -1590,7 +1591,6 @@ impl<'a> PrimaryTableCursor<'a> {
             ));
         }
         Ok(Some((primary_id_str(id)?, decode_primary_entry(value)?)))
-
     }
 }
 
@@ -1607,7 +1607,6 @@ fn primary_id_str(id: &[u8]) -> Result<&str> {
 }
 
 fn primary_table_prefix(table: &str) -> Vec<u8> {
-
     let mut key = Vec::with_capacity(4 + table.len());
     key.extend_from_slice(&(table.len() as u32).to_be_bytes());
     key.extend_from_slice(table.as_bytes());
@@ -2695,7 +2694,12 @@ fn decode_prepared_batch(
     let next = prepared
         .get(rows.len().wrapping_sub(1))
         .map(|(span, _)| span.of(prepared_ids).to_owned());
-    Ok(ScanBatch { rows, ids, next })
+    Ok(ScanBatch {
+        rows,
+        ids,
+        next,
+        handles: None,
+    })
 }
 
 /// Query-memory reservation of a key-bounded statement (see `Db::query_admission_small_bytes`).
@@ -3227,39 +3231,8 @@ enum CommitMutex {
 }
 
 enum CommitGuard<'a> {
-    Safe(MutexGuard<'a, CommitState>, HoldProbe),
-    Concurrent(ParkingMutexGuard<'a, CommitState>, HoldProbe),
-}
-
-pub(crate) struct HoldProbe {
-    site: &'static std::panic::Location<'static>,
-    wait: Duration,
-    acquired: Instant,
-}
-
-pub(crate) static HOLD_PROBE: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
-
-impl Drop for HoldProbe {
-    fn drop(&mut self) {
-        let hold = self.acquired.elapsed().as_nanos() as u64;
-        let key = format!("{}:{}", self.site.file(), self.site.line());
-        let mut map = HOLD_PROBE.lock().unwrap();
-        let entry = map.get_or_insert_with(HashMap::new).entry(key).or_default();
-        entry.0 += 1;
-        entry.1 += self.wait.as_nanos() as u64;
-        entry.2 += hold;
-    }
-}
-
-pub(crate) fn dump_hold_probe() {
-    let map = HOLD_PROBE.lock().unwrap();
-    if let Some(map) = map.as_ref() {
-        let mut rows: Vec<_> = map.iter().collect();
-        rows.sort_by_key(|(_, v)| std::cmp::Reverse(v.2));
-        for (site, (count, wait, hold)) in rows {
-            eprintln!("HOLDPROBE {site} count={count} wait_ms={} hold_ms={}", wait / 1_000_000, hold / 1_000_000);
-        }
-    }
+    Safe(MutexGuard<'a, CommitState>),
+    Concurrent(ParkingMutexGuard<'a, CommitState>),
 }
 
 impl CommitMutex {
@@ -3271,19 +3244,10 @@ impl CommitMutex {
         }
     }
 
-    #[track_caller]
     fn lock(&self) -> CommitGuard<'_> {
-        let site = std::panic::Location::caller();
-        let started = Instant::now();
         match self {
-            Self::Safe(mutex) => {
-                let guard = mutex.lock().unwrap();
-                CommitGuard::Safe(guard, HoldProbe { site, wait: started.elapsed(), acquired: Instant::now() })
-            }
-            Self::Concurrent(mutex) => {
-                let guard = mutex.lock();
-                CommitGuard::Concurrent(guard, HoldProbe { site, wait: started.elapsed(), acquired: Instant::now() })
-            }
+            Self::Safe(mutex) => CommitGuard::Safe(mutex.lock().unwrap()),
+            Self::Concurrent(mutex) => CommitGuard::Concurrent(mutex.lock()),
         }
     }
 }
@@ -3293,8 +3257,8 @@ impl Deref for CommitGuard<'_> {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Safe(guard, _) => guard,
-            Self::Concurrent(guard, _) => guard,
+            Self::Safe(guard) => guard,
+            Self::Concurrent(guard) => guard,
         }
     }
 }
@@ -3302,8 +3266,8 @@ impl Deref for CommitGuard<'_> {
 impl DerefMut for CommitGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            Self::Safe(guard, _) => guard,
-            Self::Concurrent(guard, _) => guard,
+            Self::Safe(guard) => guard,
+            Self::Concurrent(guard) => guard,
         }
     }
 }
@@ -3311,9 +3275,8 @@ impl DerefMut for CommitGuard<'_> {
 impl CommitGuard<'_> {
     fn unlock_fair(self) {
         match self {
-            Self::Safe(guard, _probe) => drop(guard),
-            Self::Concurrent(guard, _probe) => ParkingMutexGuard::unlock_fair(guard),
-
+            Self::Safe(guard) => drop(guard),
+            Self::Concurrent(guard) => ParkingMutexGuard::unlock_fair(guard),
         }
     }
 }
@@ -3333,28 +3296,6 @@ struct TimedCommitGuard<'a> {
     total_nanos: &'a AtomicU64,
     waiters: &'a AtomicU64,
     fair_handoff: bool,
-    qos_previous: Option<u32>,
-}
-
-pub(crate) mod exp_qos {
-    pub(crate) const USER_INTERACTIVE: u32 = 0x21;
-    pub(crate) const DEFAULT: u32 = 0x15;
-    extern "C" {
-        pub(crate) fn qos_class_self() -> u32;
-        pub(crate) fn pthread_set_qos_class_self_np(class: u32, relative_priority: i32) -> i32;
-    }
-    pub(crate) fn raise() -> Option<u32> {
-        unsafe {
-            let class = qos_class_self();
-            (pthread_set_qos_class_self_np(USER_INTERACTIVE, 0) == 0).then_some(class)
-        }
-    }
-    pub(crate) fn restore(previous: u32) {
-        let class = if previous == 0 { DEFAULT } else { previous };
-        unsafe {
-            pthread_set_qos_class_self_np(class, 0);
-        }
-    }
 }
 
 impl Deref for TimedCommitGuard<'_> {
@@ -3380,13 +3321,7 @@ impl Drop for TimedCommitGuard<'_> {
         let guard = self.guard.take().expect("commit guard is held");
         if self.fair_handoff && self.waiters.load(AtomicOrdering::Acquire) > 0 {
             guard.unlock_fair();
-        } else {
-            drop(guard);
         }
-        if let Some(previous) = self.qos_previous.take() {
-            exp_qos::restore(previous);
-        }
-
     }
 }
 
@@ -3920,9 +3855,7 @@ fn release_snapshot(shared: &Shared, shard: u8, version: u64) {
     }
     // The set is empty unless a compaction estimate is tracking retained
     // versions, so the common release does not take its lock.
-    if !shared
-        .compaction_retained_any
-        .load(AtomicOrdering::Acquire)
+    if !shared.compaction_retained_any.load(AtomicOrdering::Acquire)
         || shared.snapshots.holds(version)
     {
         return;
@@ -7692,7 +7625,6 @@ impl Db {
             }
             version = current;
         }
-
     }
 
     pub(crate) fn snapshot_with_identities(&self) -> (Snapshot, BTreeMap<String, i64>) {
@@ -8454,7 +8386,6 @@ impl Db {
     }
 
     fn validate_snapshot_owner(&self, snapshot: &Snapshot) -> Result<()> {
-
         if Arc::ptr_eq(&self.shared, &snapshot.shared) {
             Ok(())
         } else {
@@ -8629,8 +8560,9 @@ impl Db {
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Record)>> {
-        let batch =
-            self.find_eq_batch_version(table, column, value, after_id, limit, None, None, true)?;
+        let batch = self.find_eq_batch_version(
+            table, column, value, after_id, limit, None, None, true, false,
+        )?;
         Ok(batch.ids.into_iter().zip(batch.rows).collect())
     }
 
@@ -8646,7 +8578,26 @@ impl Db {
         keep: Option<&[&str]>,
         want_ids: bool,
     ) -> Result<ScanBatch> {
-        self.find_eq_batch_version(table, column, value, after_id, limit, None, keep, want_ids)
+        self.find_eq_batch_version(
+            table, column, value, after_id, limit, None, keep, want_ids, false,
+        )
+    }
+
+    /// `find_eq_batch_keep_unbudgeted` that also hands back, when it can,
+    /// what each row was decoded from (`ScanBatch::handles`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn find_eq_batch_keep_handles(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+        after_id: Option<&str>,
+        limit: usize,
+        keep: Option<&[&str]>,
+    ) -> Result<ScanBatch> {
+        self.find_eq_batch_version(
+            table, column, value, after_id, limit, None, keep, true, true,
+        )
     }
 
     /// Snapshot-bound `find_eq_batch_keep_unbudgeted`.
@@ -8672,6 +8623,7 @@ impl Db {
             Some(snapshot.version),
             keep,
             want_ids,
+            false,
         )
     }
 
@@ -8690,6 +8642,7 @@ impl Db {
         version: Option<u64>,
         keep: Option<&[&str]>,
         want_ids: bool,
+        want_handles: bool,
     ) -> Result<Option<ScanBatch>> {
         let view = self.shared.state.view();
         // The index describes the latest committed state only.
@@ -8707,6 +8660,7 @@ impl Db {
                 rows: Vec::new(),
                 ids: Vec::new(),
                 next: None,
+                handles: None,
             }));
         }
         let (Some(index), Some(directory)) = (
@@ -8716,9 +8670,9 @@ impl Db {
         ) else {
             return Ok(None);
         };
-        let _snapshot_guard = version.is_none().then(|| {
-            Snapshot::register(&self.shared, view.version)
-        });
+        let _snapshot_guard = version
+            .is_none()
+            .then(|| Snapshot::register(&self.shared, view.version));
         let byte_budget = version.map(|_| (self.shared.opts.memory.query_working_bytes / 2).max(1));
         let epoch = schema.epoch;
         let key = index_key(value);
@@ -8757,17 +8711,32 @@ impl Db {
             }
         }
         let projection = RowProjection::new(Some(schema), keep);
-        decode_prepared_batch(
+        let mut batch = decode_prepared_batch(
             &self.shared.blobs,
             &readers,
             &projection,
             schema.has_implicit_id(),
             &prepared,
             &prepared_ids,
-            want_ids,
+            want_ids || want_handles,
             byte_budget,
-        )
-        .map(Some)
+        )?;
+        if want_handles {
+            let rows = batch.rows.len();
+            batch.handles = Some(Box::new(reads::RowHandles {
+                blobs: self.shared.blobs.clone(),
+                readers,
+                schemas: view.schemas.clone(),
+                table: table.to_owned(),
+                kinds: prepared
+                    .into_iter()
+                    .take(rows)
+                    .map(|(_, kind)| kind)
+                    .collect(),
+                ids: batch.ids.clone(),
+            }));
+        }
+        Ok(Some(batch))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8781,9 +8750,18 @@ impl Db {
         version: Option<u64>,
         keep: Option<&[&str]>,
         want_ids: bool,
+        want_handles: bool,
     ) -> Result<ScanBatch> {
         if let Some(batch) = self.find_eq_batch_from_view(
-            table, column, value, after_id, limit, version, keep, want_ids,
+            table,
+            column,
+            value,
+            after_id,
+            limit,
+            version,
+            keep,
+            want_ids,
+            want_handles,
         )? {
             return Ok(batch);
         }
@@ -8808,6 +8786,7 @@ impl Db {
                 rows: Vec::new(),
                 ids: Vec::new(),
                 next: None,
+                handles: None,
             });
         }
         // Equality probes (index nested-loop joins issue one per outer row)
@@ -9023,9 +9002,7 @@ impl Db {
         let fresh = match pinned {
             Some(snapshot) if st.committed_version != snapshot.version() => return Ok(None),
             Some(_) => None,
-            None => {
-                Some(Snapshot::register(&self.shared, st.committed_version))
-            }
+            None => Some(Snapshot::register(&self.shared, st.committed_version)),
         };
         // Equal to the pinned snapshot's version when there is one.
         let version = st.committed_version;

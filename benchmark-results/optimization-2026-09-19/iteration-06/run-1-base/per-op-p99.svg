@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+<rect width="1080" height="480" fill="#ffffff"/>
+<text x="84" y="26" font-size="17" font-weight="600" fill="#1f2328">p99 latency per operation — run-1-base</text>
+<line x1="84" y1="416.0" x2="830" y2="416.0" stroke="#eaeef2"/>
+<text x="76" y="420.0" text-anchor="end" fill="#57606a">0.1</text>
+<line x1="84" y1="344.8" x2="830" y2="344.8" stroke="#eaeef2"/>
+<text x="76" y="348.8" text-anchor="end" fill="#57606a">1</text>
+<line x1="84" y1="273.6" x2="830" y2="273.6" stroke="#eaeef2"/>
+<text x="76" y="277.6" text-anchor="end" fill="#57606a">10</text>
+<line x1="84" y1="202.4" x2="830" y2="202.4" stroke="#eaeef2"/>
+<text x="76" y="206.4" text-anchor="end" fill="#57606a">100</text>
+<line x1="84" y1="131.2" x2="830" y2="131.2" stroke="#eaeef2"/>
+<text x="76" y="135.2" text-anchor="end" fill="#57606a">1k</text>
+<line x1="84" y1="60.0" x2="830" y2="60.0" stroke="#eaeef2"/>
+<text x="76" y="64.0" text-anchor="end" fill="#57606a">10k</text>
+<line x1="84.0" y1="60" x2="84.0" y2="416" stroke="#f0f2f4"/>
+<text x="84.0" y="434" text-anchor="middle" fill="#57606a">10</text>
+<line x1="408.2" y1="60" x2="408.2" y2="416" stroke="#f0f2f4"/>
+<text x="408.2" y="434" text-anchor="middle" fill="#57606a">100</text>
+<line x1="634.8" y1="60" x2="634.8" y2="416" stroke="#f0f2f4"/>
+<text x="634.8" y="434" text-anchor="middle" fill="#57606a">500</text>
+<line x1="732.4" y1="60" x2="732.4" y2="416" stroke="#f0f2f4"/>
+<text x="732.4" y="434" text-anchor="middle" fill="#57606a">1k</text>
+<line x1="830.0" y1="60" x2="830.0" y2="416" stroke="#f0f2f4"/>
+<text x="830.0" y="434" text-anchor="middle" fill="#57606a">2k</text>
+<rect x="84" y="60" width="746" height="356" fill="none" stroke="#d0d7de"/>
+<text x="457.0" y="466" text-anchor="middle" fill="#57606a">concurrent users (log)</text>
+<text x="18" y="238.0" text-anchor="middle" fill="#57606a" transform="rotate(-90 18 238.0)">p99 ms (log)</text>
+<path d="M84.0,284.4 L408.2,213.6 L634.8,162.1 L732.4,143.1 L830.0,72.4" fill="none" stroke="#c99700" stroke-width="2"/>
+<circle cx="84.0" cy="284.4" r="3" fill="#c99700"><title>relogin: 10 → 7.0462</title></circle>
+<circle cx="408.2" cy="213.6" r="3" fill="#c99700"><title>relogin: 100 → 69.6832</title></circle>
+<circle cx="634.8" cy="162.1" r="3" fill="#c99700"><title>relogin: 500 → 368.688</title></circle>
+<circle cx="732.4" cy="143.1" r="3" fill="#c99700"><title>relogin: 1k → 681.288</title></circle>
+<circle cx="830.0" cy="72.4" r="3" fill="#c99700"><title>relogin: 2k → 6696.5</title></circle>
+<line x1="848" y1="68" x2="870" y2="68" stroke="#c99700" stroke-width="2"/>
+<text x="876" y="72" fill="#1f2328">relogin</text>
+<path d="M84.0,302.6 L408.2,228.2 L634.8,179.2 L732.4,157.5 L830.0,73.3" fill="none" stroke="#0969da" stroke-width="2"/>
+<circle cx="84.0" cy="302.6" r="3" fill="#0969da"><title>update_profile: 10 → 3.9139</title></circle>
+<circle cx="408.2" cy="228.2" r="3" fill="#0969da"><title>update_profile: 100 → 43.3565</title></circle>
+<circle cx="634.8" cy="179.2" r="3" fill="#0969da"><title>update_profile: 500 → 212.054</title></circle>
+<circle cx="732.4" cy="157.5" r="3" fill="#0969da"><title>update_profile: 1k → 427.798</title></circle>
+<circle cx="830.0" cy="73.3" r="3" fill="#0969da"><title>update_profile: 2k → 6512.86</title></circle>
+<line x1="848" y1="84" x2="870" y2="84" stroke="#0969da" stroke-width="2"/>
+<text x="876" y="88" fill="#1f2328">update_profile</text>
+<path d="M84.0,299.0 L408.2,227.0 L634.8,175.3 L732.4,155.6 L830.0,73.4" fill="none" stroke="#cf222e" stroke-width="2"/>
+<circle cx="84.0" cy="299.0" r="3" fill="#cf222e"><title>add_to_cart: 10 → 4.4023</title></circle>
+<circle cx="408.2" cy="227.0" r="3" fill="#cf222e"><title>add_to_cart: 100 → 45.1401</title></circle>
+<circle cx="634.8" cy="175.3" r="3" fill="#cf222e"><title>add_to_cart: 500 → 239.942</title></circle>
+<circle cx="732.4" cy="155.6" r="3" fill="#cf222e"><title>add_to_cart: 1k → 453.868</title></circle>
+<circle cx="830.0" cy="73.4" r="3" fill="#cf222e"><title>add_to_cart: 2k → 6476.57</title></circle>
+<line x1="848" y1="100" x2="870" y2="100" stroke="#cf222e" stroke-width="2"/>
+<text x="876" y="104" fill="#1f2328">add_to_cart</text>
+<path d="M84.0,301.7 L408.2,224.9 L634.8,177.5 L732.4,156.7 L830.0,73.4" fill="none" stroke="#1a7f37" stroke-width="2"/>
+<circle cx="84.0" cy="301.7" r="3" fill="#1a7f37"><title>session_check: 10 → 4.0355</title></circle>
+<circle cx="408.2" cy="224.9" r="3" fill="#1a7f37"><title>session_check: 100 → 48.3284</title></circle>
+<circle cx="634.8" cy="177.5" r="3" fill="#1a7f37"><title>session_check: 500 → 223.46</title></circle>
+<circle cx="732.4" cy="156.7" r="3" fill="#1a7f37"><title>session_check: 1k → 438.22</title></circle>
+<circle cx="830.0" cy="73.4" r="3" fill="#1a7f37"><title>session_check: 2k → 6473</title></circle>
+<line x1="848" y1="116" x2="870" y2="116" stroke="#1a7f37" stroke-width="2"/>
+<text x="876" y="120" fill="#1f2328">session_check</text>
+<path d="M84.0,300.0 L408.2,228.3 L634.8,178.8 L732.4,157.4 L830.0,73.6" fill="none" stroke="#8250df" stroke-width="2"/>
+<circle cx="84.0" cy="300.0" r="3" fill="#8250df"><title>signup: 10 → 4.2546</title></circle>
+<circle cx="408.2" cy="228.3" r="3" fill="#8250df"><title>signup: 100 → 43.3433</title></circle>
+<circle cx="634.8" cy="178.8" r="3" fill="#8250df"><title>signup: 500 → 214.69</title></circle>
+<circle cx="732.4" cy="157.4" r="3" fill="#8250df"><title>signup: 1k → 428.83</title></circle>
+<circle cx="830.0" cy="73.6" r="3" fill="#8250df"><title>signup: 2k → 6441.21</title></circle>
+<line x1="848" y1="132" x2="870" y2="132" stroke="#8250df" stroke-width="2"/>
+<text x="876" y="136" fill="#1f2328">signup</text>
+<path d="M84.0,301.3 L408.2,229.3 L634.8,177.3 L732.4,157.6 L830.0,73.6" fill="none" stroke="#bf3989" stroke-width="2"/>
+<circle cx="84.0" cy="301.3" r="3" fill="#bf3989"><title>update_cart_item: 10 → 4.0774</title></circle>
+<circle cx="408.2" cy="229.3" r="3" fill="#bf3989"><title>update_cart_item: 100 → 41.8408</title></circle>
+<circle cx="634.8" cy="177.3" r="3" fill="#bf3989"><title>update_cart_item: 500 → 225.44</title></circle>
+<circle cx="732.4" cy="157.6" r="3" fill="#bf3989"><title>update_cart_item: 1k → 425.558</title></circle>
+<circle cx="830.0" cy="73.6" r="3" fill="#bf3989"><title>update_cart_item: 2k → 6437.33</title></circle>
+<line x1="848" y1="148" x2="870" y2="148" stroke="#bf3989" stroke-width="2"/>
+<text x="876" y="152" fill="#1f2328">update_cart_item</text>
+<path d="M84.0,301.2 L408.2,216.7 L634.8,150.6 L732.4,145.4 L830.0,74.5" fill="none" stroke="#0a7ea4" stroke-width="2"/>
+<circle cx="84.0" cy="301.2" r="3" fill="#0a7ea4"><title>restock: 10 → 4.0895</title></circle>
+<circle cx="408.2" cy="216.7" r="3" fill="#0a7ea4"><title>restock: 100 → 63.066</title></circle>
+<circle cx="634.8" cy="150.6" r="3" fill="#0a7ea4"><title>restock: 500 → 534.455</title></circle>
+<circle cx="732.4" cy="145.4" r="3" fill="#0a7ea4"><title>restock: 1k → 630.931</title></circle>
+<circle cx="830.0" cy="74.5" r="3" fill="#0a7ea4"><title>restock: 2k → 6266.23</title></circle>
+<line x1="848" y1="164" x2="870" y2="164" stroke="#0a7ea4" stroke-width="2"/>
+<text x="876" y="168" fill="#1f2328">restock</text>
+<path d="M84.0,259.3 L408.2,189.4 L634.8,113.8 L732.4,62.4 L830.0,81.2" fill="none" stroke="#9a6700" stroke-width="2"/>
+<circle cx="84.0" cy="259.3" r="3" fill="#9a6700"><title>admin_dashboard: 10 → 15.8621</title></circle>
+<circle cx="408.2" cy="189.4" r="3" fill="#9a6700"><title>admin_dashboard: 100 → 152.371</title></circle>
+<circle cx="634.8" cy="113.8" r="3" fill="#9a6700"><title>admin_dashboard: 500 → 1753.12</title></circle>
+<circle cx="732.4" cy="62.4" r="3" fill="#9a6700"><title>admin_dashboard: 1k → 9258.8</title></circle>
+<circle cx="830.0" cy="81.2" r="3" fill="#9a6700"><title>admin_dashboard: 2k → 5030.32</title></circle>
+<line x1="848" y1="180" x2="870" y2="180" stroke="#9a6700" stroke-width="2"/>
+<text x="876" y="184" fill="#1f2328">admin_dashboard</text>
+<path d="M84.0,290.7 L408.2,215.6 L634.8,137.0 L732.4,133.3 L830.0,102.1" fill="none" stroke="#57606a" stroke-width="2"/>
+<circle cx="84.0" cy="290.7" r="3" fill="#57606a"><title>checkout: 10 → 5.7452</title></circle>
+<circle cx="408.2" cy="215.6" r="3" fill="#57606a"><title>checkout: 100 → 65.3255</title></circle>
+<circle cx="634.8" cy="137.0" r="3" fill="#57606a"><title>checkout: 500 → 829.39</title></circle>
+<circle cx="732.4" cy="133.3" r="3" fill="#57606a"><title>checkout: 1k → 933.403</title></circle>
+<circle cx="830.0" cy="102.1" r="3" fill="#57606a"><title>checkout: 2k → 2564.32</title></circle>
+<line x1="848" y1="196" x2="870" y2="196" stroke="#57606a" stroke-width="2"/>
+<text x="876" y="200" fill="#1f2328">checkout</text>
+<path d="M84.0,302.7 L408.2,231.4 L634.8,191.7 L732.4,179.9 L830.0,159.2" fill="none" stroke="#e16f24" stroke-width="2"/>
+<circle cx="84.0" cy="302.7" r="3" fill="#e16f24"><title>write_review: 10 → 3.9025</title></circle>
+<circle cx="408.2" cy="231.4" r="3" fill="#e16f24"><title>write_review: 100 → 39.186</title></circle>
+<circle cx="634.8" cy="191.7" r="3" fill="#e16f24"><title>write_review: 500 → 141.428</title></circle>
+<circle cx="732.4" cy="179.9" r="3" fill="#e16f24"><title>write_review: 1k → 206.937</title></circle>
+<circle cx="830.0" cy="159.2" r="3" fill="#e16f24"><title>write_review: 2k → 404.045</title></circle>
+<line x1="848" y1="212" x2="870" y2="212" stroke="#e16f24" stroke-width="2"/>
+<text x="876" y="216" fill="#1f2328">write_review</text>
+<path d="M84.0,356.3 L408.2,240.9 L634.8,204.7 L732.4,199.7 L830.0,207.6" fill="none" stroke="#2da44e" stroke-width="2"/>
+<circle cx="84.0" cy="356.3" r="3" fill="#2da44e"><title>product_detail: 10 → 0.6889</title></circle>
+<circle cx="408.2" cy="240.9" r="3" fill="#2da44e"><title>product_detail: 100 → 28.7587</title></circle>
+<circle cx="634.8" cy="204.7" r="3" fill="#2da44e"><title>product_detail: 500 → 92.7522</title></circle>
+<circle cx="732.4" cy="199.7" r="3" fill="#2da44e"><title>product_detail: 1k → 109.041</title></circle>
+<circle cx="830.0" cy="207.6" r="3" fill="#2da44e"><title>product_detail: 2k → 84.4614</title></circle>
+<line x1="848" y1="228" x2="870" y2="228" stroke="#2da44e" stroke-width="2"/>
+<text x="876" y="232" fill="#1f2328">product_detail</text>
+<path d="M84.0,351.4 L408.2,254.0 L634.8,205.5 L732.4,202.2 L830.0,210.2" fill="none" stroke="#6e40c9" stroke-width="2"/>
+<circle cx="84.0" cy="351.4" r="3" fill="#6e40c9"><title>recommend: 10 → 0.809</title></circle>
+<circle cx="408.2" cy="254.0" r="3" fill="#6e40c9"><title>recommend: 100 → 18.8227</title></circle>
+<circle cx="634.8" cy="205.5" r="3" fill="#6e40c9"><title>recommend: 500 → 90.3161</title></circle>
+<circle cx="732.4" cy="202.2" r="3" fill="#6e40c9"><title>recommend: 1k → 100.55</title></circle>
+<circle cx="830.0" cy="210.2" r="3" fill="#6e40c9"><title>recommend: 2k → 77.6507</title></circle>
+<line x1="848" y1="244" x2="870" y2="244" stroke="#6e40c9" stroke-width="2"/>
+<text x="876" y="248" fill="#1f2328">recommend</text>
+<path d="M84.0,348.0 L408.2,244.4 L634.8,225.1 L732.4,219.9 L830.0,219.3" fill="none" stroke="#b35900" stroke-width="2"/>
+<circle cx="84.0" cy="348.0" r="3" fill="#b35900"><title>view_cart: 10 → 0.903</title></circle>
+<circle cx="408.2" cy="244.4" r="3" fill="#b35900"><title>view_cart: 100 → 25.6976</title></circle>
+<circle cx="634.8" cy="225.1" r="3" fill="#b35900"><title>view_cart: 500 → 48.061</title></circle>
+<circle cx="732.4" cy="219.9" r="3" fill="#b35900"><title>view_cart: 1k → 56.7339</title></circle>
+<circle cx="830.0" cy="219.3" r="3" fill="#b35900"><title>view_cart: 2k → 57.9322</title></circle>
+<line x1="848" y1="260" x2="870" y2="260" stroke="#b35900" stroke-width="2"/>
+<text x="876" y="264" fill="#1f2328">view_cart</text>
+<path d="M84.0,306.7 L408.2,235.4 L634.8,224.9 L732.4,222.0 L830.0,226.0" fill="none" stroke="#218bff" stroke-width="2"/>
+<circle cx="84.0" cy="306.7" r="3" fill="#218bff"><title>order_history: 10 → 3.4247</title></circle>
+<circle cx="408.2" cy="235.4" r="3" fill="#218bff"><title>order_history: 100 → 34.4224</title></circle>
+<circle cx="634.8" cy="224.9" r="3" fill="#218bff"><title>order_history: 500 → 48.3287</title></circle>
+<circle cx="732.4" cy="222.0" r="3" fill="#218bff"><title>order_history: 1k → 53.016</title></circle>
+<circle cx="830.0" cy="226.0" r="3" fill="#218bff"><title>order_history: 2k → 46.6337</title></circle>
+<line x1="848" y1="276" x2="870" y2="276" stroke="#218bff" stroke-width="2"/>
+<text x="876" y="280" fill="#1f2328">order_history</text>
+<path d="M84.0,341.1 L408.2,243.4 L634.8,235.3 L732.4,233.6 L830.0,233.3" fill="none" stroke="#a40e26" stroke-width="2"/>
+<circle cx="84.0" cy="341.1" r="3" fill="#a40e26"><title>browse: 10 → 1.128</title></circle>
+<circle cx="408.2" cy="243.4" r="3" fill="#a40e26"><title>browse: 100 → 26.5857</title></circle>
+<circle cx="634.8" cy="235.3" r="3" fill="#a40e26"><title>browse: 500 → 34.5483</title></circle>
+<circle cx="732.4" cy="233.6" r="3" fill="#a40e26"><title>browse: 1k → 36.467</title></circle>
+<circle cx="830.0" cy="233.3" r="3" fill="#a40e26"><title>browse: 2k → 36.7987</title></circle>
+<line x1="848" y1="292" x2="870" y2="292" stroke="#a40e26" stroke-width="2"/>
+<text x="876" y="296" fill="#1f2328">browse</text>
+<path d="M84.0,352.1 L408.2,249.2 L634.8,241.1 L732.4,240.7 L830.0,239.5" fill="none" stroke="#116329" stroke-width="2"/>
+<circle cx="84.0" cy="352.1" r="3" fill="#116329"><title>search_text: 10 → 0.789</title></circle>
+<circle cx="408.2" cy="249.2" r="3" fill="#116329"><title>search_text: 100 → 21.981</title></circle>
+<circle cx="634.8" cy="241.1" r="3" fill="#116329"><title>search_text: 500 → 28.6434</title></circle>
+<circle cx="732.4" cy="240.7" r="3" fill="#116329"><title>search_text: 1k → 29.0006</title></circle>
+<circle cx="830.0" cy="239.5" r="3" fill="#116329"><title>search_text: 2k → 30.1547</title></circle>
+<line x1="848" y1="308" x2="870" y2="308" stroke="#116329" stroke-width="2"/>
+<text x="876" y="312" fill="#1f2328">search_text</text>
+</svg>

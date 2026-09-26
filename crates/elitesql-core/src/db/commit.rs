@@ -112,17 +112,9 @@ pub(super) fn write_state_for_commit(
     guard
 }
 
-#[track_caller]
 pub(super) fn lock_commit_for_transaction(shared: &Shared) -> TimedCommitGuard<'_> {
-    let guard = Some(shared.commit.lock());
-    let qos_previous = if std::env::var_os("ELITESQL_EXP_HOLDQOS").is_some() {
-        super::exp_qos::raise()
-    } else {
-        None
-    };
     TimedCommitGuard {
-        guard,
-        qos_previous,
+        guard: Some(shared.commit.lock()),
         started: Instant::now(),
 
         total_nanos: &shared.commit_lock_hold_nanos,
@@ -130,9 +122,7 @@ pub(super) fn lock_commit_for_transaction(shared: &Shared) -> TimedCommitGuard<'
         // Safe group commit benefits from allowing the current CPU to append
         // several queued records before the elected leader fsyncs them. Fast
         // and Balanced need fair handoff to bound mutex-tail latency instead.
-        fair_handoff: shared.opts.durability != Durability::Safe
-            && std::env::var_os("ELITESQL_EXP_UNFAIR").is_none(),
-
+        fair_handoff: shared.opts.durability != Durability::Safe,
     }
 }
 
@@ -160,11 +150,8 @@ pub(super) fn commit_staged(
     // the mutex did, and the queueing hop costs five times the median latency
     // (7.6 ms against 1.4 at 500 in-flight requests) for throughput inside
     // run-to-run noise. The queue has to shorten, not move.
-    if std::env::var_os("ELITESQL_EXP_NO_COORD").is_none()
-        && is_coordinated_insert_candidate(&prepared)
-    {
+    if is_coordinated_insert_candidate(&prepared) {
         coordinate_commit(shared, prepared)
-
     } else {
         finish_prepared_commit(shared, prepared)
     }
@@ -190,11 +177,9 @@ pub(super) fn commit_staged(
 /// second, because the contended writes gained a queueing hop and won nothing.
 pub(super) fn is_coordinated_insert_candidate(prepared: &PreparedCommit) -> bool {
     prepared.preencoded_wal.is_some()
-        && (std::env::var_os("ELITESQL_EXP_GATE").is_some()
-            || prepared.staged.iter().all(|table| {
-                table.schema.text_indexes.is_empty() && table.schema.vector_indexes.is_empty()
-            }))
-
+        && prepared.staged.iter().all(|table| {
+            table.schema.text_indexes.is_empty() && table.schema.vector_indexes.is_empty()
+        })
 }
 
 /// One staged table's superseded versions: for each change, the version it
@@ -440,38 +425,6 @@ pub(super) fn prepare_commit(
     })
 }
 
-pub(super) mod cycle_probe {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    use std::time::Duration;
-    pub static N: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
-    pub static D: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
-    pub fn dadd(i: usize, d: Duration) {
-        D[i].fetch_add(d.as_nanos() as u64, Relaxed);
-    }
-    pub fn ddump() {
-        let v: Vec<u64> = D.iter().map(|a| a.load(Relaxed)).collect();
-        let n = v[0].max(1);
-        eprintln!(
-            "DIRECTPROBE n={} us/commit: validate={} maintloop={} wal={} statewait={} apply={} publish={} post={} aside_overlap={} aside_changed={} aside_changed_rebasable={} set_aside={}",
-            v[0], v[1] / n / 1000, v[2] / n / 1000, v[3] / n / 1000, v[4] / n / 1000, v[5] / n / 1000, v[6] / n / 1000, v[7] / n / 1000, v[8], v[9], v[10], super::commit::cycle_probe::N[14].load(Relaxed)
-
-        );
-    }
-    pub fn add(i: usize, d: Duration) {
-        N[i].fetch_add(d.as_nanos() as u64, Relaxed);
-    }
-    pub fn inc(i: usize, by: u64) {
-        N[i].fetch_add(by, Relaxed);
-    }
-    pub fn dump() {
-        let v: Vec<u64> = N.iter().map(|a| a.load(Relaxed)).collect();
-        eprintln!(
-            "CYCLEPROBE cycles={} members={} take_ns={} batch_ok_ns={} fallbacks={} fallback_ns={} complete_ns={} promote_ns={} cycle_ns={} lockwait_ns={} locked_ns={} post_ns={} prelock_ns={} r_small={} r_pool={}",
-            v[0], v[15], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13]
-        );
-    }
-}
-
 pub(super) fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) -> Result<u64> {
     let request = Arc::new(CoordinatedCommit::new(prepared));
     let mut leader = {
@@ -487,7 +440,6 @@ pub(super) fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) 
 
     loop {
         if leader {
-            let cycle_started = Instant::now();
             if should_coalesce_safe_batch(shared) {
                 let coalesce_started = Instant::now();
                 std::thread::sleep(Duration::from_micros(
@@ -498,7 +450,6 @@ pub(super) fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) 
                     AtomicOrdering::Relaxed,
                 );
             }
-            let take_started = Instant::now();
             let batch = {
                 let mut coordinator = shared.commit_coordinator.lock().unwrap();
                 if let Some(promoted) = coordinator.promoted_at.take() {
@@ -512,46 +463,13 @@ pub(super) fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) 
                 let take = coordinator.queue.len().min(COMMIT_COORDINATOR_MAX_BATCH);
                 coordinator.queue.drain(..take).collect::<Vec<_>>()
             };
-            cycle_probe::add(1, take_started.elapsed());
-            cycle_probe::inc(15, batch.len() as u64);
-            // The next leader is woken as soon as this one holds the commit
-            // mutex, not after it finished: waking a parked thread on a busy
-            // machine takes about as long as a batch, and this way it takes
-            // its batch and queues for the mutex while this batch runs.
-            // There is never more than one such successor, because only the
-            // leader holding the mutex promotes.
-            let early = std::env::var_os("ELITESQL_EXP_EARLY").is_some();
-            let promoted = std::cell::Cell::new(false);
-            let promote = || {
-                if !early || promoted.get() {
-                    return;
-                }
-                let mut coordinator = shared.commit_coordinator.lock().unwrap();
-                if let Some(next) = coordinator.queue.front().cloned() {
-                    coordinator.promoted_at = Some(Instant::now());
-                    next.promote_to_leader();
-                    promoted.set(true);
-                }
-            };
-            process_coordinated_batch(shared, batch, &promote);
-            let promote_started = Instant::now();
-            if !promoted.get() {
-                let mut coordinator = shared.commit_coordinator.lock().unwrap();
-                if let Some(next) = coordinator.queue.front().cloned() {
-                    coordinator.promoted_at = Some(Instant::now());
-                    next.promote_to_leader();
-                } else {
-                    coordinator.active = false;
-                }
-            }
-            cycle_probe::add(6, promote_started.elapsed());
-            cycle_probe::add(7, cycle_started.elapsed());
-            if cycle_probe::N[0].fetch_add(1, AtomicOrdering::Relaxed) % 2000 == 1999 {
-                cycle_probe::dump();
-                super::dump_hold_probe();
-                cycle_probe::ddump();
-
-
+            process_coordinated_batch(shared, batch);
+            let mut coordinator = shared.commit_coordinator.lock().unwrap();
+            if let Some(next) = coordinator.queue.front().cloned() {
+                coordinator.promoted_at = Some(Instant::now());
+                next.promote_to_leader();
+            } else {
+                coordinator.active = false;
             }
         }
         if let Some(result) = request.take_result() {
@@ -565,7 +483,6 @@ pub(super) fn coordinate_commit(shared: &Arc<Shared>, prepared: PreparedCommit) 
 }
 
 pub(super) fn should_coalesce_safe_batch(shared: &Shared) -> bool {
-
     if shared.opts.durability != Durability::Safe || shared.opts.safe_group_commit_delay_us == 0 {
         return false;
     }
@@ -587,11 +504,7 @@ pub(super) fn should_coalesce_safe_batch(shared: &Shared) -> bool {
         .is_ok()
 }
 
-pub(super) fn process_coordinated_batch(
-    shared: &Arc<Shared>,
-    batch: Vec<Arc<CoordinatedCommit>>,
-    promote: &dyn Fn(),
-) {
+pub(super) fn process_coordinated_batch(shared: &Arc<Shared>, batch: Vec<Arc<CoordinatedCommit>>) {
     let prepared = batch
         .iter()
         .map(|request| {
@@ -608,31 +521,21 @@ pub(super) fn process_coordinated_batch(
         .map(|request| request.queued_at.elapsed())
         .fold(Duration::ZERO, Duration::saturating_add);
 
-    let finish_started = Instant::now();
-    match finish_coordinated_insert_batch(shared, prepared, queue_wait, promote) {
+    match finish_coordinated_insert_batch(shared, prepared, queue_wait) {
         Ok(outcome) => {
-            cycle_probe::add(2, finish_started.elapsed());
-            let complete_started = Instant::now();
             for (member, result) in outcome.results {
                 batch[member].complete(result);
             }
-            cycle_probe::add(5, complete_started.elapsed());
             // Members the batch set aside commit one by one after it, in
             // queue order, exactly as a batch that could not form at all.
-            if !outcome.set_aside.is_empty() {
-                cycle_probe::inc(14, outcome.set_aside.len() as u64);
-            }
             for (member, prepared) in outcome.set_aside {
                 batch[member].complete(finish_prepared_commit(shared, prepared));
             }
         }
         Err(prepared) => {
-            promote();
-            cycle_probe::inc(3, 1);
             for (request, prepared) in batch.into_iter().zip(prepared) {
                 request.complete(finish_prepared_commit(shared, prepared));
             }
-            cycle_probe::add(4, finish_started.elapsed());
         }
     }
 }
@@ -658,7 +561,6 @@ fn batch_member_previous(
         let mut table_previous = Vec::with_capacity(table.changes.len());
         for (change_index, change) in table.changes.iter().enumerate() {
             if taken.contains(&(table.name.as_str(), change.id.as_str())) {
-                cycle_probe::D[8].fetch_add(1, AtomicOrdering::Relaxed);
                 return None;
             }
             let previous = if state.id_is_above_high_watermark(&table.name, &change.id) {
@@ -672,9 +574,7 @@ fn batch_member_previous(
                 .as_ref()
                 .filter(|last| last.version > commit.snap_version)
             {
-                cycle_probe::D[9].fetch_add(1, AtomicOrdering::Relaxed);
                 let record = rebase_change(state, &table.schema, change, last).ok()??;
-                cycle_probe::D[10].fetch_add(1, AtomicOrdering::Relaxed);
                 replayed.push((table_index, change_index, record));
             }
             let prior_record = match &previous {
@@ -711,7 +611,11 @@ fn batch_member_previous(
 /// payloads in its arena and a new WAL frame, as the single path does at its
 /// durability point. Identity marks are read again from the committed state;
 /// they only grow, and recovery keeps the maximum.
-fn replay_batch_member(state: &State, commit: &mut PreparedCommit, replayed: Replayed) -> Result<()> {
+fn replay_batch_member(
+    state: &State,
+    commit: &mut PreparedCommit,
+    replayed: Replayed,
+) -> Result<()> {
     let arena = Arc::make_mut(&mut commit.payload_arena);
     for (table_index, change_index, record) in replayed {
         let table = &mut commit.staged[table_index];
@@ -756,7 +660,6 @@ fn replay_batch_member(state: &State, commit: &mut PreparedCommit, replayed: Rep
     Ok(())
 }
 
-
 /// Count what one applied change makes obsolete, for auto-compaction.
 fn count_obsolete(
     table: &str,
@@ -800,9 +703,8 @@ fn send_vector_jobs(shared: &Shared, jobs: Vec<VecJob>) {
                 *shared
                     .vector_worker_error
                     .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(
-                    "vector indexing worker stopped before accepting committed work".into(),
-                );
+                    .unwrap_or_else(|poison| poison.into_inner()) =
+                    Some("vector indexing worker stopped before accepting committed work".into());
                 // Keep the backlog charged: the vector is committed but not
                 // searchable. A waiter must report the dead worker, not claim
                 // that indexing completed successfully.
@@ -871,8 +773,6 @@ fn post_commit_maintenance(
 }
 
 /// What a coordinated batch did with its members: the result of each one it
-
-
 /// committed, and the ones it set aside for the single-commit path, each with
 /// its position in the batch.
 pub(super) struct BatchOutcome {
@@ -897,12 +797,8 @@ pub(super) fn finish_coordinated_insert_batch(
     shared: &Arc<Shared>,
     mut prepared: Vec<PreparedCommit>,
     queue_wait: Duration,
-    promote: &dyn Fn(),
 ) -> std::result::Result<BatchOutcome, Vec<PreparedCommit>> {
-    let prelock_started = Instant::now();
-    let min_members = if std::env::var_os("ELITESQL_EXP_EARLY").is_some() { 1 } else { 2 };
-    if prepared.len() < min_members {
-        cycle_probe::inc(12, 1);
+    if prepared.len() < 2 {
         return Err(prepared);
     }
     debug_assert!(prepared.iter().all(is_coordinated_insert_candidate));
@@ -921,20 +817,14 @@ pub(super) fn finish_coordinated_insert_batch(
         return Err(prepared);
     };
     if shared.memory_governor.index_would_exceed(incoming_bytes) {
-        cycle_probe::inc(13, 1);
         return Err(prepared);
     }
-
-    cycle_probe::add(11, prelock_started.elapsed());
 
     let lock_started = Instant::now();
     shared.commit_waiters.fetch_add(1, AtomicOrdering::AcqRel);
     let mut cs = lock_commit_for_transaction(shared);
     shared.commit_waiters.fetch_sub(1, AtomicOrdering::AcqRel);
-    cycle_probe::add(8, lock_started.elapsed());
-    promote();
 
-    let locked_started = Instant::now();
     let lock_wait = lock_started.elapsed().saturating_add(queue_wait);
     let locked_prepare_started = Instant::now();
     // Members of the batch touch disjoint rows. That is what lets each of
@@ -1044,9 +934,9 @@ pub(super) fn finish_coordinated_insert_batch(
         });
     }
     // Members set aside charge the pool themselves when they commit.
-    let incoming_bytes = prepared
-        .iter()
-        .fold(0usize, |total, commit| total.saturating_add(commit.incoming_index_bytes));
+    let incoming_bytes = prepared.iter().fold(0usize, |total, commit| {
+        total.saturating_add(commit.incoming_index_bytes)
+    });
 
     let batch_len = u64::try_from(prepared.len()).expect("coordinator batch length fits u64");
     let Some(end_version) = start_version.checked_add(batch_len) else {
@@ -1226,8 +1116,6 @@ pub(super) fn finish_coordinated_insert_batch(
     let maintenance_needed = cs.memtable_bytes >= shared.opts.memtable_max_bytes;
     let derived_schedule_needed = derived_schedule_needed(shared, end_version);
     drop(cs);
-    cycle_probe::add(9, locked_started.elapsed());
-    let post_started = Instant::now();
     let wal_time = wal_started.elapsed();
 
     let maintenance_started = Instant::now();
@@ -1243,7 +1131,6 @@ pub(super) fn finish_coordinated_insert_batch(
         status.last_error = Some(format!("post-commit maintenance failed: {error}"));
     }
     let maintenance_wait_time = maintenance_started.elapsed();
-
 
     let elapsed_nanos = |duration: Duration| duration.as_nanos().min(u64::MAX as u128) as u64;
     let count = prepared.len() as u64;
@@ -1323,7 +1210,6 @@ pub(super) fn finish_coordinated_insert_batch(
         .coordinated_commit_count
         .fetch_add(count, AtomicOrdering::Relaxed);
 
-    cycle_probe::add(10, post_started.elapsed());
     let sync_error = match sync_outcome {
         Some((WalAppendOutcome::SyncFailed(error), _)) => {
             fence_after_wal_sync_failure(shared, &error);
@@ -1350,7 +1236,6 @@ pub(super) fn finish_coordinated_insert_batch(
             .collect(),
         set_aside,
     })
-
 }
 
 pub(super) fn finish_prepared_commit(
@@ -1383,7 +1268,6 @@ pub(super) fn finish_prepared_commit(
         let mut cs = lock_commit_for_transaction(shared);
         shared.commit_waiters.fetch_sub(1, AtomicOrdering::AcqRel);
         lock_wait = lock_wait.saturating_add(lock_started.elapsed());
-        let seg_started = Instant::now();
         // Surface asynchronous I/O failure before this transaction reaches
         // its WAL durability point; reporting it after apply would make the
         // commit outcome ambiguous to the caller.
@@ -1496,8 +1380,6 @@ pub(super) fn finish_prepared_commit(
         };
         validation_time = validation_time.saturating_add(validation_started.elapsed());
         locked_prepare_time = locked_prepare_time.saturating_add(locked_prepare_started.elapsed());
-        cycle_probe::dadd(1, seg_started.elapsed());
-        let maint_started = Instant::now();
         if shared
             .memory_governor
             .index_would_exceed(incoming_index_bytes)
@@ -1563,7 +1445,6 @@ pub(super) fn finish_prepared_commit(
             maintenance_wait_time =
                 maintenance_wait_time.saturating_add(maintenance_wait_started.elapsed());
         }
-        cycle_probe::dadd(2, maint_started.elapsed());
         break (
             cs,
             previous_entries,
@@ -1634,19 +1515,15 @@ pub(super) fn finish_prepared_commit(
     } else {
         None
     };
-    cycle_probe::dadd(3, wal_started.elapsed());
     // Publish atomically to readers.
     let apply_started = Instant::now();
     let mut added = 0u64;
     let mut obsolete_operations = 0u64;
     let mut obsolete_bytes = 0u64;
     let mut jobs: Vec<VecJob> = Vec::new();
-    let publish_started;
     {
         let write_wait_started = Instant::now();
         let mut st = write_state_for_commit(shared);
-        cycle_probe::dadd(4, write_wait_started.elapsed());
-        let apply_inner = Instant::now();
         shared.commit_state_write_wait_nanos.fetch_add(
             elapsed_nanos(write_wait_started.elapsed()),
             AtomicOrdering::Relaxed,
@@ -1705,16 +1582,12 @@ pub(super) fn finish_prepared_commit(
             st.change_log.push(commit_version, &table.name, changed_ids);
         }
         st.committed_version = commit_version;
-        cycle_probe::dadd(5, apply_inner.elapsed());
-        publish_started = Instant::now();
     }
-    cycle_probe::dadd(6, publish_started.elapsed());
     // After the read view is published; see the coordinated batch.
     shared
         .published_version
         .store(commit_version, AtomicOrdering::Release);
 
-    let post_started = Instant::now();
     let apply_time = apply_started.elapsed();
     record_obsolete(shared, obsolete_operations, obsolete_bytes);
     send_vector_jobs(shared, jobs);
@@ -1725,8 +1598,6 @@ pub(super) fn finish_prepared_commit(
     let maintenance_needed = cs.memtable_bytes >= shared.opts.memtable_max_bytes;
     let derived_schedule_needed = derived_schedule_needed(shared, commit_version);
     drop(cs);
-    cycle_probe::dadd(7, post_started.elapsed());
-    cycle_probe::D[0].fetch_add(1, AtomicOrdering::Relaxed);
 
     let waited_for_sync = sync_group.is_some();
     let sync_wait_started = Instant::now();

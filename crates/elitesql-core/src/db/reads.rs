@@ -190,6 +190,42 @@ pub(crate) struct ScanBatch {
     pub(crate) ids: Vec<String>,
     /// Id to resume strictly after, or `None` when the batch is empty.
     pub(crate) next: Option<String>,
+    /// When the caller asked for them, what each row was decoded from, so
+    /// that more of its columns can be decoded later from the very same
+    /// version; see `RowHandles`.
+    pub(crate) handles: Option<Box<RowHandles>>,
+}
+
+/// The stored version behind each row of a batch, with the segment handles
+/// its payload lives in. A statement that sorts many rows and returns a few
+/// decodes only the sort keys for all of them and the rest of the columns
+/// for the few, from the same payloads: no second lookup, and nothing a
+/// commit in between could change.
+pub(crate) struct RowHandles {
+    pub(super) blobs: PathBuf,
+    pub(super) readers: SegmentReaders,
+    pub(super) schemas: Arc<SchemaMap>,
+    pub(super) table: String,
+    pub(super) kinds: Vec<VKind>,
+    /// The id of each row, for tables whose id is not a stored column.
+    pub(super) ids: Vec<String>,
+}
+
+impl RowHandles {
+    /// Row `index` of the batch, decoded with `keep`.
+    pub(crate) fn decode(&self, index: usize, keep: Option<&[&str]>) -> Result<Record> {
+        let schema = self
+            .schemas
+            .get(&self.table)
+            .ok_or_else(|| Error::TableNotFound(self.table.clone()))?;
+        let projection = RowProjection::new(Some(schema), keep);
+        let mut record =
+            read_record_kind_keep(&self.blobs, &self.readers, &self.kinds[index], &projection)?;
+        if schema.has_implicit_id() {
+            record.insert(ID_COLUMN, Value::Text(self.ids[index].clone()));
+        }
+        Ok(record)
+    }
 }
 
 /// Up to `limit` visible rows after `after_id`, decoded from retained segment
@@ -220,6 +256,7 @@ pub(super) fn shared_scan_batch(
         rows: Vec::new(),
         ids: Vec::new(),
         next: None,
+        handles: None,
     };
     if limit == 0 {
         return Ok(empty());
@@ -368,7 +405,12 @@ pub(super) fn shared_scan_batch(
         // ruled the row out, and the caller re-checks the filter anyway.
         Some(last_visited)
     };
-    Ok(ScanBatch { rows, ids, next })
+    Ok(ScanBatch {
+        rows,
+        ids,
+        next,
+        handles: None,
+    })
 }
 
 /// What a scan needs from the committed state, taken once: from the read

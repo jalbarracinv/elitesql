@@ -40,7 +40,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::collate::Collation;
 use crate::db::{
-    Db, OrderedSecondaryRead, RebaseStep, Record, ScanBatch, ScanCmp, ScanFilter, Snapshot, Txn,
+    Db, OrderedSecondaryRead, RebaseStep, Record, RowHandles, ScanBatch, ScanCmp, ScanFilter,
+    Snapshot, Txn,
 };
 use crate::error::{Error, Result};
 use crate::memory::MemoryPermit;
@@ -210,6 +211,7 @@ impl QueryCursor<'_> {
                 rows: Vec::new(),
                 ids: Vec::new(),
                 next: None,
+                handles: None,
             };
             // One conversion per batch, not per row.
             let keep: Option<Vec<&str>> = self
@@ -228,6 +230,7 @@ impl QueryCursor<'_> {
                                 rows: vec![record],
                                 ids: Vec::new(),
                                 next: Some(id.clone()),
+                                handles: None,
                             })
                             .unwrap_or_else(empty)
                     }),
@@ -2193,6 +2196,7 @@ fn empty_batch() -> ScanBatch {
         rows: Vec::new(),
         ids: Vec::new(),
         next: None,
+        handles: None,
     }
 }
 
@@ -2215,6 +2219,7 @@ fn driven_batch(
         rows: Vec::new(),
         ids: Vec::new(),
         next: None,
+        handles: None,
     };
     match driver {
         TableDriver::Empty => Ok(empty()),
@@ -2228,6 +2233,7 @@ fn driven_batch(
                     rows: vec![record],
                     ids: Vec::new(),
                     next: Some(id.clone()),
+                    handles: None,
                 })
                 .unwrap_or_else(empty))
         }
@@ -2358,6 +2364,22 @@ fn exec_single_table_select_in(
             }
         }
         ordered_fallback = true;
+    }
+    if !ordered_fallback && pinned.is_none() {
+        if let Some(rows) = late_materialized_select(
+            db,
+            &tables[0],
+            &order_keys,
+            &extract,
+            keep.as_deref(),
+            pushed,
+            residual,
+            offset,
+            limit,
+            reservation,
+        )? {
+            return Ok(QueryOutput::Rows { columns, rows });
+        }
     }
     let taken;
     let snapshot = match pinned {
@@ -2494,6 +2516,116 @@ fn exec_single_table_select_in(
         None => out,
     };
     Ok(QueryOutput::Rows { columns, rows })
+}
+
+/// `ORDER BY … LIMIT` over an equality match, decoding late.
+///
+/// Every matching row is decoded for its sort keys and the columns the
+/// predicates read, and only the rows the limit keeps are decoded for the
+/// rest of the projection, from the same stored versions. A catalogue page
+/// of twenty products out of a category of hundreds decoded every name of
+/// the category to sort by price and throw all but twenty away.
+///
+/// `None` when the statement is not of this shape, when late decoding would
+/// save nothing, or when a batch came back without the handles to decode it
+/// later; the caller then runs the ordinary path from the start.
+#[allow(clippy::too_many_arguments)]
+fn late_materialized_select(
+    db: &Db,
+    table: &TableCtx,
+    order_keys: &[((usize, String), SortSpec)],
+    extract: &[(usize, &str)],
+    keep: Option<&[&str]>,
+    pushed: &[RExpr],
+    residual: &[RExpr],
+    offset: usize,
+    limit: Option<usize>,
+    reservation: &mut GrowingReservation<'_>,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    if order_keys.is_empty() {
+        return Ok(None);
+    }
+    let TableDriver::Equality(column, value) = table_driver(table, 0, pushed) else {
+        return Ok(None);
+    };
+    let mut sort_keep: Vec<&str> = Vec::new();
+    for ((_, name), _) in order_keys {
+        if !sort_keep.contains(&name.as_str()) {
+            sort_keep.push(name);
+        }
+    }
+    for conjunct in pushed.iter().chain(residual) {
+        columns_referenced(conjunct, 0, &mut sort_keep);
+    }
+    if keep.is_some_and(|keep| keep.len() <= sort_keep.len()) {
+        return Ok(None);
+    }
+    let memory = db.memory_options();
+    let batch_rows = memory
+        .scan_batch_rows
+        .min((memory.query_working_bytes / 1024).max(1));
+    let mut sorter = SpillSorter::new(
+        db,
+        order_keys.iter().map(|(_, spec)| *spec).collect(),
+        Some(offset.saturating_add(limit)),
+    )?;
+    let mut batches: Vec<Box<RowHandles>> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut sequence = 0u64;
+    let mut row: ExecRow = vec![None];
+    loop {
+        let batch = db.find_eq_batch_keep_handles(
+            &table.schema.name,
+            &column,
+            &value,
+            cursor.as_deref(),
+            batch_rows,
+            Some(&sort_keep),
+        )?;
+        let Some(next) = batch.next else {
+            break;
+        };
+        cursor = Some(next);
+        let Some(handles) = batch.handles else {
+            return Ok(None);
+        };
+        let batch_index = batches.len() as i64;
+        reservation.cover(batch_heap_bytes(&batch.rows).saturating_add(sorter.buffered_bytes()))?;
+        for (row_index, record) in batch.rows.into_iter().enumerate() {
+            row[0] = Some(record);
+            if !eval_all(&row, pushed)? || !eval_all(&row, residual)? {
+                continue;
+            }
+            let keys: Vec<Value> = order_keys
+                .iter()
+                .map(|((ti, col), _)| col_value(&row, *ti, col))
+                .collect();
+            if sorter.may_keep(&keys) {
+                sorter.push(SortedOutputRow {
+                    keys,
+                    values: vec![Value::Int64(batch_index), Value::Int64(row_index as i64)],
+                    sequence,
+                })?;
+            }
+            sequence = sequence.saturating_add(1);
+        }
+        batches.push(handles);
+    }
+    let mut rows = Vec::new();
+    for kept in sorter.finish(offset, Some(limit))? {
+        let (Some(Value::Int64(batch)), Some(Value::Int64(index))) = (kept.first(), kept.get(1))
+        else {
+            return Err(Error::Corrupt(
+                "late-decoded sort row lost its handle".into(),
+            ));
+        };
+        row[0] = Some(batches[*batch as usize].decode(*index as usize, keep)?);
+        rows.push(project_row(&row, extract));
+    }
+    Ok(Some(rows))
 }
 
 /// Execute the proven ordered-secondary subset without materializing a sort.
@@ -2750,25 +2882,31 @@ fn visit_single_table_rows_measured(
     let single_row = driver_yields_at_most_one_row(table, &driver);
     let mut row: ExecRow = vec![None];
     if matches!(driver, TableDriver::Scan) {
-        // A full scan streams: the visitor keeps no row, so there is no
-        // batch to hold or to measure beyond the one row in hand.
-        if let Some(on_batch) = on_batch.as_mut() {
-            on_batch(0)?;
-        }
+        // A full scan streams: the visitor keeps no row, so what the
+        // statement holds is the one row in hand. The largest seen so far
+        // is what gets measured.
+        let mut largest = 0usize;
         return db.scan_visit_at_unbudgeted(
             snapshot,
             &table.schema.name,
             filter.as_ref(),
             keep,
             |record| {
+                if let Some(on_batch) = on_batch.as_mut() {
+                    let bytes = record_heap_bytes(&record) + size_of::<Record>();
+                    if bytes > largest {
+                        largest = bytes;
+                        on_batch(bytes)?;
+                    }
+                }
                 row[0] = Some(record);
+
                 Ok(!(eval_all(&row, pushed)? && eval_all(&row, residual)? && !visit(&row)?))
             },
         );
     }
     let mut cursor: Option<String> = None;
     loop {
-
         let batch = driven_batch(
             db,
             snapshot,
@@ -2973,6 +3111,7 @@ fn exec_single_indexed_join_select(
                             rows: vec![record],
                             ids: Vec::new(),
                             next: Some(id.clone()),
+                            handles: None,
                         })
                         .unwrap_or_else(empty_batch)
                     } else {

@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+<rect width="1080" height="480" fill="#ffffff"/>
+<text x="84" y="26" font-size="17" font-weight="600" fill="#1f2328">CPU used (cores) during the measured window</text>
+<line x1="84" y1="416.0" x2="830" y2="416.0" stroke="#eaeef2"/>
+<text x="76" y="420.0" text-anchor="end" fill="#57606a">0</text>
+<line x1="84" y1="327.0" x2="830" y2="327.0" stroke="#eaeef2"/>
+<text x="76" y="331.0" text-anchor="end" fill="#57606a">2</text>
+<line x1="84" y1="238.0" x2="830" y2="238.0" stroke="#eaeef2"/>
+<text x="76" y="242.0" text-anchor="end" fill="#57606a">4</text>
+<line x1="84" y1="149.0" x2="830" y2="149.0" stroke="#eaeef2"/>
+<text x="76" y="153.0" text-anchor="end" fill="#57606a">6</text>
+<line x1="84" y1="60.0" x2="830" y2="60.0" stroke="#eaeef2"/>
+<text x="76" y="64.0" text-anchor="end" fill="#57606a">8</text>
+<line x1="84.0" y1="60" x2="84.0" y2="416" stroke="#f0f2f4"/>
+<text x="84.0" y="434" text-anchor="middle" fill="#57606a">10</text>
+<line x1="408.2" y1="60" x2="408.2" y2="416" stroke="#f0f2f4"/>
+<text x="408.2" y="434" text-anchor="middle" fill="#57606a">100</text>
+<line x1="634.8" y1="60" x2="634.8" y2="416" stroke="#f0f2f4"/>
+<text x="634.8" y="434" text-anchor="middle" fill="#57606a">500</text>
+<line x1="732.4" y1="60" x2="732.4" y2="416" stroke="#f0f2f4"/>
+<text x="732.4" y="434" text-anchor="middle" fill="#57606a">1k</text>
+<line x1="830.0" y1="60" x2="830.0" y2="416" stroke="#f0f2f4"/>
+<text x="830.0" y="434" text-anchor="middle" fill="#57606a">2k</text>
+<rect x="84" y="60" width="746" height="356" fill="none" stroke="#d0d7de"/>
+<text x="457.0" y="466" text-anchor="middle" fill="#57606a">concurrent users (log)</text>
+<text x="18" y="238.0" text-anchor="middle" fill="#57606a" transform="rotate(-90 18 238.0)">cores</text>
+<path d="M84.0,191.7 L408.2,100.1 L634.8,138.3 L732.4,102.3 L830.0,168.6" fill="none" stroke="#c99700" stroke-width="2"/>
+<circle cx="84.0" cy="191.7" r="3" fill="#c99700"><title>run-2-current server: 10 → 5.04</title></circle>
+<circle cx="408.2" cy="100.1" r="3" fill="#c99700"><title>run-2-current server: 100 → 7.1</title></circle>
+<circle cx="634.8" cy="138.3" r="3" fill="#c99700"><title>run-2-current server: 500 → 6.24</title></circle>
+<circle cx="732.4" cy="102.3" r="3" fill="#c99700"><title>run-2-current server: 1k → 7.05</title></circle>
+<circle cx="830.0" cy="168.6" r="3" fill="#c99700"><title>run-2-current server: 2k → 5.56</title></circle>
+<line x1="848" y1="68" x2="870" y2="68" stroke="#c99700" stroke-width="2"/>
+<text x="876" y="72" fill="#1f2328">run-2-current server</text>
+<path d="M84.0,344.4 L408.2,325.2 L634.8,330.1 L732.4,322.6 L830.0,334.1" fill="none" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="84.0" cy="344.4" r="3" fill="#0969da"><title>run-2-current load generators: 10 → 1.61</title></circle>
+<circle cx="408.2" cy="325.2" r="3" fill="#0969da"><title>run-2-current load generators: 100 → 2.04</title></circle>
+<circle cx="634.8" cy="330.1" r="3" fill="#0969da"><title>run-2-current load generators: 500 → 1.93</title></circle>
+<circle cx="732.4" cy="322.6" r="3" fill="#0969da"><title>run-2-current load generators: 1k → 2.1</title></circle>
+<circle cx="830.0" cy="334.1" r="3" fill="#0969da"><title>run-2-current load generators: 2k → 1.84</title></circle>
+<line x1="848" y1="84" x2="870" y2="84" stroke="#0969da" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="876" y="88" fill="#1f2328">run-2-current load generators</text>
+</svg>
