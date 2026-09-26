@@ -1,6 +1,6 @@
 {
   "name": "@elitesql/client",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "EliteSQL Node client for the sidecar mode (elitesql serve) — zero dependencies",
   "main": "elitesql.js",
   "types": "elitesql.d.ts",

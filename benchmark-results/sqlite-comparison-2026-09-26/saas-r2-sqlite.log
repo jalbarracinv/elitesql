@@ -1,0 +1,9 @@
+results → /Users/jalbarracin/Code/elitesql/benchmark-results/sqlite-comparison-2026-09-26/saas-r2-sqlite
+database → /private/var/folders/wf/3gnfq1cs66j1wjyc0ty6vfrw0000gq/T/saas-sim-90tmfnfb/saas.sqlite
+seeded 20000 accounts, 5000 products in 0.12 s (4.6 MiB)
+ users     ops/s    p50ms     p99ms   usr p99   succ%  retry% srvCPU genCPU  inv   wall
+    10   14634.9    0.166     9.425     9.425   100.0     0.0   None   4.17   ok  40.37
+   100   12320.1    0.439   148.058   148.059   100.0     0.0   None   7.14   ok   40.5
+   500   11390.4    0.656  1299.358  1299.359   100.0     0.0   None   7.72   ok  41.16
+offline check: ok (0.09 s)
+report → /Users/jalbarracin/Code/elitesql/benchmark-results/sqlite-comparison-2026-09-26/saas-r2-sqlite/report.md

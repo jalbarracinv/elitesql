@@ -1,4 +1,4 @@
-/* EliteSQL stable C ABI — v0.0.1
+/* EliteSQL stable C ABI — v0.1.0
  *
  * Conventions:
  *  - Every function returns uint32_t: 0 = OK, otherwise a stable error code:

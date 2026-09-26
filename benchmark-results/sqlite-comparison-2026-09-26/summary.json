@@ -1,0 +1,420 @@
+{
+  "scale": [
+    {
+      "rows": 1000000,
+      "batch_size": 1000,
+      "total_seconds": {
+        "EliteSQL": [
+          0.879484041,
+          1.082655792,
+          0.836447459
+        ],
+        "SQLite": [
+          0.749562542,
+          0.734287959,
+          0.739415375
+        ]
+      },
+      "ratio": 0.8407376831525701,
+      "sql_point_us": {
+        "EliteSQL": [
+          1.705,
+          1.732,
+          1.737
+        ],
+        "SQLite": [
+          2.415,
+          2.382,
+          2.398
+        ]
+      },
+      "sql_point_ratio": 1.384526558891455
+    },
+    {
+      "rows": 1000000,
+      "batch_size": 10000,
+      "total_seconds": {
+        "EliteSQL": [
+          0.797403916,
+          0.773907125,
+          0.837002375
+        ],
+        "SQLite": [
+          0.709540083,
+          0.707287125,
+          0.73236825
+        ]
+      },
+      "ratio": 0.8898126391945134,
+      "sql_point_us": {
+        "EliteSQL": [
+          1.742,
+          1.724,
+          1.84
+        ],
+        "SQLite": [
+          2.415,
+          2.399,
+          2.396
+        ]
+      },
+      "sql_point_ratio": 1.3771526980482205
+    },
+    {
+      "rows": 10000000,
+      "batch_size": 1000,
+      "total_seconds": {
+        "EliteSQL": [
+          7.69785175,
+          7.245409666,
+          7.184816584
+        ],
+        "SQLite": [
+          12.111783376,
+          11.137494793,
+          10.075721708
+        ]
+      },
+      "ratio": 1.537179442766929,
+      "sql_point_us": {
+        "EliteSQL": [
+          2.301,
+          2.106,
+          2.059
+        ],
+        "SQLite": [
+          19.684,
+          19.317,
+          15.915
+        ]
+      },
+      "sql_point_ratio": 9.172364672364672
+    },
+    {
+      "rows": 10000000,
+      "batch_size": 10000,
+      "total_seconds": {
+        "EliteSQL": [
+          6.46320725,
+          8.954049583,
+          7.80787575
+        ],
+        "SQLite": [
+          7.747850958,
+          7.67258175,
+          8.611985791
+        ]
+      },
+      "ratio": 0.9923122762295493,
+      "sql_point_us": {
+        "EliteSQL": [
+          2.198,
+          2.098,
+          2.07
+        ],
+        "SQLite": [
+          16.649,
+          12.931,
+          14.396
+        ]
+      },
+      "sql_point_ratio": 6.861773117254529
+    }
+  ],
+  "writers": [
+    {
+      "profile": "fast",
+      "writers": 1,
+      "throughput": {
+        "EliteSQL": [
+          641336.802,
+          700543.284,
+          715840.538
+        ],
+        "SQLite-fsync": [
+          440401.276,
+          437855.769,
+          444306.299
+        ]
+      },
+      "p99_ms": {
+        "EliteSQL": 0.02075,
+        "SQLite-fsync": 0.047833
+      },
+      "ratio": 1.5906931295993791
+    },
+    {
+      "profile": "fast",
+      "writers": 4,
+      "throughput": {
+        "EliteSQL": [
+          519781.982,
+          521872.775,
+          523147.42
+        ],
+        "SQLite-fsync": [
+          323875.275,
+          280055.759,
+          327902.269
+        ]
+      },
+      "p99_ms": {
+        "EliteSQL": 0.136125,
+        "SQLite-fsync": 0.055625
+      },
+      "ratio": 1.611338732170895
+    },
+    {
+      "profile": "fast",
+      "writers": 8,
+      "throughput": {
+        "EliteSQL": [
+          712649.273,
+          711591.937,
+          719545.572
+        ],
+        "SQLite-fsync": [
+          273339.693,
+          234384.842,
+          266973.761
+        ]
+      },
+      "p99_ms": {
+        "EliteSQL": 0.215833,
+        "SQLite-fsync": 0.099875
+      },
+      "ratio": 2.669360727925618
+    },
+    {
+      "profile": "balanced",
+      "writers": 1,
+      "throughput": {
+        "EliteSQL": [
+          598600.398,
+          588005.642,
+          590762.76
+        ],
+        "SQLite-fsync": [
+          426289.902,
+          423315.364,
+          427689.967
+        ]
+      },
+      "p99_ms": {
+        "EliteSQL": 0.024291,
+        "SQLite-fsync": 0.051875
+      },
+      "ratio": 1.385823959770926
+    },
+    {
+      "profile": "balanced",
+      "writers": 4,
+      "throughput": {
+        "EliteSQL": [
+          467138.964,
+          467085.189,
+          471700.338
+        ],
+        "SQLite-fsync": [
+          326032.16,
+          325431.12,
+          327500.191
+        ]
+      },
+      "p99_ms": {
+        "EliteSQL": 0.14575,
+        "SQLite-fsync": 0.054792
+      },
+      "ratio": 1.4328002611766888
+    },
+    {
+      "profile": "balanced",
+      "writers": 8,
+      "throughput": {
+        "EliteSQL": [
+          654156.559,
+          640078.602,
+          640377.483
+        ],
+        "SQLite-fsync": [
+          266087.557,
+          267388.81,
+          266926.045
+        ]
+      },
+      "p99_ms": {
+        "EliteSQL": 0.268875,
+        "SQLite-fsync": 0.058334000000000004
+      },
+      "ratio": 2.3990820491121427
+    },
+    {
+      "profile": "safe",
+      "writers": 1,
+      "throughput": {
+        "EliteSQL": [
+          2855.587,
+          2686.683,
+          2704.182
+        ],
+        "SQLite-fullfsync": [
+          2832.681,
+          2764.581,
+          2913.78
+        ]
+      },
+      "p99_ms": {
+        "EliteSQL": 4.884209,
+        "SQLite-fullfsync": 5.023417
+      },
+      "ratio": 0.9546369675935976
+    },
+    {
+      "profile": "safe",
+      "writers": 4,
+      "throughput": {
+        "EliteSQL": [
+          10113.16,
+          9892.397,
+          9632.869
+        ],
+        "SQLite-fullfsync": [
+          2584.5,
+          2711.233,
+          2532.914
+        ]
+      },
+      "p99_ms": {
+        "EliteSQL": 5.1495,
+        "SQLite-fullfsync": 5.047542
+      },
+      "ratio": 3.827586380344361
+    },
+    {
+      "profile": "safe",
+      "writers": 8,
+      "throughput": {
+        "EliteSQL": [
+          19255.375,
+          19520.414,
+          19076.565
+        ],
+        "SQLite-fullfsync": [
+          2704.073,
+          2580.617,
+          2417.036
+        ]
+      },
+      "p99_ms": {
+        "EliteSQL": 5.176542,
+        "SQLite-fullfsync": 5.158084
+      },
+      "ratio": 7.461539236546918
+    }
+  ],
+  "saas": [
+    {
+      "users": 10,
+      "throughput": {
+        "sidecar": [
+          14828.6,
+          13017.5,
+          12742.2
+        ],
+        "sqlite": [
+          16390.1,
+          14634.9,
+          15385.0
+        ]
+      },
+      "p99_ms": {
+        "sidecar": 6.824,
+        "sqlite": 9.289
+      },
+      "minimum_success_pct": {
+        "sidecar": 100.0,
+        "sqlite": 100.0
+      },
+      "ratio": 0.8461163470913227
+    },
+    {
+      "users": 100,
+      "throughput": {
+        "sidecar": [
+          17633.0,
+          14858.2,
+          15247.5
+        ],
+        "sqlite": [
+          12550.3,
+          12320.1,
+          11852.9
+        ]
+      },
+      "p99_ms": {
+        "sidecar": 46.234,
+        "sqlite": 148.058
+      },
+      "minimum_success_pct": {
+        "sidecar": 100.0,
+        "sqlite": 100.0
+      },
+      "ratio": 1.2376117076971778
+    },
+    {
+      "users": 500,
+      "throughput": {
+        "sidecar": [
+          13968.1,
+          12081.0,
+          11095.1
+        ],
+        "sqlite": [
+          11706.1,
+          11390.4,
+          11058.8
+        ]
+      },
+      "p99_ms": {
+        "sidecar": 208.81,
+        "sqlite": 1299.358
+      },
+      "minimum_success_pct": {
+        "sidecar": 100.0,
+        "sqlite": 100.0
+      },
+      "ratio": 1.060630004214075
+    }
+  ],
+  "saas_operations": {
+    "weights": {
+      "browse": 20.0,
+      "product_detail": 17.0,
+      "session_check": 12.0,
+      "add_to_cart": 10.0,
+      "search_text": 8.0,
+      "view_cart": 8.0,
+      "checkout": 4.0,
+      "update_cart_item": 3.0,
+      "order_history": 3.0,
+      "write_review": 2.0,
+      "relogin": 1.5,
+      "update_profile": 1.0,
+      "admin_dashboard": 1.0,
+      "signup": 0.5,
+      "restock": 0.3
+    },
+    "divisor": 91.3,
+    "weighted_us": {
+      "elite": 72.84226692801899,
+      "sqlite": 45.187362072033544
+    },
+    "ratio": 0.6203453568611014
+  },
+  "validation": {
+    "failed_ops": 0,
+    "consistency_violations": 0,
+    "invariants_ok": true,
+    "offline_checks_ok": true
+  }
+}

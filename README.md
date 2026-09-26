@@ -4,12 +4,12 @@
 
 # EliteSQL
 
-> **Alpha release 0.1** — EliteSQL is under active development and its APIs and on-disk format may still change.
+> **Alpha release 0.1.0** — EliteSQL is under active development and its APIs and on-disk format may still change. This README describes the current source tree; a published wheel may lag behind it.
 
 > **A tiny operational database for AI-native apps.**
-> SQLite-fast reads, better concurrent writes, native ANN.
+> Records, SQL, concurrent transactions and native ANN in one engine.
 
-EliteSQL is an **embedded** database engine (no enforced server, no daemon, no ceremonial tuning) written in Rust and made for **Python** applications first: one `pip install`, one shared library, `import elitesql`. A database is a self-contained directory you can copy, back up and move. When several processes need it, or the app runs on another machine, the same binary can [serve it](#multi-worker-and-remote-the-sidecar-mode) over a socket or a port — a deployment option, not a requirement.
+EliteSQL is an **embedded** database engine (no enforced server, no daemon, no ceremonial tuning) written in Rust and made for **Python** applications first: one `pip install`, one shared library, `import elitesql`. A closed database is a self-contained directory you can copy and move. Rust's `Db::backup()` copies a live database consistently; the backup CLI opens and owns the database for its operation. When several processes need it, or the app runs on another machine, the same binary can [serve it](#multi-worker-and-remote-the-sidecar-mode) over a socket or a port — a deployment option, not a requirement.
 
 It does not compete with big db projects like PostgreSQL or MySQL: it competes against the complexity of operating this tower in a modern app:
 
@@ -17,9 +17,9 @@ It does not compete with big db projects like PostgreSQL or MySQL: it competes a
 SQLite + vector DB + cache + sync layer + files + embeddings metadata
 ```
 
-But also it delivers [strong performance](benchmark.md) enough to handle millions of records and thousands of concurrent operations.
+The [current benchmark](benchmark.md) compares EliteSQL with SQLite at up to ten million records and in a concurrent mini-SaaS workload, including cases where SQLite is faster.
 
-The promise is opening a single file and having records, JSON, blobs, indexes, ANN vector search, snapshots and sane concurrency inside:
+The promise is opening one database directory and having records, JSON, blobs, indexes, ANN vector search, snapshots and concurrency inside:
 
 ```python
 from elitesql import EliteSQL
@@ -28,7 +28,7 @@ db = EliteSQL("app.esql")
 
 ## Why EliteSQL
 
-- **Real concurrent writes.** SQLite serializes all writers behind a global lock. EliteSQL uses MVCC with optimistic commits: writers prepare transactions in parallel and only meet at commit (`Readers never block writers. Writers only meet at commit.`).
+- **Concurrent transaction preparation.** SQLite permits one writer at a time. EliteSQL uses MVCC and optimistic validation: writers stage transactions in parallel, then coordinate publication at commit. Snapshots preserve stable reads while other transactions commit.
 - **Native vectors**: `vector<float32, N>` and an HNSW index as a first-class type, not a bolted-on extension.
 - **A bounded resource footprint.** SQL operators, scalar/text/vector indexes,
   recovery and maintenance share an explicit database-wide memory budget.
@@ -58,7 +58,8 @@ parity, vector recall, BM25/hybrid, blobs and read-only), crash injection with r
 `kill -9` of live processes, corruption and SQL-parser fuzzing, plus Python FFI
 parameter tests and real Node sidecar roundtrips. Run `bash scripts/acceptance.sh`
 for formatting, Clippy, the workspace suite, FFI, both clients and external sort
-under a 128-descriptor limit. CI defines Linux/macOS and Rust 1.89/1.93.1 jobs.
+under a 128-descriptor limit. CI defines Linux/macOS and Rust 1.89/1.93.1 jobs,
+with Python 3.12 and Node.js 24 for the bindings.
 The [implementation report](docs/implementacion-plan.md) records local evidence
 and the [audit](docs/auditoria-y-plan-2026-09-10.md) explains the changes.
 Onboarding docs in [docs/](docs/).
@@ -87,25 +88,30 @@ concurrent virtual users, verifying business invariants and integrity at every
 level, and records the capacity and latency curves:
 
 ```bash
+cargo build --locked --release -p elitesql-cli -p elitesql-ffi
 python3 examples/saas_simulation/sweep.py --transport sidecar --levels 10,100,500,1000,2000,5000
 ```
 
-On the 2026-09-12 reference run it serves 3 000 users with realistic think
-time (2 392 operations/s) at a 5.5 ms p99 on less than one core, and 5 000 of
-them at 3 825 operations/s on 1.7 cores. Under a closed loop, where every
-virtual user keeps one request in flight, SQLite is still ahead on this
-workload at every level: EliteSQL reaches 55-65 % of its throughput up to 200
-concurrent requests with a better tail there, and falls to 40 % at 500. The
-storage engine resolves a row in 0.23 µs, seven times faster than SQLite
-answers the whole statement, so the difference is the SQL executor, row
-materialization and the commit serialization above it;
-`cargo run --release -p elitesql-core --example statement_cost` breaks the
-statement path down layer by layer.
+The [2026-09-26 comparison](benchmark.md#mini-saas-application) uses 20,000
+accounts, 5,000 products and fifteen operations shared by both engines;
+recommendations are excluded because their vector/category implementations
+answer different questions. Three repetitions at 10/100/500 users, with no
+think time and 30 measured seconds per level, give EliteSQL 0.85×/1.24×/1.06×
+SQLite's throughput. The 500-user ranges overlap. All runs completed with no
+failed operations or read-your-writes violations, and passed business
+invariants and offline integrity checks after reopening.
+
+EliteSQL runs over a Unix-socket sidecar in this concurrent test; SQLite is
+embedded in the generator processes. The isolated embedded-operation mix
+favors SQLite (45.19 µs versus EliteSQL's 72.84 µs weighted median cost).
+These are local workload measurements, not a maximum-user capacity claim.
 
 See [examples/saas_simulation/README.md](examples/saas_simulation/README.md)
-for the workload and what it measures, and
-[benchmark-results/saas-simulation-2026-09-12/](benchmark-results/saas-simulation-2026-09-12/README.md)
-for the curves, the engine counters and the optimization pass they drove.
+for simulator options and
+[the current raw results](benchmark-results/sqlite-comparison-2026-09-26/README.md)
+for commands, repetitions, resource logs and recovery checks. The command
+above exercises the full simulator; the paired comparison is reproduced by
+the runner in [Performance](#performance).
 
 ## Install for Python
 
@@ -117,11 +123,12 @@ separate library to install.
 pip install elitesql
 ```
 
-Until the first PyPI release lands, the same wheels are attached to every
-[GitHub Release](https://github.com/jalbarracinv/elitesql/releases); install
-one with `pip install <wheel-url>`.
+Published releases are available on [PyPI](https://pypi.org/project/elitesql/).
+Wheels are also attached to
+[GitHub Releases](https://github.com/jalbarracinv/elitesql/releases).
+To use changes made after the published release, build from source below.
 
-**From source** (any platform with the Rust toolchain, 1.89 or newer):
+**From source** (Linux or macOS with the Rust toolchain, 1.89 or newer):
 
 ```bash
 git clone https://github.com/jalbarracinv/elitesql.git
@@ -172,6 +179,11 @@ with EliteSQL("app.esql") as db:                 # creates the directory if miss
 `bytes`, `bool`, `None`, `datetime.date`/`time`/`datetime` (UTC), `dict`/`list`
 for `json`, and `list[float]` for vectors.
 
+The following Python examples continue with that database. Reopen it with
+`db = EliteSQL("app.esql")` after the context manager exits, and call
+`db.close()` when finished. The quick start creates its schema once; use a
+fresh directory when repeating it.
+
 ### DB-API style cursors
 
 ```python
@@ -188,8 +200,8 @@ print(cur.rowcount)            # 2
 
 ### Transactions
 
-Several operations become one atomic commit. Writers prepare in parallel and
-only meet at commit; a conflict raises `EliteSQLError` with code 9
+Several operations become one atomic commit. Transactions stage writes in
+parallel, then validate and publish at commit; a conflict raises `EliteSQLError` with code 9
 (`CONFLICT_RETRY`) and the whole unit can be rerun.
 
 ```python
@@ -198,8 +210,11 @@ from elitesql import EliteSQLError
 with db.transaction() as tx:                      # commits on success, rolls back on exception
     new = tx.insert("users", {"email": "eve@example.com"})
     tx.query("UPDATE users SET plan = 'pro' WHERE id = %s", [new["record"]["id"]])
-    row = tx.get("users", new["id"])              # new["id"] is the physical ULID
+    row = tx.get("users", new["id"])              # opaque physical key; record["id"] is the SQL integer
     tx.update("users", new["id"], {"plan": "free"})
+
+db.query("CREATE TABLE accounts (id int AUTO_INCREMENT PRIMARY KEY, credits int NOT NULL)")
+db.query("INSERT INTO accounts (id, credits) VALUES (7, 5)")
 
 def promote(tx):
     tx.query("UPDATE accounts SET credits = credits - 1 WHERE id = 7 AND credits >= 1")
@@ -224,6 +239,7 @@ Embeddings are an ordinary column type with a native HNSW index; BM25 full-text
 and reciprocal-rank-fusion hybrid search sit next to it.
 
 ```python
+# Supply 768-dimensional embeddings from your embedding model.
 db.query("CREATE TABLE notes (body text NOT NULL, workspace text, emb vector(768))")
 db.create_vector_index("notes", "emb", metric="cosine")   # sync by default; mode="async", quantized=True available
 db.create_text_index("notes", "body")                     # BM25
@@ -239,7 +255,7 @@ hits = db.search_text("notes", "body", "quarterly numbers", top_k=10)
 # A hit carries the whole row by default, indexed text included. `columns`
 # narrows it, and `columns=[]` returns ids and scores alone: for a search that
 # only ranks, that is most of what each result costs.
-hits = db.search_text("notes", "body", "quarterly numbers", top_k=10, columns=["title"])
+hits = db.search_text("notes", "body", "quarterly numbers", top_k=10, columns=["workspace"])
 hits = db.search_hybrid("notes", text=("body", "quarterly numbers"),
                         vector=("emb", query_embedding), top_k=10)
 ```
@@ -257,7 +273,7 @@ position while others keep committing:
 ```python
 with db.snapshot() as snap:
     before = snap.scan("users")          # every row as of this instant
-    one = snap.get("users", some_ulid)
+    one = snap.get("users", new["id"])   # physical key returned by tx.insert(), not the SQL integer
 ```
 
 ### Multiple processes: gunicorn, uwsgi, cron jobs
@@ -283,15 +299,17 @@ crash-safe through an intent journal. Placeholders are `?`, `%s` or
 `%(name)s`; `LIMIT`/`OFFSET` may be parameters.
 
 ```python
+db.query("CREATE TABLE orders (user_id int NOT NULL REFERENCES users(id), amount float64)")
+db.query("INSERT INTO orders (user_id, amount) VALUES (%s, %s)", [ana_id, 19.99])
 db.query("""
-    SELECT u.name, o.amount FROM users u
+    SELECT u.email, o.amount FROM users u
     JOIN orders o ON o.user_id = u.id
     WHERE u.email = %s ORDER BY o.amount DESC LIMIT 10
-""", ["ana@x.com"])
+""", ["ana@example.com"])
 
 db.query("""
-    SELECT age, count(*) AS n FROM users
-    WHERE since >= '2026-01-01' GROUP BY age HAVING count(*) > 1 ORDER BY n DESC
+    SELECT plan, count(*) AS n FROM users
+    WHERE created_at >= '2026-01-01' GROUP BY plan HAVING count(*) > 1 ORDER BY n DESC
 """)
 ```
 
@@ -309,6 +327,8 @@ elitesql --help
 ```bash
 
 elitesql --create app.esql               # create a new database (once)
+elitesql query app.esql "CREATE TABLE docs (title text NOT NULL)"
+elitesql query app.esql "INSERT INTO docs (title) VALUES ('hello')"
 elitesql query app.esql "SELECT count(*) AS n FROM docs"
 elitesql app.esql                       # interactive shell (SQLite-style shorthand)
 elitesql repl app.esql                  # interactive shell (.exit to quit)
@@ -316,9 +336,10 @@ elitesql tables app.esql                # schemas as JSON
 elitesql check app.esql                 # offline integrity check
 elitesql compact app.esql
 elitesql backup app.esql backup.esql    # snapshot-consistent copy, verified
-elitesql restore backup.esql app.esql   # validate a backup and materialize it
+elitesql restore backup.esql restored.esql   # destination must not exist
 elitesql export app.esql docs > docs.jsonl
-elitesql import app.esql docs < docs.jsonl
+elitesql query restored.esql "CREATE TABLE imported_docs (title text NOT NULL)"
+elitesql import restored.esql imported_docs < docs.jsonl
 elitesql repair damaged.esql rescued.esql    # salvage, never silent
 elitesql serve app.esql /tmp/elitesql.sock   # sidecar mode
 ```
@@ -333,13 +354,14 @@ directory named after the typo in the working directory.
 
 ## Multi-worker and remote: the sidecar mode
 
-A database directory is owned by **one process**. When several processes need it — or when the app runs on a different host — that process serves them: it owns the engine and answers a line-delimited JSON protocol, one thread per connection over a shared `Db`. Concurrency still comes from the engine: readers never block writers, writers only meet at commit.
+A database directory is owned by **one process**. When several processes need it — or when the app runs on a different host — that process serves them: it owns the engine and answers a line-delimited JSON protocol, one thread per connection over a shared `Db`. Transactions stage writes in parallel; the engine coordinates validation and publication at commit.
 
 ### Same host: Unix socket
 
 For multi-process deployments (gunicorn, PHP-FPM), the transport is a Unix socket, authenticated by filesystem permissions:
 
 ```bash
+elitesql query app.esql "CREATE TABLE visits (who text NOT NULL)"  # initialize once
 elitesql serve app.esql /tmp/elitesql.sock
 ```
 
@@ -356,7 +378,7 @@ with db.streaming_cursor("SELECT id, who FROM visits", batch_rows=512) as rows:
         consume(row)
 ```
 
-Reproducible demo with real gunicorn (4 workers, concurrent visitors reading and writing without blocking): `examples/gunicorn_demo/run_demo.sh`.
+Reproducible demo with real gunicorn (4 workers, concurrent visitors reading and writing): `examples/gunicorn_demo/run_demo.sh`.
 
 ### Another host: TCP
 
@@ -366,6 +388,7 @@ elitesql serve app.esql --tcp 127.0.0.1:7070
 ```
 
 ```python
+import os
 from elitesql import SidecarClient
 db = SidecarClient(host="127.0.0.1", port=7070, token=os.environ["ELITESQL_TOKEN"])
 db.query("SELECT count(*) AS n FROM visits")
@@ -380,7 +403,7 @@ A Unix socket is authenticated by the filesystem; a TCP port is not, so it **req
 Two limits to plan around, neither of which the Unix socket had:
 
 - **No encryption.** Traffic and the token itself travel in cleartext. Bind loopback and cross machines through an SSH tunnel (`ssh -N -L 7070:127.0.0.1:7070 user@db-host`), a VPN, or a private network. The server warns on startup when the bind address is not loopback.
-- **Latency changes the performance profile.** A point lookup is ~4 µs; a network round trip is ~0.5 ms in a datacenter and 10–50 ms across regions. Over TCP the network dominates by orders of magnitude and the engine stops behaving like an embedded one. If you only need several workers, keep them on one host with the Unix socket.
+- **Latency changes the performance profile.** TCP adds network round trips to every request; embedded benchmark timings do not predict remote latency. Measure on the intended network. If you only need several workers, keep them on one host with the Unix socket.
 
 `--max-connections` (default 128) caps concurrent connections on **both** transports, since each one costs a thread; past the cap the server answers with a refusal instead of queueing.
 
@@ -422,6 +445,8 @@ but must receive a non-negative `int64`.
 
 **Node** ([bindings/node/elitesql.js](bindings/node/elitesql.js)) — dependency-free sidecar client:
 
+The client declares Node.js 18 or newer; CI uses Node.js 24.
+
 ```js
 const { SidecarClient } = require('./elitesql');
 const db = await SidecarClient.connect('/tmp/elitesql.sock');
@@ -450,7 +475,9 @@ complete commit; damage *followed by* a complete commit is refused as
 corruption. Atomicity holds in all modes: never half a commit.
 
 Concurrent `Safe` commits share a physical WAL sync when they overlap; every
-caller still waits for that group's sync result before returning. `Balanced`
+caller still waits for that group's sync result before returning. The default
+`safe_group_commit_delay_us` is 200; setting it to zero removes the intentional
+coalescing window without changing durability. `Balanced`
 commits are acknowledged as soon as they are applied: the timer thread runs the
 barrier on a duplicated file handle with the commit mutex released, so an
 fsync never stalls the commit pipeline. If a sync fails, a `Safe` commit
@@ -462,7 +489,10 @@ WAL chain re-validated.
 a process or kernel crash but not a power loss unless you set
 `DbOptions { full_fsync: true, .. }` (`F_FULLFSYNC`, opt-in like SQLite's
 `fullfsync`; roughly an order of magnitude slower per barrier). Linux needs
-nothing. The published benchmarks use the default.
+nothing extra. The current Safe writer benchmark enables strict drive-cache
+flushes on both engines; Fast and Balanced measurements do not make the same
+per-commit power-loss guarantee. Python exposes `EliteSQL(path,
+full_fsync=True)` and the CLI accepts `--full-fsync`.
 
 ```rust
 use elitesql_core::{Db, DbOptions, Durability};
@@ -481,9 +511,8 @@ the caller are not charged.
 The query pool bounds how many statements run at once, so it follows the cores
 that can run them: 24 MiB per core, between 64 and 512 MiB. On a ten-core
 machine that is a 240 MiB pool inside a 568 MiB envelope. The pool is a ceiling
-the governor accounts against, not an allocation, and on a mixed shop workload
-it is worth 35 % of the throughput at 500 in-flight requests for 70 MiB of
-actual resident memory. `elitesql serve --memory-mib <n>` scales the whole
+the governor accounts against, not an allocation.
+`elitesql serve --memory-mib <n>` scales the whole
 profile from one number.
 Traditional SQL queries are subject to a working-memory budget too. Scans run
 in batches; `ORDER BY` and high-cardinality `GROUP BY` spill temporary sorted
@@ -571,9 +600,9 @@ only for short validation, WAL-writer swap and in-memory adoption. A background 
 runs, while equality/BM25 retain fanout eight. Disjoint V3 primary ranges copy
 their already checksummed pages directly instead of decoding and rebuilding
 every entry. The atomic `primary.runs` manifest selects one exact generation.
-Paged format V3 checksums navigation metadata and retains one small offset per
-page in heap; keys remain
-file-backed. Checkpoint snapshots intern table names and pack IDs contiguously,
+Paged format V3 checksums navigation metadata. Mapped runs retain compact
+page-navigation metadata and lazily build table/page fences for primary-key
+lookups; complete keys remain file-backed. Checkpoint snapshots intern table names and pack IDs contiguously,
 and generate the primary run directly from captured segment offsets instead of
 updating and rescanning the mutable tree. Missing, stale or damaged run state is
 disposable and rebuilt from canonical segments with bounded external runs.
@@ -674,141 +703,52 @@ ELITESQL_FUZZ_ITERS=5000 cargo test --release --test corruption
 
 ## Performance
 
-The [September 11 integrity/performance review](benchmark-results/review-2026-09-11/README.md)
-compares the implemented fixes with the audited revision across 10K–1M rows,
-including raw repetitions, source patches, allocations, spill and RSS. It
-reports both selective-query gains and scan regressions.
+[benchmark.md](benchmark.md) contains the current EliteSQL-versus-SQLite
+comparison, measured on 2026-09-26 on an Apple M5 with three repetitions per
+engine and workload. It covers transactional load at 1M/10M rows, identical
+parameterized SQL point reads, concurrent writers and the mini-SaaS simulator.
+Ratios above 1 favor EliteSQL; ranges and exact timing boundaries are in the
+report.
 
-Current measurements are deliberately published even where they are
-unfavorable. The 2026-08-09 Apple Silicon repeat after relational compatibility
-used the exact former 128 MiB transactional profile: EliteSQL completed 10M
-rows in 24.049 s versus SQLite's 15.670 s (1.535x SQLite time). Against the
-2026-08-08 EliteSQL baseline, throughput decreased 5.9%; SQLite also varied in
-this repeat, and the relative load-time ratio improved from 1.656x to 1.535x.
+- **Transactional load, Fast/OFF:** SQLite wins at 1M rows. At 10M rows,
+  EliteSQL is 1.54× faster with 1K-row transactions; 10K-row transactions are
+  effectively tied (0.99×, overlapping ranges).
+- **Warmed SQL point reads:** EliteSQL is 1.38× faster at 1M rows and
+  6.86–9.17× faster at 10M rows in this narrow-row fixture.
+- **Concurrent writes:** EliteSQL delivers 1.39–2.67× SQLite's throughput
+  in Fast/Balanced at one/four/eight writers. Safe with strict macOS flushes
+  is near parity at one writer and reaches 3.83×/7.46× at four/eight writers;
+  throughput gains do not imply lower commit p99 in every case.
+- **Mini-SaaS:** SQLite has lower isolated operation cost. Concurrent
+  throughput favors SQLite at 10 users and EliteSQL at 100; the 500-user
+  ranges overlap. See [the simulator results](#current-status) and the
+  benchmark for transport and operation-mix differences.
 
-The 2026-08-23 coordinated-commit repeat improved the focused Fast workload
-from 382,868 to 401,175 rows/s at four writers and from 373,521 to 572,261 at
-sixteen. It preserves one versioned CRC recovery frame per transaction and is
-limited to disjoint inserts without identity, foreign-key or derived-index
-work. Safe now uses the same independent-frame coordinator and waits for one
-strict sync per eligible batch; other transactions retain the general
-group-sync path. A new
-persisted-reader/mixed harness measured median point-read throughput of
-362,557/666,045/841,250/815,137 reads/s at 1/4/8/16 readers with no query-pool
-waits. CPU-aware point-read admission now activates only while state writers
-are active. In the exact 16-reader/four-writer repeat it reduced median writer
-p99 from 11.147 ms to 0.595 ms (-94.7%) while mixed read/write throughput rose
-0.9%; the deliberate tradeoff was reader p99 moving from 0.062 to 0.222 ms.
-
-The expanded contention matrix also validates updates, deletes, identity,
-foreign keys and synchronous equality/BM25/HNSW maintenance. Warm-cache writer
-p99 medians were 0.458/1.362/1.170/1.271/0.768/1.665 ms respectively. Its cold
-mode reopens without warmup and performs explicit OS page-cache eviction on
-Linux/Android; macOS results report `evict=0/0` and must be treated as reopened,
-not truly OS-cold. See `benchmark.md` for methodology and raw CSVs; these are
-focused local measurements, not universal hardware claims.
-
-A subsequent full normal-power acceptance run repeated every core Cargo
-benchmark without replacing those historical results. At 10M rows the current
-transactional profile measured 8.643 s versus SQLite's 7.595 s, while direct
-sorted bulk measured 5.235 s versus 8.260 s. Fast/Balanced concurrent writes
-won aggregate throughput at every tested writer count. The original Safe table
-was not like-for-like on macOS: EliteSQL used `F_FULLFSYNC`, while SQLite FULL
-used ordinary `fsync`. With SQLite `fullfsync=ON`, the corrected one-writer
-result is tied at about 2.5K rows/s and EliteSQL reaches 36.7K rows/s at 16
-writers by averaging 15.7 commits per strict sync. ANN search became
-5.3-6.6x faster while recall and persisted reopen regressed, so that result is
-not quality-neutral. See the [full acceptance report](benchmark-results/full-acceptance-2026-08-23.md).
-
-The 2026-09-04 acceptance rerun followed a hot-path pass that reads segment
-payloads through read-only mappings instead of one `pread` per record, tests
-unindexed equality predicates on encoded payloads, merges primary runs without
-per-record allocation, vectorizes the HNSW distance kernels and makes vector
-index memory accounting incremental. Against the 2026-08-23 run, the SQL
-unindexed 1M-row filter fell from 291 ms to 34 ms, read-only point-read
-throughput peaked at 3.58M reads/s with 16 readers (1.22M before), the
-16-reader/four-writer mix sustained 2.53M reads/s and 101K rows/s, ANN search
-became 27-31% faster with identical recall, HNSW ingest fell from 15.3 s to
-9.2 s and persisted reopen from 22.6 s to 10.9 s. The 10M transactional load
-completed in 7.330 s versus SQLite's 8.631 s (ingest wall 7.220 s versus
-6.005 s; SQLite's deferred checkpoint took 2.626 s in that run) and direct
-sorted bulk in 4.559 s versus 7.289 s. Fast/Balanced/Safe writer throughput
-stayed within the previous matrix's spread. See the
-[current acceptance report](benchmark-results/current-acceptance-2026-09-04.md).
-
-A 2026-09-05 pass (A/B against that tree, documented in
-[benchmark.md](benchmark.md#hot-path-optimizations--2026-09-05)) made the
-persisted HNSW graph durable across restarts: the immutable runs published
-while the database runs now stay on disk under a small run manifest, so the
-100K-vector reopen that previously rebuilt the whole graph in 10.8 s maps it in
-61 ms with identical results. The same pass prefetches neighbour vectors in
-the HNSW beam search (search 27-30% faster, recall unchanged), stops cloning
-column values and joined records in the SQL executor (indexed join -18%),
-trims the last scan batch of bounded queries (`LIMIT 5` over an unindexed
-1M-row filter from 33.4 ms to 0.31 ms), releases the state lock before point
-reads decode their record, and builds releases with fat LTO. Two follow-ups
-the same day: the maintenance worker merges comparably sized HNSW runs in the
-background (13 unmerged runs searched 2.8x slower than the merged set, and
-the run count no longer grows with publications), and single-table GROUP BY
-aggregates into a budgeted hash table before falling back to the external
-sort (997 and 10K groups over 1M rows: -63%, identical output). A sustained
-1M-vector ingest then showed merges stalling commits for up to 20 s while
-they held the whole maintenance pool; frozen heaps are now accounted without
-waiting, the exclusion between maintenance tasks is an explicit lease, a
-merge reserves only its estimated footprint, and background publications
-need a run's worth of delta. The same ingest finishes with no commit above
-166 ms.
-
-The complete acceptance sequence was then rerun on 2026-09-05 (see the
-[acceptance report](benchmark-results/current-acceptance-2026-09-05.md)):
-10M transactional rows loaded in 7.363 s versus SQLite's 7.693 s (ingest wall
-7.207 s versus 5.855 s), direct sorted bulk in 4.388 s versus 6.821 s, Fast and
-Balanced writers beat SQLite at every count by 1.77-6.06x and 1.68-4.90x, Safe
-strict reached 13.47x at 16 writers, 16 readers with four writers sustained
-2.62M reads/s and 105K rows/s with a 342 us writer p99, ANN recall was
-identical with searches 11-24% faster, and the 100K-vector graph opened in
-74.5 ms.
-
-Historical results remain useful: the former 256 MiB ingest profile completed
-in 18.798 s, and `Db::bulk_insert_sorted` completed in 9.968 s versus SQLite's
-13.822 s.
-
-An isolated 10M transactional run stayed inside every logical pool
-(16/64 MiB query, 22.81/24 MiB delta and 32/32 MiB maintenance) and reported a
-65.56 MiB peak physical footprint. Max RSS was 879.47 MiB because it includes
-clean file-backed mmap pages touched during the historical run; those pages are
-reclaimable and intentionally not equivalent to mandatory heap. Remaining
-performance work includes primary-manifest publication latency, true cold-cache
-runs on Linux, Safe/Balanced mixed matrices, more hardware, and possibly
-transaction-local identity ranges if their rollback semantics are specified.
-Re-run the scale matrix for the current 384/512 MiB profiles before comparing
-them directly with the former-profile results.
-
-For reproducible comparisons at 1–10 million rows, use the single-run scalable benchmark:
+Reproduce the paired suites, including SaaS, from the checkout:
 
 ```bash
-cargo bench -p elitesql-core --bench scale_vs_sqlite -- --rows 1m
-cargo bench -p elitesql-core --bench scale_vs_sqlite -- --rows 10m \
-  --durability fast --batch-size 10k --point-reads 10k --full-scans 3 \
-  --total-memory-mib 128 --index-delta-mib 24 \
-  --maintenance-mib 32 --memtable-mib 16
-cargo bench -p elitesql-core --bench concurrent_rw -- \
-  --rows 100k --read-operations 200k --write-rows 20k \
-  --readers 1,4,8,16 --writers 0,1,4 --repetitions 3
-cargo bench -p elitesql-core --bench contention_matrix -- \
-  --workloads insert,update,delete,identity,foreign-key,derived \
-  --cache warm,cold --readers 16 --writers 4 --repetitions 3
+# Choose an unused output directory.
+out=benchmark-results/sqlite-comparison-local
+mkdir -p "$out"
+cargo bench --locked -p elitesql-core --bench scale_vs_sqlite \
+  --bench concurrent_writers --no-run --message-format=json > "$out/build.jsonl"
+cargo build --locked --release -p elitesql-ffi -p elitesql-cli
+python3 scripts/compare-sqlite.py --output "$out" \
+  --build-json "$out/build.jsonl" --repetitions 3 --saas-duration 30
 ```
 
-It gives both engines the same deterministic rows and 10K-row transaction batches. Durability is matched explicitly: EliteSQL `fast` ↔ SQLite WAL/`synchronous=OFF`, `balanced` ↔ `NORMAL`, and `safe` ↔ `FULL`. Use `--bulk-sorted` for the direct import path; `--durability balanced|safe`, `--batch-size`, `--point-reads`, `--full-scans`, `--engine both|elitesql|sqlite`, `--total-memory-mib`, `--index-delta-mib`, `--maintenance-mib`, and `--memtable-mib` change or isolate the workload; `--smoke` runs a quick 10K-row correctness check.
-
-See [benchmark.md](benchmark.md) for the complete methodology, exact environment, timing definitions, reproducible commands, 1M/10M results, and the 1/2/4/8 concurrent-writer comparison with CSV data and SVG charts. The scalable benchmark reports the write path separately from all automatic/final checkpoints and prints `SQLite time / EliteSQL time`; a ratio above 1 means EliteSQL was faster.
+The runner records commands, source/binary hashes, exit statuses, resource
+logs and raw results, then regenerates the base `benchmark.md` report.
+Build comparisons, internal diagnostics and older measurements remain in
+[old_benchmark.md](old_benchmark.md). The
+[September 11 integrity/performance review](benchmark-results/review-2026-09-11/README.md)
+is historical evidence, not a measurement of the current source tree.
 
 ## Using from Rust
 
 The engine is a Rust crate, `elitesql-core`; everything the Python binding does
 goes through this API. Requirements: [Rust](https://rustup.rs) 1.89 or newer,
-installed with `rustup` rather than an operating-system package:
+with `rustup` as one installation option:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -851,15 +791,15 @@ fn main() -> elitesql_core::Result<()> {
 
     // Simple write (auto-commit). The id is a ULID generated by the engine.
     let mut rec = Record::new();
-    rec.insert("title".into(), Value::Text("hello".into()));
-    rec.insert("score".into(), Value::Int64(10));
+    rec.insert("title", Value::Text("hello".into()));
+    rec.insert("score", Value::Int64(10));
     let id = db.insert("docs", rec)?;
 
     // Multi-operation transaction: atomic, isolated, optimistically
     // validated at commit (Error::Conflict => retry).
     let mut txn = db.begin();
     let mut patch = Record::new();
-    patch.insert("score".into(), Value::Int64(99));
+    patch.insert("score", Value::Int64(99));
     txn.update("docs", &id, patch)?;
     txn.commit()?;
 
@@ -878,8 +818,11 @@ fn main() -> elitesql_core::Result<()> {
 
 ### Relational and MySQL compatibility (SQL)
 
-Every table has an immutable physical ULID, while `id` is available for an
-ordinary declared SQL column. This permits direct MySQL-style primary keys:
+Tables without a declared `id` expose an implicit text key, normally a
+generated ULID. A declared integer identity `id` is instead the primary lookup
+key, stored internally as an order-preserving text encoding. SQL returns the
+integer; low-level CRUD uses the opaque physical key returned by insert.
+This permits direct MySQL-style primary keys:
 
 ```sql
 CREATE TABLE users (
@@ -890,6 +833,12 @@ CREATE TABLE users (
 );
 CREATE UNIQUE INDEX ON users (email);
 
+CREATE TABLE products (
+  id int AUTO_INCREMENT PRIMARY KEY,
+  name text NOT NULL,
+  category text NOT NULL,
+  price_cents int NOT NULL
+);
 CREATE INDEX ON products (category, price_cents);
 SELECT id, name, price_cents
 FROM products
@@ -904,6 +853,8 @@ CREATE TABLE documents (
 );
 
 INSERT INTO users (email) VALUES ('ana@example.com') RETURNING id;
+CREATE TABLE accounts (id int AUTO_INCREMENT PRIMARY KEY, credits int NOT NULL);
+INSERT INTO accounts (id, credits) VALUES (7, 5);
 UPDATE accounts SET credits = credits - 1
 WHERE id = 7 AND credits >= 1;
 ```
@@ -918,13 +869,21 @@ sidecar can run multi-statement SQL through an explicit transaction. See the
 [SQL manual](manual.md) and [MySQL migration guide](mysql2elite.md) for limits
 and retry rules.
 
+Eligible arithmetic updates such as `credits = credits - 1` can reapply their
+delta to a newer row at commit instead of failing immediately on contention.
+The engine rechecks the `WHERE` guard and constraints; this optimization is
+disabled when the transaction has returned that row to the caller or mixed
+delta updates with ordinary writes. Applications must still handle conflicts.
+
 An index can contain one or more ordered columns. `UNIQUE (a, b)` applies to
 the complete tuple; tuples containing `NULL` remain indexable but do not
-conflict with one another. The first ordered-read path covers a non-NULL
+conflict with one another. The ordered-read path covers a non-NULL
 equality prefix plus ascending `ORDER BY` over the remaining indexed columns
 with `LIMIT`; text ordering requires `COLLATE binary`. Unicode collation,
 descending order, historical snapshots and staged transaction reads retain the
 normal sort path. `EXPLAIN` prints `INDEX ORDERED` only when that path is used.
+Eligible indexed reads defer decoding projected records until filtering and
+`LIMIT`/`OFFSET` select the rows that will be returned.
 
 ### Vector search (ANN) in Rust
 
@@ -946,7 +905,7 @@ db.create_vector_index("notes", "embedding", VectorIndexOptions::default())?; //
 // ... insert records with Value::Vector(...) ...
 
 let mut filter = elitesql_core::Record::new();
-filter.insert("workspace".into(), Value::Text("acme".into()));
+filter.insert("workspace", Value::Text("acme".into()));
 let hits = db.search_vector(
     "notes", "embedding", &query_embedding, 20,
     &VectorSearchOptions { filter: Some(filter), ..Default::default() },
@@ -956,32 +915,35 @@ for hit in hits {
 }
 ```
 
-Vectors are ordinary typed columns, so replacing an embedding is a single SQL
-update; the vector index follows the committed record automatically:
+Vectors are ordinary typed columns, so replacing an embedding is a parameterized
+SQL update; the vector index follows the committed record automatically:
 
-```sql
-UPDATE notes
-SET embedding = '[0.12, -0.04, 0.87, ...]'
-WHERE id = 'note-42';
+```rust
+db.query_params(
+    "UPDATE notes SET embedding = %s WHERE workspace = %s",
+    &[Value::Vector(query_embedding.clone()), Value::Text("acme".into())],
+)?;
 ```
 
 The replacement vector must have the column's declared dimension (768 above).
 
-The current 100K-vector synthetic benchmark (dim 64) obtains recall@10 of
-0.994 at `ef_search=128` and 0.998 at 256 (1.0 at 512), with mean search
-intervals of about 0.42 ms and 0.77 ms respectively. An `Async` mode is available so commits do not
-wait for indexing, plus a `quantized` (int8) option for roughly 4x smaller
-vector payloads. See [benchmark.md](benchmark.md) for the measured memory,
-latency, and quality trade-offs.
+An `Async` mode lets commits proceed without waiting for indexing; search may
+lag behind recent writes. The optional `quantized` (int8) representation uses
+roughly 4× less space for index vector payloads; canonical row vectors remain
+exact. Historical ANN latency, memory and recall measurements are in
+[old_benchmark.md](old_benchmark.md). They are separate from the current
+SQLite comparison, which has no equivalent native SQLite ANN workload.
 
 ### Full-text and hybrid in Rust
 
 ```rust
+use elitesql_core::HybridQuery;
+
 db.create_text_index("notes", "body")?;                    // BM25
 let hits = db.search_text("notes", "body", "query", 10, None)?;
 let hits = db.search_hybrid("notes", &HybridQuery {        // RRF: text + vector
     text: Some(("body", "query")),
-    vector: Some(("emb", &embedding)),
+    vector: Some(("embedding", &query_embedding)),
     top_k: 10,
     ..Default::default()
 })?;
@@ -994,9 +956,11 @@ The same engine exposes a deliberately small SQL dialect — full reference with
 ```rust
 use elitesql_core::{QueryOutput, Record, Value};
 
-db.query("CREATE TABLE users (name text NOT NULL, email text, age int, since date)")?;
+db.query("CREATE TABLE users (id int AUTO_INCREMENT PRIMARY KEY, name text NOT NULL, email text, age int, since date)")?;
 db.query("CREATE UNIQUE INDEX ON users (email)")?;
 db.query("INSERT INTO users (name, email, age, since) VALUES ('ana', 'ana@x.com', 30, '2026-08-07')")?;
+db.query("CREATE TABLE orders (user_id int NOT NULL REFERENCES users(id), amount float64)")?;
+db.query("INSERT INTO orders (user_id, amount) VALUES (1, 19.99)")?;
 
 if let QueryOutput::Rows { columns, rows } = db.query(
     "SELECT u.name, o.amount FROM users u \
@@ -1019,8 +983,8 @@ db.query_params(
 )?;
 
 let mut params = Record::new();
-params.insert("email".into(), Value::Text("ana@x.com".into()));
-params.insert("limit".into(), Value::Int64(10));
+params.insert("email", Value::Text("ana@x.com".into()));
+params.insert("limit", Value::Int64(10));
 db.query_named_params(
     "SELECT name FROM users WHERE email = %(email)s LIMIT %(limit)s",
     &params,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "elitesql"
-version = "0.0.1"
+version = "0.1.0"
 description = "EliteSQL: embedded SQL + vector database for Python (ctypes over libelitesql) and sidecar client"
 readme = "README.md"
 requires-python = ">=3.9"

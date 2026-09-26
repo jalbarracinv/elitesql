@@ -1,0 +1,9 @@
+results → /Users/jalbarracin/Code/elitesql/benchmark-results/sqlite-comparison-2026-09-26/saas-r2-sidecar
+database → /private/var/folders/wf/3gnfq1cs66j1wjyc0ty6vfrw0000gq/T/saas-sim-4d4s97y5/saas.esql
+seeded 20000 accounts, 5000 products in 1.09 s (12.9 MiB)
+ users     ops/s    p50ms     p99ms   usr p99   succ%  retry% srvCPU genCPU  inv   wall
+    10   13017.5    0.426     6.824     6.825   100.0     0.0   5.08   1.52   ok   41.5
+   100   14858.2    1.397    48.373    48.373   100.0     0.0   6.65   2.16   ok  40.36
+   500   12081.0    6.182    208.81   208.811   100.0     0.0   6.61   1.82   ok  41.26
+offline check: ok (20.47 s); after kill: 0 errors, 843042 warnings
+report → /Users/jalbarracin/Code/elitesql/benchmark-results/sqlite-comparison-2026-09-26/saas-r2-sidecar/report.md

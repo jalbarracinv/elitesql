@@ -1,0 +1,31 @@
+EliteSQL vs SQLite concurrent writers
+  EliteSQL:    0.0.1
+  SQLite:      3.45.0 (rusqlite bundled)
+  writers:     [1, 4, 8]
+  total rows:  200000 per engine/run
+  batch size:  10 rows/transaction
+  repetitions: 3
+  durability:  EliteSQL fast <-> SQLite WAL + synchronous=OFF
+  SQLite sync: ["ordinary"]
+  Safe coalescing window: 200 us
+  checkpoints: outside measured write window
+  EliteSQL           writers=1  run=1     641337 rows/s  p50=    14.7 us  p95=    22.3 us  p99=    32.4 us  max=    871.1 us  checkpoint=0.148 s  primitive=F_FULLFSYNC  wal_syncs=0 avg=0.0us commits/sync=0.00 max_group=0 grouped=0 coordinated=0/0  lock(wait/hold)=0.0/8.4 us prepare=0.3 append=2.1 apply=5.8 us
+  SQLite-fsync       writers=1  run=1     440401 rows/s  p50=    15.6 us  p95=    40.1 us  p99=    48.3 us  max=    654.4 us  checkpoint=0.021 s  primitive=fsync
+  SQLite-fsync       writers=1  run=2     437856 rows/s  p50=    15.6 us  p95=    40.5 us  p99=    47.8 us  max=   1616.9 us  checkpoint=0.021 s  primitive=fsync
+  EliteSQL           writers=1  run=2     700543 rows/s  p50=    13.9 us  p95=    17.9 us  p99=    20.8 us  max=    373.0 us  checkpoint=0.141 s  primitive=F_FULLFSYNC  wal_syncs=0 avg=0.0us commits/sync=0.00 max_group=0 grouped=0 coordinated=0/0  lock(wait/hold)=0.0/7.8 us prepare=0.2 append=1.9 apply=5.5 us
+  EliteSQL           writers=1  run=3     715841 rows/s  p50=    13.8 us  p95=    17.7 us  p99=    20.4 us  max=    176.2 us  checkpoint=0.137 s  primitive=F_FULLFSYNC  wal_syncs=0 avg=0.0us commits/sync=0.00 max_group=0 grouped=0 coordinated=0/0  lock(wait/hold)=0.0/7.7 us prepare=0.2 append=1.8 apply=5.5 us
+  SQLite-fsync       writers=1  run=3     444306 rows/s  p50=    15.4 us  p95=    39.8 us  p99=    47.5 us  max=   1059.5 us  checkpoint=0.021 s  primitive=fsync
+  EliteSQL           writers=4  run=1     519782 rows/s  p50=    63.8 us  p95=   117.9 us  p99=   137.1 us  max=    364.5 us  checkpoint=0.127 s  primitive=F_FULLFSYNC  wal_syncs=0 avg=0.0us commits/sync=0.00 max_group=0 grouped=0 coordinated=13381/6207  lock(wait/hold)=14.0/14.3 us prepare=2.6 append=3.1 apply=8.3 us
+  SQLite-fsync       writers=4  run=1     323875 rows/s  p50=    26.9 us  p95=    43.1 us  p99=    55.6 us  max= 474517.0 us  checkpoint=0.021 s  primitive=fsync
+  SQLite-fsync       writers=4  run=2     280056 rows/s  p50=    27.7 us  p95=    44.1 us  p99=    58.1 us  max= 572729.9 us  checkpoint=0.022 s  primitive=fsync
+  EliteSQL           writers=4  run=2     521873 rows/s  p50=    63.2 us  p95=   117.7 us  p99=   136.1 us  max=    286.0 us  checkpoint=0.124 s  primitive=F_FULLFSYNC  wal_syncs=0 avg=0.0us commits/sync=0.00 max_group=0 grouped=0 coordinated=13165/6022  lock(wait/hold)=13.7/14.2 us prepare=2.6 append=3.1 apply=8.2 us
+  EliteSQL           writers=4  run=3     523147 rows/s  p50=    63.0 us  p95=   117.8 us  p99=   135.2 us  max=    310.4 us  checkpoint=0.127 s  primitive=F_FULLFSYNC  wal_syncs=0 avg=0.0us commits/sync=0.00 max_group=0 grouped=0 coordinated=13250/6076  lock(wait/hold)=13.8/14.1 us prepare=2.6 append=3.1 apply=8.1 us
+  SQLite-fsync       writers=4  run=3     327902 rows/s  p50=    27.1 us  p95=    42.6 us  p99=    55.4 us  max= 462888.7 us  checkpoint=0.022 s  primitive=fsync
+  EliteSQL           writers=8  run=1     712649 rows/s  p50=   109.3 us  p95=   157.9 us  p99=   186.3 us  max=    376.5 us  checkpoint=0.129 s  primitive=F_FULLFSYNC  wal_syncs=0 avg=0.0us commits/sync=0.00 max_group=0 grouped=0 coordinated=19970/4525  lock(wait/hold)=37.0/9.4 us prepare=4.0 append=1.2 apply=4.0 us
+  SQLite-fsync       writers=8  run=1     273340 rows/s  p50=    28.2 us  p95=    49.0 us  p99=   106.2 us  max= 659499.9 us  checkpoint=0.023 s  primitive=fsync
+  SQLite-fsync       writers=8  run=2     234385 rows/s  p50=    27.8 us  p95=    48.8 us  p99=    99.9 us  max= 788195.2 us  checkpoint=0.022 s  primitive=fsync
+  EliteSQL           writers=8  run=2     711592 rows/s  p50=   108.9 us  p95=   150.3 us  p99=   215.8 us  max=    395.2 us  checkpoint=0.130 s  primitive=F_FULLFSYNC  wal_syncs=0 avg=0.0us commits/sync=0.00 max_group=0 grouped=0 coordinated=19952/4616  lock(wait/hold)=36.2/9.6 us prepare=4.3 append=1.2 apply=3.9 us
+  EliteSQL           writers=8  run=3     719546 rows/s  p50=   108.4 us  p95=   142.6 us  p99=   222.0 us  max=    435.7 us  checkpoint=0.126 s  primitive=F_FULLFSYNC  wal_syncs=0 avg=0.0us commits/sync=0.00 max_group=0 grouped=0 coordinated=19967/4677  lock(wait/hold)=36.2/9.6 us prepare=4.5 append=1.2 apply=3.8 us
+  SQLite-fsync       writers=8  run=3     266974 rows/s  p50=    27.5 us  p95=    45.9 us  p99=    60.8 us  max= 678103.7 us  checkpoint=0.023 s  primitive=fsync
+
+CSV: /Users/jalbarracin/Code/elitesql/benchmark-results/sqlite-comparison-2026-09-26/writers-fast.csv

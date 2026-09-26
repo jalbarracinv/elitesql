@@ -33,7 +33,7 @@ jobs:
     # RHEL 8+, and NAS firmware based on them).
     container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -60,7 +60,7 @@ jobs:
               assert db.query("SELECT name FROM t")["rows"] == [["wheel"]]
           print("wheel-smoke-ok")
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-linux-${{ matrix.arch }}
           path: bindings/python/dist/*.whl
@@ -70,8 +70,8 @@ jobs:
     name: wheel (macOS arm64)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install Rust
@@ -96,7 +96,7 @@ jobs:
               assert db.query("SELECT name FROM t")["rows"] == [["wheel"]]
           print("wheel-smoke-ok")
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-macos-arm64
           path: bindings/python/dist/*.whl
@@ -110,7 +110,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheel-*
           merge-multiple: true
@@ -137,7 +137,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheel-*
           merge-multiple: true

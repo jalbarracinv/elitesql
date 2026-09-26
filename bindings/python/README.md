@@ -7,8 +7,8 @@ pip install elitesql
 ```
 
 Wheels for Linux x86_64/aarch64 (manylinux_2_28) and macOS arm64 ship the
-engine (`libelitesql`) inside the package; Python 3.9 or newer. Until the first
-PyPI release, install the wheel attached to a
+engine (`libelitesql`) inside the package; Python 3.9 or newer. Install from
+[PyPI](https://pypi.org/project/elitesql/) or use a wheel attached to a
 [GitHub Release](https://github.com/jalbarracinv/elitesql/releases).
 
 - `EliteSQL(path)`: embedded in-process over the C ABI (`libelitesql`).

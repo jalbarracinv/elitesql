@@ -1,0 +1,48 @@
+{
+  "name": "scale-1m-10k-r2-elitesql",
+  "argv": [
+    "/Users/jalbarracin/Code/elitesql/target/release/deps/scale_vs_sqlite-f5ba50643154ecf7",
+    "--rows",
+    "1m",
+    "--batch-size",
+    "10k",
+    "--durability",
+    "fast",
+    "--point-reads",
+    "100k",
+    "--full-scans",
+    "1",
+    "--engine",
+    "elitesql",
+    "--csv",
+    "/Users/jalbarracin/Code/elitesql/benchmark-results/sqlite-comparison-2026-09-26/scale-1m-10k-r2-elitesql.csv"
+  ],
+  "before": {
+    "utc": "2026-09-26T10:27:38Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  },
+  "returncode": 0,
+  "seconds": 1.8184813749976456,
+  "after": {
+    "utc": "2026-09-26T10:27:40Z",
+    "battery": {
+      "code": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 \t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal": {
+      "code": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    }
+  }
+}
